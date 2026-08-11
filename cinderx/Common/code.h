@@ -112,6 +112,16 @@ namespace jit {
 void failJitPublishStepForTest(int step);
 void throwIfJitPublishStepArmedForTest(int step);
 bool consumeJitPublishStepForTest(int step);
+
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+// Observe the real CodeExtra resolver boundaries for one code object.  This
+// probe exists only in CMake RuntimeTests builds; production and Buck builds
+// neither expose it nor pay for a counting branch.
+void resetCodeExtraResolverCountsForTest(PyCodeObject* target);
+void disableCodeExtraResolverCountingForTest();
+size_t codeExtraGetOrCreateCountForTest();
+size_t codeExtraIfExistsCountForTest();
+#endif
 } // namespace jit
 #endif // __cplusplus
 

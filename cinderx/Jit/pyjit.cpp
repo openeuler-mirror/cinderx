@@ -109,6 +109,55 @@ struct AutoJitGateState {
   GateContext context;
 };
 
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+thread_local bool s_count_jit_context_lookups{false};
+thread_local size_t s_jit_context_lookup_count{0};
+#endif
+
+CompilerContext<Compiler>* jitCtx();
+
+// Resolve a code object's CodeExtra at most once after it has been found or
+// created during one scheduleJitCompile() call. A miss from the non-allocating
+// lookup may still be followed by one allocating lookup, preserving the
+// existing lazy-creation behavior.
+class ScheduleJitCompileState {
+ public:
+  explicit ScheduleJitCompileState(PyCodeObject* code) : code_(code) {}
+
+  CodeExtra* getIfExists() {
+    if (!looked_up_) {
+      extra_ = codeExtraIfExists(code_);
+      looked_up_ = true;
+    }
+    return extra_;
+  }
+
+  CodeExtra* getOrCreate() {
+    if (!looked_up_ || extra_ == nullptr) {
+      extra_ = codeExtra(code_);
+      // If allocation or module-state access failed, let a later
+      // non-allocating lookup retain the old behavior of checking again.
+      looked_up_ = extra_ != nullptr;
+    }
+    return extra_;
+  }
+
+  CompilerContext<Compiler>* context() {
+    if (!context_looked_up_) {
+      context_ = jitCtx();
+      context_looked_up_ = true;
+    }
+    return context_;
+  }
+
+ private:
+  PyCodeObject* code_;
+  CodeExtra* extra_{nullptr};
+  bool looked_up_{false};
+  CompilerContext<Compiler>* context_{nullptr};
+  bool context_looked_up_{false};
+};
+
 AutoJitGateStats g_auto_jit_gate_stats;
 std::atomic<bool> g_auto_jit_gate_stats_enabled{false};
 
@@ -330,6 +379,11 @@ class DisableGilCheck {
 };
 
 CompilerContext<Compiler>* jitCtx() {
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+  if (s_count_jit_context_lookups) {
+    s_jit_context_lookup_count++;
+  }
+#endif
   auto state = cinderx::getModuleState();
   if (state != nullptr) {
     return static_cast<CompilerContext<Compiler>*>(state->jit_context.get());
@@ -463,7 +517,8 @@ bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
 }
 
 bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
-    BorrowedRef<PyFunctionObject> func) {
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
   if (!getConfig().roi_backoff_enabled ||
       cinderx::getModuleState()->jit_list != nullptr) {
     return false;
@@ -471,8 +526,7 @@ bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
   if (shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject>{func->func_code})) {
     return false;
   }
-  CodeExtra* extra =
-      codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+  CodeExtra* extra = state.getIfExists();
   if (extra == nullptr) {
     return false;
   }
@@ -1432,10 +1486,12 @@ FlagProcessor initFlagProcessor() {
  * Return true if the function was successfully reopted, false if nothing
  * happened.
  */
-bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
-  if (jitCtx() == nullptr) {
+bool reoptFuncWithContext(
+    BorrowedRef<PyFunctionObject> func,
+    CompilerContext<Compiler>* ctx) {
+  if (ctx == nullptr) {
     return false;
-  } else if (jitCtx()->didCompile(func)) {
+  } else if (ctx->didCompile(func)) {
     return true;
   }
 
@@ -1444,7 +1500,7 @@ bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-  if (CompiledFunction* compiled = jitCtx()->lookupFunc(func)) {
+  if (CompiledFunction* compiled = ctx->lookupFunc(func)) {
 #if PY_VERSION_HEX < 0x030C0000
     // finalizeFunc() reports a refusal as "nothing to do", which is right
     // for it -- nothing was installed and nothing is half-built -- but
@@ -1459,13 +1515,17 @@ bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
 #endif
     // finalizeFunc() unparks on success; a failed publication leaves the
     // entry parked so a later enable() can retry it.
-    return jitCtx()->finalizeFunc(func, compiled);
+    return ctx->finalizeFunc(func, compiled);
   }
   // No artifact remains for this function, so nothing will ever reattach
   // it: drop the parked entry (a no-op for a nested function that was
   // never explicitly deopted).
-  jitCtx()->removeDeoptedFunc(func);
+  ctx->removeDeoptedFunc(func);
   return false;
+}
+
+bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
+  return reoptFuncWithContext(func, jitCtx());
 }
 
 // Check if we have exceeded the max code size limit.
@@ -5634,6 +5694,21 @@ extern "C" int Ci_QuickenWarmupStep_311;
 
 namespace jit {
 
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+void resetJitContextLookupCountForTest() {
+  s_jit_context_lookup_count = 0;
+  s_count_jit_context_lookups = true;
+}
+
+void disableJitContextLookupCountingForTest() {
+  s_count_jit_context_lookups = false;
+}
+
+size_t jitContextLookupCountForTest() {
+  return s_jit_context_lookup_count;
+}
+#endif
+
 void setUncompileMidpointHookForTest(void (*hook)()) {
   s_uncompile_midpoint_hook_for_test = hook;
 }
@@ -6259,7 +6334,8 @@ bool shouldScheduleCompile(BorrowedRef<PyFunctionObject> func) {
 }
 
 bool shouldSkipAutoJitScheduleForSteadyColdCode(
-    BorrowedRef<PyFunctionObject> func) {
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
   if (!getConfig().auto_classify ||
       !getConfig().compile_after_n_calls.has_value() ||
       cinderx::getModuleState()->jit_list != nullptr) {
@@ -6270,7 +6346,7 @@ bool shouldSkipAutoJitScheduleForSteadyColdCode(
   if (shouldAlwaysScheduleCompile(code)) {
     return false;
   }
-  CodeExtra* extra = codeExtraIfExists(code);
+  CodeExtra* extra = state.getIfExists();
   if (extra == nullptr) {
     return false;
   }
@@ -6298,8 +6374,11 @@ bool shouldSkipAutoJitScheduleForSteadyColdCode(
 // hands off to the normal finalizeFunc() so the function is fully tracked for
 // deopt and the CompiledFunction's lifetime is anchored exactly as on the slow
 // path. Returns true if the function was attached.
-bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
-  if (jitCtx() == nullptr) {
+bool tryAttachCachedCompiledEntry(
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
+  auto* ctx = state.context();
+  if (ctx == nullptr) {
     return false;
   }
 #if PY_VERSION_HEX < 0x030C0000
@@ -6319,8 +6398,7 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   if (cinderx::getModuleState()->jit_list != nullptr) {
     return false;
   }
-  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
-  CodeExtra* extra = codeExtra(code);
+  CodeExtra* extra = state.getOrCreate();
   if (extra == nullptr) {
     return false;
   }
@@ -6346,7 +6424,7 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   // finalizeFunc() does the full association (compiled_funcs_ tracking,
   // CompiledFunction function set, func_dict strong ref, vectorcall + static
   // entry), so deopt and GC behave identically to the slow path.
-  return jitCtx()->finalizeFunc(func, compiled);
+  return ctx->finalizeFunc(func, compiled);
 #endif
 }
 
@@ -6377,15 +6455,18 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-  if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func)) {
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  ScheduleJitCompileState state{code};
+
+  if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func, state)) {
     return true;
   }
 
-  if (tryAttachCachedCompiledEntry(func)) {
+  if (tryAttachCachedCompiledEntry(func, state)) {
     return true;
   }
 
-  if (shouldSkipAutoJitScheduleForSteadyColdCode(func)) {
+  if (shouldSkipAutoJitScheduleForSteadyColdCode(func, state)) {
     incAutoJitGateStat(g_auto_jit_gate_stats.classified_schedule_cold_skip);
     return true;
   }
@@ -6416,7 +6497,8 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   // functions if the user had disabled the JIT without selecting to deopt
   // everything.  This is a weird behavior though, to have "new" functions get
   // JIT-compiled code despite the JIT being disabled.
-  if (!isInstrumentationActive() && reoptFunc(func)) {
+  if (!isInstrumentationActive() &&
+      reoptFuncWithContext(func, state.context())) {
     return true;
   }
 

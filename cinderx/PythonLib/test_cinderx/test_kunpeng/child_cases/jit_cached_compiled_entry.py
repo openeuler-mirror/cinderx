@@ -50,10 +50,29 @@ def instrumentation_bail() -> None:
         sys.setprofile(None)
 
 
+def many_recreated() -> None:
+    def make_inner_with_value(value):
+        def inner(offset=1):
+            return value + offset
+
+        return inner
+
+    first = make_inner_with_value(0)
+    assert cinderx.jit.force_compile(first)
+    assert cinderx.jit.is_jit_compiled(first)
+
+    for value in range(10_000):
+        current = make_inner_with_value(value)
+        assert current.__code__ is first.__code__
+        assert cinderx.jit.is_jit_compiled(current)
+        assert current() == value + 1
+
+
 CASES = {
     "fast-attach": fast_attach,
     "instrumentation-bail": instrumentation_bail,
     "jit-list-bail": jit_list_bail,
+    "many-recreated": many_recreated,
 }
 
 
