@@ -151,6 +151,40 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void addDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Arm the death watch (idempotent); false on allocation failure, no
+   * error pending.  Arming is a precondition of recording any borrowed
+   * registry pointer.
+   */
+  bool watchFunctionDeath(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Drop the watch for a function that has died.  Called from the callback,
+   * and by publication when it unwinds an arm it created.
+   */
+  void forgetFunctionDeathWatch(PyFunctionObject* func);
+
+  /*
+   * True while the function's death is already in flight: its watch has been
+   * cleared by the collector but the callback has not landed yet.  During a
+   * cyclic collection the weak references of the doomed are cleared, and
+   * their callbacks run, before anything is untracked -- so a query from a
+   * user callback in that batch sees the function still tracked while it is
+   * already condemned.  The cleared watch is the only oracle for that state.
+   */
+  bool isFunctionDeathPending(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * Drop every watch.  Teardown only: after this the JIT stops being told
+   * about function deaths.
+   */
+  void clearFunctionDeathWatch();
+
+  /* Number of functions currently watched; read by tests and reports. */
+  size_t watchedFunctionCount() const;
+#endif
+
   /*
    * Removes a function from the deopted functions set.
    */
@@ -168,6 +202,45 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * that publishes again and defers more anchors extends the same drain.
    */
   void drainDeferredAnchorReleases();
+
+  /*
+   * Park a reference on the deferred-release queue, for a caller outside
+   * finalizeFunc() that must not run the reference's destructor inside
+   * its own operation.  The caller drains at its boundary.
+   */
+  void deferAnchorRelease(Ref<> anchor);
+
+  /*
+   * Whether any compilation state is attached to this function: an
+   * association (which survives parking and __code__ swaps), a parked
+   * entry, or an installation.  This is the force-uncompile predicate.
+   * It is deliberately NOT isJitCompiled(), which answers the narrower
+   * question "will the next call execute machine code" and is false in
+   * exactly the states -- parked, __code__ swapped, evaluator away --
+   * whose retained state force_uncompile() exists to remove.
+   */
+  bool hasCompilationState(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * The artifact the association map claims for this function, or null.
+   * The association is the authoritative answer to "which artifact":
+   * func_code is writable Python state and may point at another live
+   * function's code by the time anyone asks.
+   */
+  BorrowedRef<CompiledFunction> findAssociated(
+      BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * Retire a compiled-code entry by ARTIFACT identity: the key is built
+   * from the artifact's own runtime (code, builtins, globals), never from
+   * the function's current code object.  force_uncompile() retires the
+   * artifact its association claimed; keying by the function's mutable
+   * func_code cleared whichever artifact currently owned that code -- a
+   * donor function's, after a __code__ swap.
+   */
+  void forgetCodeForArtifact(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
 #endif
 
   /*
@@ -270,6 +343,18 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * Remove the specified code object from the known compiled codes.
    */
   void forgetCode(BorrowedRef<PyFunctionObject> func);
+
+ private:
+  /*
+   * Shared tail of forgetCode()/forgetCodeForArtifact(): nested-list
+   * cleanup, cache and dedup-index drops, the artifact clear, and the
+   * erase of the given entry.
+   */
+  void forgetCodeEntry(
+      UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>>::iterator it,
+      BorrowedRef<PyFunctionObject> func);
+
+ public:
   /*
    * Remove the specified code object from the known compiled codes.
    */
@@ -583,7 +668,7 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 #if PY_VERSION_HEX < 0x030C0000
   /*
    * Which artifact claims each function: the inverse of the artifacts'
-   * owned-functions sets, and the lookup the installed registry cannot
+   * artifacts' member sets, and the lookup the installed registry cannot
    * answer.  Association identity and installation identity are distinct
    * states on this branch: compiled_funcs_ records what is installed right
    * now and empties on a deopt, while the association survives parking so
@@ -593,8 +678,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * needs this map, because the function is then neither installed nor
    * reachable through its current code object.
    *
-   * Entries are borrowed on both sides and maintained in lockstep with the
-   * owned-functions sets: created in finalizeFunc(), transferred by its
+   * Entries are borrowed on both sides and move together with the
+   * artifacts' member sets: created in finalizeFunc(), transferred by its
    * stale-claim severing, and erased by funcDestroyed() and by the death
    * of the claiming artifact (forgetCompiledFunction).
    */
@@ -618,6 +703,26 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   /* Set of which functions were JIT-compiled but have since been deopted. */
   UnorderedSet<BorrowedRef<PyFunctionObject>> deopted_funcs_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Weak references standing in for 3.11's missing function watcher.  JIT
+   * ownership is what makes cycle deaths deliver (a watch owned by the
+   * dying graph is cleared silently); entries deliberately outlive
+   * registration -- a stale watch is one weak reference that finds
+   * nothing to erase.
+   */
+  UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+
+  /*
+   * Death-watch owner token: capsule-held cell naming this context, shared
+   * by every armed callback.  ClearWeakRefs snapshots callbacks before
+   * invoking any, so a raw Context* can dangle; the cell is nulled by
+   * ~Context, outlives it by refcount, and is per-instance (a recycled
+   * address cannot impersonate a dead owner).
+   */
+  Ref<> death_watch_owner_token_;
+#endif
 
   /*
    * Set of compilations that are currently active, across all threads.

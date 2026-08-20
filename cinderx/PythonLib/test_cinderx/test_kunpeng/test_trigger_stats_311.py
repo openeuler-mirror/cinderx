@@ -35,9 +35,11 @@ class TriggerStatsGateTest(unittest.TestCase):
         self.assertEqual(
             sorted(stats),
             [
+                "code_destroyed_notifications",
                 "compiled_function_creations",
                 "executable_alloc_bytes",
                 "executable_alloc_calls",
+                "function_destroyed_notifications",
                 "machine_code_entries",
                 "shadow_codegen_bytes",
                 "shadow_compile_success",

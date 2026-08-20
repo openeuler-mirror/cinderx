@@ -3,6 +3,8 @@
 #include "cinderx/Jit/pyjit.h"
 
 #include "internal/pycore_pystate.h"
+
+#include "cinderx/Jit/trigger_stats.h"
 #if PY_VERSION_HEX >= 0x030E0000
 #include "internal/pycore_interp_structs.h"
 #endif
@@ -1665,6 +1667,10 @@ bool compile_all(size_t workers = 0) {
     std::vector<BorrowedRef<>> compilation_units;
     // units that were deleted during preloading
     std::unordered_set<BorrowedRef<>> deleted_units;
+    // The deletion record is taken inside a death callback, where nothing
+    // may throw; a failed record means the deleted-units view is
+    // incomplete and this batch cannot be trusted.
+    bool deletion_record_lost = false;
 
     auto& jit_reg_units =
         cinderx::getModuleState()->registered_compilation_units;
@@ -1686,13 +1692,26 @@ bool compile_all(size_t workers = 0) {
         }
         hir::Preloader* preloader = preloadWithUnitDeletedCallback(
             unit, [&](BorrowedRef<> deleted_unit) {
-              deleted_units.emplace(deleted_unit);
+              try {
+                throwIfJitPublishStepArmedForTest(9);
+                deleted_units.emplace(deleted_unit);
+              } catch (const std::bad_alloc&) {
+                deletion_record_lost = true;
+              }
             });
         if (!preloader) {
           return false;
         }
         compilation_units.push_back(unit);
       }
+    }
+
+    if (deletion_record_lost || consumeUnitDeletionTrackingPoison()) {
+      // A unit died during preloading and its record was lost; any entry
+      // below may be dead.  Refuse the whole batch rather than execute a
+      // guess.
+      PyErr_NoMemory();
+      return false;
     }
 
     // Filter out any units that were deleted as a side effect of preloading.
@@ -1886,8 +1905,24 @@ bool registerFunction(BorrowedRef<PyFunctionObject> func) {
   JIT_CHECK(
       !getThreadedCompileContext().compileRunning(),
       "Not intended for using during threaded compilation");
+#if PY_VERSION_HEX < 0x030C0000
+  // Borrowed pointer: arm the death watch BEFORE recording it (same
+  // discipline as the installed/parked registries), or a function dying
+  // registered-but-never-compiled leaves a dangling key for batch compile.
+  if (!jitCtx()->watchFunctionDeath(func)) {
+    return false;
+  }
+#endif
   auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
-  jit_reg_units.emplace(func.getObj());
+  try {
+    jit_reg_units.emplace(func.getObj());
+  } catch (const std::bad_alloc&) {
+    // Report not-registered rather than letting the exception cross the
+    // C API.  The watch stays armed: a watch without registry entries is
+    // a benign no-op at delivery, and disarming here could withdraw a
+    // watch an earlier publication armed.
+    return false;
+  }
 
   return true;
 }
@@ -1944,15 +1979,6 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-#if PY_VERSION_HEX < 0x030C0000
-  // On 3.11 the artifact owns its functions, and removeCompiledFunc()
-  // releases that reference.  A function whose only other owner is its own
-  // dictionary's artifact entry dies inside that call -- the dictionary
-  // clear drops the artifact too -- and the entry install below would then
-  // write into freed memory.  Hold the function until the entry is back on
-  // the interpreter.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   if (!jitCtx()->removeCompiledFunc(func)) {
     return false;
   }
@@ -1961,11 +1987,6 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
 }
 
 void uncompileImpl(BorrowedRef<PyFunctionObject> func) {
-#if PY_VERSION_HEX < 0x030C0000
-  // deoptFuncImpl() can release the last reference the JIT holds on this
-  // function (see the guard there); forgetCode() still reads it.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   deoptFuncImpl(func);
   jitCtx()->forgetCode(func);
 }
@@ -1982,13 +2003,6 @@ void uncompile(BorrowedRef<PyFunctionObject> func) {
  * Return true if the function was previously JIT-compiled, false otherwise.
  */
 bool deoptFunc(BorrowedRef<PyFunctionObject> func) {
-#if PY_VERSION_HEX < 0x030C0000
-  // Same hazard as in deoptFuncImpl(): once the artifact's owned reference
-  // is released in there, parking below would resurrect a freed pointer.
-  // The parked set takes its own reference, so the function survives this
-  // guard's release exactly when it was parked.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   if (jitCtx() && deoptFuncImpl(func)) {
     jitCtx()->addDeoptedFunc(func);
     return true;
@@ -2011,6 +2025,15 @@ void disable_jit_impl(bool deopt_all) {
       // Advance before deoptFunc() which erases func from funcs,
       // invalidating the iterator pointing to it.
       ++it;
+#if PY_VERSION_HEX < 0x030C0000
+      // This walk is reachable from a user weak-reference callback while
+      // the function it watches is mid-death (weak references clear before
+      // the JIT's own callback runs).  Deopting would park a pointer whose
+      // owner is already being destroyed; its callback owns the cleanup.
+      if (jitCtx()->isFunctionDeathPending(func)) {
+        continue;
+      }
+#endif
       if (deoptFunc(func)) {
         success++;
       } else {
@@ -2056,14 +2079,24 @@ static bool reattachParkedFuncs() {
   // success, and a reattachment that takes over a prior artifact queues
   // that artifact's displaced anchor -- whose eventual release runs
   // arbitrary Python that can call disable() and INSERT into the set.  The
-  // strong references also keep each entry alive across the walk: on 3.11
-  // the parked set owns its entries, so an erase can drop the last
-  // reference while the call is still using it.
+  // strong references keep entries alive across the walk (the set holds
+  // by borrow); one that dies between snapshot and visit is skipped by the
+  // still-parked check, its death having erased it from the set.
   std::vector<Ref<PyFunctionObject>> parked;
   {
     auto& funcs = jitCtx()->deoptedFuncs();
     parked.reserve(funcs.size());
     for (BorrowedRef<PyFunctionObject> func : funcs) {
+#if PY_VERSION_HEX < 0x030C0000
+      // A parked entry whose death is already pending -- its weak
+      // reference cleared, its callback batch running, this walk reached
+      // from a user callback in that batch -- must not be resurrected by
+      // the snapshot's strong reference: an INCREF here revives an object
+      // mid-deallocation.  Its own callback erases the entry; skip it.
+      if (jitCtx()->isFunctionDeathPending(func)) {
+        continue;
+      }
+#endif
       parked.emplace_back(Ref<PyFunctionObject>::create(func));
     }
   }
@@ -2569,6 +2602,10 @@ PyObject* lazy_compile(PyObject* /* self */, PyObject* arg) {
   Py_RETURN_TRUE;
 }
 
+namespace {
+void (*s_uncompile_midpoint_hook_for_test)() = nullptr;
+} // namespace
+
 // Uncompile a function by returning it to its non-jitted version.
 PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   BorrowedRef<PyFunctionObject> func = get_func_arg("force_uncompile", arg);
@@ -2577,20 +2614,102 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   }
   FreeThreadedJITEntrypointGuard guard;
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Gate on retained state, not the call predicate: isJitCompiled() is
+  // deliberately false while parked / after a __code__ swap / with the
+  // evaluator away, yet those states retain exactly what uncompile must
+  // remove -- gated on it, the artifact revived on the way back.
+  if (jitCtx() == nullptr || !jitCtx()->hasCompilationState(func)) {
+    Py_RETURN_FALSE;
+  }
+#else
   if (!isJitCompiled(func)) {
     Py_RETURN_FALSE;
   }
+#endif
+
+  // Pin the function for the duration: a last external reference dropped
+  // mid-operation must not free what the remaining steps read.
+  Ref<PyFunctionObject> keep = Ref<PyFunctionObject>::create(func);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Capture the claimed artifact BEFORE unpublication severs the
+  // association -- the association is authoritative; func_code is mutable
+  // and after a swap names another function's code (retiring by that key
+  // cleared the donor's artifact).  Doubles as the retirement pin.
+  Ref<jit::CompiledFunction> claimed;
+  {
+    BorrowedRef<jit::CompiledFunction> assoc = jitCtx()->findAssociated(func);
+    if (assoc != nullptr) {
+      claimed = Ref<jit::CompiledFunction>::create(assoc);
+    }
+  }
+#endif
 
   // Replace the function entrypoint with the interpreter entrypoint, so that it
   // can properly be called again.
   setVectorcall(func, getInterpretedVectorcall(func));
 
-  // "Destroy" the function from the perspective of the JIT, effectively erasing
-  // all traces of it from the metadata.
-  funcDestroyed(func);
+  // Unpublish the function: erase the JIT's records of it.  This is not a
+  // death and must not count as one.
+  funcUnpublished(func);
+
+  if (s_uncompile_midpoint_hook_for_test != nullptr) {
+    s_uncompile_midpoint_hook_for_test();
+  }
 
   if (jitCtx() != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Retire the dictionary anchor (what keeps the artifact resident),
+    // detained in a local pin: released in place it would run arbitrary
+    // Python mid-operation.  A local needs no allocation, so no failure.
+    Ref<> detained_anchor;
+    if (func->func_dict != nullptr) {
+      BorrowedRef<> anchored =
+          PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey);
+      if (anchored == nullptr && PyErr_Occurred()) {
+        PyErr_Clear();
+      }
+      // Only the claimed artifact's own anchor is ours: the key is
+      // user-writable state, and a forged foreign value may be the last
+      // reference to ANOTHER function's artifact -- releasing it would
+      // uncompile that function.  Anything else stays as the user wrote
+      // it (retirement goes by identity, not by this key).
+      if (anchored != nullptr && claimed != nullptr &&
+          anchored.get() == reinterpret_cast<PyObject*>(claimed.get())) {
+        detained_anchor = Ref<>::create(anchored);
+        if (PyDict_DelItem(func->func_dict, jit::kCompiledFunctionKey) < 0) {
+          PyErr_Clear();
+        }
+      }
+    }
+    // Retire by artifact identity: the entry-point bookkeeping, then the
+    // compiled-codes entry of the artifact the association CLAIMED --
+    // keyed from the artifact's own runtime, never rebuilt from the
+    // function's mutable func_code.
+    deoptFuncImpl(func);
+    if (claimed != nullptr) {
+      jitCtx()->forgetCodeForArtifact(func, claimed);
+    }
+    // Settlement: every structure is consistent.  The pins release here --
+    // either can be the artifact's last reference, and whatever their
+    // destruction runs sees the finished uncompilation.  Residue from the
+    // destruction drains with it.
+    claimed.reset();
+    detained_anchor.reset();
+    jitCtx()->drainDeferredAnchorReleases();
+    // Verdict AFTER the releases: a __del__ there can reenter
+    // force_compile(), and a rebuilt compilation state is a newer decision
+    // this operation must not report over (symmetric to force_compile's
+    // post-drain re-verification).
+    if (jitCtx()->hasCompilationState(func)) {
+      PyErr_SetString(
+          PyExc_RuntimeError, "function was recompiled during force_uncompile");
+      return nullptr;
+    }
+#else
     uncompileImpl(func);
+#endif
   }
 
   Py_RETURN_TRUE;
@@ -3002,17 +3121,15 @@ PyObject* read_jit_list(PyObject* /* self */, PyObject* arg) {
 // the two apart is what makes a lifecycle report mean anything.
 PyObject* get_resident_compiled_functions(PyObject* /* self */, PyObject*) {
   // A physical measurement, so it must not depend on the JIT's current
-  // state: pausing does not release a code buffer, and answering None (or
-  // zero) while artifacts are still resident is exactly the false negative
-  // this exists to prevent.  Counting compiled_codes_ rather than the
-  // installed-function map also keeps deopted-but-resident artifacts
-  // visible.  An integer, because the question is "how much is still
-  // alive", not "which functions would run".
-  auto* ctx = jitCtx();
-  if (ctx == nullptr) {
-    return PyLong_FromLong(0);
-  }
-  return PyLong_FromSize_t(ctx->compiledCodes().size());
+  // state OR its registries: pausing does not release a code buffer, and
+  // neither does force_uncompile() while an external reference pins the
+  // artifact -- the registry entry is gone, the machine code is not.  The
+  // gauge is maintained on the buffer's real lifetime (acquired with the
+  // artifact, released in its destructor), so it answers "how much
+  // executable memory is still alive", not "which functions would run"
+  // and not "what does the registry remember".
+  return PyLong_FromUnsignedLongLong(
+      jit::triggerStatsSnapshot().resident_code_buffers);
 }
 
 PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
@@ -3022,6 +3139,29 @@ PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
   }
   for (auto func_and_compiled : jitCtx()->compiledFuncs()) {
 #if PY_VERSION_HEX < 0x030C0000
+    // Never hand out a function that is already being destroyed.  This can
+    // run from a weak-reference callback, which CPython invokes from inside
+    // func_dealloc after temporarily resurrecting the object to a reference
+    // count of one; appending it here would take that count to two, and the
+    // restore that follows the callbacks frees it anyway -- leaving this
+    // list holding freed memory.  func_dealloc untracks before it runs the
+    // callbacks, so "not tracked" is exactly "being destroyed" for a type
+    // that is otherwise always tracked.
+    if (!PyObject_GC_IsTracked(func_and_compiled.first)) {
+      continue;
+    }
+    // The untracked check catches an ordinary dealloc, where func_dealloc
+    // untracks before it runs the weak-reference callbacks.  A cyclic
+    // collection is the other way around: the collector clears the weak
+    // references of the doomed, and runs the externally rooted callbacks,
+    // before anything is untracked -- so a query from such a callback sees
+    // a condemned function still tracked, and appending it here would
+    // resurrect it out of the garbage set.  The JIT's own death watch is
+    // the oracle for that state: its weak reference is cleared, the
+    // callback has not landed, the death is already in flight.
+    if (jitCtx()->isFunctionDeathPending(func_and_compiled.first)) {
+      continue;
+    }
     // Report what is actually installed.  A function whose code, globals or
     // defaults changed since it compiled still holds a registry entry, but
     // every call to it now goes to the interpreter, so listing it here
@@ -4102,11 +4242,11 @@ PyModuleDef_Slot jit_slots[] = {
 #if PY_VERSION_HEX < 0x030C0000
 // The 3.11 canary control plane.
 //
-// The full method table is a control surface for capabilities MR-04 does
-// not have: precompile_all() and lazy_compile() install machine code
-// through the batch and re-optimization paths, force_uncompile() and the
-// jit-list mutators belong to MR-05, and the guard and specialization
-// setters can re-open exactly the speculation this milestone excludes.
+// The full method table is a control surface for capabilities this port
+// does not yet have: precompile_all() and lazy_compile() install machine
+// code through the batch and re-optimization paths, the jit-list mutators
+// belong to a later milestone, and the guard and specialization setters can
+// re-open exactly the speculation MR-04 excludes.
 // Exposing them would make the execute surface a matter of which entry a
 // caller picked.  Canary therefore publishes only what its own evidence
 // needs, and each later milestone adds back what its acceptance covers.
@@ -4128,6 +4268,15 @@ PyMethodDef jit_methods_311_canary[] = {
      force_compile,
      METH_O,
      PyDoc_STR("Force a function to be JIT compiled if it hasn't yet.")},
+    // MR-05: the inverse of force_compile, and the only published way to
+    // take a function back off machine code.  A call already inside the
+    // artifact keeps running it -- the guarded entry pins it for the
+    // duration -- so this affects subsequent calls only.
+    {"force_uncompile",
+     force_uncompile,
+     METH_O,
+     PyDoc_STR("Take a function off JIT-compiled code; later calls run in "
+               "the interpreter.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -4213,13 +4362,8 @@ void trackEligibleCodeObjects(
     JitEligibility eligibility = JitEligibility::Eligible) {
 #if PY_VERSION_HEX < 0x030C0000
   // This table maps a code object to the function it was first seen on,
-  // and both halves are borrowed.  CPython 3.11 has no function-destroy
-  // notification, so nothing removes an entry when that function dies:
-  // hold on to the code object and the value dangles, and a later
-  // compilation of the same code would read the dead function's globals.
-  // The table exists to find nested functions for the batch paths, which
-  // the canary control plane does not publish, so on 3.11 it simply stays
-  // empty until MR-05 supplies the notification.
+  // and both halves are borrowed; its only consumer is the batch path the
+  // canary does not publish, so on 3.11 it stays empty (wired in MR-11).
   (void)func;
   (void)func_code;
   (void)eligibility;
@@ -4493,29 +4637,65 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
   auto& jit_code_outer_funcs = jitCtx()->codeOuterFunctions();
 
   BorrowedRef<PyCodeObject> top_code{func->func_code};
+  // The unconditional erases come first: this often runs under a C
+  // destructor, and erasing cannot fail while the nested walk below
+  // allocates.
+  jit_reg_units.erase(func);
+  jit_reg_units.erase(top_code);
+
   auto it = jit_code_outer_funcs.find(top_code);
   if (it != jit_code_outer_funcs.end() && it->second == func) {
     jit_code_outer_funcs.erase(it);
     PyObject* module = func->func_module;
     BorrowedRef<> top_consts{top_code->co_consts};
-    for (BorrowedRef<PyCodeObject> code : findNestedCodes(module, top_consts)) {
-      jit_reg_units.erase(code);
-      auto existing = jit_code_outer_funcs.find(code);
-      if (existing != jit_code_outer_funcs.end() && existing->second == func) {
-        jit_code_outer_funcs.erase(code);
+    try {
+      for (BorrowedRef<PyCodeObject> code :
+           findNestedCodes(module, top_consts)) {
+        jit_reg_units.erase(code);
+        auto existing = jit_code_outer_funcs.find(code);
+        if (existing != jit_code_outer_funcs.end() &&
+            existing->second == func) {
+          jit_code_outer_funcs.erase(code);
+        }
+        notifyUnitDeletedDuringPreload(mod_state, code.getObj());
       }
-      notifyUnitDeletedDuringPreload(mod_state, code.getObj());
+    } catch (const std::bad_alloc&) {
+      // The nested registrations could not be enumerated: some may remain,
+      // and their deletions were never announced, so no batch may trust
+      // its deleted-units view.
+      jit::poisonUnitDeletionTracking();
     }
   }
 
-  jit_reg_units.erase(func);
-  jit_reg_units.erase(top_code);
   notifyUnitDeletedDuringPreload(mod_state, func.getObj());
 }
 
 } // namespace
 
 namespace jit {
+
+void setUncompileMidpointHookForTest(void (*hook)()) {
+  s_uncompile_midpoint_hook_for_test = hook;
+}
+
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
+  return registerFunction(func);
+}
+
+void poisonUnitDeletionTracking() {
+  if (auto* state = cinderx::getModuleState()) {
+    state->unit_deletion_tracking_failed = true;
+  }
+}
+
+bool consumeUnitDeletionTrackingPoison() {
+  auto* state = cinderx::getModuleState();
+  if (state == nullptr || !state->unit_deletion_tracking_failed) {
+    return false;
+  }
+  state->unit_deletion_tracking_failed = false;
+  return true;
+}
 
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
   if (!getConfig().roi_backoff_enabled) {
@@ -4708,15 +4888,28 @@ int initialize() {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+  // 3.11 has no code watcher: the code-extra free function delivers the
+  // watcher-equivalent notification (both modes; shadow populates too).
+  // The hook is invoked from inside code_dealloc, so no C++ exception may
+  // cross it; a caught failure means a deletion may have gone unrecorded.
+  setCodeDestroyedHook([](PyCodeObject* code) {
+    try {
+      codeDestroyed(code);
+      // The bookkeeping above is no-throw by construction; the injection
+      // models a fault at the boundary's edge, after cleanup has run.
+      throwIfJitPublishStepArmedForTest(11);
+    } catch (...) {
+      poisonUnitDeletionTracking();
+    }
+  });
+
   // The 3.11 attribute-cache default is explicitly OFF until the MR-09
   // pull-based invalidation acceptance; neither shadow nor canary may walk
   // an unaccepted IC arm (dev plan MR-04).
   getMutableConfig().attr_caches = false;
-  // A compiled artifact may not be shared across function objects until the
-  // MR-05 lifecycle lands: 3.11 has no function-destroy notification (the
-  // compatibility shim's PyFunction_AddWatcher registers nothing), so a
-  // second owner keeps the artifact alive past the first owner's death and
-  // leaves that dead function as a borrowed pointer in the registry.
+  // Artifact sharing across functions stays off as policy: the death
+  // watch removed the old safety hazard, but twin adoption is scheduling
+  // policy with its own acceptance, outside this milestone.
   getMutableConfig().auto_code_twin_dedup = false;
   if (!canary_requested) {
     // Shadow owns the same front-end/compiler context as the executing JIT
@@ -4753,11 +4946,10 @@ int initialize() {
   // putting a guard-and-deopt arm under machine code.
   getMutableConfig().specialized_opcodes = false;
   // Refuse, do not silently clear: an immortal artifact skips the
-  // dictionary anchor and the owned-function association, so the registry
-  // would carry a borrowed function pointer with nothing behind it and the
-  // guarded entry would refuse a function the registry calls compiled.
-  // 3.11 raises no function-destroy notification to clean any of that up.
-  // The configuration is simply incompatible with this milestone's
+  // dictionary anchor and the function association, so the guarded entry
+  // would refuse a function the registry calls compiled -- and the death
+  // watch cannot reconcile that, because an immortalized function never
+  // dies.  The configuration is simply incompatible with this milestone's
   // ownership model, and saying so beats behaving as if it were honoured.
   if (getConfig().immortalize_compiled_functions) {
     PyErr_SetString(
@@ -4956,6 +5148,7 @@ void finalize() {
     }
     mod_state->jit_context.reset();
     mod_state->code_allocator.reset();
+    setCodeDestroyedHook(nullptr);
     getMutableConfig().state = State::kNotInitialized;
     return;
   }
@@ -5012,8 +5205,8 @@ void finalize() {
   // kFinalizing, so nothing their destructors run can re-arm the JIT --
   // before the registries they reach back into are torn down.
   jitCtx()->drainDeferredAnchorReleases();
-  // The deopted set owns its functions on this branch; release them
-  // before the context goes.
+  // The deopted set holds borrowed entries on this branch; empty it
+  // before the context goes so nothing walks it during teardown.
   jitCtx()->clearDeoptedFuncs();
 #endif
 
@@ -5041,6 +5234,9 @@ void finalize() {
 
   restoreSysMonitoringRegisterCallback();
   restoreSysSetProfileAndSetTrace();
+
+  // Past this point nothing can service a code-death notification.
+  setCodeDestroyedHook(nullptr);
 
   getMutableConfig().state = State::kNotInitialized;
   getMutableConfig().osr_capable = false;
@@ -5099,10 +5295,8 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   }
 #if PY_VERSION_HEX < 0x030C0000
   // This path exists to hand an already-compiled artifact to a freshly
-  // created function object, which is exactly the second owner 3.11 cannot
-  // account for: it has no function-destroy notification, so the first
-  // owner's death would leave a borrowed pointer behind. Re-attachment
-  // returns with the MR-05 lifecycle.
+  // created function object.  Fresh attachment is scheduled with auto-JIT
+  // (MR-11); the path stays closed here.
   (void)func;
   return false;
 #else
@@ -5293,6 +5487,9 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
   // Track units that are deleted while preloading.
   std::unordered_set<PyObject*> deleted_units;
+  // The deletion record is taken inside a death callback, where nothing may
+  // throw; losing one makes the pruning below unsound.
+  bool deletion_record_lost = false;
 
   worklist.push_back(func);
 
@@ -5308,7 +5505,12 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
     hir::Preloader* preloader =
         preloadWithUnitDeletedCallback(f, [&](BorrowedRef<> deleted_unit) {
-          deleted_units.emplace(deleted_unit);
+          try {
+            throwIfJitPublishStepArmedForTest(9);
+            deleted_units.emplace(deleted_unit);
+          } catch (const std::bad_alloc&) {
+            deletion_record_lost = true;
+          }
         });
 
     if (preloader == nullptr) {
@@ -5341,6 +5543,15 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     }
   }
 
+  if (deletion_record_lost || consumeUnitDeletionTrackingPoison()) {
+    // A unit died during preloading and its record was lost; the pruning
+    // below could keep a dead function.  Fail the whole preload
+    // conservatively -- the caller's contract is an empty result with a
+    // Python error set.
+    PyErr_NoMemory();
+    return {};
+  }
+
   // Prune out all functions that are no longer alive / allocated.
   result.erase(
       std::remove_if(
@@ -5358,7 +5569,15 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
 void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   FreeThreadedJITEntrypointGuard guard;
-  if (isJitUsable()) {
+  triggerStatsOnCodeDestroyed();
+#if PY_VERSION_HEX < 0x030C0000
+  // The notification comes from the code-extra free function (no watcher)
+  // and shadow populates the registries too: gate on "initialized".
+  const bool deliverable = isJitInitialized();
+#else
+  const bool deliverable = isJitUsable();
+#endif
+  if (deliverable) {
     auto mod_state = cinderx::getModuleState();
     if (!mod_state) {
       return;
@@ -5372,7 +5591,9 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   }
 }
 
-void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
+void funcUnpublishedInContext(
+    Context* ctx,
+    BorrowedRef<PyFunctionObject> func) {
   auto mod_state = cinderx::getModuleState();
   if (!mod_state) {
     return;
@@ -5381,14 +5602,35 @@ void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
 
   unregisterFunctionCodes(func);
 
-  // Have to check if context exists as this can fire after jit::finalize().
-  if (jitCtx()) {
-    jitCtx()->funcDestroyed(func);
-  }
-
-  if (CompilerContext<Compiler>* ctx = jitCtx()) {
+  // The registries and entry caches to clean belong to the context whose
+  // watch (or caller) delivered the event; the module-state bookkeeping
+  // above is process-wide either way.  A null context means the event
+  // arrived after jit::finalize() took the context down.
+  if (ctx != nullptr) {
+    ctx->funcDestroyed(func);
     ctx->clearFunctionEntryCache(func);
   }
+}
+
+void funcUnpublished(BorrowedRef<PyFunctionObject> func) {
+  funcUnpublishedInContext(jitCtx(), func);
+}
+
+void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func) {
+  if (cinderx::getModuleState() == nullptr) {
+    return;
+  }
+  // The counter is the proof that death notifications are delivered at
+  // all, so only the real sources may move it: the function watcher on
+  // 3.12+ and the weak-reference death watch on 3.11.  Administrative
+  // unpublication goes through funcUnpublished() and manufactures no
+  // death.
+  triggerStatsOnFunctionDestroyed();
+  funcUnpublishedInContext(ctx, func);
+}
+
+void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
+  funcDestroyedInContext(jitCtx(), func);
 }
 
 void funcModified(BorrowedRef<PyFunctionObject> func) {

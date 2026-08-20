@@ -187,6 +187,12 @@ Ref<CompiledFunction> CompiledFunction::create(
   // Trigger-proof accounting: every compiled-function object ever created
   // is counted, regardless of how it is later installed or released.
   jit::triggerStatsOnCompiledFunctionCreate();
+  // Physical residency: the object now owns executable memory, and holds
+  // it until its destructor -- clear() and registry removal do not release
+  // the buffer, and an externally pinned artifact keeps its machine code.
+  if (cf->codeBuffer().data() != nullptr) {
+    jit::triggerStatsOnCodeBufferAcquired();
+  }
 
   // Return a stolen reference - the caller owns it.
   return Ref<CompiledFunction>::steal(cf);
@@ -195,11 +201,16 @@ Ref<CompiledFunction> CompiledFunction::create(
 CompiledFunction::~CompiledFunction() {
   clear();
 
-  auto mod_state = cinderx::getModuleState();
-  if (mod_state != nullptr && data_.code.data() != nullptr) {
-    auto code_allocator = mod_state->code_allocator.get();
-    if (code_allocator != nullptr) {
-      code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+  if (data_.code.data() != nullptr) {
+    // The buffer's lifetime ends with this object (or ended with the
+    // allocator at teardown); either way it stops being resident here.
+    jit::triggerStatsOnCodeBufferReleased();
+    auto mod_state = cinderx::getModuleState();
+    if (mod_state != nullptr) {
+      auto code_allocator = mod_state->code_allocator.get();
+      if (code_allocator != nullptr) {
+        code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+      }
     }
   }
 }
@@ -357,32 +368,16 @@ void CompiledFunction::addFunction(BorrowedRef<PyFunctionObject> func) {
   // for removing itself via funcDestroyed() when it is deallocated.
   // We don't incref to avoid preventing garbage collection of functions
   // when multiple functions share the same CompiledFunction.
-#if PY_VERSION_HEX < 0x030C0000
-  // Except on 3.11, where that responsibility has no mechanism: there are
-  // no function watchers, so nothing calls funcDestroyed() and a dead
-  // function would stay in this set and in the context registry as a
-  // dangling pointer -- reachable from Python, because the artifact is an
-  // object in the function's __dict__ and can be kept alive on its own.
-  // Owning the reference keeps the pointer valid for as long as anything
-  // can observe it.  The resulting function <-> artifact cycle is
-  // collectable: traverse() visits the set on this branch.
-  if (functions_.insert(func.get()).second) {
-    Py_INCREF(func.get());
-  }
-#else
+  //
+  // On 3.11 that responsibility is carried by the weak-reference death watch
+  // the context arms (see Context::watchFunctionDeath), which stands in for
+  // the function watcher this branch does not have.
   functions_.insert(func.get());
-#endif
 }
 
 void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
   // Remove the borrowed reference. No decref needed since we don't own it.
-#if PY_VERSION_HEX < 0x030C0000
-  if (functions_.erase(func.get()) > 0) {
-    Py_DECREF(func.get());
-  }
-#else
   functions_.erase(func.get());
-#endif
 }
 
 int CompiledFunction::traverse(visitproc visit, void* arg) {
@@ -390,13 +385,6 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
-#if PY_VERSION_HEX < 0x030C0000
-  // On 3.11 the references are owned (see addFunction), so they have to be
-  // reported or the function <-> artifact cycle would never be collected.
-  for (PyFunctionObject* func : functions_) {
-    Py_VISIT(func);
-  }
-#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -407,11 +395,8 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-void CompiledFunction::releaseOwnedFunctions() {
-  auto owned = std::move(functions_);
-  for (PyFunctionObject* func : owned) {
-    Py_DECREF(func);
-  }
+void CompiledFunction::forgetFunctions() {
+  functions_.clear();
 }
 #endif
 
@@ -449,8 +434,6 @@ void CompiledFunction::clear(bool context_finalizing) {
       if (context_finalizing) {
         func->vectorcall = getInterpretedVectorcall(func);
       }
-      // ... and on 3.11 this set owns its members.
-      Py_DECREF(func);
 #else
       func->vectorcall = getInterpretedVectorcall(func);
 #endif

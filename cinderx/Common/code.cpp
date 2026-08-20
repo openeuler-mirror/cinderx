@@ -11,6 +11,7 @@
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 #include "cinderx/module_state.h"
 
+#include <cstddef>
 #include <new>
 #include <utility>
 
@@ -34,6 +35,48 @@ struct CodeObjectExtra311 {
   void* ce_extras[1];
 };
 #endif
+
+CodeDestroyedHook g_code_destroyed_hook = nullptr;
+
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11: the free call is a dead code object's only signal, so the block
+// names its owner in a version-local header (shared struct untouched).
+struct OwnedCodeExtra311 {
+  PyCodeObject* owner;
+  CodeExtra extra;
+};
+
+OwnedCodeExtra311* ownedBlockOf(void* extra) {
+  auto* bytes = reinterpret_cast<char*>(extra);
+  return reinterpret_cast<OwnedCodeExtra311*>(
+      bytes - offsetof(OwnedCodeExtra311, extra));
+}
+#endif
+
+// Code-extra free function; CPython also calls it for never-written
+// indices, so a null argument is expected.
+void codeExtraFree(void* extra) {
+  if (extra == nullptr) {
+    return;
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  OwnedCodeExtra311* block = ownedBlockOf(extra);
+  PyCodeObject* owner = block->owner;
+  if (owner != nullptr && g_code_destroyed_hook != nullptr) {
+    // Key only.  code_dealloc is already tearing the object down, so no
+    // C++ exception may cross this boundary and the block must be freed
+    // on every path.  The hook contains its own failures; this arm is the
+    // last line of defense for a hook that does not.
+    try {
+      g_code_destroyed_hook(owner);
+    } catch (...) {
+    }
+  }
+  PyMem_Free(block);
+#else
+  PyMem_Free(extra);
+#endif
+}
 
 // Store a code-extra value, keeping the co_extra allocation as small as the
 // target index allows.
@@ -262,7 +305,12 @@ void initCodeExtraIndex() {
       state->code_extra_index == -1,
       "Cannot re-initialize code extra index without finalizing it first");
 
-  state->code_extra_index = PyUnstable_Eval_RequestCodeExtraIndex(PyMem_Free);
+  state->code_extra_index =
+      PyUnstable_Eval_RequestCodeExtraIndex(codeExtraFree);
+}
+
+void setCodeDestroyedHook(CodeDestroyedHook hook) {
+  g_code_destroyed_hook = hook;
 }
 
 void finiCodeExtraIndex() {
@@ -339,6 +387,19 @@ CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
     return reinterpret_cast<CodeExtra*>(data_ptr);
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  auto block = reinterpret_cast<OwnedCodeExtra311*>(
+      PyMem_Calloc(1, sizeof(OwnedCodeExtra311)));
+  if (block == nullptr) {
+    if (preserve_error) {
+      PyErr_NoMemory();
+    }
+    return nullptr;
+  }
+  block->owner = code;
+  CodeExtra* extra = &block->extra;
+  void* owned = block;
+#else
   auto extra = reinterpret_cast<CodeExtra*>(PyMem_Calloc(1, sizeof(CodeExtra)));
   if (extra == nullptr) {
     if (preserve_error) {
@@ -346,6 +407,8 @@ CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
     }
     return nullptr;
   }
+  void* owned = extra;
+#endif
 
   int set_rc;
   if (jit::consumeJitPublishStepForTest(5)) {
@@ -363,7 +426,7 @@ CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
       jit::printPythonException();
       PyErr_Clear();
     }
-    PyMem_Free(extra);
+    PyMem_Free(owned);
     return nullptr;
   }
 

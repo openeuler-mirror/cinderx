@@ -11,6 +11,7 @@
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+#include "cinderx/module_state.h"
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface predicates the lifecycle cases assert on.
 #include "cinderx/Interpreter/3.11/observe.h"
@@ -297,28 +298,40 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
   // observable installation, no hidden artifact -- and a clean publish of
   // the same function afterwards, which is only possible if the unwind
   // left no residue.
-  const char* sources[5] = {
-      "def func(a, b):\n    total = a - a\n    while total < b:\n"
+  // One name per step: rebinding would kill the prior step's function and
+  // pollute the per-step watch arithmetic.
+  const char* sources[7] = {
+      "def func1(a, b):\n    total = a - a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = a + a\n    while total < b:\n"
+      "def func2(a, b):\n    total = a + a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = b - a\n    while total < b:\n"
+      "def func3(a, b):\n    total = b - a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = b + a\n    while total < a:\n"
+      "def func4(a, b):\n    total = b + a\n    while total < a:\n"
       "        total = total + b\n    return total",
       // Step 5: the code-extra reserve -- the C-convention allocation whose
       // MemoryError used to be swallowed on the way up.
-      "def func(a, b):\n    total = b + b\n    while total < a:\n"
+      "def func5(a, b):\n    total = b + b\n    while total < a:\n"
       "        total = total + a\n    return total",
+      // Step 6: the death watch's Python allocations.  The watch is what
+      // keeps the borrowed registry entry from dangling, so failing to arm
+      // it must fail the publication, not fall back to an unwatched entry.
+      "def func6(a, b):\n    total = a - b\n    while total < b:\n"
+      "        total = total + b\n    return total",
+      // Step 7: the death-watch map slot itself.
+      "def func7(a, b):\n    total = a + b\n    while total < a:\n"
+      "        total = total + b\n    return total",
   };
-  for (int step = 1; step <= 5; step++) {
-    Ref<PyFunctionObject> func(compileAndGet(sources[step - 1], "func"));
+  for (int step = 1; step <= 7; step++) {
+    std::string name = "func" + std::to_string(step);
+    Ref<PyFunctionObject> func(compileAndGet(sources[step - 1], name.c_str()));
     ASSERT_NE(func, nullptr) << "step " << step;
     std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
         func, jit::makeFrameReifier(func->func_code)));
     ASSERT_NE(preloader, nullptr) << "step " << step;
 
     vectorcallfunc vectorcall_before = func->vectorcall;
+    size_t watched_before = jit_ctx_->watchedFunctionCount();
     jit::failJitPublishStepForTest(step);
     EXPECT_EQ(
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
@@ -332,6 +345,9 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
     EXPECT_FALSE(jit_ctx_->didCompile(func)) << "step " << step;
     EXPECT_EQ(jit_ctx_->lookupFunc(func), nullptr) << "step " << step;
     EXPECT_EQ(func->vectorcall, vectorcall_before) << "step " << step;
+    EXPECT_EQ(jit_ctx_->watchedFunctionCount(), watched_before)
+        << "step " << step
+        << " left a death watch armed for a function it did not publish";
     if (func->func_dict != nullptr) {
       EXPECT_EQ(
           PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
@@ -345,6 +361,8 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
         jit::Result::OK)
         << "step " << step << " left residue behind";
     EXPECT_TRUE(jit_ctx_->didCompile(func)) << "step " << step;
+    EXPECT_EQ(jit_ctx_->watchedFunctionCount(), watched_before + 1)
+        << "step " << step << " published without arming the death watch";
   }
 }
 
@@ -395,7 +413,7 @@ def replacement(a, b):
   // the swap, so the prior claim stays exactly as published.
   ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
 
-  for (int step = 1; step <= 3; step++) {
+  for (int step : {1, 2, 3, 8}) {
     std::unique_ptr<jit::hir::Preloader> takeover(jit::hir::Preloader::make(
         func, jit::makeFrameReifier(func->func_code)));
     ASSERT_NE(takeover, nullptr) << "step " << step;
@@ -448,6 +466,497 @@ def replacement(a, b):
       reinterpret_cast<PyObject*>(new_art));
   PyErr_Clear();
 }
+TEST_F(JITContextTest, TeardownReleasesCannotOutliveTheDeathWatch) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A's runtime holds the only chain to function B, so ~Context's
+  // releases kill B mid-teardown.  Sever-before-release plus watch-
+  // dismantled-last means that death is still reported -- the counter is
+  // the order's observable.
+  const char* py_src = R"(
+def carrier(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def doomed(a, b):
+    total = a + b
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> carrier(compileAndGet(py_src, "carrier"));
+  Ref<PyFunctionObject> doomed(getGlobal("doomed"));
+  ASSERT_NE(carrier, nullptr);
+  ASSERT_NE(doomed, nullptr);
+
+  for (BorrowedRef<PyFunctionObject> func : {carrier.get(), doomed.get()}) {
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code)));
+    ASSERT_NE(preloader, nullptr);
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+        jit::Result::OK);
+  }
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 2u);
+
+  jit::CompiledFunction* carrier_compiled = jit_ctx_->lookupFunc(carrier);
+  ASSERT_NE(carrier_compiled, nullptr);
+  ASSERT_NE(carrier_compiled->runtime(), nullptr);
+
+  // Hand the killer to A's runtime, then reduce B to the killer's single
+  // reference: out of the module globals, out of our hands.
+  {
+    auto killer = Ref<>::steal(PyList_New(0));
+    ASSERT_NE(killer, nullptr);
+    ASSERT_EQ(
+        PyList_Append(killer, reinterpret_cast<PyObject*>(doomed.get())), 0);
+    carrier_compiled->runtime()->addReference(killer);
+  }
+  ASSERT_EQ(PyDict_DelItemString(doomed->func_globals, "doomed"), 0);
+  BorrowedRef<PyFunctionObject> doomed_borrowed = doomed.get();
+  doomed.reset();
+  ASSERT_EQ(Py_REFCNT(doomed_borrowed.get()), 1);
+
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  jit_ctx_.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "a function died inside ~Context and its death went unreported: "
+         "the watch was withdrawn before the releases that can still kill";
+}
+
+TEST_F(JITContextTest, DeathReportsToTheWatchOwningContext) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A watch belongs to the context that recorded the borrowed pointer, so
+  // the death callback has to clean that context -- not whichever context
+  // the module currently holds.  This context is exactly the local kind
+  // the callback used to miss: publish here, pin the artifact so it
+  // outlives everything, then let the function die independently.  The
+  // death must empty THIS context's registries and its watch map; a
+  // callback that reports into the module context instead leaves all of
+  // them holding freed pointers, and the destructor's severing walk then
+  // writes through one (ASAN: write after free).
+  //
+  // This is also the local-context native twin of the external-pin
+  // contract: the artifact's lifetime is the pin's business, the
+  // function's lifetime is its own, and the two part ways cleanly.
+  const char* py_src = R"(
+def standalone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "standalone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+  ASSERT_EQ(jit_ctx_->compiledFuncs().size(), 1u);
+
+  // Pin the artifact independently of the function.
+  jit::CompiledFunction* compiled = jit_ctx_->lookupFunc(func);
+  ASSERT_NE(compiled, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(compiled);
+
+  // Reduce the function to our single reference, then let it die.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "standalone"), 0);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the death was not delivered at all";
+  EXPECT_EQ(jit_ctx_->watchedFunctionCount(), 0u)
+      << "the death was delivered to a different context's watch map";
+  EXPECT_EQ(jit_ctx_->compiledFuncs().size(), 0u)
+      << "the owning context's installed registry still names the dead "
+         "function";
+  EXPECT_TRUE(compiled->functions().empty())
+      << "the artifact still names the dead function as a member";
+  // Physical residency is the pin's business, not the function's.
+  EXPECT_EQ(jit_ctx_->compiledCodes().size(), 1u);
+
+  // The severing walk in ~Context must find nothing dead to touch.
+  jit_ctx_.reset();
+}
+
+namespace {
+
+// Weak-reference callback helper for the owner-death test below: resets
+// the context holder the capsule names, destroying the context from
+// inside the callback batch.
+extern "C" PyObject* destroyContextForTest(PyObject* self, PyObject* /*ref*/) {
+  auto* holder =
+      static_cast<std::unique_ptr<jit::CompilerContext<jit::Compiler>>*>(
+          PyCapsule_GetPointer(self, "cinderx-test.ctx-holder"));
+  if (holder != nullptr) {
+    holder->reset();
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef kDestroyContextForTest = {
+    "destroy_ctx_for_test",
+    destroyContextForTest,
+    METH_O,
+    nullptr,
+};
+
+} // namespace
+
+TEST_F(JITContextTest, DeathCallbackSurvivesItsOwnerDyingFirst) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython's weak-reference machinery snapshots every pending callback --
+  // holding strong references to them -- before invoking any.  A user
+  // callback in the same batch can therefore destroy the context whose
+  // watch armed the JIT's callback, and the JIT's callback still runs.
+  // The payload's owner token is what makes that safe: ~Context nulls the
+  // cell, the late callback reads the null and takes the ownerless path --
+  // process-wide accounting only, no registry access.  A raw Context* in
+  // the payload is a use-after-free here (the sanitizer arm carries that
+  // assertion).
+  const char* py_src = R"(
+import weakref
+import _cinderx
+
+events = []
+refs = []
+
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def arm(func):
+    def on_death(ref):
+        # Runs before the JIT's callback (newest callback-ref first): the
+        # death has not been delivered to the JIT yet, and the counter
+        # value recorded here proves that ordering held.
+        events.append(
+            _cinderx._get_trigger_stats()["function_destroyed_notifications"])
+        destroy_ctx_for_test(None)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+
+  // Keep the artifact alive past its owner so the only lifetime in
+  // question is the context's.
+  jit::CompiledFunction* compiled = jit_ctx_->lookupFunc(func);
+  ASSERT_NE(compiled, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(compiled);
+
+  // Hand the context-destroying helper to the probe and arm the user
+  // callback AFTER the watch: the newest callback-ref runs first, so the
+  // user's callback destroys the context before the JIT's callback fires.
+  {
+    auto holder = Ref<>::steal(
+        PyCapsule_New(&jit_ctx_, "cinderx-test.ctx-holder", nullptr));
+    ASSERT_NE(holder, nullptr);
+    auto destroy =
+        Ref<>::steal(PyCFunction_New(&kDestroyContextForTest, holder.get()));
+    ASSERT_NE(destroy, nullptr);
+    ASSERT_EQ(
+        PyDict_SetItemString(
+            func->func_globals, "destroy_ctx_for_test", destroy.get()),
+        0);
+  }
+  {
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(func.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  // Reduce the function to our single reference, then let it die: the
+  // batch runs the user's callback (killing the context), then the JIT's.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  ASSERT_EQ(jit_ctx_, nullptr)
+      << "the user callback did not destroy the context; the ordering this "
+         "test exists to exercise did not happen";
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the ownerless death was not accounted";
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 1);
+  auto recorded = PyLong_AsUnsignedLongLong(PyList_GET_ITEM(events.get(), 0));
+  EXPECT_EQ(recorded, deaths_before)
+      << "the JIT callback ran before the user callback: the owner-death "
+         "window was not exercised";
+}
+
+namespace {
+
+// Probe invoked from a user weak-reference callback while the watched
+// function is mid-death: its weak references are already cleared, the JIT's
+// own callback has not run.  Everything here reads through borrowed
+// pointers; taking a strong reference would itself resurrect the referent.
+struct DeathInFlightProbe {
+  jit::CompilerContext<jit::Compiler>* ctx{nullptr};
+  PyFunctionObject* func{nullptr};
+  bool ran{false};
+  bool pending_before{false};
+  bool watch_refused{false};
+  bool pending_after{false};
+  bool parked{true};
+  size_t watch_count_delta{~0u};
+};
+
+DeathInFlightProbe* g_death_in_flight_probe{nullptr};
+
+extern "C" PyObject* probeDeathInFlightForTest(PyObject*, PyObject*) {
+  DeathInFlightProbe* probe = g_death_in_flight_probe;
+  if (probe != nullptr && probe->ctx != nullptr && probe->func != nullptr) {
+    BorrowedRef<PyFunctionObject> func{probe->func};
+    size_t count_before = probe->ctx->watchedFunctionCount();
+    probe->ran = true;
+    probe->pending_before = probe->ctx->isFunctionDeathPending(func);
+    probe->watch_refused = !probe->ctx->watchFunctionDeath(func);
+    probe->pending_after = probe->ctx->isFunctionDeathPending(func);
+    probe->watch_count_delta =
+        probe->ctx->watchedFunctionCount() - count_before;
+    probe->ctx->addDeoptedFunc(func);
+    probe->parked = probe->ctx->deoptedFuncs().count(func) != 0;
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef kProbeDeathInFlight = {
+    "probe_death_in_flight",
+    probeDeathInFlightForTest,
+    METH_O,
+    nullptr,
+};
+
+} // namespace
+
+TEST_F(JITContextTest, DeathInFlightWatchIsATombstone) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython clears every weak reference of a dying function before it runs
+  // any callback, newest callback first.  A user callback therefore sees
+  // the JIT's watch already cleared while the JIT's own callback is still
+  // pending -- and that cleared entry must behave as a tombstone: it keeps
+  // answering isFunctionDeathPending(), it cannot be replaced, and the
+  // park/publication paths it gates refuse the dying function.  Replacing
+  // it would hang a fresh weak reference on an object mid-teardown --
+  // outside the callback snapshot -- and enable() would then resurrect the
+  // function from a reference count of zero.
+  const char* py_src = R"(
+import weakref
+
+refs = []
+
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def arm(func):
+    def on_death(ref):
+        probe_death_in_flight(None)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+
+  DeathInFlightProbe probe;
+  probe.ctx = jit_ctx_.get();
+  probe.func = func.get();
+  g_death_in_flight_probe = &probe;
+
+  {
+    auto probe_fn =
+        Ref<>::steal(PyCFunction_New(&kProbeDeathInFlight, nullptr));
+    ASSERT_NE(probe_fn, nullptr);
+    ASSERT_EQ(
+        PyDict_SetItemString(
+            func->func_globals, "probe_death_in_flight", probe_fn.get()),
+        0);
+  }
+  {
+    // Armed after the JIT's watch, so the user callback runs first.
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(func.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  g_death_in_flight_probe = nullptr;
+
+  ASSERT_TRUE(probe.ran) << "the user callback never ran";
+  EXPECT_TRUE(probe.pending_before)
+      << "the watch was not cleared when the user callback ran: the "
+         "death-in-flight window was not exercised";
+  EXPECT_TRUE(probe.watch_refused)
+      << "watchFunctionDeath() re-armed over a death in flight";
+  EXPECT_TRUE(probe.pending_after)
+      << "the death-in-flight tombstone was replaced";
+  EXPECT_EQ(probe.watch_count_delta, 0u)
+      << "the watch map changed size under a death in flight";
+  EXPECT_FALSE(probe.parked)
+      << "a function mid-death was parked as a borrowed pointer";
+  EXPECT_EQ(deaths_after, deaths_before + 1) << "the death was not delivered";
+  EXPECT_EQ(jit_ctx_->watchedFunctionCount(), 0u)
+      << "the tombstone outlived its own delivery";
+}
+
+TEST_F(JITContextTest, FunctionDeathCallbackContainsBookkeepingFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The death callback runs on a C destructor stack: a C++ exception must
+  // not cross it, the watch must still come down, and the failure must be
+  // recorded (poison) rather than swallowed.  The injected fault sits at
+  // the boundary's edge, after the interior cleanup has run.
+  const char* py_src = R"(
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+
+  jit::failJitPublishStepForTest(10);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  jit::failJitPublishStepForTest(0);
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "cleanup did not run before the boundary fault";
+  EXPECT_EQ(jit_ctx_->watchedFunctionCount(), 0u)
+      << "the watch survived its own delivery";
+  EXPECT_TRUE(jit::consumeUnitDeletionTrackingPoison())
+      << "the contained failure was swallowed without a record";
+  EXPECT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(JITContextTest, PoisonedDeletionTrackingFailsTheNextBatchOnce) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A contained death-callback failure means a deletion notification may
+  // have been lost, and the mark it leaves has a consumer: the next batch
+  // preload must refuse conservatively -- an untrustworthy deleted-units
+  // view could keep a dead function -- and exactly once, so the machinery
+  // recovers.  The mark is planted through the real delivery path (a
+  // watched function dying with the boundary fault armed), not by calling
+  // the poison setter directly.  (3.11 plain-code preload runs no Python
+  // and takes no tracked allocation, so a mid-window death cannot be
+  // staged organically here; the shared batch sinks have their own
+  // fault-injection coverage where preload does run Python.)
+  const char* py_src = R"(
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def other(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  Ref<PyFunctionObject> other(getGlobal("other"));
+  ASSERT_NE(other, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  jit::failJitPublishStepForTest(10);
+  func.reset();
+  jit::failJitPublishStepForTest(0);
+
+  // The batch consumer sees the mark exactly once.
+  std::vector<BorrowedRef<PyFunctionObject>> refused =
+      jit::preloadFuncAndDeps(other);
+  bool memory_error = PyErr_ExceptionMatches(PyExc_MemoryError);
+  PyErr_Clear();
+  EXPECT_TRUE(refused.empty())
+      << "a batch after a lost deletion record was allowed to proceed";
+  EXPECT_TRUE(memory_error)
+      << "the conservative failure did not report as a MemoryError";
+
+  std::vector<BorrowedRef<PyFunctionObject>> recovered =
+      jit::preloadFuncAndDeps(other);
+  EXPECT_FALSE(recovered.empty())
+      << "the poison mark was not consumed by the refused batch";
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+  jit::hir::preloaderManager().clear();
+}
+
 #endif
 
 TEST_F(JITContextTest, UnwatchableBuiltins) {
@@ -3216,6 +3725,185 @@ def forget_me():
 // control plane publishes, and the registries these cases read are not on it.
 class JITLifecycle311Test : public RuntimeTest {};
 
+TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The code-extra free function is 3.11's substitute for a code watcher:
+  // attach extra data, drop the code object, and the notification must
+  // arrive.
+  jit::TriggerStats before = jit::triggerStatsSnapshot();
+  {
+    Ref<> code = Ref<>::steal(Py_CompileString(
+        "def transient():\n    return 5\n", "<lifecycle>", Py_file_input));
+    ASSERT_NE(code, nullptr);
+    // Claiming the extra slot is what registers the free function for this
+    // code object; without it there is nothing to call.
+    ASSERT_NE(codeExtra(reinterpret_cast<PyCodeObject*>(code.get())), nullptr);
+    EXPECT_EQ(
+        jit::triggerStatsSnapshot().code_destroyed_notifications,
+        before.code_destroyed_notifications)
+        << "the notification arrived before the code object died";
+  }
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.code_destroyed_notifications, before.code_destroyed_notifications)
+      << "no code-death notification; the free function is not wired to the "
+         "JIT, and code-keyed registries will keep dead keys";
+}
+
+TEST_F(JITLifecycle311Test, CodeExtraFreeContainsHookFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The code-extra free function runs from inside code_dealloc: a C++
+  // exception must not cross it, the block must still be freed, and the
+  // failure must be recorded (poison) rather than swallowed.  The injected
+  // fault sits at the hook boundary's edge, after the notification's own
+  // bookkeeping has run.
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  jit::TriggerStats before = jit::triggerStatsSnapshot();
+  {
+    Ref<> code = Ref<>::steal(Py_CompileString(
+        "def transient():\n    return 7\n", "<lifecycle>", Py_file_input));
+    ASSERT_NE(code, nullptr);
+    ASSERT_NE(codeExtra(reinterpret_cast<PyCodeObject*>(code.get())), nullptr);
+    jit::failJitPublishStepForTest(11);
+  }
+  jit::failJitPublishStepForTest(0);
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.code_destroyed_notifications, before.code_destroyed_notifications)
+      << "cleanup did not run before the boundary fault";
+  EXPECT_TRUE(jit::consumeUnitDeletionTrackingPoison())
+      << "the contained failure was swallowed without a record";
+  EXPECT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(JITLifecycle311Test, CodeExtraStaysAtOurOwnIndex) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // _PyCode_SetExtra sizes a fresh co_extra to the interpreter-wide number
+  // of registered indices, and code_dealloc then calls every registered
+  // free function below that size -- including for slots this code object
+  // never wrote.  The JIT attaches its data to broad swaths of code, so a
+  // block sized to the full index count would drag every foreign free
+  // function into the destruction of every code object the JIT ever saw.
+  // Capping the allocation at our own index is what keeps foreign indices
+  // above ours out of that path.
+  auto* state = cinderx::getModuleState();
+  ASSERT_NE(state, nullptr);
+  Py_ssize_t ours = state->code_extra_index;
+  ASSERT_GE(ours, 0);
+
+  // Claim an index above ours, the way a third party importing after
+  // CinderX would.  Its free function is never registered, so nothing here
+  // depends on it being called -- only on it not being.
+  Py_ssize_t foreign = PyUnstable_Eval_RequestCodeExtraIndex(nullptr);
+  ASSERT_GT(foreign, ours);
+
+  Ref<> code = Ref<>::steal(Py_CompileString(
+      "def capped():\n    return 1\n", "<capped>", Py_file_input));
+  ASSERT_NE(code, nullptr);
+  auto code_obj = reinterpret_cast<PyCodeObject*>(code.get());
+  ASSERT_NE(codeExtra(code_obj), nullptr);
+
+  // Read the size back through the same private layout the setter assumes.
+  struct Layout {
+    Py_ssize_t ce_size;
+    void* ce_extras[1];
+  };
+  auto* block = reinterpret_cast<Layout*>(code_obj->co_extra);
+  ASSERT_NE(block, nullptr);
+  EXPECT_EQ(block->ce_size, ours + 1)
+      << "the code-extra block is not capped at the JIT's own index";
+  EXPECT_LE(block->ce_size, foreign)
+      << "the block spans a foreign index, so that index's free function "
+         "will be called for every code object the JIT touches";
+}
+
+TEST_F(JITLifecycle311Test, FunctionDeathIsReported) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // With the death watch armed and nothing owning the function on the JIT's
+  // behalf, a compiled function dies the moment its last reference goes --
+  // no collection required -- and the JIT is told.
+  const char* py_src = R"(
+def transient_fn(x):
+    return x + 1
+)";
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  Ref<> weak;
+  jit::TriggerStats before;
+  {
+    Ref<PyFunctionObject> func(compileAndGet(py_src, "transient_fn"));
+    ASSERT_NE(func, nullptr);
+    ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+    ASSERT_EQ(ctx->watchedFunctionCount(), 1u)
+        << "the death watch was not armed when the function was registered";
+    weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
+    ASSERT_NE(weak, nullptr);
+    before = jit::triggerStatsSnapshot();
+    runStockCode("del transient_fn");
+  }
+
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None)
+      << "a compiled function outlived its last reference; something on the "
+         "JIT side is still holding it";
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.function_destroyed_notifications,
+      before.function_destroyed_notifications)
+      << "the function died without the JIT being told; its registry entries "
+         "are now dead keys";
+  EXPECT_EQ(ctx->watchedFunctionCount(), 0u)
+      << "the watch outlived the function it watched";
+}
+
+TEST_F(JITLifecycle311Test, FunctionDeathInsideACycleIsReported) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The path that decides whether holding the weak reference matters: the
+  // collector runs a callback only when the weak reference is reachable, so
+  // a watch owned by the dying graph would be cleared in silence.  This
+  // function is reachable only through a cycle of its own making.
+  const char* py_src = R"(
+def self_referential(x):
+    return x + 1
+
+self_referential.myself = self_referential
+)";
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  Ref<> weak;
+  jit::TriggerStats before;
+  {
+    Ref<PyFunctionObject> func(compileAndGet(py_src, "self_referential"));
+    ASSERT_NE(func, nullptr);
+    ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+    weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
+    ASSERT_NE(weak, nullptr);
+    before = jit::triggerStatsSnapshot();
+    runStockCode("del self_referential");
+  }
+
+  ASSERT_NE(PyWeakref_GetObject(weak), Py_None)
+      << "the cycle did not keep the function alive; this case is not "
+         "exercising the collector path";
+  PyGC_Collect();
+
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None) << "the cycle survived";
+  EXPECT_GT(
+      jit::triggerStatsSnapshot().function_destroyed_notifications,
+      before.function_destroyed_notifications)
+      << "a function collected as garbage died unreported";
+  EXPECT_EQ(ctx->watchedFunctionCount(), 0u);
+}
+
 TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -3258,6 +3946,156 @@ def defaulted(x):
   auto defaulted = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
   ASSERT_NE(defaulted, nullptr);
   EXPECT_EQ(PyLong_AsLong(defaulted), 42);
+}
+
+TEST_F(JITLifecycle311Test, ReplacingCodeStopsTheOldMachineCode) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // 3.11 has no function watcher, so nothing announces that __code__ moved.
+  // The guarded entry notices on the next call instead: the artifact was
+  // built for the old code object and must not run for the new one.
+  const char* py_src = R"(
+def swapped(x):
+    return x + 1
+
+def replacement(x):
+    return x + 100
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "swapped"));
+  Ref<PyFunctionObject> other(getGlobal("replacement"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(other, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  auto arg = makeLong(1);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto before = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(before, nullptr);
+  ASSERT_EQ(PyLong_AsLong(before), 2);
+
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", other->func_code), 0);
+
+  EXPECT_FALSE(isJitCompiled(func))
+      << "the function still reports as compiled for code it no longer has";
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  // The answer has to come from the new code, not the old machine code.
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 101);
+}
+
+TEST_F(JITLifecycle311Test, ForceUncompileAffectsLaterCallsOnly) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def undo_me(x):
+    return x * 2
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "undo_me"));
+  ASSERT_NE(func, nullptr);
+  auto mod = importCinderJitModule();
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  size_t resident_before = ctx->compiledCodes().size();
+  ASSERT_GT(resident_before, 0u);
+
+  auto arg = makeLong(21);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto compiled_result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(compiled_result, nullptr);
+  ASSERT_EQ(PyLong_AsLong(compiled_result), 42);
+
+  callJitOneArg(mod, "force_uncompile", func);
+
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_LT(ctx->compiledCodes().size(), resident_before)
+      << "the artifact is still resident after force_uncompile";
+
+  // Still callable, still correct, now through the interpreter.
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 42);
+
+  // And compiling it again has to work rather than report "already done".
+  callJitOneArg(mod, "force_compile", func);
+  EXPECT_TRUE(isJitCompiled(func));
+  auto recompiled = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(recompiled, nullptr);
+  EXPECT_EQ(PyLong_AsLong(recompiled), 42);
+}
+
+namespace {
+// The midpoint hook takes a plain function pointer, so the reference the
+// hook drops lives at namespace scope.
+Ref<PyFunctionObject> s_uncompile_last_ref_slot;
+} // namespace
+
+TEST_F(JITLifecycle311Test, UncompileSurvivesLosingItsLastReferenceMidway) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The lifecycle contract says a function cannot die in the middle of a
+  // JIT operation on it because its last reference fell.  Python callers
+  // cannot construct that state -- the call machinery owns the argument for
+  // the duration -- so this drives the raw C entry with a borrowed pointer
+  // and drops the only strong reference from the midpoint hook, exactly
+  // between force_uncompile's unpublication and its artifact retirement.
+  // The operation's own pin has to carry the function to the end; the death
+  // then lands after the operation, is reported once, and leaves nothing
+  // registered.
+  const char* py_src = R"(
+def vanishing(x):
+    return x + 7
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "vanishing"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  // Reduce the function to a single strong reference and park it where the
+  // hook can reach it.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "vanishing"), 0);
+  s_uncompile_last_ref_slot = std::move(func);
+  ASSERT_EQ(
+      Py_REFCNT(reinterpret_cast<PyObject*>(s_uncompile_last_ref_slot.get())),
+      1);
+
+  // Fetch the raw C function so the call adds no argument reference.
+  auto mod = importCinderJitModule();
+  auto uncompile_obj =
+      Ref<>::steal(PyObject_GetAttrString(mod, "force_uncompile"));
+  ASSERT_NE(uncompile_obj, nullptr);
+  ASSERT_TRUE(PyCFunction_Check(uncompile_obj.get()));
+  PyCFunction raw = PyCFunction_GetFunction(uncompile_obj.get());
+  PyObject* self = PyCFunction_GetSelf(uncompile_obj.get());
+  ASSERT_NE(raw, nullptr);
+
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  BorrowedRef<PyFunctionObject> borrowed = s_uncompile_last_ref_slot.get();
+  jit::setUncompileMidpointHookForTest(
+      []() { s_uncompile_last_ref_slot.reset(); });
+  auto result =
+      Ref<>::steal(raw(self, reinterpret_cast<PyObject*>(borrowed.get())));
+  jit::setUncompileMidpointHookForTest(nullptr);
+
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result.get(), Py_True);
+  EXPECT_EQ(s_uncompile_last_ref_slot, nullptr)
+      << "the midpoint hook did not run";
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the subject of force_uncompile must die exactly once, after the "
+         "operation, not in the middle of it";
 }
 
 TEST_F(JITLifecycle311Test, PausedArtifactStaysResidentAndReattaches) {
@@ -3689,13 +4527,532 @@ class Downer:
   EXPECT_EQ(PyLong_AsLong(result), 6);
 }
 
-TEST_F(JITLifecycle311Test, ParkedFunctionOutlivesEveryOtherReference) {
+TEST_F(
+    JITLifecycle311Test,
+    ForceUncompileReportsReentrantCompileDuringRetirement) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // While paused, the parked set is the only thing keeping the function
-  // reachable: 3.11 raises no destroy notification, so a borrowed entry
-  // would be walked as a dangling pointer the moment the JIT is re-enabled.
-  // Drop every reference this test holds and re-enable.
+  // A __del__ riding the retirement's releases can reenter
+  // force_compile(); the newer decision wins and uncompile must not
+  // report success over it -- verdict after every release.
+  const char* py_src = R"(
+events = []
+
+def waverer(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def afterimage(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+
+class Reenter:
+    def __init__(self, target):
+        self.target = target
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            events.append(cinderjit.force_compile(self.target))
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "waverer"));
+  Ref<PyFunctionObject> donor(getGlobal("afterimage"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(donor, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  runCode("k = Reenter(waverer)\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // Swap to new code so the reentrant force_compile() has something fresh
+  // to compile and publish.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+
+  auto mod = importCinderJitModule();
+  auto failed = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  EXPECT_EQ(failed, nullptr)
+      << "force_uncompile() reported success over a reentrant recompile";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The newer decision owns the world: the reentry's publication stands.
+  EXPECT_TRUE(isJitCompiled(func));
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 1), Py_True)
+      << "the reentrant compile inside the retirement did not succeed";
+
+  // With no trigger left, uncompilation completes and reports honestly.
+  auto clean = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  ASSERT_NE(clean, nullptr);
+  EXPECT_EQ(clean.get(), Py_True);
+  EXPECT_FALSE(isJitCompiled(func));
+}
+
+TEST_F(JITLifecycle311Test, ForceUncompileIgnoresForgedForeignAnchor) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A forged foreign value at the user-writable key can be the last
+  // reference to ANOTHER function's artifact; uncompile(f1) must not
+  // release it.  The key is touched only when it holds the claimed
+  // artifact itself.
+  const char* py_src = R"(
+def keeper(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def neighbour(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> f1(compileAndGet(py_src, "keeper"));
+  Ref<PyFunctionObject> f2(getGlobal("neighbour"));
+  ASSERT_NE(f1, nullptr);
+  ASSERT_NE(f2, nullptr);
+  ASSERT_EQ(jit::compileFunction(f1), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(f2), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* art_b = ctx->lookupFunc(f2);
+  ASSERT_NE(art_b, nullptr);
+
+  // Keep A alive independently, forge B into f1's anchor slot, and make
+  // that forged reference B's only strong one.
+  auto pin_a = Ref<jit::CompiledFunction>::create(ctx->lookupFunc(f1));
+  ASSERT_NE(pin_a, nullptr);
+  runCode(
+      "keeper.__dict__['__cinderx_compiled_func__'] = "
+      "neighbour.__dict__['__cinderx_compiled_func__']\n"
+      "del neighbour.__dict__['__cinderx_compiled_func__']\n");
+  ASSERT_TRUE(isJitCompiled(f2));
+
+  auto mod = importCinderJitModule();
+  {
+    auto ok = Ref<>::steal(
+        PyObject_CallMethod(mod, "force_uncompile", "O", f1.get()));
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok.get(), Py_True);
+  }
+  EXPECT_FALSE(isJitCompiled(f1));
+
+  // The neighbour's world is untouched: installed, associated, reachable,
+  // and still executing machine code.
+  EXPECT_TRUE(isJitCompiled(f2))
+      << "uncompiling f1 retired f2's artifact through a forged anchor";
+  EXPECT_EQ(ctx->lookupFunc(f2), art_b);
+  EXPECT_EQ(ctx->findAssociated(f2).get(), art_b);
+  // The forged value stays exactly where the user wrote it.
+  ASSERT_NE(f1->func_dict, nullptr);
+  EXPECT_EQ(
+      PyDict_GetItemWithError(f1->func_dict, jit::kCompiledFunctionKey),
+      reinterpret_cast<PyObject*>(art_b));
+  PyErr_Clear();
+
+  uint64_t entries_before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(f2, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+  EXPECT_EQ(
+      jit::triggerStatsSnapshot().machine_code_entries, entries_before + 1)
+      << "the neighbour fell back to the interpreter";
+}
+
+TEST_F(
+    JITLifecycle311Test,
+    ForceUncompilePreservesSameKeyReentrantPublication) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Same-key variant: no code swap, so the reentrant successor lives
+  // under the very key the retirement erases.  Blind by-key erase left it
+  // installed-but-unreachable (lookupFunc null) and outside the
+  // destructor's pin-and-sever walk.
+  const char* py_src = R"(
+events = []
+
+def steady(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+class Reenter:
+    def __init__(self, target):
+        self.target = target
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            events.append(cinderjit.force_compile(self.target))
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "steady"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  runCode("k = Reenter(steady)\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // No __code__ swap: the reentrant publication reuses the same key.
+  auto mod = importCinderJitModule();
+  auto failed = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  EXPECT_EQ(failed, nullptr)
+      << "force_uncompile() reported success over a reentrant recompile";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The successor's world is whole: installed, associated, and -- the
+  // point of this case -- still reachable through the compiled-codes map.
+  EXPECT_TRUE(isJitCompiled(func));
+  jit::CompiledFunction* successor = ctx->lookupFunc(func);
+  ASSERT_NE(successor, nullptr)
+      << "the retirement erased the successor's compiled-codes entry";
+  EXPECT_EQ(successor, ctx->findAssociated(func).get());
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 1), Py_True);
+
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, StaleArtifactDeathPreservesSameKeySuccessor) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Death-path sequence pin: a pinned stale artifact dies after a
+  // same-key successor published; the successor must survive.  (Today the
+  // stale generation reaches death already cleared; the identity guard on
+  // the death-path erase is the backstop for future uncleared paths.)
+  const char* py_src = R"(
+def perennial(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "perennial"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(ctx->lookupFunc(func));
+  ASSERT_NE(pin, nullptr);
+
+  auto mod = importCinderJitModule();
+  {
+    auto ok = Ref<>::steal(
+        PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok.get(), Py_True);
+  }
+  ASSERT_FALSE(isJitCompiled(func));
+
+  // Publish the successor under the same key, then let the stale
+  // generation die.
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+  jit::CompiledFunction* successor = ctx->lookupFunc(func);
+  ASSERT_NE(successor, nullptr);
+  ASSERT_NE(successor, pin.get());
+
+  pin.reset();
+
+  EXPECT_TRUE(isJitCompiled(func));
+  EXPECT_EQ(ctx->lookupFunc(func), successor)
+      << "the stale generation's death erased the successor's entry";
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, RegisteredFunctionDeathCleansTheRegistry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Registration records a borrowed pointer in the module state's
+  // compilation-unit registry, and the registration contract promises a
+  // death notification.  On 3.11 that promise is the weak-reference death
+  // watch, armed at registration exactly like the installed and parked
+  // registries arm it at publication: a function that dies
+  // registered-but-never-compiled must leave no dangling key behind for
+  // the next batch compile to dereference.
+  const char* py_src = R"(
+def drifter(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "drifter"));
+  ASSERT_NE(func, nullptr);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  size_t watched_before = ctx->watchedFunctionCount();
+
+  ASSERT_TRUE(jit::registerFunctionForTest(func));
+  auto& reg = cinderx::getModuleState()->registered_compilation_units;
+  PyObject* raw = reinterpret_cast<PyObject*>(func.get());
+  ASSERT_EQ(reg.count(raw), 1u);
+  EXPECT_EQ(ctx->watchedFunctionCount(), watched_before + 1)
+      << "registration recorded a borrowed pointer without arming the "
+         "death watch";
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "drifter"), 0);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "a registered function died without a notification";
+  EXPECT_EQ(reg.count(raw), 0u)
+      << "the registry still holds the dead function's address";
+  EXPECT_EQ(ctx->watchedFunctionCount(), watched_before);
+}
+
+TEST_F(JITLifecycle311Test, DeathBatchDisableLeavesNoDeadKeys) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython clears every weak reference in a batch before invoking any
+  // callback, so a user callback runs while the JIT's registries still
+  // name the dying function and the JIT's own death callback has not.
+  // disable(deopt_all=True) from that window walks the installed registry
+  // and parks the dying function; the JIT's callback must then still
+  // remove it, leaving no dead key in any registry and exactly one death
+  // on the counter.
+  const char* py_src = R"(
+import weakref
+import cinderjit
+
+events = []
+refs = []
+
+def doomed(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def bystander(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+
+def arm(func):
+    def on_death(ref):
+        try:
+            cinderjit.disable(deopt_all=True)
+            events.append("disabled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> doomed(compileAndGet(py_src, "doomed"));
+  Ref<PyFunctionObject> bystander(getGlobal("bystander"));
+  ASSERT_NE(doomed, nullptr);
+  ASSERT_NE(bystander, nullptr);
+  ASSERT_EQ(jit::compileFunction(doomed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(bystander), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(doomed));
+  ASSERT_TRUE(isJitCompiled(bystander));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  {
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(doomed.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(doomed->func_globals, "doomed"), 0);
+  PyObject* raw = reinterpret_cast<PyObject*>(doomed.get());
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  doomed.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the death was not delivered exactly once";
+  EXPECT_EQ(ctx->compiledFuncs().count(raw), 0u)
+      << "the installed registry still names the dead function";
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u)
+      << "the parked registry still names the dead function";
+  EXPECT_EQ(jit::getConfig().state, jit::State::kPaused);
+  EXPECT_EQ(ctx->deoptedFuncs().count(bystander.get()), 1u)
+      << "the reentrant disable() did not park the bystander exactly once";
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 1);
+
+  auto mod = importCinderJitModule();
+  callJitNoArgs(mod, "enable");
+  EXPECT_TRUE(isJitCompiled(bystander));
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u);
+}
+
+TEST_F(JITLifecycle311Test, DeathBatchDisableEnableDoesNotResurrect) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The aggressive variant: the user callback pauses AND re-enables while
+  // the function's death is pending.  enable()'s reattach walk snapshots
+  // the parked set with strong references, and a strong reference to an
+  // object mid-deallocation is a resurrection; the walk must skip entries
+  // whose death is pending (their own callback removes them).  The world
+  // afterwards: exactly one death, no dead key anywhere, the bystander
+  // back on machine code, the JIT running.
+  const char* py_src = R"(
+import weakref
+import cinderjit
+
+events = []
+refs = []
+
+def doomed2(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def bystander2(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+
+def arm(func):
+    def on_death(ref):
+        try:
+            cinderjit.disable(deopt_all=True)
+            cinderjit.enable()
+            events.append("cycled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> doomed(compileAndGet(py_src, "doomed2"));
+  Ref<PyFunctionObject> bystander(getGlobal("bystander2"));
+  ASSERT_NE(doomed, nullptr);
+  ASSERT_NE(bystander, nullptr);
+  ASSERT_EQ(jit::compileFunction(doomed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(bystander), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  {
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(doomed.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(doomed->func_globals, "doomed2"), 0);
+  PyObject* raw = reinterpret_cast<PyObject*>(doomed.get());
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  doomed.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the death was not delivered exactly once";
+  EXPECT_EQ(ctx->compiledFuncs().count(raw), 0u);
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u)
+      << "the enable() walk resurrected or re-recorded the dying function";
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 1);
+  EXPECT_TRUE(
+      PyUnicode_CompareWithASCIIString(
+          PyList_GET_ITEM(events.get(), 0), "cycled") == 0);
+
+  EXPECT_EQ(jit::getConfig().state, jit::State::kRunning);
+  EXPECT_TRUE(isJitCompiled(bystander))
+      << "the reentrant enable() did not reattach the bystander";
+  auto arg_a = makeLong(3);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(bystander, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 5);
+}
+
+TEST_F(JITLifecycle311Test, ParkedFunctionDeathUnparksIt) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A function can die while the JIT is paused, and the parked set holds it
+  // by borrow.  Re-enabling walks that set, so the death has to remove the
+  // entry or enable() dereferences a freed function.
   const char* py_src = R"(
 def parked(x):
     return x - 1
@@ -3713,91 +5070,30 @@ def parked(x):
   callJitOneArg(mod, "disable", deopt_all);
   ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
 
-  // The module still names it, so drop that too: after this the parked set
-  // is the last owner.
+  auto weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
+  ASSERT_NE(weak, nullptr);
   runStockCode("del parked");
-  BorrowedRef<PyFunctionObject> observed = func;
-  // Assert ownership before dropping: if the parked set only borrowed, the
-  // reset below would free the function and every read after it would be a
-  // use-after-free rather than a failed expectation.
-  ASSERT_GT(Py_REFCNT(func.get()), 1);
   func.reset();
-  // Nothing outside the parked set names it now, and the cycle it sits in is
-  // collectable, so a borrowing set would lose it right here.
-  PyGC_Collect();
-  ASSERT_EQ(ctx->deoptedFuncs().count(observed), 1u);
 
-  // Take a strong reference back before re-enabling.  enable() drops the
-  // parked set's ownership, and what remains is the collectable
-  // function -> dict -> artifact -> function cycle; reading through a
-  // borrowed pointer afterwards would be at the mercy of whichever
-  // allocation trips the next collection.
-  Ref<PyFunctionObject> revived{Ref<PyFunctionObject>::create(observed)};
+  ASSERT_EQ(PyWeakref_GetObject(weak), Py_None)
+      << "the parked function did not die; the parked set is still owning it";
+  EXPECT_EQ(ctx->deoptedFuncs().size(), 0u)
+      << "a dead function is still parked; enable() would walk it";
 
-  // Re-enabling walks the parked set.  A borrowed entry crashes here.
+  // Re-enabling must be uneventful rather than fatal.
   callJitNoArgs(mod, "enable");
-  EXPECT_EQ(ctx->deoptedFuncs().count(revived), 0u);
-  EXPECT_TRUE(isJitCompiled(revived));
-
-  // The function is still callable and still correct after the round trip.
-  auto arg = makeLong(9);
-  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
-  auto* callee = reinterpret_cast<PyObject*>(revived.get());
-  auto result = Ref<>::steal(PyObject_Call(callee, args, nullptr));
-  ASSERT_NE(result, nullptr);
-  EXPECT_EQ(PyLong_AsLong(result), 8);
-}
-
-TEST_F(JITLifecycle311Test, MultithreadedTeardownSurvivesSelfFree) {
-  SKIP_311_EXECUTABLE_COMPILE();
-
-  // The sharp case for the teardown above: leave the function and its
-  // artifact holding only each other.  Releasing the artifact's owned
-  // reference then destroys the function, whose dictionary holds the
-  // artifact's last reference -- so the artifact can be freed inside the
-  // very call that is walking it, and everything the teardown does
-  // afterwards would touch freed memory.
-  const char* py_src = R"(
-def solo(x):
-    return x + 6
-)";
-
-  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
-  Ref<> weak;
-  {
-    Ref<PyFunctionObject> func(compileAndGet(py_src, "solo"));
-    ASSERT_NE(func, nullptr);
-    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
-        func, jit::makeFrameReifier(func->func_code)));
-    ASSERT_EQ(
-        jit::compilePreloaderImpl(ctx.get(), *preloader, func),
-        jit::Result::OK);
-    weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
-    ASSERT_NE(weak, nullptr);
-  }
-  // Drop the module binding too; after this the cycle is all that is left.
-  runStockCode("del solo");
-  ASSERT_NE(PyWeakref_GetObject(weak), Py_None)
-      << "the artifact's owned reference should still be holding the function";
-
-  ctx->clearForMultithreadedCompileTest();
-
-  // The owned reference was the last one, so the function died inside the
-  // call -- which is the condition this case exists to put the teardown in.
-  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
-
-  ctx.reset();
+  EXPECT_FALSE(jit::isJitPaused());
 }
 
 TEST_F(JITLifecycle311Test, FinalizeRefusesReentrantEnable) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // Releasing the parked set runs destructors, and a destructor runs
+  // Finalization releases references, and releasing a reference runs
   // arbitrary Python.  If that Python re-enters enable(), the execute
-  // surface is re-armed in the middle of teardown and the same set is walked
-  // again while it is being emptied.  Teardown has to be one-way, and the
-  // tripwire below is what a user object in the function's dictionary can
-  // actually do.
+  // surface is re-armed in the middle of teardown and the registries being
+  // emptied are walked again.  Teardown has to be one-way.  The tripwire
+  // rides on the context's own reference list, which releaseReferences()
+  // drops partway through finalize().
   runStockCode(R"(
 import cinderjit
 
@@ -3812,29 +5108,18 @@ class Tripwire:
             reentry.append("refused")
         except BaseException as exc:
             reentry.append("other:" + type(exc).__name__)
-
-def tripwired(x):
-    return x + 2
-
-tripwired.tripwire = Tripwire()
 )");
-
-  Ref<PyFunctionObject> func(getGlobal("tripwired"));
-  ASSERT_NE(func, nullptr);
-  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
 
   jit::Context* ctx = jit::getContext();
   ASSERT_NE(ctx, nullptr);
-  auto mod = importCinderJitModule();
-  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
-  callJitOneArg(mod, "disable", deopt_all);
-  ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
-
-  // Leave the parked set as the only owner, so finalize() is what destroys
-  // the function and therefore what runs the tripwire.
-  runStockCode("del tripwired");
-  ASSERT_GT(Py_REFCNT(func.get()), 1);
-  func.reset();
+  {
+    Ref<> tripwire_type(getGlobal("Tripwire"));
+    ASSERT_NE(tripwire_type, nullptr);
+    auto tripwire = Ref<>::steal(PyObject_CallNoArgs(tripwire_type));
+    ASSERT_NE(tripwire, nullptr);
+    ctx->addReference(tripwire);
+  }
+  runStockCode("del Tripwire");
 
   jit::finalize();
 
@@ -3842,7 +5127,8 @@ tripwired.tripwire = Tripwire()
   ASSERT_NE(reentry, nullptr);
   ASSERT_TRUE(PyList_CheckExact(reentry));
   ASSERT_EQ(PyList_GET_SIZE(reentry.get()), 1)
-      << "the tripwire did not run; finalize() never released the parked set";
+      << "the tripwire never ran; finalize() released nothing that could "
+         "re-enter, so this case is not exercising the guard";
   BorrowedRef<> outcome = PyList_GET_ITEM(reentry.get(), 0);
   const char* text = PyUnicode_AsUTF8(outcome);
   ASSERT_NE(text, nullptr);
@@ -3850,14 +5136,13 @@ tripwired.tripwire = Tripwire()
   EXPECT_FALSE(jit::isJitInitialized());
 }
 
-TEST_F(JITLifecycle311Test, MultithreadedCompileTeardownReleasesFunctions) {
+TEST_F(JITLifecycle311Test, MultithreadedTeardownLeavesNoDeadKeys) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // The multithreaded-compile teardown detaches every artifact from the
-  // context before dropping the maps.  clear() only releases the functions an
-  // artifact owns while that owner is still set, so a detached artifact would
-  // carry its references to the grave -- silently, forever, once per run of
-  // that path.  Nothing crashes, so the assertion has to be on the count.
+  // The teardown orphans every artifact and empties both borrowed
+  // registries.  What has to hold afterwards is that nothing keeps pointing
+  // at the function: the association is gone, so the guarded entry refuses
+  // and the call goes back to the interpreter.
   const char* py_src = R"(
 def orphaned(x):
     return x - 3
@@ -3866,11 +5151,6 @@ def orphaned(x):
   Ref<PyFunctionObject> func(compileAndGet(py_src, "orphaned"));
   ASSERT_NE(func, nullptr);
 
-  // A private context, as the existing clearForMultithreadedCompileTest case
-  // uses.  That helper orphans artifacts while their functions keep owning
-  // them, and an orphaned artifact holds a raw CodeRuntime pointer into the
-  // context's slab.  Run against the process-wide context, such an artifact
-  // is collected at interpreter shutdown -- after the slab is gone.
   auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
   std::unique_ptr<jit::hir::Preloader> preloader(
       jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
@@ -3882,25 +5162,18 @@ def orphaned(x):
   ASSERT_NE(compiled, nullptr);
   ASSERT_EQ(compiled->functions().count(func), 1u);
 
-  Py_ssize_t before = Py_REFCNT(func.get());
   ctx->clearForMultithreadedCompileTest();
-  Py_ssize_t after = Py_REFCNT(func.get());
 
-  EXPECT_LT(after, before) << "the orphaned artifact kept its owned reference";
-  EXPECT_EQ(compiled->functions().count(func), 0u);
-
-  // The association is gone, so the guarded entry has to send the call back
-  // to the interpreter rather than into an artifact nobody tracks.
+  EXPECT_EQ(compiled->functions().count(func), 0u)
+      << "the orphaned artifact still names a function nobody tracks";
   EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
   auto arg = makeLong(11);
   auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
   auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(PyLong_AsLong(result), 8);
 
-  // Release the artifact before the context whose slab its CodeRuntime lives
-  // in: the orphan is not in compiled_codes_ any more, so ~Context() does not
-  // clear it and it would be cleared later against freed memory.
   compiled.reset();
   preloader.reset();
   func.reset();
@@ -3960,14 +5233,40 @@ def finalized(x):
   EXPECT_EQ(PyLong_AsLong(result), 10);
 }
 
+TEST_F(JITLifecycle311Test, FinalizeIsRepeatable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Shutdown can reach finalization more than once -- the module teardown
+  // and the interpreter teardown both drive it -- so a second pass has to
+  // be a no-op rather than a second teardown of state that is already gone.
+  const char* py_src = R"(
+def twice(x):
+    return x + 9
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "twice"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::finalize();
+  ASSERT_FALSE(jit::isJitInitialized());
+  jit::finalize();
+  jit::finalize();
+  EXPECT_FALSE(jit::isJitInitialized());
+
+  auto arg = makeLong(1);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 10);
+}
+
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheParkedRegistry) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // The parked set owns its entries on this branch, so finalizing while it
-  // is populated has to release them.  Skipping that release would not
-  // crash -- it would leak every parked function for the life of the
-  // process -- which is why the assertion is on the reference count and not
-  // on survival.
+  // Finalizing with a populated parked set has to leave nothing parked and
+  // nothing armed: after this the JIT is gone, and a watch that outlived it
+  // would deliver a notification with no registry to service it.
   const char* py_src = R"(
 def parked_at_exit(x):
     return x * 5
@@ -3984,13 +5283,13 @@ def parked_at_exit(x):
   auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
   callJitOneArg(mod, "disable", deopt_all);
   ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
+  ASSERT_GT(ctx->watchedFunctionCount(), 0u);
 
-  Py_ssize_t before = Py_REFCNT(func.get());
   jit::finalize();
-  Py_ssize_t after = Py_REFCNT(func.get());
 
   EXPECT_FALSE(jit::isJitInitialized());
-  EXPECT_LT(after, before) << "the parked set kept its owned reference";
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
 
   auto arg = makeLong(7);
   auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));

@@ -135,6 +135,11 @@ struct ModuleState {
   // Callback invoked when a compilation unit is deleted during preloading.
   std::function<void(BorrowedRef<>)> unit_deleted_during_preload;
 
+  // Set when a unit-deletion notification may have been lost (its record
+  // could not be taken inside a death callback, where nothing may throw).
+  // Batch compiles consume this and fail conservatively.
+  bool unit_deletion_tracking_failed{false};
+
   // Index for the extra data that CinderX saves on code objects with
   // PyUnstable_Code_SetExtra, and loads with PyUnstable_Code_GetExtra.
   Py_ssize_t code_extra_index{-1};

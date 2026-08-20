@@ -148,7 +148,7 @@ const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
       : reinterpret_cast<jit::CompiledFunction*>(
             _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
   if (published != nullptr && !published->functions().contains(func)) {
-    // The owned-functions set is the ownership oracle, and it lives
+    // The artifact's member set is the ownership oracle, and it lives
     // entirely in C++: a deopt removes the installation but not the
     // membership, so a parked function passes this check on re-enable, and
     // nothing Python code can write -- the artifact reference in

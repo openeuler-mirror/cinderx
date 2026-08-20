@@ -72,6 +72,9 @@ canary_population() {
   # headers wrap across lines, so the header is joined before matching; an
   # unparsed header would attribute the site to the previous case, the
   # filter would miss it, and the count check below turns red.
+  # $1 (optional): test-source directory override, for self-tests that
+  # probe the scan itself; the gate always scans the real tree.
+  local tests_dir="${1:-$REPO_ROOT/cinderx/RuntimeTests}"
   awk '
     /^TEST_F\(/ { head = $0
                   while (head !~ /\)/ && (getline nextline) > 0) {
@@ -90,7 +93,7 @@ canary_population() {
       if (suite == "") { exit 2 }
       print suite "." test
     }
-  ' "$REPO_ROOT"/cinderx/RuntimeTests/*.cpp | sort -u
+  ' "$tests_dir"/*.cpp | sort -u
 }
 
 green_log_verdict() {
@@ -135,8 +138,10 @@ if [ "${1:-}" = "--verify-skip-growth" ]; then
   exit $?
 fi
 if [ "${1:-}" = "--verify-canary-population" ]; then
-  # Self-test entry: print the derived population without a build.
-  canary_population
+  # Self-test entry: print the derived population without a build.  An
+  # optional directory argument points the scan at doctored sources, so a
+  # self-test can pin what does -- and does not -- count as a gate site.
+  canary_population "${2:-}"
   exit $?
 fi
 if [ "${1:-}" = "--verify-green-log" ]; then

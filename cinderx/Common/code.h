@@ -54,6 +54,23 @@ int loadGlobalIndex(int oparg);
 void initCodeExtraIndex();
 void finiCodeExtraIndex();
 
+/*
+ * Report that a code object is being destroyed.
+ *
+ * CPython 3.11 has no code watcher -- PyCode_AddWatcher is a compatibility
+ * shim that registers nothing -- so the co_extra free function is the only
+ * signal a dying code object produces.  The JIT installs its handler here;
+ * the pointer it receives is a registry key and must never be dereferenced,
+ * because it arrives from code_dealloc.
+ *
+ * Installing a null hook (the default, and what finalization restores)
+ * leaves the free function doing nothing but freeing the block.
+ */
+#ifdef __cplusplus
+using CodeDestroyedHook = void (*)(PyCodeObject*);
+void setCodeDestroyedHook(CodeDestroyedHook hook);
+#endif
+
 // Get the extra data object associated with a code object. Lazily allocates
 // this data if this is the first access. Returns nullptr on failure with no
 // Python error set.
@@ -69,7 +86,10 @@ namespace jit {
 // insert, 4 = the compiled-codes insert, 5 = the code-extra reserve, where
 // the armed step models setCodeExtraCapped() failing with its MemoryError
 // set -- so the fault travels the reserve's real preserve-or-clear branch.
-// The failpoint clears when it fires.
+// Steps 9-11 model failures on the death-notification side: 9 = the batch
+// deleted-units record, 10 = the function death callback's bookkeeping,
+// 11 = the code-destroyed hook's bookkeeping.  The failpoint clears when
+// it fires.
 void failJitPublishStepForTest(int step);
 void throwIfJitPublishStepArmedForTest(int step);
 bool consumeJitPublishStepForTest(int step);

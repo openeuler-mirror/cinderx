@@ -54,38 +54,40 @@ _jit311_target_modules_attempted = 0
 
 def _jit311_emit():
     installed = _cinderx.is_frame_evaluator_installed()
+    # Logical lists answer "would a call enter machine code" -- read them
+    # while the evaluator is still installed (atexit, before finalize).
+    try:
+        import cinderjit as _cinderjit_module
+        from cinderjit import get_compiled_functions
+        _live_at_exit = len(get_compiled_functions())
+        # The logical count above answers "would a call enter machine
+        # code".  A function that temporarily fell back -- its defaults
+        # changed, say -- leaves that list while its artifact and code
+        # buffer are still resident, so the physical count is reported
+        # next to it rather than folded into it.
+        _resident = getattr(
+            _cinderjit_module, "_get_resident_compiled_functions", None
+        )
+        # An integer straight from the runtime; coercing a missing answer to
+        # zero here would reintroduce the false negative this measures.
+        _resident_at_exit = _resident() if _resident is not None else None
+    except ImportError:
+        _live_at_exit = 0
+        _resident_at_exit = 0
     # Freeze scheduling before taking the multi-source snapshot.  Otherwise
     # report helper frames can themselves cross a low threshold between the
     # observe and trigger reads and make an internally inconsistent report.
     if installed:
         _cinderx.remove_frame_evaluator()
     snap = _jit311_report.snapshot()
+    # snapshot() derives machine_code_installed from the same logical list
+    # the removal above has just emptied; the pre-removal reading is the
+    # truthful one.
+    snap["machine_code_installed"] = _live_at_exit
     snap["evaluator_installed"] = installed
     snap["target_modules_attempted"] = _jit311_target_modules_attempted
-    try:
-        import cinderjit as _cinderjit_module
-        from cinderjit import get_compiled_functions
-        # Sampled here at Python atexit, before _cinderx module_free /
-        # jit::finalize().  Finalize-after emptiness is a C-layer contract.
-        snap["live_compiled_functions_at_exit"] = len(
-            get_compiled_functions()
-        )
-        # The logical count above answers "would a call enter machine
-        # code".  A function that temporarily fell back -- its defaults
-        # changed, say -- leaves that list while its artifact and code
-        # buffer are still resident, so the physical count is reported
-        # next to it rather than folded into it.
-        resident = getattr(
-            _cinderjit_module, "_get_resident_compiled_functions", None
-        )
-        # An integer straight from the runtime; coercing a missing answer to
-        # zero here would reintroduce the false negative this measures.
-        snap["resident_compiled_functions_at_exit"] = (
-            resident() if resident is not None else None
-        )
-    except ImportError:
-        snap["live_compiled_functions_at_exit"] = 0
-        snap["resident_compiled_functions_at_exit"] = 0
+    snap["live_compiled_functions_at_exit"] = _live_at_exit
+    snap["resident_compiled_functions_at_exit"] = _resident_at_exit
     with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:
         json.dump(snap, fp)
 
@@ -413,10 +415,18 @@ if not _cinderx.is_frame_evaluator_installed():
 
 def _jit311_nested_emit():
     installed = _cinderx.is_frame_evaluator_installed()
+    # Same ordering contract as the primary emitter: the logical installed
+    # count is only answerable while the evaluator is still in place.
+    try:
+        from cinderjit import get_compiled_functions
+        _installed_at_exit = len(get_compiled_functions())
+    except ImportError:
+        _installed_at_exit = 0
     if installed:
         _cinderx.remove_frame_evaluator()
     from ci_pipeline.jit311 import report as _jit311_report
     snap = _jit311_report.snapshot()
+    snap["machine_code_installed"] = _installed_at_exit
     snap["evaluator_installed"] = installed
     # The manager and venv-management processes also import sitecustomize.
     # Mark the actual benchmark workers so manager-only activity cannot make
@@ -939,6 +949,304 @@ assert not _leftover, _leftover
 """
 
 
+# MR-05 lifecycle exercises: each drives a watcher-less death path and
+# asserts via the notification counters that the JIT was actually told.
+LIFECYCLE_PRELUDE = """\
+import gc
+import _cinderx
+
+
+def _notifications():
+    stats = _cinderx._get_trigger_stats()
+    return (
+        stats["function_destroyed_notifications"],
+        stats["code_destroyed_notifications"],
+    )
+
+
+def _make_plain(name, body="    return x + 1\\n"):
+    ns = {}
+    exec("def %s(x):\\n%s" % (name, body), ns)
+    # Pop it from its own globals, or every subject sits in a cycle and
+    # the exercise measures the collector instead of the notification.
+    return ns.pop(name)
+
+
+def _compile_fresh(name, body="    return x + 1\\n"):
+    fn = _make_plain(name, body)
+    assert cinderjit.force_compile(fn) is True, name
+    return fn
+"""
+
+# function_churn: plain functions, created, compiled, executed, dropped.
+LIFECYCLE_FUNCTION_CHURN = """\
+_funcs, _codes = _notifications()
+for _i in range(2000):
+    _fn = _compile_fresh("churned_%d" % _i)
+    assert _fn(1) == 2
+    del _fn
+    # No collection: with no cycle and no registry owning it, the function
+    # has to die on that line.  One death per generation is what makes a
+    # retained reference visible instead of merely delayed.
+    assert _notifications()[0] - _funcs == _i + 1, _i
+_after_funcs, _after_codes = _notifications()
+assert _after_funcs - _funcs == 2000, (_funcs, _after_funcs)
+assert _after_codes - _codes >= 2000, (_codes, _after_codes)
+assert not [f for f in cinderjit.get_compiled_functions()
+            if f.__qualname__.startswith("churned_")]
+assert cinderjit._get_resident_compiled_functions() == 0
+"""
+
+# closure_churn: 10k closures (cells -- refused; proves the refusal path
+# leaks nothing) plus 2k lambdas (compile against one code object; each
+# generation exercises artifact succession).
+LIFECYCLE_CLOSURE_CHURN = """\
+def _make(i):
+    def inner(x):
+        return x + i
+    return inner
+
+
+_refused = 0
+for _i in range(10000):
+    _fn = _make(_i)
+    for _ in range(3):
+        _fn(_i)
+    try:
+        cinderjit.force_compile(_fn)
+    except RuntimeError:
+        _refused += 1
+    else:
+        raise SystemExit(
+            "a cell-carrying closure compiled on the MR-04 surface; "
+            "closure_churn is about the refusal path")
+    del _fn
+assert _refused == 10000, _refused
+for _i in range(2000):
+    _lam = (lambda x: x + 1)
+    assert cinderjit.force_compile(_lam) is True
+    assert _lam(1) == 2
+    del _lam
+gc.collect()
+assert cinderjit._get_resident_compiled_functions() == 0
+assert not cinderjit.get_compiled_functions()
+"""
+
+# code_replace: repeatedly swap __code__ under a compiled function.
+LIFECYCLE_CODE_REPLACE = """\
+_victim = _compile_fresh("victim")
+assert _victim(1) == 2
+for _i in range(500):
+    _ns = {}
+    exec("def _new(x):\\n    return x + %d\\n" % (_i + 2), _ns)
+    _victim.__code__ = _ns["_new"].__code__
+    assert cinderjit.is_jit_compiled(_victim) is False
+    assert _victim(0) == _i + 2
+    assert cinderjit.force_compile(_victim) is True
+    assert _victim(0) == _i + 2
+    del _ns
+del _victim
+gc.collect()
+assert cinderjit._get_resident_compiled_functions() == 0
+"""
+
+# weakref_reentry: mutating reentry (uncompile a live peer, walk the
+# survivors) from a callback firing while the subject is mid-death.
+LIFECYCLE_WEAKREF_REENTRY = """\
+import weakref
+
+_seen = []
+_peer = [None]
+
+
+def _observe(_ref):
+    # Runs from the dying function's own teardown, alongside the JIT's own
+    # death watch.  Both must tolerate the other having run first, and both
+    # must tolerate the registry being rewritten under them.
+    _seen.append(cinderjit._get_resident_compiled_functions())
+    peer = _peer[0]
+    if peer is not None:
+        assert cinderjit.force_uncompile(peer) is True
+        assert cinderjit.is_jit_compiled(peer) is False
+    for _live in cinderjit.get_compiled_functions():
+        assert _live.__qualname__
+
+
+_refs = []
+for _i in range(500):
+    _fn = _compile_fresh("reentrant_%d" % _i)
+    _peer[0] = _compile_fresh("peer_%d" % _i)
+    # The weak reference has to outlive the referent, or the callback is
+    # discarded along with it and never runs.
+    _refs.append(weakref.ref(_fn, _observe))
+    assert _fn(1) == 2
+    assert _peer[0](1) == 2
+    del _fn
+    assert len(_seen) == _i + 1, (_i, len(_seen))
+    _peer[0] = None
+del _refs
+assert len(_seen) == 500, len(_seen)
+gc.collect()
+assert cinderjit._get_resident_compiled_functions() == 0
+"""
+
+# last_ref_during_action: the last strong reference falls inside a dealloc
+# batch where the JIT's death watch is a peer (both interleavings), and the
+# dropping callback performs a JIT operation on the victim.  The stronger
+# mid-operation form is native-only (UncompileSurvivesLosingItsLast-
+# ReferenceMidway, via the midpoint hook).
+LIFECYCLE_LAST_REF = """\
+import weakref
+
+_holder = {}
+_dropped = 0
+
+
+def _drop_the_rest(_ref):
+    global _dropped
+    _dropped += 1
+    victim = _holder.pop("victim", None)
+    if victim is not None:
+        # The frame's reference is the victim's last; uncompile it here,
+        # then let it fall with the frame.  The operation runs while the
+        # JIT is mid-teardown for the companion.
+        assert cinderjit.force_uncompile(victim) is True
+        assert cinderjit.is_jit_compiled(victim) is False
+
+
+for _i in range(500):
+    if (_i % 2) == 0:
+        # User weak reference armed before the JIT's own death watch.
+        _companion = _make_plain("companion_%d" % _i)
+        _watch = weakref.ref(_companion, _drop_the_rest)
+        assert cinderjit.force_compile(_companion) is True
+    else:
+        # And armed after it.
+        _companion = _compile_fresh("companion_%d" % _i)
+        _watch = weakref.ref(_companion, _drop_the_rest)
+    _fn = _compile_fresh("suicidal_%d" % _i)
+    assert _fn(1) == 2
+    assert _companion(1) == 2
+    # The companion's death fires the callback that owns _fn's last strong
+    # reference, from inside the JIT's own unwind of the companion.
+    _holder["victim"] = _fn
+    del _fn
+    del _companion
+    del _watch
+assert _dropped == 500, _dropped
+gc.collect()
+assert cinderjit._get_resident_compiled_functions() == 0
+assert not cinderjit.get_compiled_functions()
+"""
+
+# shutdown_graph: a complex object graph, still rooted, at interpreter exit.
+LIFECYCLE_SHUTDOWN_GRAPH = """\
+class _Node:
+    def __init__(self, i):
+        self.i = i
+        self.peer = None
+        self.fn = _compile_fresh("node_%d" % i)
+
+
+_graph = [_Node(_i) for _i in range(200)]
+for _i, _node in enumerate(_graph):
+    _node.peer = _graph[(_i + 1) % len(_graph)]
+for _node in _graph:
+    assert _node.fn(_node.i) == _node.i + 1
+# Deliberately left rooted: finalization has to take this apart itself.
+"""
+
+
+def lifecycle_runner(
+    name: str,
+    payload: str,
+    *,
+    extra_judges: list[Judge] | None = None,
+    judges: list[Judge] | None = None,
+) -> RunnerSpec:
+    """MR-05 lifecycle exercise in the executing mode.
+
+    Every one of these drives objects to their death and then requires the
+    process to exit clean with nothing resident.  The shared judges are the
+    churn contract: machine code ran, and nothing outlived it."""
+    default = [
+        expect("evaluator_installed", "==", True),
+        expect("machine_code_entries", ">", 0),
+        expect("compiled_function_creations", ">", 0),
+        expect("live_compiled_functions_at_exit", "==", 0),
+        expect("resident_compiled_functions_at_exit", "==", 0),
+        expect("unknown_rejects", "==", 0),
+        expect("events_dropped", "==", 0),
+        expect("compile_success", "==", 0),
+        expect("shadow_codegen_bytes", "==", 0),
+    ]
+    default += extra_judges or []
+    return RunnerSpec(
+        name=name,
+        payload=CANARY_ATTEST + LIFECYCLE_PRELUDE + payload,
+        env={
+            "CINDERX_JIT_MODE": "canary",
+            "PYTHONJITAUTO": "1000000",
+            "PYTHONMALLOC": "debug",
+        },
+        asserted_env={"CINDERX_JIT_MODE": "canary"},
+        judges=judges if judges is not None else default,
+    )
+
+
+def lifecycle_runners() -> list[RunnerSpec]:
+    """The six exercises the plan fixes for this milestone."""
+    return [
+        lifecycle_runner(
+            "function_churn",
+            LIFECYCLE_FUNCTION_CHURN,
+            extra_judges=[
+                expect("function_destroyed_notifications", ">", 0),
+                expect("code_destroyed_notifications", ">", 0),
+            ],
+        ),
+        # The closure arm is refused by the execute surface (cells), the
+        # lambda arm compiles and dies generation after generation.  The
+        # refusal proof lives in the payload itself -- force_compile must
+        # raise for all ten thousand closures, and a single acceptance
+        # aborts the child -- because an explicit force_compile refusal
+        # moves no scheduling counter for a judge to read.  The judges
+        # hold the lambda arm and the exit hygiene.
+        lifecycle_runner(
+            "closure_churn",
+            LIFECYCLE_CLOSURE_CHURN,
+            judges=[
+                expect("evaluator_installed", "==", True),
+                expect("unknown_rejects", "==", 0),
+                expect("compiled_function_creations", ">", 0),
+                expect("machine_code_entries", ">", 0),
+                expect("function_destroyed_notifications", ">", 0),
+                expect("live_compiled_functions_at_exit", "==", 0),
+                expect("resident_compiled_functions_at_exit", "==", 0),
+                expect("events_dropped", "==", 0),
+                expect("compile_success", "==", 0),
+                expect("shadow_codegen_bytes", "==", 0),
+            ],
+        ),
+        lifecycle_runner("code_replace", LIFECYCLE_CODE_REPLACE),
+        lifecycle_runner("weakref_reentry", LIFECYCLE_WEAKREF_REENTRY),
+        lifecycle_runner("last_ref_during_action", LIFECYCLE_LAST_REF),
+        # The graph is still rooted at exit, so the process ends with
+        # artifacts alive; only the exit code and the absence of dropped
+        # events are meaningful here.
+        lifecycle_runner(
+            "shutdown_graph",
+            LIFECYCLE_SHUTDOWN_GRAPH,
+            judges=[
+                expect("evaluator_installed", "==", True),
+                expect("machine_code_entries", ">", 0),
+                expect("unknown_rejects", "==", 0),
+                expect("events_dropped", "==", 0),
+            ],
+        ),
+    ]
+
+
 # Singleton lifetime: True/False/None are mortal on 3.11, so an emitter
 # that types them immortal skips reference counting and drains them until
 # bool_dealloc runs -- the regression the singleton-lifetime fix closed.
@@ -1053,7 +1361,7 @@ def canary_churn_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
 
 
 def shutdown_repetition_runner(
-    *, repetitions: int = 5, judges: list[Judge] | None = None
+    *, repetitions: int = 10, judges: list[Judge] | None = None
 ) -> list[RunnerSpec]:
     """The same workload run to interpreter shutdown N times; every
     repetition must exit cleanly and report identically."""
@@ -1075,7 +1383,7 @@ def shutdown_repetition_runner(
 
 
 def canary_shutdown_runner(
-    *, repetitions: int = 5, judges: list[Judge] | None = None
+    *, repetitions: int = 10, judges: list[Judge] | None = None
 ) -> list[RunnerSpec]:
     """MR-04 shutdown discipline: compile, execute, then run to
     interpreter shutdown N times.  Lifecycle errors surface at
@@ -1571,6 +1879,7 @@ def run_all(python: str | None = None) -> list[RunResult]:
         canary_churn_runner(),
         singleton_lifetime_runner(),
     ]
+    specs += lifecycle_runners()
     specs += shutdown_repetition_runner()
     specs += canary_shutdown_runner()
     specs += config_matrix_runner()

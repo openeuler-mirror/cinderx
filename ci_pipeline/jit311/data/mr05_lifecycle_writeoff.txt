@@ -1,0 +1,10 @@
+# MR-05 lifecycle write-off pins: each row closes an audit item against
+# named RuntimeTests cases.  The self-test in
+# ci_pipeline/test_jit311_runners.py requires every named case to be
+# registered and passing -- no row closes against a narrative.
+#
+# status: landed | not-applicable; evidence is semicolon-separated.
+# item	status	evidence
+weakref death-watch replication	landed	JITLifecycle311Test.FunctionDeathIsReported; JITLifecycle311Test.FunctionDeathInsideACycleIsReported; JITLifecycle311Test.ParkedFunctionDeathUnparksIt; JITContextTest.DeathReportsToTheWatchOwningContext
+co_extra minimum capacity	landed	JITLifecycle311Test.CodeExtraStaysAtOurOwnIndex; JITLifecycle311Test.CodeDeathIsReported
+finalize cross-period GC re-entry UAF family	landed	JITLifecycle311Test.FinalizeRefusesReentrantEnable; JITLifecycle311Test.FinalizeIsRepeatable; JITLifecycle311Test.FinalizeEmptiesTheInstalledRegistry; JITLifecycle311Test.FinalizeEmptiesTheParkedRegistry; JITLifecycle311Test.MultithreadedTeardownLeavesNoDeadKeys
