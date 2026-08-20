@@ -427,11 +427,17 @@ Type Type::fromObject(PyObject* obj) {
     return _Py_IsImmortal(obj) ? TImmortalNoneType : TMortalNoneType;
   }
   if (obj == Py_True || obj == Py_False) {
-    // True and False are process-lifetime singletons even on stock CPython
-    // 3.11, where they are not tagged as immortal objects.  Keep the object
-    // specialization for the concrete value, but avoid generating refcount
-    // traffic that could deallocate a bool singleton.
-    return Type{fromTypeExact(Py_TYPE(obj)).bits_, kLifetimeImmortal, obj};
+    // Stock 3.11 bools are NOT immortal.  Modeling them as immortal elides
+    // the incref on borrowed-constant returns while every caller still
+    // decrefs the result, draining the singleton one call at a time until
+    // finalization dies with bool_dealloc.  Keep the concrete-value
+    // specialization but derive the lifetime honestly, exactly like None
+    // above; on 3.12+ the real immortal bit makes this immortal again.
+    bits_t bool_lifetime = [&]() {
+      ThreadedCompileSerialize guard;
+      return _Py_IsImmortal(obj) ? kLifetimeImmortal : kLifetimeMortal;
+    }();
+    return Type{fromTypeExact(Py_TYPE(obj)).bits_, bool_lifetime, obj};
   }
 
   bits_t lifetime = [&]() {

@@ -1013,6 +1013,7 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
     case Opcode::kCallStaticRetVoid:
     case Opcode::kCast:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckNeg:
     case Opcode::kCheckFreevar:
     case Opcode::kCheckField:

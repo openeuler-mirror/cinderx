@@ -20,6 +20,7 @@
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
+#include "cinderx/Jit/trigger_stats.h"
 // NOLINTNEXTLINE(facebook-unused-include-check)
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -607,6 +608,10 @@ static PyThreadState* allocate_and_link_interpreter_frame(
   // the frame-header specials.
   _PyInterpreterFrame* frame = Cix_PyThreadState_PushFrame(
       tstate, co->co_nlocalsplus + co->co_stacksize + FRAME_SPECIALS_SIZE);
+  // This helper is the 3.11 entry glue: every machine-code invocation of a
+  // compiled function links its frame here, so this is the counting point
+  // the trigger-stats contract promises (trigger_stats.h).
+  jit::triggerStatsOnMachineCodeEntry();
 #endif
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 

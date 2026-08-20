@@ -259,27 +259,45 @@ static BCIndex getDeoptResumeIndex(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame,
     bool forced_deopt,
-    bool is_instrumentation_deopt = false) {
+    bool is_patched_instrumentation = false) {
   // We only need to consider guards as the deopt cause in the inner-most
   // inlined location. If we are reifying the conceptual frames for an inlined
   // function's callers then these will be resumed by the interpreter in
   // future and will never be a JIT guard failure.
   bool is_innermost = &frame == &meta.innermostFrame();
 
-  // For instrumentation deopts: kPeriodicTaskFailure means the bytecode
-  // hasn't completed (RunPeriodicTasks) — re-execute. Other reasons mean
-  // the bytecode's C call completed — advance past it.
-  if (is_instrumentation_deopt && is_innermost) {
-    if (meta.reason == DeoptReason::kPeriodicTaskFailure) {
-      return frame.cause_instr_idx;
-    }
+  // The patched instrumentation flavor stops with the PRE-instruction
+  // state and the completed call's result recovered from a register:
+  // advance past the completed instruction.  This flag is the patched
+  // flavor only -- a combined "is instrumentation" bit was tried here and
+  // made the polled flavor advance too, skipping the instruction its own
+  // frame state names; the polled and periodic-task flavors are recognized
+  // below by their reasons instead.  (A patched stop never carries
+  // kPeriodicTaskFailure: patched means the call completed, the periodic
+  // failure means it did not.)
+  if (is_patched_instrumentation && is_innermost) {
     return BytecodeInstruction(frame.code, frame.cause_instr_idx)
         .nextInstrOffset();
   }
 
   if ((is_innermost &&
        (meta.reason == DeoptReason::kGuardFailure ||
-        meta.reason == DeoptReason::kRaise)) ||
+        meta.reason == DeoptReason::kRaise ||
+        // A polled instrumentation exit's frame state IS the resume
+        // point: the poll sits after the per-bytecode snapshot, whose
+        // state has the completed instruction's result on the operand
+        // stack and names the instruction to execute next.  Advancing
+        // would skip that instruction outright.
+        // kPeriodicTaskFailure is deliberately NOT in this list.  On 3.11
+        // the back-edge polls are per edge and carry the frame state AT
+        // the backward jump (see insertRunPeriodicActivitesForBackedge),
+        // and stock 3.11 raises the asynchronous exception after the jump
+        // has executed -- its eval-breaker check runs inside the
+        // backward-jump handler, so tb_lasti names the jump.  The default
+        // advance below reproduces that exactly: the reified frame reads
+        // "the jump just executed", and the pending exception is raised
+        // before anything at the advanced position runs.
+        meta.reason == DeoptReason::kInstrumentation)) ||
       forced_deopt) {
     return frame.cause_instr_idx;
   }
@@ -304,6 +322,9 @@ bool shouldResumeInterpreterInErrorHandler(DeoptReason reason) {
   switch (reason) {
     case DeoptReason::kGuardFailure:
     case DeoptReason::kRaise:
+    // Not an error path: the instrumentation resume decides error state
+    // from PyErr_Occurred() alone.
+    case DeoptReason::kInstrumentation:
       return false;
     case DeoptReason::kYieldFrom:
     case DeoptReason::kUnhandledException:
@@ -324,17 +345,18 @@ static void reifyFrameImpl(
     const DeoptFrameMetadata& frame_meta,
     bool forced_deopt,
     const uint64_t* regs,
-    bool is_instrumentation_deopt = false) {
+    bool is_patched_instrumentation = false) {
   // Note frame->prev_instr doesn't point to the previous instruction, it
   // actually points to the memory location sizeof(Py_CODEUNIT) bytes before
   // the next instruction to execute. This means it might point to inline-
   // cache data or a negative location.
   //
-  // For instrumentation deopts, getDeoptResumeIndex re-executes for
-  // kPeriodicTaskFailure and advances for all other reasons.
+  // For instrumentation exits, getDeoptResumeIndex advances only for the
+  // patched flavor (the completed call's result is recovered separately);
+  // the polled and periodic-task flavors resume at their own frame state.
   int prev_idx =
       (getDeoptResumeIndex(
-           meta, frame_meta, forced_deopt, is_instrumentation_deopt) -
+           meta, frame_meta, forced_deopt, is_patched_instrumentation) -
        1)
           .value();
 
@@ -361,18 +383,17 @@ void reifyFrame(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame_meta,
     const uint64_t* regs,
-    [[maybe_unused]] bool is_instrumentation_deopt) {
-#if PY_VERSION_HEX >= 0x030C0000
+    bool is_patched_instrumentation) {
+  // Forwarded on every version.  The 3.11 branch used to drop this flag,
+  // which made the resume selection of every instrumentation-family exit
+  // depend on the default value instead of the caller's answer.
   reifyFrameImpl(
       frame,
       meta,
       frame_meta,
       false /* forced_deopt */,
       regs,
-      is_instrumentation_deopt);
-#else
-  reifyFrameImpl(frame, meta, frame_meta, false /* forced_deopt */, regs);
-#endif
+      is_patched_instrumentation);
 }
 
 void reifyGeneratorFrame(
@@ -434,6 +455,9 @@ static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
     }
     case jit::hir::Opcode::kRaiseStatic: {
       return DeoptReason::kRaiseStatic;
+    }
+    case jit::hir::Opcode::kCheckInstrumentation: {
+      return DeoptReason::kInstrumentation;
     }
     case jit::hir::Opcode::kRunPeriodicTasks: {
       return DeoptReason::kPeriodicTaskFailure;

@@ -4,12 +4,17 @@
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/compiler.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 execute surface predicates the lifecycle cases assert on.
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 
 #include <initializer_list>
 #include <memory>
@@ -17,10 +22,40 @@
 #include <string>
 
 #if PY_VERSION_HEX < 0x030C0000
-#define SKIP_311_EXECUTABLE_COMPILE() \
-  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only"
+// A mode gate, not a version gate.  These cases compile and install
+// machine code, which on 3.11 the executing (canary) mode does and the
+// shadow mode does not -- so what decides is the mode the binary was
+// started in, not the version it was built for.  Left as a version gate
+// they skipped on every 3.11 build, including the sanitized one, which is
+// the only place a use-after-free in the install and lifecycle paths would
+// actually be caught.  Run the binary with CINDERX_JIT_MODE=canary to
+// execute them.
+#define SKIP_311_EXECUTABLE_COMPILE()                                    \
+  do {                                                                   \
+    if (jit::getConfig().state != jit::State::kRunning) {                \
+      GTEST_SKIP() << "3.11 executes machine code only in canary mode; " \
+                      "set CINDERX_JIT_MODE=canary to run this";         \
+    }                                                                    \
+  } while (0)
 #else
 #define SKIP_311_EXECUTABLE_COMPILE() static_cast<void>(0)
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+// A milestone gate, not a mode gate.  These cases assert a surface the 3.11
+// port has not opened in either mode -- generators and coroutines, the
+// opcodes outside the MR-04 execute whitelist, the Static Python runtime
+// cache, or control-plane entry points the canary does not publish -- so
+// the executing mode refuses to compile them by design.  Running them there
+// would only assert that a deliberate refusal is a failure.  The reason
+// names the surface the case waits on, so that widening the surface makes
+// the skip visible instead of leaving it inert.
+#define SKIP_311_UNTIL_SURFACE(reason)                                    \
+  do {                                                                    \
+    GTEST_SKIP() << "3.11 has not opened this surface yet: " << (reason); \
+  } while (0)
+#else
+#define SKIP_311_UNTIL_SURFACE(reason) static_cast<void>(0)
 #endif
 
 class JITContextTest : public RuntimeTest {
@@ -41,6 +76,15 @@ class JITContextTest : public RuntimeTest {
 
 #if PY_VERSION_HEX < 0x030C0000
 TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The mirror image of SKIP_311_EXECUTABLE_COMPILE: this case asserts
+  // that shadow refuses to install, so it is the executing mode that has
+  // nothing to say here.
+  if (jit::getConfig().state == jit::State::kRunning) {
+    GTEST_SKIP() << "shadow-mode assertion; the canary mode installs by "
+                    "design";
+  }
+#endif
   Ref<PyFunctionObject> func(compileAndGet("def func(): return 42", "func"));
   ASSERT_NE(func, nullptr);
 
@@ -83,6 +127,329 @@ TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
 }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, CanaryExecutesUnspecializedForms) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The contract behind force_compile_warm(): "warm" is warmed interpreter
+  // state, not specialized input.  Consuming a specialized instruction is
+  // what creates a speculative guard, and guard and deopt metadata belong
+  // to MR-07 -- so the executing mode must compile the unspecialized
+  // forms, and the attribute-cache arm stays closed until MR-09.  If
+  // either flag is found open here, the warm entry has silently started
+  // claiming a dimension this milestone does not deliver.
+  EXPECT_FALSE(jit::getConfig().specialized_opcodes);
+  EXPECT_FALSE(jit::getConfig().attr_caches);
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // codeCompiled() sits between "the compiler produced machine code" and
+  // "the function is installed", and publication is fallible there: the
+  // artifact allocation, the code-extra reservation, and the post-compile
+  // execute refusal all live below it.  Its answer is what lets the
+  // compile entry stop reporting OK for a function that was never
+  // installed.  A keyword-only signature is a deterministic publication
+  // refusal, and an empty data block exercises the same early-return
+  // paths an allocation failure would take.
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(*, flag=None): return flag", "func"));
+  ASSERT_NE(func, nullptr);
+
+  vectorcallfunc vectorcall_before = func->vectorcall;
+  jit::CompilationKey key{func};
+  EXPECT_FALSE(jit_ctx_->codeCompiled(func, key, {}));
+  EXPECT_FALSE(jit_ctx_->didCompile(func));
+  EXPECT_EQ(jit_ctx_->lookupFunc(func), nullptr);
+  EXPECT_EQ(func->vectorcall, vectorcall_before);
+  EXPECT_FALSE(PyErr_Occurred());
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The pre-compile choke and the install run the same refusal predicate,
+  // so every failure a caller can predict is answered before the compiler
+  // runs; what remains are the failures only publication can see.  This
+  // manufactures one deterministically: a second function sharing the
+  // published code object under a fresh namespace forms a new compilation
+  // key, so the compile itself succeeds -- and publication then hits the
+  // one-artifact-per-code refusal.  The result must say so; reporting OK
+  // here was how force_compile() returned True for a function whose every
+  // call runs interpreted.
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def func(a, b, one):\n"
+      "    total = a - a\n"
+      "    i = total\n"
+      "    while i < b:\n"
+      "        total = total + a\n"
+      "        i = i + one\n"
+      "    return total",
+      "func"));
+  ASSERT_NE(owner, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> owner_preloader(
+      jit::hir::Preloader::make(
+          owner, jit::makeFrameReifier(owner->func_code)));
+  ASSERT_NE(owner_preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *owner_preloader, owner),
+      jit::Result::OK);
+  ASSERT_TRUE(jit_ctx_->didCompile(owner));
+
+  auto globals = Ref<>::steal(PyDict_New());
+  ASSERT_NE(globals, nullptr);
+  auto second =
+      Ref<PyFunctionObject>::steal(reinterpret_cast<PyFunctionObject*>(
+          PyFunction_New(owner->func_code, globals)));
+  ASSERT_NE(second, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> second_preloader(
+      jit::hir::Preloader::make(
+          second, jit::makeFrameReifier(second->func_code)));
+  ASSERT_NE(second_preloader, nullptr);
+
+  vectorcallfunc vectorcall_before = second->vectorcall;
+  EXPECT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *second_preloader, second),
+      jit::Result::CANNOT_SPECIALIZE);
+  EXPECT_FALSE(jit_ctx_->didCompile(second));
+  EXPECT_EQ(jit_ctx_->lookupFunc(second), nullptr);
+  EXPECT_EQ(second->vectorcall, vectorcall_before);
+  // The owner's installation is untouched by the refused publication.
+  EXPECT_TRUE(jit_ctx_->didCompile(owner));
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The refcount pass runs after the instrumentation-poll insertion and
+  // generates arbitrary execution of its own: the last DECREF of a value
+  // can enter tp_dealloc and run __del__.  The boundary polls only close
+  // that door if every Decref-family instruction is followed by another
+  // poll before the frame can return.  Assert that ordering on the final
+  // HIR -- the exact pipeline codegen consumes -- for the shape that
+  // exercises it: a discarded operator result released by POP_TOP.
+  Ref<PyFunctionObject> func(compileAndGet(
+      "def func(a, b):\n"
+      "    a + b\n"
+      "    return 42",
+      "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Function> irfunc =
+      jit::compileToFinalHIRForTest(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  int polls = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    bool decref_since_poll = false;
+    const jit::hir::Instr* offender = nullptr;
+    for (const jit::hir::Instr& instr : block) {
+      switch (instr.opcode()) {
+        case jit::hir::Opcode::kDecref:
+        case jit::hir::Opcode::kXDecref:
+        case jit::hir::Opcode::kBatchDecref:
+          decref_since_poll = true;
+          offender = &instr;
+          break;
+        case jit::hir::Opcode::kCheckInstrumentation:
+          polls++;
+          decref_since_poll = false;
+          break;
+        case jit::hir::Opcode::kReturn:
+          EXPECT_FALSE(decref_since_poll)
+              << "a Decref (last: "
+              << (offender != nullptr
+                      ? jit::hir::hirOpcodeName(offender->opcode())
+                      : "?")
+              << " at bytecode offset "
+              << (offender != nullptr ? offender->bytecodeOffset().value() : -1)
+              << ") can run __del__ after the last poll and before the "
+                 "return";
+          break;
+        default:
+          break;
+      }
+    }
+    (void)offender;
+  }
+  EXPECT_GT(polls, 0);
+}
+
+TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The association writes the dictionary anchor first, and the container
+  // inserts that follow can throw std::bad_alloc.  Escaping mid-transaction
+  // used to strand the artifact: anchored by the function, connected to the
+  // context through its owner pointer, and in no registry -- so context
+  // teardown could not find it, and its eventual destructor called back
+  // into a context that no longer existed.  Fail each allocation point in
+  // turn and require the same story every time: a MemoryError, no
+  // observable installation, no hidden artifact -- and a clean publish of
+  // the same function afterwards, which is only possible if the unwind
+  // left no residue.
+  const char* sources[5] = {
+      "def func(a, b):\n    total = a - a\n    while total < b:\n"
+      "        total = total + a\n    return total",
+      "def func(a, b):\n    total = a + a\n    while total < b:\n"
+      "        total = total + a\n    return total",
+      "def func(a, b):\n    total = b - a\n    while total < b:\n"
+      "        total = total + a\n    return total",
+      "def func(a, b):\n    total = b + a\n    while total < a:\n"
+      "        total = total + b\n    return total",
+      // Step 5: the code-extra reserve -- the C-convention allocation whose
+      // MemoryError used to be swallowed on the way up.
+      "def func(a, b):\n    total = b + b\n    while total < a:\n"
+      "        total = total + a\n    return total",
+  };
+  for (int step = 1; step <= 5; step++) {
+    Ref<PyFunctionObject> func(compileAndGet(sources[step - 1], "func"));
+    ASSERT_NE(func, nullptr) << "step " << step;
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code)));
+    ASSERT_NE(preloader, nullptr) << "step " << step;
+
+    vectorcallfunc vectorcall_before = func->vectorcall;
+    jit::failJitPublishStepForTest(step);
+    EXPECT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+        jit::Result::PYTHON_EXCEPTION)
+        << "step " << step;
+    jit::failJitPublishStepForTest(0);
+    ASSERT_TRUE(PyErr_Occurred()) << "step " << step;
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_MemoryError)) << "step " << step;
+    PyErr_Clear();
+
+    EXPECT_FALSE(jit_ctx_->didCompile(func)) << "step " << step;
+    EXPECT_EQ(jit_ctx_->lookupFunc(func), nullptr) << "step " << step;
+    EXPECT_EQ(func->vectorcall, vectorcall_before) << "step " << step;
+    if (func->func_dict != nullptr) {
+      EXPECT_EQ(
+          PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
+          nullptr)
+          << "step " << step << " left a hidden artifact anchored";
+      PyErr_Clear();
+    }
+
+    EXPECT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+        jit::Result::OK)
+        << "step " << step << " left residue behind";
+    EXPECT_TRUE(jit_ctx_->didCompile(func)) << "step " << step;
+  }
+}
+
+TEST_F(JITContextTest, FailedRepublicationRestoresThePriorClaim) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Publishing a successor for a function whose __code__ moved is a
+  // takeover, and a takeover that fails must leave the prior claim exactly
+  // as it found it.  Severing the prior claim first was irrecoverable:
+  // with the prior artifact pinned, the ownership oracle -- membership --
+  // refused the function forever after a failed publication, and the
+  // code-extra ledger blocked any fresh compile of the old code.  Walk
+  // every allocation failpoint of the publication and require the prior
+  // association, membership, installation and dictionary anchor to
+  // survive each failure -- then require both directions to still work:
+  // the old code re-attaches, and a clean republication takes over.
+  const char* py_src = R"(
+def shifty(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def replacement(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "shifty"));
+  Ref<PyFunctionObject> donor(getGlobal("replacement"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(donor, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+
+  jit::CompiledFunction* prior_art = jit_ctx_->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  auto prior_pin = Ref<jit::CompiledFunction>::create(prior_art);
+  auto old_code = Ref<>::create(func->func_code);
+
+  // Move the function to the replacement's code; on 3.11 nothing announces
+  // the swap, so the prior claim stays exactly as published.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+
+  for (int step = 1; step <= 3; step++) {
+    std::unique_ptr<jit::hir::Preloader> takeover(jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code)));
+    ASSERT_NE(takeover, nullptr) << "step " << step;
+    jit::failJitPublishStepForTest(step);
+    EXPECT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *takeover, func),
+        jit::Result::PYTHON_EXCEPTION)
+        << "step " << step;
+    jit::failJitPublishStepForTest(0);
+    ASSERT_TRUE(PyErr_Occurred()) << "step " << step;
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_MemoryError)) << "step " << step;
+    PyErr_Clear();
+
+    EXPECT_TRUE(prior_art->functions().contains(func.get()))
+        << "step " << step << " severed the prior membership";
+    auto installed = jit_ctx_->compiledFuncs().find(func.get());
+    ASSERT_TRUE(installed != jit_ctx_->compiledFuncs().end())
+        << "step " << step << " dropped the prior installation";
+    EXPECT_EQ(installed->second.get(), prior_art)
+        << "step " << step << " re-pointed the installation";
+    ASSERT_NE(func->func_dict, nullptr) << "step " << step;
+    EXPECT_EQ(
+        PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
+        reinterpret_cast<PyObject*>(prior_art))
+        << "step " << step << " lost the prior anchor";
+    PyErr_Clear();
+  }
+
+  // The old code still re-attaches: the oracle accepts its own function.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", old_code), 0);
+  EXPECT_EQ(Ci_JitShell311_ExecuteRefusal(func), nullptr)
+      << "the prior claim no longer answers for its own function";
+  EXPECT_TRUE(jit_ctx_->finalizeFunc(func, prior_art));
+
+  // And a clean takeover still works end to end.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+  std::unique_ptr<jit::hir::Preloader> clean(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(clean, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *clean, func), jit::Result::OK);
+  jit::CompiledFunction* new_art = jit_ctx_->lookupFunc(func);
+  ASSERT_NE(new_art, nullptr);
+  EXPECT_NE(new_art, prior_art);
+  EXPECT_TRUE(new_art->functions().contains(func.get()));
+  EXPECT_FALSE(prior_art->functions().contains(func.get()))
+      << "the settled takeover left the prior claim standing";
+  EXPECT_EQ(
+      PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
+      reinterpret_cast<PyObject*>(new_art));
+  PyErr_Clear();
+}
+#endif
+
 TEST_F(JITContextTest, UnwatchableBuiltins) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -109,7 +476,20 @@ foo = "hello"
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+#if PY_VERSION_HEX < 0x030C0000
+  // The body reads globals, loads an attribute and makes calls -- opcodes
+  // the canary execute surface has not opened (MR-06 and later), so
+  // publication refuses this compile.  While the publication verdict was
+  // swallowed this case reported OK, ran the call through the interpreter,
+  // and was green without asserting anything; the honest verdict is what
+  // it can assert until the surface opens, at which point the OK branch
+  // below takes over and the builtins-watchability contract it was
+  // written for becomes checkable again.
+  ASSERT_EQ(comp_result, jit::Result::CANNOT_SPECIALIZE);
+  ASSERT_FALSE(jit_ctx_->didCompile(func));
+#else
   ASSERT_EQ(comp_result, jit::Result::OK);
+#endif
 
   auto empty_tuple = Ref<>::steal(PyTuple_New(0));
   auto result = Ref<>::steal(PyObject_Call(func, empty_tuple, nullptr));
@@ -653,7 +1033,7 @@ def add(a, b):
 }
 
 TEST_F(JITFrameTest, CompileAndRunGeneratorFunc) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -788,7 +1168,7 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileGenerator) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1246,7 +1626,7 @@ TEST_F(JITGenDataFooterTest, GenDataFooterDefaults) {
 }
 
 TEST_F(JITGenDataFooterTest, CompileGeneratorAndCheckRuntime) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1680,7 +2060,7 @@ class JITGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(JITGeneratorTest, CompileGenerator) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1707,7 +2087,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorAndCheck) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1730,7 +2110,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndRunGenerator) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1760,7 +2140,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorWithArg) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen(n: int):
@@ -1799,7 +2179,7 @@ def gen(n: int):
 
 
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1822,7 +2202,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndIterateGenerator) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -1860,7 +2240,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, CompileCoroutine) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 async def coro():
@@ -1908,7 +2288,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def gen():
@@ -2282,7 +2662,8 @@ class RaisingIndex:
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignFastPathSemantics) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 def target(seq, k):
@@ -2339,7 +2720,8 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignExceptionSideEffects) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 class GetError(Exception):
@@ -2435,7 +2817,8 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledArithmeticUnaryModAndPower) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 def kernel(a, b):
@@ -2460,7 +2843,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGlobalNameLoad) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 ANSWER = 321
@@ -2484,7 +2868,7 @@ def run():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGeneratorSendAndYieldFrom) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
 
   const char* py_src = R"(
 def inner():
@@ -2518,7 +2902,8 @@ def drive():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledVectorcallEntry) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 def callee(a, b, c):
@@ -2540,7 +2925,8 @@ def caller():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledContainersComparisonsAndBitOps) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 def mix(a, b):
@@ -2571,7 +2957,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledAttributesMethodsAndLoops) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 class Box:
@@ -2609,7 +2996,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledBroadOpcodeShapes) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE(
+      "calls, attribute loads and global loads in the execute whitelist");
 
   const char* py_src = R"(
 class Base:
@@ -2698,7 +3086,7 @@ TEST_F(JITPyjitApiCoverageTest, EnableDisableAndQueryState) {
 }
 
 TEST_F(JITPyjitApiCoverageTest, CompileLazyForceAndUncompile) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("lazy compilation and force_uncompile");
 
   const char* py_src = R"(
 def sample(x):
@@ -2726,7 +3114,7 @@ def sample(x):
 }
 
 TEST_F(JITPyjitApiCoverageTest, JitListDisassembleAndSuppress) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("the JIT list and disassembly control plane");
 
   runStockCode(R"(
 import cinderx.jit as jit
@@ -2761,7 +3149,7 @@ jit.force_uncompile(listed_fn)
 }
 
 TEST_F(JITPyjitApiCoverageTest, AutoCompileAfterNCallsAndStats) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("automatic compilation and its statistics");
 
   runStockCode(R"(
 import cinderx.jit as jit
@@ -2821,6 +3209,798 @@ def forget_me():
   EXPECT_FALSE(ctx->didCompile(func));
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 lifecycle contracts, asserted natively rather than only from
+// Python.  Each of these was reported against a build where the Python-level
+// suite was already green: the Python surface can only see what the canary
+// control plane publishes, and the registries these cases read are not on it.
+class JITLifecycle311Test : public RuntimeTest {};
+
+TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Adding __defaults__ moves the function out of the argument shape the
+  // artifact was compiled for.  3.11 has no function watcher to notice, so
+  // the guarded entry has to notice on the next call -- and every reporter
+  // of "is this compiled" has to agree with it, or the state is compiled to
+  // one caller and interpreted to another.
+  const char* py_src = R"(
+def defaulted(x):
+    return x + 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "defaulted"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_NE(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  auto arg = makeLong(41);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto before = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(before, nullptr);
+  EXPECT_EQ(PyLong_AsLong(before), 42);
+
+  auto defaults = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  ASSERT_NE(defaults, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(func, "__defaults__", defaults), 0);
+
+  // Both reporters must move together with the entry.
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_FALSE(isJitCompiled(func));
+
+  // And the call still has to produce the right answer, through the
+  // interpreter.
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 42);
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto defaulted = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  ASSERT_NE(defaulted, nullptr);
+  EXPECT_EQ(PyLong_AsLong(defaulted), 42);
+}
+
+TEST_F(JITLifecycle311Test, PausedArtifactStaysResidentAndReattaches) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Pausing deopts every function, which empties the installed registry.
+  // The artifact itself is still resident -- it holds code memory -- so a
+  // lifecycle report that counts only installed functions reads zero while
+  // the machine code is still allocated.  The two counts are separate
+  // measurements and this asserts they stay separate.
+  const char* py_src = R"(
+def paused(x):
+    return x * 3
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "paused"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  size_t resident_before = ctx->compiledCodes().size();
+  ASSERT_GT(resident_before, 0u);
+
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+
+  EXPECT_TRUE(jit::isJitPaused());
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  // Resident, not installed: the artifact outlives the entry.
+  EXPECT_EQ(ctx->compiledCodes().size(), resident_before);
+  EXPECT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  auto arg = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto while_paused = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(while_paused, nullptr);
+  EXPECT_EQ(PyLong_AsLong(while_paused), 15);
+
+  callJitNoArgs(mod, "enable");
+  EXPECT_FALSE(jit::isJitPaused());
+  EXPECT_TRUE(isJitCompiled(func));
+  EXPECT_NE(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_EQ(ctx->deoptedFuncs().count(func), 0u);
+
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 15);
+}
+
+TEST_F(JITLifecycle311Test, EnableKeepsParkedFunctionsAcrossFailures) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // enable() walks the parked set and republishes each function.  A
+  // publication can fail (MemoryError), and the walk used to swallow the
+  // failure: the parked entry was already removed before the attempt, the
+  // error stayed pending while the walk kept calling into the C API, and
+  // enable() reported success.  Now the failure propagates, and whatever
+  // was not reattached -- the failed function included -- stays parked for
+  // the next enable() to retry.
+  const char* py_src = R"(
+def resilient(x):
+    total = x - x
+    while total < x:
+        total = total + x
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "resilient"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+  ASSERT_FALSE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  // Fail the first republication the walk attempts.  Which parked function
+  // consumes the failpoint depends on set order; the contract holds either
+  // way: enable() reports the failure, and nothing is lost.
+  jit::failJitPublishStepForTest(2);
+  auto failed = Ref<>::steal(PyObject_CallMethod(mod, "enable", nullptr));
+  jit::failJitPublishStepForTest(0);
+  EXPECT_EQ(failed, nullptr) << "enable() swallowed a failed republication";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_MemoryError));
+  PyErr_Clear();
+
+  // A failed enable() hands back the flip it performed: the caller that
+  // saw the exception must not find the JIT reporting enabled, globally or
+  // by state.
+  EXPECT_EQ(jit::getConfig().state, jit::State::kPaused)
+      << "the failed enable() left the execute state armed";
+  {
+    auto enabled =
+        Ref<>::steal(PyObject_CallMethod(mod, "is_enabled", nullptr));
+    ASSERT_NE(enabled, nullptr);
+    EXPECT_FALSE(PyObject_IsTrue(enabled))
+        << "is_enabled() says true after enable() raised";
+  }
+
+  // The failed function is still parked or already reattached -- never
+  // silently gone -- so a clean enable() finishes the job.
+  callJitNoArgs(mod, "enable");
+  EXPECT_TRUE(isJitCompiled(func))
+      << "the failed enable() dropped the parked entry";
+  EXPECT_EQ(ctx->deoptedFuncs().count(func), 0u);
+  EXPECT_EQ(jit::getConfig().state, jit::State::kRunning);
+  {
+    auto enabled =
+        Ref<>::steal(PyObject_CallMethod(mod, "is_enabled", nullptr));
+    ASSERT_NE(enabled, nullptr);
+    EXPECT_TRUE(PyObject_IsTrue(enabled));
+  }
+
+  auto arg = makeLong(4);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 4);
+}
+
+TEST_F(JITLifecycle311Test, RepublicationSurvivesReentrantAnchorRelease) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The dictionary anchor written by a takeover displaces the prior
+  // artifact's owning reference.  Released in place, that reference's
+  // destructor can run arbitrary Python -- here an object held only by the
+  // prior artifact's runtime, whose __del__ reenters force_compile() for
+  // the same function -- in the middle of the publication.  The inner call
+  // used to complete a full installation that the outer transaction then
+  // dismantled while reporting success.  The displaced anchor is now
+  // detained until the transaction settles: the reentry runs after
+  // publication completes and finds a consistent, finished world.
+  const char* py_src = R"(
+events = []
+
+def chameleon(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def replacement(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+
+class Reenter:
+    def __init__(self, target):
+        self.target = target
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            events.append(cinderjit.is_jit_compiled(self.target))
+            events.append(cinderjit.force_compile(self.target))
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "chameleon"));
+  Ref<PyFunctionObject> donor(getGlobal("replacement"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(donor, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  // Hand the reentry trigger to the prior artifact's runtime, keep no
+  // other reference to it, and make the anchor the artifact's only owner.
+  runCode("k = Reenter(chameleon)\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // Take over with new code.  On the unfixed order the prior artifact died
+  // inside the anchor write, __del__ reentered force_compile() and the
+  // outer transaction dismantled the inner installation.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+  auto mod = importCinderJitModule();
+  callJitOneArg(mod, "force_compile", func);
+
+  // The published world is coherent: installed, listed, anchored, and the
+  // reentry observed it exactly once, after settlement.
+  EXPECT_TRUE(isJitCompiled(func));
+  jit::CompiledFunction* new_art = ctx->lookupFunc(func);
+  ASSERT_NE(new_art, nullptr);
+  EXPECT_NE(new_art, prior_art);
+  EXPECT_TRUE(new_art->functions().contains(func.get()));
+  ASSERT_NE(func->func_dict, nullptr);
+  EXPECT_EQ(
+      PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
+      reinterpret_cast<PyObject*>(new_art));
+  PyErr_Clear();
+
+  // The reentry fired exactly once and observed one finished world: the
+  // predicate answers compiled, and a forced recompile is refused as
+  // already-compiled -- the established answer for a settled publication.
+  // (Before the displaced anchor moved to the deferred-release queue, the
+  // release fired inside the publication call stack, where the code-extra
+  // ledger was not yet written: the same reentry then saw not-compiled and
+  // ran a full nested publication against the half-written world.)
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_TRUE(PyList_Check(events.get()));
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 3)
+      << "the reentry trigger did not fire exactly once";
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 1), Py_True)
+      << "the post-settlement reentry did not see a finished publication";
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 2), Py_False)
+      << "the reentry re-ran a publication instead of being refused as "
+         "already-compiled";
+
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, RepublicationSurvivesReentrantDisable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The displaced anchor's release can run a __del__ that calls
+  // disable(deopt_all=True): everything just published is unloaded again,
+  // parked, and the JIT is paused -- before the compile that performed the
+  // takeover reports its verdict.  The verdict must describe the world it
+  // returns into, not the one it built: the drain runs before the answer
+  // is computed, the answer re-verifies the installation, and a caller
+  // never sees force_compile() succeed for a function whose every call
+  // runs interpreted.
+  const char* py_src = R"(
+events = []
+
+def swapper(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def successor(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+
+class Downer:
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            cinderjit.disable(deopt_all=True)
+            events.append("disabled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "swapper"));
+  Ref<PyFunctionObject> donor(getGlobal("successor"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(donor, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  runCode("k = Downer()\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // Take over with new code; the prior artifact dies in the post-verdict
+  // drain and its __del__ pauses the JIT.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+  auto mod = importCinderJitModule();
+  auto failed =
+      Ref<>::steal(PyObject_CallMethod(mod, "force_compile", "O", func.get()));
+  EXPECT_EQ(failed, nullptr)
+      << "force_compile() reported success for a function the reentrant "
+         "disable() already unloaded";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The reentrant decision owns the final state: paused, function parked,
+  // nothing installed -- and nothing lost.
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(jit::getConfig().state, jit::State::kPaused);
+  EXPECT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+  EXPECT_TRUE(
+      PyUnicode_CompareWithASCIIString(
+          PyList_GET_ITEM(events.get(), 1), "disabled") == 0);
+
+  // The next enable() reattaches what the reentry parked.
+  callJitNoArgs(mod, "enable");
+  EXPECT_TRUE(isJitCompiled(func));
+  EXPECT_EQ(ctx->deoptedFuncs().count(func), 0u);
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, EnableReattachSurvivesReentrantDisable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The enable() walk can displace a value planted at the anchor key of a
+  // parked function -- a forged entry carries no ownership, but its
+  // release still runs arbitrary Python.  The release is deferred to the
+  // walk's end, so it cannot mutate the set mid-iteration; a __del__ that
+  // calls disable(deopt_all=True) there re-parks everything, and the
+  // decision is newer than the enable(): the state it wrote survives, the
+  // caller is told the JIT did not come up enabled, and no entry is
+  // duplicated or lost.
+  const char* py_src = R"(
+events = []
+
+def alpha(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def bravo(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+
+class Downer:
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            cinderjit.disable(deopt_all=True)
+            events.append("disabled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> alpha(compileAndGet(py_src, "alpha"));
+  Ref<PyFunctionObject> bravo(getGlobal("bravo"));
+  ASSERT_NE(alpha, nullptr);
+  ASSERT_NE(bravo, nullptr);
+  ASSERT_EQ(jit::compileFunction(alpha), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(bravo), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  // Keep bravo's artifact alive across the forged-anchor overwrite below:
+  // the anchor is its only owning reference while parked.
+  Ref<jit::CompiledFunction> pin(
+      Ref<jit::CompiledFunction>::create(ctx->lookupFunc(bravo)));
+  ASSERT_NE(pin, nullptr);
+
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+  ASSERT_FALSE(isJitCompiled(alpha));
+  ASSERT_FALSE(isJitCompiled(bravo));
+  ASSERT_EQ(ctx->deoptedFuncs().size(), 2u);
+
+  // Plant the trigger at bravo's anchor key; the reattachment displaces
+  // it, and the deferred release fires after the walk.
+  runCode("bravo.__dict__['__cinderx_compiled_func__'] = Downer()\n");
+
+  auto failed = Ref<>::steal(PyObject_CallMethod(mod, "enable", nullptr));
+  EXPECT_EQ(failed, nullptr)
+      << "enable() reported an enabled JIT after a reentrant disable()";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The reentrant decision owns the state; both functions are parked
+  // exactly once and nothing is installed.
+  EXPECT_EQ(jit::getConfig().state, jit::State::kPaused);
+  EXPECT_FALSE(isJitCompiled(alpha));
+  EXPECT_FALSE(isJitCompiled(bravo));
+  EXPECT_EQ(ctx->deoptedFuncs().size(), 2u);
+  EXPECT_EQ(ctx->deoptedFuncs().count(alpha), 1u);
+  EXPECT_EQ(ctx->deoptedFuncs().count(bravo), 1u);
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+
+  // A clean enable() finishes the job for both.
+  callJitNoArgs(mod, "enable");
+  EXPECT_TRUE(isJitCompiled(alpha));
+  EXPECT_TRUE(isJitCompiled(bravo));
+  EXPECT_EQ(ctx->deoptedFuncs().size(), 0u);
+  auto arg_a = makeLong(3);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(alpha, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, ParkedFunctionOutlivesEveryOtherReference) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // While paused, the parked set is the only thing keeping the function
+  // reachable: 3.11 raises no destroy notification, so a borrowed entry
+  // would be walked as a dangling pointer the moment the JIT is re-enabled.
+  // Drop every reference this test holds and re-enable.
+  const char* py_src = R"(
+def parked(x):
+    return x - 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "parked"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+  ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  // The module still names it, so drop that too: after this the parked set
+  // is the last owner.
+  runStockCode("del parked");
+  BorrowedRef<PyFunctionObject> observed = func;
+  // Assert ownership before dropping: if the parked set only borrowed, the
+  // reset below would free the function and every read after it would be a
+  // use-after-free rather than a failed expectation.
+  ASSERT_GT(Py_REFCNT(func.get()), 1);
+  func.reset();
+  // Nothing outside the parked set names it now, and the cycle it sits in is
+  // collectable, so a borrowing set would lose it right here.
+  PyGC_Collect();
+  ASSERT_EQ(ctx->deoptedFuncs().count(observed), 1u);
+
+  // Take a strong reference back before re-enabling.  enable() drops the
+  // parked set's ownership, and what remains is the collectable
+  // function -> dict -> artifact -> function cycle; reading through a
+  // borrowed pointer afterwards would be at the mercy of whichever
+  // allocation trips the next collection.
+  Ref<PyFunctionObject> revived{Ref<PyFunctionObject>::create(observed)};
+
+  // Re-enabling walks the parked set.  A borrowed entry crashes here.
+  callJitNoArgs(mod, "enable");
+  EXPECT_EQ(ctx->deoptedFuncs().count(revived), 0u);
+  EXPECT_TRUE(isJitCompiled(revived));
+
+  // The function is still callable and still correct after the round trip.
+  auto arg = makeLong(9);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto* callee = reinterpret_cast<PyObject*>(revived.get());
+  auto result = Ref<>::steal(PyObject_Call(callee, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 8);
+}
+
+TEST_F(JITLifecycle311Test, MultithreadedTeardownSurvivesSelfFree) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The sharp case for the teardown above: leave the function and its
+  // artifact holding only each other.  Releasing the artifact's owned
+  // reference then destroys the function, whose dictionary holds the
+  // artifact's last reference -- so the artifact can be freed inside the
+  // very call that is walking it, and everything the teardown does
+  // afterwards would touch freed memory.
+  const char* py_src = R"(
+def solo(x):
+    return x + 6
+)";
+
+  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+  Ref<> weak;
+  {
+    Ref<PyFunctionObject> func(compileAndGet(py_src, "solo"));
+    ASSERT_NE(func, nullptr);
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code)));
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(ctx.get(), *preloader, func),
+        jit::Result::OK);
+    weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
+    ASSERT_NE(weak, nullptr);
+  }
+  // Drop the module binding too; after this the cycle is all that is left.
+  runStockCode("del solo");
+  ASSERT_NE(PyWeakref_GetObject(weak), Py_None)
+      << "the artifact's owned reference should still be holding the function";
+
+  ctx->clearForMultithreadedCompileTest();
+
+  // The owned reference was the last one, so the function died inside the
+  // call -- which is the condition this case exists to put the teardown in.
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
+
+  ctx.reset();
+}
+
+TEST_F(JITLifecycle311Test, FinalizeRefusesReentrantEnable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Releasing the parked set runs destructors, and a destructor runs
+  // arbitrary Python.  If that Python re-enters enable(), the execute
+  // surface is re-armed in the middle of teardown and the same set is walked
+  // again while it is being emptied.  Teardown has to be one-way, and the
+  // tripwire below is what a user object in the function's dictionary can
+  // actually do.
+  runStockCode(R"(
+import cinderjit
+
+reentry = []
+
+class Tripwire:
+    def __del__(self):
+        try:
+            cinderjit.enable()
+            reentry.append("enabled")
+        except RuntimeError:
+            reentry.append("refused")
+        except BaseException as exc:
+            reentry.append("other:" + type(exc).__name__)
+
+def tripwired(x):
+    return x + 2
+
+tripwired.tripwire = Tripwire()
+)");
+
+  Ref<PyFunctionObject> func(getGlobal("tripwired"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+  ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  // Leave the parked set as the only owner, so finalize() is what destroys
+  // the function and therefore what runs the tripwire.
+  runStockCode("del tripwired");
+  ASSERT_GT(Py_REFCNT(func.get()), 1);
+  func.reset();
+
+  jit::finalize();
+
+  Ref<> reentry(getGlobal("reentry"));
+  ASSERT_NE(reentry, nullptr);
+  ASSERT_TRUE(PyList_CheckExact(reentry));
+  ASSERT_EQ(PyList_GET_SIZE(reentry.get()), 1)
+      << "the tripwire did not run; finalize() never released the parked set";
+  BorrowedRef<> outcome = PyList_GET_ITEM(reentry.get(), 0);
+  const char* text = PyUnicode_AsUTF8(outcome);
+  ASSERT_NE(text, nullptr);
+  EXPECT_STREQ(text, "refused");
+  EXPECT_FALSE(jit::isJitInitialized());
+}
+
+TEST_F(JITLifecycle311Test, MultithreadedCompileTeardownReleasesFunctions) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The multithreaded-compile teardown detaches every artifact from the
+  // context before dropping the maps.  clear() only releases the functions an
+  // artifact owns while that owner is still set, so a detached artifact would
+  // carry its references to the grave -- silently, forever, once per run of
+  // that path.  Nothing crashes, so the assertion has to be on the count.
+  const char* py_src = R"(
+def orphaned(x):
+    return x - 3
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "orphaned"));
+  ASSERT_NE(func, nullptr);
+
+  // A private context, as the existing clearForMultithreadedCompileTest case
+  // uses.  That helper orphans artifacts while their functions keep owning
+  // them, and an orphaned artifact holds a raw CodeRuntime pointer into the
+  // context's slab.  Run against the process-wide context, such an artifact
+  // is collected at interpreter shutdown -- after the slab is gone.
+  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(ctx.get(), *preloader, func), jit::Result::OK);
+
+  auto compiled =
+      ctx->lookupCode(func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_EQ(compiled->functions().count(func), 1u);
+
+  Py_ssize_t before = Py_REFCNT(func.get());
+  ctx->clearForMultithreadedCompileTest();
+  Py_ssize_t after = Py_REFCNT(func.get());
+
+  EXPECT_LT(after, before) << "the orphaned artifact kept its owned reference";
+  EXPECT_EQ(compiled->functions().count(func), 0u);
+
+  // The association is gone, so the guarded entry has to send the call back
+  // to the interpreter rather than into an artifact nobody tracks.
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  auto arg = makeLong(11);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 8);
+
+  // Release the artifact before the context whose slab its CodeRuntime lives
+  // in: the orphan is not in compiled_codes_ any more, so ~Context() does not
+  // clear it and it would be cleared later against freed memory.
+  compiled.reset();
+  preloader.reset();
+  func.reset();
+  ctx.reset();
+}
+
+TEST_F(JITLifecycle311Test, FinalizeEmptiesTheInstalledRegistry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // finalize() enforces "nothing is still compiled" with a JIT_CHECK that
+  // aborts the process, so reaching the end of this case is part of the
+  // assertion.  What is observable afterwards is the function itself: the
+  // entry must be back on the interpreter and the code-extra cache must no
+  // longer name an artifact, or a later call would jump into freed code.
+  const char* py_src = R"(
+def finalized(x):
+    return x + 4
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "finalized"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_NE(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  jit::finalize();
+
+  EXPECT_FALSE(jit::isJitInitialized());
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  // Assert the cache directly, not just the predicate built on it: the
+  // predicate also fails when the artifact merely forgot this function, so
+  // on its own it would pass over a code object still naming an artifact
+  // that is about to be freed.
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  CodeExtra* extra = codeExtraIfExists(code);
+  ASSERT_NE(extra, nullptr);
+  EXPECT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), nullptr);
+
+  // Now outlive the artifact.  Its last strong reference is the entry in the
+  // function's dictionary; drop that, then query again.  A stale cache turns
+  // this into a use-after-free under the sanitizer instead of a null read.
+  auto artifact_key =
+      Ref<>::steal(PyUnicode_FromString("__cinderx_compiled_func__"));
+  ASSERT_NE(artifact_key, nullptr);
+  ASSERT_NE(func->func_dict, nullptr);
+  ASSERT_EQ(PyDict_Contains(func->func_dict, artifact_key), 1);
+  ASSERT_EQ(PyDict_DelItem(func->func_dict, artifact_key), 0);
+  PyGC_Collect();
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  auto arg = makeLong(6);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 10);
+}
+
+TEST_F(JITLifecycle311Test, FinalizeEmptiesTheParkedRegistry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The parked set owns its entries on this branch, so finalizing while it
+  // is populated has to release them.  Skipping that release would not
+  // crash -- it would leak every parked function for the life of the
+  // process -- which is why the assertion is on the reference count and not
+  // on survival.
+  const char* py_src = R"(
+def parked_at_exit(x):
+    return x * 5
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "parked_at_exit"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  auto mod = importCinderJitModule();
+  auto deopt_all = Ref<>::steal(PyBool_FromLong(1));
+  callJitOneArg(mod, "disable", deopt_all);
+  ASSERT_EQ(ctx->deoptedFuncs().count(func), 1u);
+
+  Py_ssize_t before = Py_REFCNT(func.get());
+  jit::finalize();
+  Py_ssize_t after = Py_REFCNT(func.get());
+
+  EXPECT_FALSE(jit::isJitInitialized());
+  EXPECT_LT(after, before) << "the parked set kept its owned reference";
+
+  auto arg = makeLong(7);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 35);
+}
+
+#endif // PY_VERSION_HEX < 0x030C0000
+
 class JITStaticJitRtCoverageTest : public RuntimeTest {
  public:
   JITStaticJitRtCoverageTest()
@@ -2836,7 +4016,7 @@ class JITStaticJitRtCoverageTest : public RuntimeTest {
 };
 
 TEST_F(JITStaticJitRtCoverageTest, StaticPrimitiveBoxUnboxModPow) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("the Static Python runtime cache");
 
   const char* py_src = R"(
 from __static__ import int32, int64, uint32, uint64
@@ -2868,7 +4048,7 @@ def run() -> int64:
 }
 
 TEST_F(JITStaticJitRtCoverageTest, StaticArrayFieldsAndInvoke) {
-  SKIP_311_EXECUTABLE_COMPILE();
+  SKIP_311_UNTIL_SURFACE("the Static Python runtime cache");
 
   const char* py_src = R"(
 from __static__ import Array, box, clen, int64

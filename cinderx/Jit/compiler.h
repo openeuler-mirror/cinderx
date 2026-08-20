@@ -94,4 +94,13 @@ class Compiler {
   codegen::NativeGeneratorFactory ngen_factory_;
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+// Test-only: run the executing mode's exact HIR pipeline -- preload, build,
+// instrumentation polls, passes -- and return the final HIR, so RuntimeTests
+// can assert structural invariants (e.g. every Decref precedes the next
+// boundary poll) on what codegen would actually consume.
+std::unique_ptr<hir::Function> compileToFinalHIRForTest(
+    BorrowedRef<PyFunctionObject> func);
+#endif
+
 } // namespace jit

@@ -15,6 +15,7 @@ They need a CPython 3.11 interpreter with the cinderx wheel importable
 (the gate runs them on the venv the wheel job builds).
 """
 
+import json
 import sys
 
 import pytest
@@ -169,7 +170,7 @@ def test_corpus_module_missing_turns_red():
     # The completeness contract is asserted inside the child against the
     # manifest count; a shrunken corpus (modeled by demanding one module
     # more than exists) exits nonzero and turns red.
-    spec = runners.corpus_completeness_runner(expected_modules=10)
+    spec = runners.corpus_completeness_runner(expected_modules=11)
     result = runners.run(spec)
     assert not result.ok
     assert any("worker exited" in err for err in result.errors)
@@ -216,13 +217,34 @@ def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
     assert proc.returncode == 2, (proc.returncode, proc.stderr[-300:])
     assert b"refusing to fall back" in proc.stderr or b"force_compile refused" in proc.stderr
 
-    # diff mode: equal drift passes, unequal drift exits 1.
+    # diff mode compares drift AND semantic outcome, and refuses a report
+    # whose outcome table is missing -- otherwise it silently degrades to
+    # the drift-only check it used to be.
+    rcm = str(corpus_dir / "refcount_matrix.py")
     a = tmp_path / "a.json"; b = tmp_path / "b.json"
-    a.write_text('{"drift": {"case_x": {"o": 1}}}')
-    b.write_text('{"drift": {"case_x": {"o": 1}}}')
-    assert _sp.run([sys.executable, str(corpus_dir / "refcount_matrix.py"), "diff", str(a), str(b)]).returncode == 0
-    b.write_text('{"drift": {"case_x": {"o": 2}}}')
-    assert _sp.run([sys.executable, str(corpus_dir / "refcount_matrix.py"), "diff", str(a), str(b)]).returncode == 1
+
+    def diff_rc(doc_a, doc_b):
+        a.write_text(_json.dumps(doc_a))
+        b.write_text(_json.dumps(doc_b))
+        return _sp.run([sys.executable, rcm, "diff", str(a), str(b)]).returncode
+
+    equal = {"drift": {"case_x": {"o": 1}}, "outcome": {"case_x": "ok:1234"}}
+    assert diff_rc(equal, equal) == 0
+    # Drift differs.
+    assert diff_rc(equal, {"drift": {"case_x": {"o": 2}},
+                           "outcome": {"case_x": "ok:1234"}}) == 1
+    # Drift agrees but the answer does not: a refcount-neutral lowering that
+    # returns the wrong result must still fail.
+    assert diff_rc(equal, {"drift": {"case_x": {"o": 1}},
+                           "outcome": {"case_x": "ok:9999"}}) == 1
+    # No outcome table at all.
+    assert diff_rc(equal, {"drift": {"case_x": {"o": 1}}}) == 1
+    # An executing jit report that recorded a case with no machine-code
+    # entries is not execution evidence.
+    assert diff_rc(equal, {"drift": {"case_x": {"o": 1}},
+                           "outcome": {"case_x": "ok:1234"},
+                           "mode": "jit", "executing": True,
+                           "machine_code_entries": {"case_x": 0}}) == 1
 
 
 GATE_REQUIRED_JOBS = {
@@ -230,11 +252,11 @@ GATE_REQUIRED_JOBS = {
     "bytecode_support_gate", "dynsym_allowlist", "interpreter_and_eval_hook",
     "trigger_stats_gate", "jit311_runner_selftests",
     "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
-    "observe_gate", "shadow_compile_gate",
+    "observe_gate", "shadow_compile_gate", "release_canary_execute",
 }
 DAILY_REQUIRED_JOBS = {
     "asan_build_311", "debug_build_311", "runtime_tests_311_census",
-    "jit311_drivers", "jit311_pyperf_completeness",
+    "jit311_drivers", "jit311_pyperf_completeness", "jit311_pyperf_canary",
     "jit311_shadow_surface",
 }
 
@@ -878,3 +900,53 @@ def test_rt314_allowlist_growth_must_be_symmetric_failures(tmp_path):
     )
     assert proc.returncode == 1
     assert "did not fail identically" in proc.stdout
+
+
+def test_refcount_matrix_canary_minimal_tier(tmp_path):
+    # MR-04 minimal tier: on the execute-min corpus the jit mode genuinely
+    # compiles (canary), every case executes machine code, and the
+    # per-case refcount drift equals the interpreted run exactly.
+    import os as _os
+    import subprocess as _sp
+
+    corpus_dir = Path(runners.REPO_ROOT) / "ci_pipeline" / "jit311"
+    rcm = str(corpus_dir / "refcount_matrix.py")
+    interp_out = tmp_path / "interp.json"
+    jit_out = tmp_path / "jit.json"
+
+    proc = _sp.run(
+        [sys.executable, rcm, str(corpus_dir), "corpus_execute_min",
+         "interp", str(interp_out)],
+        capture_output=True, timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")[-400:]
+
+    env = dict(_os.environ)
+    env["CINDERX_JIT_MODE"] = "canary"
+    # No call threshold: the cases are force-compiled, and a threshold would
+    # arm the ROI deopt backoff, which withdraws the raising cases partway
+    # through the iteration loop and leaves the rest of their run
+    # interpreted.
+    env.pop("PYTHONJITAUTO", None)
+    # The plan makes the debug allocator mandatory from MR-04, and this tier
+    # is one of the places it has to hold.
+    env["PYTHONMALLOC"] = "debug"
+    proc = _sp.run(
+        [sys.executable, rcm, str(corpus_dir), "corpus_execute_min",
+         "jit", str(jit_out)],
+        capture_output=True, env=env, timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")[-400:]
+
+    proc = _sp.run(
+        [sys.executable, rcm, "diff", str(interp_out), str(jit_out)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout[-400:]
+
+    # Every case must have run compiled for the whole loop, and the report
+    # must carry the semantic outcomes the diff compares.
+    report = json.loads(jit_out.read_text())
+    assert set(report["outcome"]) == set(report["drift"]), report
+    entries = report["machine_code_entries"]
+    assert entries and all(v >= 200 for v in entries.values()), entries

@@ -9,7 +9,6 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
-#include "cinderx/Jit/config.h"
 #include "cinderx/StaticPython/classloader.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 #include "cinderx/StaticPython/vtable_builder.h"
@@ -383,8 +382,18 @@ PyObject** Preloader::getGlobalCache(BorrowedRef<> name_obj) const {
       "Name must be a str, got {}",
       Py_TYPE(name_obj)->tp_name);
   BorrowedRef<PyUnicodeObject> name{name_obj};
-  return cinderx::getModuleState()->cache_manager->getGlobalCache(
-      builtins_, globals_, name);
+  // The manager is allocated for every version that emits LoadGlobalCached
+  // and for no version that does not, so a null here means a caller reached
+  // this on a branch with no global-cache story.  Fail the compile with the
+  // name rather than dereferencing null.
+  jit::IGlobalCacheManager* caches =
+      cinderx::getModuleState()->cache_manager.get();
+  JIT_THROW_IF(
+      caches == nullptr,
+      "Trying to get a globals cache on a build without a global cache "
+      "manager for {}",
+      fullname());
+  return caches->getGlobalCache(builtins_, globals_, name);
 }
 
 bool Preloader::canCacheGlobals() const {
@@ -575,13 +584,20 @@ bool Preloader::preload() {
     switch (bc_instr.opcode()) {
       case LOAD_GLOBAL: {
 #if PY_VERSION_HEX < 0x030C0000
-        // Shadow compilation validates generated code but never installs it.
-        // Do not register process-lifetime dict watchers for an artifact that
-        // is discarded at the end of this compile. The 3.11 builder lowers
-        // global loads from preloaded dictionary facts without this cache.
-        if (isJitShadow()) {
-          break;
-        }
+        // 3.11 has no consumer for a global cache in either mode.  The only
+        // LOAD_GLOBAL fast path on this branch reads the interpreter's own
+        // quickened cache (tryEmitLoadGlobalModuleValue311), and
+        // LoadGlobalCached -- the instruction a GlobalCache serves -- is
+        // emitted from 3.12 on.  Preloading one here would register a
+        // process-lifetime dict watcher for a cache nothing reads, and the
+        // module state deliberately allocates no GlobalCacheManager on this
+        // branch (_cinderx-lib.cpp), so the call would dereference null.
+        //
+        // Written as a shadow-mode check this held only while 3.11 meant
+        // shadow.  The executing canary mode fell straight through it into
+        // that null, and so did the inliner's preload worklist, which walks
+        // globalNames() and calls global() for each entry.
+        break;
 #endif
         if (!canCacheGlobals()) {
           break;

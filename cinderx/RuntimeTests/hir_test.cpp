@@ -2707,6 +2707,12 @@ def test(value):
 }
 
 TEST_F(HIRBuildTest, ReadonlyMemberDescriptorStoreStaysGeneric) {
+  // This test pins the CACHED store form, which requires the attribute
+  // caches the 3.11 default keeps off until MR-09; enable them for the
+  // scope of this compilation.
+  bool old_attr_caches = getConfig().attr_caches;
+  getMutableConfig().attr_caches = true;
+  SCOPE_EXIT(getMutableConfig().attr_caches = old_attr_caches);
   const char* src = R"(
 def test(value):
     test.__globals__ = value

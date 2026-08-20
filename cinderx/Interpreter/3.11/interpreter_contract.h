@@ -18,6 +18,14 @@ PyObject* _Py_HOT_FUNCTION Ci_EvalFrameDefault_311(
     struct _PyInterpreterFrame* frame,
     int throwflag);
 
+// The vendored evaluator's own eval-breaker service, exposed for the JIT's
+// loop back edges.  Py_MakePendingCalls covers only signals and pending
+// calls; the anchored 3.11.6 eval_frame_handle_pending() additionally
+// honours a GIL drop request and delivers asynchronous exceptions, and a
+// compiled loop owes its thread exactly those semantics.  Returns 0, or -1
+// with an exception set.
+int Ci_EvalFrameHandlePending_311(PyThreadState* tstate);
+
 #ifdef __cplusplus
 }
 #endif

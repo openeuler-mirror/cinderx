@@ -67,6 +67,32 @@ unexpected_skips() {
   fi
 }
 
+canary_population() {
+  # Emits "Suite.Test" for each SKIP_311_EXECUTABLE_COMPILE() site.  TEST_F
+  # headers wrap across lines, so the header is joined before matching; an
+  # unparsed header would attribute the site to the previous case, the
+  # filter would miss it, and the count check below turns red.
+  awk '
+    /^TEST_F\(/ { head = $0
+                  while (head !~ /\)/ && (getline nextline) > 0) {
+                    head = head nextline
+                  }
+                  if (match(head, /TEST_F\([ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*,[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\)/)) {
+                    hdr = substr(head, RSTART, RLENGTH)
+                    gsub(/TEST_F\(|\)|[ \t]/, "", hdr)
+                    split(hdr, parts, ",")
+                    suite = parts[1]; test = parts[2]
+                  } else {
+                    suite = ""; test = ""
+                  }
+                }
+    /^[ \t]*SKIP_311_EXECUTABLE_COMPILE\(\);[ \t]*$/ {
+      if (suite == "") { exit 2 }
+      print suite "." test
+    }
+  ' "$REPO_ROOT"/cinderx/RuntimeTests/*.cpp | sort -u
+}
+
 green_log_verdict() {
   # $1: green-gate log; $2: expected green population.  The PASSED count
   # must equal the expected population exactly -- ran-count alone would
@@ -106,6 +132,11 @@ if [ "${1:-}" = "--verify-baseline-growth" ]; then
 fi
 if [ "${1:-}" = "--verify-skip-growth" ]; then
   baseline_growth "${2:?old skip allowlist}" "${3:?new skip allowlist}"
+  exit $?
+fi
+if [ "${1:-}" = "--verify-canary-population" ]; then
+  # Self-test entry: print the derived population without a build.
+  canary_population
   exit $?
 fi
 if [ "${1:-}" = "--verify-green-log" ]; then
@@ -173,8 +204,20 @@ if [ "$MODE" = "--census" ]; then
   if git -C "$REPO_ROOT" show \
        "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_allowed_skips.txt" \
        > "$BASE_SKIPS" 2>/dev/null; then
-    baseline_growth "$BASE_SKIPS" "$SKIP_ALLOWLIST"
-    echo "census: skip-allowlist growth guard held against $RT311_BASELINE_BASE"
+    # A case that skips in this run because it belongs to the canary
+    # population is not being washed green by the allowlist: it runs, in the
+    # other mode, in this same gate, and has to pass there.  Exempt exactly
+    # those and hold the guard against everything else, so "add a skip and
+    # its allowlist row" still cannot buy silence.
+    SKIP_EXEMPT="$BUILD_DIR-skip-allowlist-exempt.txt"
+    canary_population > "$SKIP_EXEMPT"
+    SKIP_UNPROVEN="$BUILD_DIR-skip-allowlist-unproven.txt"
+    comm -23 <(grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" | sort -u) \
+             "$SKIP_EXEMPT" > "$SKIP_UNPROVEN"
+    baseline_growth "$BASE_SKIPS" "$SKIP_UNPROVEN"
+    echo "census: skip-allowlist growth guard held against" \
+      "$RT311_BASELINE_BASE ($(grep -c . "$SKIP_EXEMPT") entries exempt as" \
+      "canary-population members)"
   else
     SKIP_NORMALIZED="$BUILD_DIR-skips-normalized.txt"
     grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" > "$SKIP_NORMALIZED"
@@ -278,3 +321,49 @@ if [ "$GREEN_RAN" != "$GREEN_EXPECTED" ]; then
   exit 1
 fi
 green_log_verdict "$BUILD_DIR-green.log" "$GREEN_EXPECTED"
+
+# The executable-compile family compiles and installs machine code, which
+# on 3.11 only the executing mode does -- so it is skipped in the run
+# above and has to be run again in that mode, or it is never run at all.
+# That was the state until now: a version gate skipped it on every 3.11
+# build, including the sanitized one, which is the only place a
+# use-after-free in the install and lifecycle paths would be caught.
+#
+# The population is derived from the sources that carry the mode gate, not
+# from a hand-written list: a filter naming a suite would silently cover
+# whichever members happen to live there, and a committed manifest would
+# drift the moment a case is added.  Every case carrying the mode gate must
+# run here, and every one of them must pass.
+CANARY_CASES=$(canary_population)
+CANARY_EXPECTED=$(printf '%s\n' "$CANARY_CASES" | grep -c .)
+if [ "$CANARY_EXPECTED" -lt 1 ]; then
+  echo "no SKIP_311_EXECUTABLE_COMPILE() sites found; the mode gate has"
+  echo "been renamed or removed and the executable-compile family would"
+  echo "run in neither mode"
+  exit 1
+fi
+CANARY_FILTER=$(printf '%s\n' "$CANARY_CASES" | paste -sd: -)
+set +e
+(cd "$REPO_ROOT/cinderx" && \
+  CINDERX_JIT_MODE=canary "$BIN" --gtest_filter="$CANARY_FILTER") \
+  > "$BUILD_DIR-canary.log" 2>&1
+CANARY_CODE=$?
+set -e
+if [ "$CANARY_CODE" != 0 ]; then
+  echo "canary-mode RuntimeTests failed (exit $CANARY_CODE)"
+  tail -30 "$BUILD_DIR-canary.log"
+  exit 1
+fi
+# Exit status alone would accept an invocation that skipped everything --
+# which is exactly the failure this second run exists to end.  A skip here
+# is red for the same reason: the mode gate is satisfied in this run, so a
+# case that still skips is skipping for a reason nobody declared.
+no_skips_allowed "$BUILD_DIR-canary.log" || exit 1
+CANARY_PASSED=$({ grep -E '^\[  PASSED  \] [0-9]+ tests?\.' "$BUILD_DIR-canary.log" || true; } \
+  | sed -E 's/^\[  PASSED  \] ([0-9]+) tests?\./\1/' | tail -1)
+if [ "${CANARY_PASSED:-0}" != "$CANARY_EXPECTED" ]; then
+  echo "canary-mode run passed ${CANARY_PASSED:-0} of $CANARY_EXPECTED"
+  echo "mode-gated tests; the filter, the gate or a case has drifted"
+  exit 1
+fi
+echo "canary-mode RuntimeTests ok ($CANARY_PASSED tests)"

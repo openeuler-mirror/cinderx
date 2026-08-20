@@ -5,6 +5,7 @@
 corpus_calls=285:183:a56696feed726318
 corpus_controlflow=36:2:b74628687bbb2c3d
 corpus_deopt_resume=5:0:1f3272fbc719df24
+corpus_execute_min=13:2:24f1661f0f7d72a4
 corpus_frames=16:1:ec05652d291fd4ee
 corpus_generators=23:0:07ce06735c57acbf
 corpus_hotloops=6:0:3dcc92fed05bd093

@@ -212,6 +212,16 @@ class CompiledFunction {
     owner_ = owner;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Release the references this artifact holds on its functions and forget
+   * them.  Only for teardown paths that detach the artifact from its context
+   * before clear() can run: clear() releases them itself, but only while the
+   * owner is still set.
+   */
+  void releaseOwnedFunctions();
+#endif
+
   std::unordered_set<BorrowedRef<PyFunctionObject>>& functions() {
     return functions_;
   }
@@ -247,10 +257,19 @@ BorrowedRef<PyTypeObject> getCompiledFunctionType();
 
 // Associate a function with a CompiledFunction and store a reference to the
 // CompiledFunction in the function's __dict__.
+//
+// When `displaced_anchor` is given, the value the dictionary write displaces
+// is detained into it instead of being released in place.  On 3.11 that
+// value is the prior artifact's owning reference: releasing it inside the
+// write would let its destructor run arbitrary Python in the middle of a
+// publication (a __del__ can reenter force_compile()), and the caller also
+// needs it as the restore token if the publication is rolled back.  The
+// caller releases the reference only after its transaction has settled.
 bool associateFunctionWithCompiled(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled,
-    bool is_nested);
+    bool is_nested,
+    Ref<>* displaced_anchor = nullptr);
 
 } // namespace jit
 

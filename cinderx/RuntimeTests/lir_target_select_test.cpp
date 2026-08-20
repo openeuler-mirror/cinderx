@@ -519,9 +519,16 @@ def func(x, y):
   EXPECT_NE(lir_str.find("PrimitiveCompare<Equal>"), std::string::npos)
       << lir_str;
   EXPECT_NE(lir_str.find("Guard 4"), std::string::npos) << lir_str;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 bools are mortal, so the immortal-only Cmp/BranchE fusion does
+  // not apply: the Python compare result keeps its refcounted Equal
+  // materialization and the branch consumes it generically.
+  EXPECT_NE(lir_str.find(" = Equal "), std::string::npos) << lir_str;
+#else
   EXPECT_NE(lir_str.find("Cmp "), std::string::npos) << lir_str;
   EXPECT_NE(lir_str.find("BranchE"), std::string::npos) << lir_str;
   EXPECT_EQ(lir_str.find(" = Equal "), std::string::npos) << lir_str;
+#endif
 }
 
 TEST_F(LIRTargetSelectTest, SelectsMulAddAndMulSubForAdjacentSingleUseMul) {

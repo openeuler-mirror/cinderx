@@ -41,3 +41,10 @@
 #undef WITH_DTRACE
 
 #include "upstream/ceval.c"
+
+// Defined after the include so the static eval_frame_handle_pending() above
+// is in scope.  The wrapper adds nothing: the anchored source stays the
+// oracle for what a back edge must service.
+int Ci_EvalFrameHandlePending_311(PyThreadState* tstate) {
+  return eval_frame_handle_pending(tstate);
+}

@@ -43,6 +43,31 @@ void Ci_Observe311_Finalize(void);
 // artifact without installing an entry point.
 const char* Ci_JitShell311_RequestCompile(PyFunctionObject* func);
 
+// The MR-04 execute-surface predicate: the registered refusal reason for
+// this function, or NULL when machine code may be installed for it.  The
+// compile choke point, the eligibility report and the canary control plane
+// all ask this one predicate, so a refusal is reported with the same reason
+// wherever it surfaces.
+const char* Ci_JitShell311_ExecuteRefusal(PyFunctionObject* func);
+
+// The artifact currently installed for this function, or NULL.  "Installed"
+// means the next call runs machine code: the code object, globals, builtins,
+// argument shape and artifact ownership all still match what was compiled.
+// Returned as void* because the artifact type is C++; callers in the JIT
+// cast it back to jit::CompiledFunction*.
+void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func);
+
+// The vectorcall entry installed on a function whose artifact may execute.
+// It re-checks the predicate above on every call and falls back to the
+// interpreter entry when anything has moved, so a function that leaves the
+// execute surface stops running machine code without needing a watcher --
+// 3.11 has none.
+PyObject* Ci_JitShell311_GuardedEntry(
+    PyObject* func,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
 #ifdef __cplusplus
 }
 #endif

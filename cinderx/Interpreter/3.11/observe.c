@@ -77,12 +77,15 @@ int Ci_Observe311_Configure(void) {
     Ci_Observe311_Enabled = 0;
     return 0;
   }
-  if (strcmp(mode, "observe") != 0 && strcmp(mode, "shadow") != 0) {
-    // Configuration parsing accepts no execution-capable mode on 3.11.
+  if (strcmp(mode, "observe") != 0 && strcmp(mode, "shadow") != 0 &&
+      strcmp(mode, "canary") != 0) {
+    // canary is the MR-04 test-only execution mode: eligible simple
+    // functions compile, install and execute machine code.  The product
+    // auto-JIT stays unavailable on 3.11.
     PyErr_Format(
         PyExc_RuntimeError,
         "CINDERX_JIT_MODE=%s is not accepted on CPython 3.11: this build "
-        "takes \"off\", \"observe\" or \"shadow\"",
+        "takes \"off\", \"observe\", \"shadow\" or \"canary\"",
         mode);
     return -1;
   }

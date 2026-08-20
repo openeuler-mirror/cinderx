@@ -85,16 +85,16 @@ struct LiveValue {
   }
 };
 
-#define DEOPT_REASONS(X)                                                \
-  X(GuardFailure)                                                       \
-  X(YieldFrom)                                                          \
-  X(Raise)                                                              \
-  X(RaiseStatic)                                                        \
-  X(UnhandledException)                                                 \
-  X(UnhandledUnboundLocal)                                              \
-  X(UnhandledUnboundFreevar)                                            \
-  X(UnhandledNullField)                                                 \
-  /* TODO(T262710971): Add a dedicated Instrumentation deopt reason. */ \
+#define DEOPT_REASONS(X)     \
+  X(GuardFailure)            \
+  X(YieldFrom)               \
+  X(Raise)                   \
+  X(RaiseStatic)             \
+  X(UnhandledException)      \
+  X(UnhandledUnboundLocal)   \
+  X(UnhandledUnboundFreevar) \
+  X(UnhandledNullField)      \
+  X(Instrumentation)         \
   X(PeriodicTaskFailure)
 
 enum class DeoptReason : char {
@@ -240,7 +240,7 @@ void reifyFrame(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame_meta,
     const uint64_t* regs,
-    bool is_instrumentation_deopt = false);
+    bool is_patched_instrumentation = false);
 
 // Like reifyFrame(), but for a suspended generator. Takes a single base
 // pointer for spill data rather than a full set of registers.

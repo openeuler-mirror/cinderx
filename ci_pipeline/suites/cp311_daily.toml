@@ -61,6 +61,18 @@ command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-ch
 # on the PR gate is only the MR-05 canary. Per-module and per-case
 # completeness is written to completeness.json; worker crashes, unknown
 # rejects and any machine-code side effect are red.
+# The same completion leg under canary execution (MR-04): benchmark
+# drivers must finish with a closed ledger while eligible machinery
+# functions genuinely execute machine code in the driver process.
+# Each worker attests its own mode, allocator and wheel, and the leg
+# rejects a run where the workers neither executed machine code nor
+# refused anything.  The canary tranche is the committed benchmark
+# list, not the full applicable set -- the leg prints its own coverage,
+# and full-surface completeness stays on the shadow job above.
+[[jobs]]
+name = "jit311_pyperf_canary"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-canary'"
+
 [[jobs]]
 name = "jit311_shadow_surface"
 command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --shadow-surface --out \"{run_dir}/shadow-surface\"'"

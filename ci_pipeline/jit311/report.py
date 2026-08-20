@@ -27,6 +27,9 @@ Field sources:
                              consumed by successful shadow compilations
   shadow_codegen_bytes       trigger stats: discarded machine-code byte count
   peak_rss_bytes             process peak resident set size
+  compile_installed          scheduling events answered by installing
+                             machine code (canary; zero under shadow, which
+                             compiles without installing)
   machine_code_installed     len(cinderjit.get_compiled_functions())
   machine_code_entries       trigger stats (incremented by the 3.11 entry
                              glue once machine-code execution ships; zero on
@@ -40,7 +43,7 @@ Field sources:
 Harness-owned fields (filled by runners, None until then):
 
   target_modules_attempted, worker_crashes,
-  live_compiled_functions_at_exit
+  live_compiled_functions_at_exit, resident_compiled_functions_at_exit
 
 The refusal-reason registry starts with the capability-gate refusal; the
 front-end MR extends it from the bytecode support list and the shape-refusal
@@ -108,6 +111,7 @@ RUNTIME_FIELDS = (
     "evaluator_installed",
     "compile_requests",
     "compile_success",
+    "compile_installed",
     "compile_rejected",
     "events_dropped",
     "capability_rejects",
@@ -131,6 +135,7 @@ HARNESS_FIELDS = (
     "target_modules_attempted",
     "worker_crashes",
     "live_compiled_functions_at_exit",
+    "resident_compiled_functions_at_exit",
 )
 
 ALL_FIELDS = RUNTIME_FIELDS + HARNESS_FIELDS
@@ -199,13 +204,16 @@ def snapshot() -> dict[str, Any]:
     }
     supported_opcode_failures = 0
     unknown_rejects = 0
+    compile_installed = 0
     if observe is not None:
         events = observe.get("events", [])
         compile_requests = len(events)
         events_dropped = int(observe.get("events_dropped", 0))
         for event in events:
             result = event.get("result")
-            if result in ("ok", "compiled"):
+            if result in ("ok", "compiled", "installed"):
+                if result == "installed":
+                    compile_installed += 1
                 continue
             category = classify_refusal_reason(result)
             reject_counts[category] += 1
@@ -220,6 +228,7 @@ def snapshot() -> dict[str, Any]:
         "evaluator_installed": _evaluator_installed(),
         "compile_requests": compile_requests,
         "compile_success": int(trigger["shadow_compile_success"]),
+        "compile_installed": compile_installed,
         "compile_rejected": compile_rejected,
         "events_dropped": events_dropped,
         "capability_rejects": reject_counts["capability"],

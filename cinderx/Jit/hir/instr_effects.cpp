@@ -96,6 +96,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     // These can deopt but don't write to any memory locations when they fall
     // through.
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckExc:
     case Opcode::kCheckField:
     case Opcode::kCheckFreevar:
@@ -379,6 +380,7 @@ bool hasArbitraryExecution(const Instr& inst) {
     // us into and resuming execution in the interpreter is sufficient to not
     // need special handling for effective side-effects.
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckExc:
     case Opcode::kCheckField:
     case Opcode::kCheckFreevar:

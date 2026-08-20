@@ -869,6 +869,22 @@ static bool should_snapshot(
     return false;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // The executing mode snapshots every non-terminator boundary.  The skip
+  // list below is a metadata-size optimization: replay-safe instructions
+  // do not need a resume point of their own.  The instrumentation polls
+  // change the calculus -- they live on boundaries, and a boundary without
+  // a snapshot is a boundary the poll pass cannot guard.  The gap is not
+  // theoretical: a value released at such a boundary (POP_TOP's operand,
+  // a STORE_FAST's previous value) runs its __del__ AFTER the last polled
+  // boundary, and a profile function registered there would never hear
+  // from the running frame again.  Metadata size is the wrong thing to
+  // save in a milestone whose subject is correctness.
+  if (getConfig().state == State::kRunning) {
+    return true;
+  }
+#endif
+
   switch (bci.opcode()) {
     // These instructions only modify frame state and are always safe to
     // replay. We don't snapshot these in order to limit the amount of
@@ -1273,6 +1289,62 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
   return nullptr;
 }
 
+const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The MR-04 execute surface: machine code may only run for functions
+  // whose every instruction sits inside this audited whitelist --
+  // positional/local data flow, basic arithmetic and comparisons, control
+  // flow, and iteration over already-materialized iterables.  Everything
+  // the plan defers stays out by construction: no CALL family, no attr or
+  // subscript ICs, no LOAD_GLOBAL (3.11 has no global-cache story yet),
+  // no cells/closures, no exception table, no generators.  The decoder
+  // yields unspecialized opcodes, so quickened forms cannot slip past.
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    switch (bc_it->opcode()) {
+      case BINARY_OP:
+      case COMPARE_OP:
+      case CONTAINS_OP:
+      case COPY:
+      case DELETE_FAST:
+      case EXTENDED_ARG:
+      case FOR_ITER:
+      case GET_ITER:
+      case IS_OP:
+      case JUMP_BACKWARD:
+      case JUMP_BACKWARD_NO_INTERRUPT:
+      case JUMP_FORWARD:
+      case LOAD_CONST:
+      case LOAD_FAST:
+      case NOP:
+      case POP_JUMP_BACKWARD_IF_FALSE:
+      case POP_JUMP_BACKWARD_IF_NONE:
+      case POP_JUMP_BACKWARD_IF_NOT_NONE:
+      case POP_JUMP_BACKWARD_IF_TRUE:
+      case POP_JUMP_FORWARD_IF_FALSE:
+      case POP_JUMP_FORWARD_IF_NONE:
+      case POP_JUMP_FORWARD_IF_NOT_NONE:
+      case POP_JUMP_FORWARD_IF_TRUE:
+      case POP_TOP:
+      case RESUME:
+      case RETURN_VALUE:
+      case STORE_FAST:
+      case SWAP:
+      case UNARY_INVERT:
+      case UNARY_NEGATIVE:
+      case UNARY_NOT:
+      case UNARY_POSITIVE:
+        break;
+      default:
+        return "REFUSE_SHAPE_EXECUTE_SURFACE";
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
+
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
 }
@@ -1540,6 +1612,18 @@ void HIRBuilder::translate(
   std::deque<TranslationContext> queue = {initial_tc};
   std::unordered_set<BasicBlock*> processed;
   std::unordered_set<BasicBlock*> loop_headers;
+#if PY_VERSION_HEX < 0x030C0000
+  // One record per backward jump: the edge and the frame state AT the
+  // jump, after its stack effect.  The polls these become are inserted
+  // per edge (see insertRunPeriodicActivitesForBackedge), matching stock
+  // 3.11's eval-breaker placement and its traceback position.
+  struct BackedgePoll {
+    BasicBlock* src;
+    BasicBlock* target;
+    FrameState frame;
+  };
+  std::vector<BackedgePoll> backedge_polls;
+#endif
   bool entry_guards_emitted = false;
   bool in_entry_setup = true;
   bool saw_initial_yield = false;
@@ -1907,6 +1991,9 @@ void HIRBuilder::translate(
           BasicBlock* target = getBlockAtOff(target_off);
           if (target_off <= bc_instr.baseOffset() || opcode != JUMP_ABSOLUTE) {
             loop_headers.emplace(target);
+#if PY_VERSION_HEX < 0x030C0000
+            backedge_polls.push_back({tc.block, target, tc.frame});
+#endif
           }
           tc.emit<Branch>(target);
           break;
@@ -1939,10 +2026,20 @@ void HIRBuilder::translate(
 #endif
         {
           BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+#if PY_VERSION_HEX < 0x030C0000
+          BasicBlock* jump_block = tc.block;
+#endif
           if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIf(tc, bc_instr);
+#if PY_VERSION_HEX < 0x030C0000
+          if (bc_instr.isBackwardBranch()) {
+            // Recorded after the emit: the poll's frame state is the
+            // post-pop state at the jump.
+            backedge_polls.push_back({jump_block, target, tc.frame});
+          }
+#endif
           break;
         }
         case POP_JUMP_IF_NONE:
@@ -1955,10 +2052,20 @@ void HIRBuilder::translate(
 #endif
         {
           BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+#if PY_VERSION_HEX < 0x030C0000
+          BasicBlock* jump_block = tc.block;
+#endif
           if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIfNone(tc, bc_instr);
+#if PY_VERSION_HEX < 0x030C0000
+          if (bc_instr.isBackwardBranch()) {
+            // Recorded after the emit: the poll's frame state is the
+            // post-pop state at the jump.
+            backedge_polls.push_back({jump_block, target, tc.frame});
+          }
+#endif
           break;
         }
         case POP_ITER:
@@ -2451,9 +2558,24 @@ void HIRBuilder::translate(
       "Stashed a KW_NAMES value for function {} but never consumed it",
       irfunc.fullname);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Per-edge polls, not a header-shared check block: stock 3.11 checks the
+  // eval breaker inside the backward-jump handlers, on the taken branch
+  // only, and its traceback for an asynchronous exception names the jump.
+  // A shared check block in front of the header polls the loop-entry
+  // fallthrough and JUMP_BACKWARD_NO_INTERRUPT too -- positions stock
+  // never polls -- and can only carry the header's frame state, a
+  // different bytecode position than stock reports.
+  (void)loop_headers;
+  for (auto& poll : backedge_polls) {
+    insertRunPeriodicActivitesForBackedge(
+        irfunc.cfg, poll.src, poll.target, poll.frame);
+  }
+#else
   for (auto block : loop_headers) {
     insertRunPeriodicActivitesForLoop(irfunc.cfg, block);
   }
+#endif
 }
 
 void BlockCanonicalizer::InsertCopies(
@@ -6912,6 +7034,67 @@ void HIRBuilder::insertRunPeriodicActivitesForLoop(
   auto check_block = cfg.AllocateBlock();
   loop_header->retargetPreds(check_block);
   insertRunPeriodicActivites(cfg, check_block, loop_header, *fs);
+}
+
+void HIRBuilder::insertRunPeriodicActivitesForBackedge(
+    CFG& cfg,
+    BasicBlock* src,
+    BasicBlock* target,
+    const FrameState& frame) {
+  // One poll per back edge, on the taken path only.  This is stock 3.11's
+  // shape exactly: the eval-breaker check runs inside the backward-jump
+  // handlers on the taken branch, so the loop-entry fallthrough never
+  // polls and JUMP_BACKWARD_NO_INTERRUPT never polls.  The header-shared
+  // alternative -- one check block in front of the loop header, fed by
+  // every predecessor -- polls both of those, and can only name the
+  // header's frame state.
+  //
+  // Two frame states serve two consumers.  The service itself
+  // (RunPeriodicTasks) carries the state AT the jump: a failure there is
+  // stock's "exception raised by the eval-breaker check inside the jump
+  // handler", whose traceback names the jump -- the deopt's default
+  // advance reproduces that, and a failure never resumes, so the advanced
+  // position is never executed.  The bytecode-boundary snapshots around it
+  // carry the TARGET's entry state: an instrumentation transition observed
+  // by the polls after them resumes at the jump target, which the jump has
+  // already reached -- resuming at the jump itself would execute it a
+  // second time against a stack that already had its operand popped.
+  auto check_block = cfg.AllocateBlock();
+  Instr* terminator = src->GetTerminator();
+  JIT_CHECK(terminator != nullptr, "backedge source has no terminator");
+  bool retargeted = false;
+  for (std::size_t i = 0; i < terminator->numEdges(); i++) {
+    if (terminator->successor(i) == target) {
+      terminator->set_successor(i, check_block);
+      retargeted = true;
+    }
+  }
+  JIT_CHECK(
+      retargeted,
+      "backedge from block {} no longer targets block {}",
+      src->id,
+      target->id);
+
+  auto snap = target->entrySnapshot();
+  JIT_CHECK(snap != nullptr, "block {} has no entry snapshot", target->id);
+  auto target_fs = snap->frameState();
+  JIT_CHECK(
+      target_fs != nullptr,
+      "entry snapshot for block {} has no FrameState",
+      target->id);
+
+  TranslationContext check(check_block, *target_fs);
+  TranslationContext body(cfg.AllocateBlock(), *target_fs);
+  if constexpr (kFreeThreadedBuild) {
+    check.emit<AtQuiescentState>();
+  }
+  Register* eval_breaker = temps_.AllocateStack();
+  check.emit<LoadEvalBreaker>(eval_breaker);
+  check.emit<CondBranch>(eval_breaker, body.block, target);
+  body.emitSnapshot();
+  body.emit<RunPeriodicTasks>(temps_.AllocateStack(), frame);
+  body.emitSnapshot();
+  body.emit<Branch>(target);
 }
 
 void HIRBuilder::insertRunPeriodicActivitesForExcept(

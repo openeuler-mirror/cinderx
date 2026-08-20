@@ -11,6 +11,7 @@
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 #include "cinderx/module_state.h"
 
+#include <new>
 #include <utility>
 
 #ifdef ENABLE_ZLIB
@@ -23,6 +24,75 @@ namespace {
 
 CodeExtra* codeExtraIfPresent(BorrowedRef<PyCodeObject> code) {
   return codeExtraIfExists(code);
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+// Layout of PyCodeObject::co_extra, private to Objects/codeobject.c but
+// stable across 3.11: a size-prefixed inline pointer array.
+struct CodeObjectExtra311 {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+};
+#endif
+
+// Store a code-extra value, keeping the co_extra allocation as small as the
+// target index allows.
+//
+// _PyCode_SetExtra sizes a fresh co_extra to the full number of registered
+// indices, and code_dealloc later invokes EVERY registered freefunc below
+// that size -- whether or not this code object ever stored a value in the
+// slot.  Third-party code can register a mortal freefunc (test.test_code
+// registers a ctypes closure at import time) that is already dead by the
+// time long-lived code objects reach dealloc during shutdown.  Since the
+// runtime attaches its data to broad swaths of code, cap an allocation we
+// create at exactly our own slot.
+//
+// What that buys is precise: every foreign index ABOVE ours stops being
+// walked.  A foreign index below ours still is -- the layout is a dense
+// prefix array, so storing at index N requires spanning [0, N] -- and there
+// it behaves exactly as stock CPython already does, because the capped
+// allocation is never larger than the one the stock setter would make.
+// Claiming our index during module initialization is what usually keeps
+// foreign indices above ours; it is a property of load order, not something
+// enforced here.
+int setCodeExtraCapped(PyObject* code_obj, Py_ssize_t index, void* extra) {
+#if PY_VERSION_HEX < 0x030C0000
+  auto code = reinterpret_cast<PyCodeObject*>(code_obj);
+  auto ce = reinterpret_cast<CodeObjectExtra311*>(code->co_extra);
+  // Read back the size through our own view of the layout before trusting
+  // it for arithmetic: CPython caps registered indices at MAX_CO_EXTRA_USERS
+  // (255), so anything outside that range means this declaration no longer
+  // matches the interpreter and the write must not proceed.
+  JIT_CHECK(
+      ce == nullptr || (ce->ce_size >= 0 && ce->ce_size <= 255),
+      "co_extra size {} is outside the range CPython can produce; the "
+      "private layout this build assumes no longer matches the runtime",
+      ce == nullptr ? 0 : ce->ce_size);
+  if (ce != nullptr && ce->ce_size > index) {
+    // Fits in the existing allocation; the stock path will not grow it.
+    return PyUnstable_Code_SetExtra(code_obj, index, extra);
+  }
+  Py_ssize_t old_size = ce != nullptr ? ce->ce_size : 0;
+  auto grown = reinterpret_cast<CodeObjectExtra311*>(
+      PyMem_Realloc(ce, sizeof(CodeObjectExtra311) + index * sizeof(void*)));
+  if (grown == nullptr) {
+    // This helper speaks the int-returning Python C API convention, so a
+    // failed allocation must leave the exception the convention promises;
+    // without it the caller's error path reports a capability refusal
+    // where a MemoryError happened.
+    PyErr_NoMemory();
+    return -1;
+  }
+  for (Py_ssize_t i = old_size; i <= index; i++) {
+    grown->ce_extras[i] = nullptr;
+  }
+  grown->ce_size = index + 1;
+  code->co_extra = grown;
+  grown->ce_extras[index] = extra;
+  return 0;
+#else
+  return PyUnstable_Code_SetExtra(code_obj, index, extra);
+#endif
 }
 
 std::string fullnameImpl(PyObject* module, PyObject* qualname) {
@@ -207,7 +277,39 @@ void finiCodeExtraIndex() {
   state->code_extra_index = -1;
 }
 
-CodeExtra* codeExtra(PyCodeObject* code) {
+namespace jit {
+namespace {
+int s_publish_failpoint_for_test = 0;
+} // namespace
+
+void failJitPublishStepForTest(int step) {
+  s_publish_failpoint_for_test = step;
+}
+
+void throwIfJitPublishStepArmedForTest(int step) {
+  if (s_publish_failpoint_for_test == step) {
+    s_publish_failpoint_for_test = 0;
+    throw std::bad_alloc();
+  }
+}
+
+bool consumeJitPublishStepForTest(int step) {
+  if (s_publish_failpoint_for_test == step) {
+    s_publish_failpoint_for_test = 0;
+    return true;
+  }
+  return false;
+}
+} // namespace jit
+
+namespace {
+
+// Get-or-create the CodeExtra block.  The two callers want different
+// failure contracts: counters and observation are best-effort and swallow
+// an allocation failure, while machine-code publication must surface the
+// MemoryError so force_compile() reports what actually happened instead of
+// a generic capability refusal.
+CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
   auto* state = cinderx::getModuleState();
   // On shutdown the module state becomes inaccessible.
   if (state == nullptr) {
@@ -227,8 +329,10 @@ CodeExtra* codeExtra(PyCodeObject* code) {
   void* data_ptr = nullptr;
   if (PyUnstable_Code_GetExtra(code_obj, extra_index, &data_ptr) < 0) {
     JIT_LOG("Failed to get code extra data for {}", codeName(code));
-    jit::printPythonException();
-    PyErr_Clear();
+    if (!preserve_error) {
+      jit::printPythonException();
+      PyErr_Clear();
+    }
     return nullptr;
   }
   if (data_ptr != nullptr) {
@@ -237,13 +341,28 @@ CodeExtra* codeExtra(PyCodeObject* code) {
 
   auto extra = reinterpret_cast<CodeExtra*>(PyMem_Calloc(1, sizeof(CodeExtra)));
   if (extra == nullptr) {
+    if (preserve_error) {
+      PyErr_NoMemory();
+    }
     return nullptr;
   }
 
-  if (PyUnstable_Code_SetExtra(code_obj, extra_index, extra) < 0) {
+  int set_rc;
+  if (jit::consumeJitPublishStepForTest(5)) {
+    // Model setCodeExtraCapped() failing out of memory, exception
+    // included: what is under test from here on is the preserve-or-clear
+    // branch below and the propagation above it, not the injection site.
+    PyErr_NoMemory();
+    set_rc = -1;
+  } else {
+    set_rc = setCodeExtraCapped(code_obj, extra_index, extra);
+  }
+  if (set_rc < 0) {
     JIT_LOG("Failed to set code extra data for {}", codeName(code));
-    jit::printPythonException();
-    PyErr_Clear();
+    if (!preserve_error) {
+      jit::printPythonException();
+      PyErr_Clear();
+    }
     PyMem_Free(extra);
     return nullptr;
   }
@@ -254,6 +373,16 @@ CodeExtra* codeExtra(PyCodeObject* code) {
 size_t codeCallCount(PyCodeObject* code) {
   CodeExtra* extra = codeExtraIfPresent(code);
   return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
+}
+
+} // namespace
+
+CodeExtra* codeExtra(PyCodeObject* code) {
+  return codeExtraImpl(code, false /* preserve_error */);
+}
+
+CodeExtra* codeExtraOrError(PyCodeObject* code) {
+  return codeExtraImpl(code, true /* preserve_error */);
 }
 
 CodeExtra* codeExtraIfExists(PyCodeObject* code) {

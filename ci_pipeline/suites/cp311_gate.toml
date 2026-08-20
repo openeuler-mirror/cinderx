@@ -27,6 +27,15 @@ command = "bash -lc 'cd cinderx/Interpreter/3.11/upstream && sha256sum --check -
 name = "wheel_build_import"
 command = "bash -lc 'python3.11 -m pip wheel . -w \"{run_dir}/wheels\" --no-deps --no-build-isolation && python3.11 -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\" && \"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pytest==8.3.4 && \"{run_dir}/venv/bin/python\" -m pytest --version'"
 
+# Scenario 1b: the same thing at CMAKE_BUILD_TYPE=Release, running the
+# canary suite against it.  The default wheel is RelWithDebInfo, so without
+# this job nothing proves the prologue, the guarded entry, the materialized
+# frame or the reference cleanup behave the same once the optimizer has had
+# its way with them -- which is exactly what a release build ships.
+[[jobs]]
+name = "release_canary_execute"
+command = "bash -lc 'CMAKE_BUILD_TYPE=Release python3.11 -m pip wheel . -w \"{run_dir}/release-wheels\" --no-deps --no-build-isolation && if ! grep -qx \"CMAKE_BUILD_TYPE:STRING=Release\" scratch/*/CMakeCache.txt; then echo \"the wheel was not built at Release; setup.py reuses a cached build tree, so the build type has to be proven, not assumed\"; grep -h \"^CMAKE_BUILD_TYPE\" scratch/*/CMakeCache.txt; exit 1; fi && python3.11 -m venv \"{run_dir}/release-venv\" && \"{run_dir}/release-venv/bin/pip\" install \"{run_dir}\"/release-wheels/cinderx-*.whl && cd cinderx/PythonLib && \"{run_dir}/release-venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_canary_execute_311'"
+
 # The differential engine is this suite's judge; its own unit tests run
 # before the engine judges anything, on the venv the wheel job provisioned.
 [[jobs]]
@@ -53,10 +62,12 @@ name = "interpreter_and_eval_hook"
 command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_interpreter_311 test_cinderx.test_kunpeng.test_jit_unsupported_311'"
 
 # Counter-backed capability-gate proof: under load and forced compile
-# requests, executable allocations and CompiledFunction creations stay zero.
+# requests, executable allocations and CompiledFunction creations stay zero
+# -- while the canary child (MR-04) proves the same counters genuinely move
+# when execution is explicitly requested, with attribute caches still off.
 [[jobs]]
 name = "trigger_stats_gate"
-command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_trigger_stats_311'"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_trigger_stats_311 test_cinderx.test_kunpeng.test_canary_execute_311'"
 
 # The trigger-proof drivers' own red paths run before anything consumes
 # them: an expected trigger that does not fire must fail, a dead worker must
@@ -115,6 +126,12 @@ command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m un
 # repetitions, the configuration matrix and the 72-module import canary.
 # Frozen-surface execution (440 modules + test_cinderx under shadow) lives
 # on the daily completeness job, not this fail-fast PR suite.
+#
+# From MR-04 the same driver also runs the canary children, where those
+# counters are required to move instead: cold and warm force-compile against
+# an interpreted oracle, organic-threshold execution, the 72-module import
+# under execution, and five shutdown repetitions. Each child asserts its own
+# mode, so a shadow judge can never accept a canary run or the reverse.
 [[jobs]]
 name = "shadow_compile_gate"
 command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners'"

@@ -1,6 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/lir/generator.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
 
 extern "C" {
 #include "internal/pycore_call.h"
@@ -3663,6 +3666,24 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         appendGuard(bbb, InstrGuardKind::kZero, instr, load);
         break;
       }
+      case Opcode::kCheckInstrumentation: {
+        const auto& instr = static_cast<const DeoptBase&>(i);
+        // Two independent loads and exits rather than an OR: either
+        // registration alone is the transition, and the deopt carries
+        // the complete post-instruction frame state, so nothing here
+        // depends on which one fired.
+        Instruction* trace = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_tracefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, trace);
+        Instruction* profile = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_profilefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, profile);
+        break;
+      }
       case Opcode::kCheckExc:
       case Opcode::kCheckField:
       case Opcode::kCheckFreevar:
@@ -4551,8 +4572,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kRunPeriodicTasks: {
 #if PY_VERSION_HEX < 0x030C0000
-        auto helper = Py_MakePendingCalls;
-        bbb.appendCallInstruction(i.output(), helper);
+        // Py_MakePendingCalls services signals and pending calls only.  The
+        // eval breaker this back edge just observed is also raised for a
+        // GIL drop request and for PyThreadState_SetAsyncExc(), and the
+        // anchored 3.11.6 evaluator services all four in
+        // eval_frame_handle_pending() -- so a compiled loop calling the
+        // narrow helper would hold the GIL for its whole run and deliver
+        // async exceptions only at return.  Call the vendored handler
+        // itself; same contract, 0 or -1 with an exception set.
+        auto helper = Ci_EvalFrameHandlePending_311;
+        bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
 #else
         auto helper = _Py_HandlePending;
         bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
@@ -5329,6 +5358,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         case Opcode::kCheckErrOccurred:
         case Opcode::kCheckExc:
         case Opcode::kCheckField:
+        case Opcode::kCheckInstrumentation:
         case Opcode::kCheckNeg:
         case Opcode::kCheckVar:
         case Opcode::kCompareBool:

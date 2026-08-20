@@ -156,6 +156,20 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void removeDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+  /* Empty the deopted set, releasing whatever it owns. */
+  void clearDeoptedFuncs();
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Release every displaced anchor a publication deferred.  Runs arbitrary
+   * Python: call only from a control-plane boundary, with no registry walk
+   * active and no computed-but-unreported verdict.  Reentrancy-safe -- one
+   * reference is released at a time and the queue is re-read, so a release
+   * that publishes again and defers more anchors extends the same drain.
+   */
+  void drainDeferredAnchorReleases();
+#endif
+
   /*
    * Fully remove all effects of compilation from a function.
    */
@@ -459,7 +473,11 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   // compile the CompiledFunction will immediately be created, otherwise the
   // CompiledFunctionData will be preserved until the multi-threaded compile can
   // finalize things.
-  void codeCompiled(
+  //
+  // Returns whether the result was published (or deferred for later
+  // publication).  A false return means the compile succeeded but nothing
+  // was installed -- the caller must not report the function as compiled.
+  bool codeCompiled(
       BorrowedRef<PyFunctionObject> func,
       CompilationKey& key,
       CompiledFunctionData&& compiled_func);
@@ -561,6 +579,42 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   /* Set of which functions have JIT-compiled entrypoints. */
   UnorderedMap<BorrowedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>
       compiled_funcs_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Which artifact claims each function: the inverse of the artifacts'
+   * owned-functions sets, and the lookup the installed registry cannot
+   * answer.  Association identity and installation identity are distinct
+   * states on this branch: compiled_funcs_ records what is installed right
+   * now and empties on a deopt, while the association survives parking so
+   * a paused function can walk back onto its own artifact.  Severing an
+   * old claim when a function re-associates -- above all after a __code__
+   * swap, which unmoors the association from every code-keyed structure --
+   * needs this map, because the function is then neither installed nor
+   * reachable through its current code object.
+   *
+   * Entries are borrowed on both sides and maintained in lockstep with the
+   * owned-functions sets: created in finalizeFunc(), transferred by its
+   * stale-claim severing, and erased by funcDestroyed() and by the death
+   * of the claiming artifact (forgetCompiledFunction).
+   */
+  UnorderedMap<BorrowedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>
+      associated_funcs_;
+
+  /*
+   * Displaced dictionary anchors awaiting release.  A takeover displaces
+   * the prior artifact's owning reference, and releasing it anywhere
+   * inside the publication call stack runs arbitrary Python at a point
+   * where a verdict has been computed but not yet reported, or where a
+   * registry walk is active: a __del__ calling disable() would unpublish
+   * a function whose compile is about to report OK, and one firing inside
+   * the enable() reattach walk would mutate the set being iterated.
+   * finalizeFunc() parks the displaced reference here; control-plane
+   * boundaries drain the queue where no walk is active, then re-verify
+   * whatever they are about to report.
+   */
+  std::vector<Ref<>> deferred_anchor_releases_;
+#endif
 
   /* Set of which functions were JIT-compiled but have since been deopted. */
   UnorderedSet<BorrowedRef<PyFunctionObject>> deopted_funcs_;

@@ -58,6 +58,28 @@ void finiCodeExtraIndex();
 // this data if this is the first access. Returns nullptr on failure with no
 // Python error set.
 CodeExtra* codeExtra(PyCodeObject* code);
+
+#ifdef __cplusplus
+// This header is included from C translation units; everything C++ stays
+// behind the guard.
+namespace jit {
+// One-shot failpoint for the publication exception-safety RuntimeTests.
+// Steps: 1 = the artifact's owned-functions insert (inside the
+// association), 2 = the association map insert, 3 = the installed-registry
+// insert, 4 = the compiled-codes insert, 5 = the code-extra reserve, where
+// the armed step models setCodeExtraCapped() failing with its MemoryError
+// set -- so the fault travels the reserve's real preserve-or-clear branch.
+// The failpoint clears when it fires.
+void failJitPublishStepForTest(int step);
+void throwIfJitPublishStepArmedForTest(int step);
+bool consumeJitPublishStepForTest(int step);
+} // namespace jit
+#endif // __cplusplus
+
+// As codeExtra(), but an allocation failure leaves the MemoryError set:
+// the machine-code publication path must report what actually happened,
+// not a generic capability refusal.
+CodeExtra* codeExtraOrError(PyCodeObject* code);
 size_t codeCallCount(PyCodeObject* code);
 
 // Get the extra data object associated with a code object if it already exists.

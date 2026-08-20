@@ -32,6 +32,7 @@ CORPUS_MODULES = (
     "corpus_ic_mutation",
     "corpus_operators",
     "corpus_unbound",
+    "corpus_execute_min",
 )
 
 

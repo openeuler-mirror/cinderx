@@ -59,6 +59,13 @@ REFUSE_SHAPE_FRONTEND_POLICY = "the code object uses a front-end policy pattern 
 REFUSE_SHAPE_CODEGEN_SPAN = "shadow AArch64 relocation cannot encode the generated span (pathological EXTENDED_ARG tests, or RelocOffsetOutOfRange)"
 REFUSE_SHAPE_STATIC_RUNTIME_CACHE = "shadow codegen cannot retain the runtime cache required by a static invoke"
 REFUSE_SHAPE_INVALID_UTF8_NAME = "co_names contains a string that is not valid UTF-8, so eligibility cannot read it"
+REFUSE_SHAPE_EXECUTE_SURFACE = "the code object uses instructions outside the MR-04 machine-code execution whitelist"
+REFUSE_SHAPE_VARIADIC_ARGS_UNAUDITED = "*args and **kwargs collection contracts are deferred to MR-06"
+REFUSE_SHAPE_KEYWORD_ARGS_UNAUDITED = "keyword-only parameter binding is deferred to MR-06"
+REFUSE_SHAPE_ARG_DEFAULTS_UNAUDITED = "parameter defaults and keyword defaults are deferred to MR-06"
+REFUSE_SHAPE_SPECULATIVE_GUARD = "the optimized artifact would hold a speculative type guard; guard and deopt metadata are deferred to MR-07"
+REFUSE_SHAPE_CODE_ARTIFACT_ALREADY_PUBLISHED = "the code object already has a published compiled artifact owned by another function; one artifact per code object until the MR-05 lifecycle"
+REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE = "a compiled artifact already belongs to another function; sharing needs the MR-05 function-destroy notification"
 
 [opcodes]
 ASYNC_GEN_WRAP = { num = 87, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }

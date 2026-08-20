@@ -10,28 +10,41 @@ namespace jit::hir {
 
 namespace {
 
+// Bool and None singletons are genuinely immortal only from 3.12 onward;
+// on 3.11 typing an output as Immortal elides refcount operations the
+// runtime still requires (observed as bool_dealloc underflow once machine
+// code executes).  3.14 keeps the precise immortal types so its HIR golden
+// texts stay byte-identical.
+#if PY_VERSION_HEX < 0x030C0000
+constexpr Type kBoolOutput = TBool;
+constexpr Type kNoneOutput = TNoneType;
+#else
+constexpr Type kBoolOutput = TImmortalBool;
+constexpr Type kNoneOutput = TImmortalNoneType;
+#endif
+
 std::optional<Type> builtinFunctionReturnType(std::string_view name) {
   static const UnorderedMap<std::string_view, Type> kRetTypes = {
-      {"dict.copy", TDictExact},          {"hasattr", TImmortalBool},
-      {"isinstance", TImmortalBool},      {"len", TLongExact},
-      {"list.copy", TListExact},          {"list.count", TLongExact},
-      {"list.index", TLongExact},         {"str.capitalize", TUnicodeExact},
-      {"str.center", TUnicodeExact},      {"str.count", TLongExact},
-      {"str.endswith", TImmortalBool},    {"str.find", TLongExact},
-      {"str.format", TUnicodeExact},      {"str.index", TLongExact},
-      {"str.isalnum", TImmortalBool},     {"str.isalpha", TImmortalBool},
-      {"str.isascii", TImmortalBool},     {"str.isdecimal", TImmortalBool},
-      {"str.isdigit", TImmortalBool},     {"str.isidentifier", TImmortalBool},
-      {"str.islower", TImmortalBool},     {"str.isnumeric", TImmortalBool},
-      {"str.isprintable", TImmortalBool}, {"str.isspace", TImmortalBool},
-      {"str.istitle", TImmortalBool},     {"str.isupper", TImmortalBool},
-      {"str.join", TUnicodeExact},        {"str.lower", TUnicodeExact},
-      {"str.lstrip", TUnicodeExact},      {"str.partition", TTupleExact},
-      {"str.replace", TUnicodeExact},     {"str.rfind", TLongExact},
-      {"str.rindex", TLongExact},         {"str.rpartition", TTupleExact},
-      {"str.rsplit", TListExact},         {"str.split", TListExact},
-      {"str.splitlines", TListExact},     {"str.upper", TUnicodeExact},
-      {"tuple.count", TLongExact},        {"tuple.index", TLongExact},
+      {"dict.copy", TDictExact},        {"hasattr", kBoolOutput},
+      {"isinstance", kBoolOutput},      {"len", TLongExact},
+      {"list.copy", TListExact},        {"list.count", TLongExact},
+      {"list.index", TLongExact},       {"str.capitalize", TUnicodeExact},
+      {"str.center", TUnicodeExact},    {"str.count", TLongExact},
+      {"str.endswith", kBoolOutput},    {"str.find", TLongExact},
+      {"str.format", TUnicodeExact},    {"str.index", TLongExact},
+      {"str.isalnum", kBoolOutput},     {"str.isalpha", kBoolOutput},
+      {"str.isascii", kBoolOutput},     {"str.isdecimal", kBoolOutput},
+      {"str.isdigit", kBoolOutput},     {"str.isidentifier", kBoolOutput},
+      {"str.islower", kBoolOutput},     {"str.isnumeric", kBoolOutput},
+      {"str.isprintable", kBoolOutput}, {"str.isspace", kBoolOutput},
+      {"str.istitle", kBoolOutput},     {"str.isupper", kBoolOutput},
+      {"str.join", TUnicodeExact},      {"str.lower", TUnicodeExact},
+      {"str.lstrip", TUnicodeExact},    {"str.partition", TTupleExact},
+      {"str.replace", TUnicodeExact},   {"str.rfind", TLongExact},
+      {"str.rindex", TLongExact},       {"str.rpartition", TTupleExact},
+      {"str.rsplit", TListExact},       {"str.split", TListExact},
+      {"str.splitlines", TListExact},   {"str.upper", TUnicodeExact},
+      {"tuple.count", TLongExact},      {"tuple.index", TLongExact},
   };
   auto return_type = kRetTypes.find(name);
   if (return_type != kRetTypes.end()) {
@@ -134,7 +147,7 @@ Type outputType(
     case Opcode::kCompare: {
       CompareOp op = static_cast<const Compare&>(instr).op();
       if (op == CompareOp::kIn || op == CompareOp::kNotIn) {
-        return TImmortalBool;
+        return kBoolOutput;
       }
       return TObject;
     }
@@ -240,7 +253,7 @@ Type outputType(
     case Opcode::kUnaryOp: {
       auto op = static_cast<const UnaryOp&>(instr).op();
       if (op == UnaryOpKind::kNot) {
-        return TImmortalBool;
+        return kBoolOutput;
       }
       return TObject;
     }
@@ -367,7 +380,7 @@ Type outputType(
     case Opcode::kFloatCompare:
     case Opcode::kLongCompare:
     case Opcode::kUnicodeCompare:
-      return TImmortalBool;
+      return kBoolOutput;
     case Opcode::kDictUpdate:
     case Opcode::kDictMerge:
     case Opcode::kRunPeriodicTasks:
@@ -378,7 +391,7 @@ Type outputType(
     // we should get rid of this extra layer and deal with the int return value
     // directly.
     case Opcode::kListExtend:
-      return TImmortalNoneType;
+      return kNoneOutput;
 
     case Opcode::kListAppend:
     case Opcode::kMergeSetUnpack:
@@ -444,7 +457,7 @@ Type outputType(
     }
 
     case Opcode::kPrimitiveBoxBool: {
-      return TImmortalBool;
+      return kBoolOutput;
     }
 
     case Opcode::kPrimitiveBox: {
@@ -526,6 +539,7 @@ Type outputType(
     case Opcode::kBranch:
     case Opcode::kCallStaticRetVoid:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCondBranch:
     case Opcode::kCondBranchCheckType:
     case Opcode::kCondBranchIterNotDone:

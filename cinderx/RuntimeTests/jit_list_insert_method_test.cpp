@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/codegen/environ.h"
 #include "cinderx/Jit/compiler.h"
@@ -105,6 +106,12 @@ class ListInsertMethodTest : public RuntimeTest {
 };
 
 TEST_F(ListInsertMethodTest, ConstantIndexSkipsConversionInHIRAndLIR) {
+  // The specialized insert path leans on the cached-attribute machinery;
+  // the 3.11 default keeps attribute caches off until MR-09, so enable
+  // them for this test's scope.
+  bool old_attr_caches = jit::getConfig().attr_caches;
+  jit::getMutableConfig().attr_caches = true;
+  SCOPE_EXIT(jit::getMutableConfig().attr_caches = old_attr_caches);
   runCode(R"(
 import cinderx.jit as jit
 

@@ -1,6 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/codegen/gen_asm.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
 
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
@@ -157,7 +160,7 @@ DeoptResult prepareForDeopt(
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
   const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
-  bool is_instrumentation_deopt = false;
+  bool is_patched_instrumentation = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
   // Check JIT_FRAME_DEOPT_PATCHED on the outermost frame's header before
@@ -169,11 +172,31 @@ DeoptResult prepareForDeopt(
       for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
         outer = outer->previous;
       }
-      is_instrumentation_deopt = (jitFrameGetHeader(outer)->frame_status &
-                                  JIT_FRAME_DEOPT_PATCHED) != 0;
+      is_patched_instrumentation = (jitFrameGetHeader(outer)->frame_status &
+                                    JIT_FRAME_DEOPT_PATCHED) != 0;
     }
   }
 #endif
+
+  // The patched flavor above stops a frame at its next deopt exit with the
+  // PRE-instruction state, leaving the completed call's return value in a
+  // register to be recovered below.  The polled flavor -- a
+  // CheckInstrumentation exit -- carries the complete post-instruction
+  // frame state instead: the result is already in the reified stack, and
+  // there is nothing to recover from registers.  The two flavors resume
+  // differently -- patched advances past the completed instruction, polled
+  // resumes at its own frame state -- so only the patched flag travels into
+  // frame reification; the polled and periodic-task cases are recognized
+  // there by their deopt reasons.  A single "is instrumentation" bit was
+  // tried as the resume selector and is exactly wrong: it made the polled
+  // flavor advance, skipping the instruction the frame state names.  The
+  // combined bit survives below only for what it is right about --
+  // statistics, backoff accounting and the resume-target routing, which
+  // treat both flavors alike.
+  const bool is_polled_instrumentation =
+      deopt_meta.reason == DeoptReason::kInstrumentation;
+  const bool is_instrumentation_deopt =
+      is_patched_instrumentation || is_polled_instrumentation;
 
   if (getConfig().frame_mode == FrameMode::kLightweight) {
     frame = reifyLightweightFrames(
@@ -196,14 +219,14 @@ DeoptResult prepareForDeopt(
         deopt_meta,
         deopt_meta.frame_meta.at(i),
         regs,
-        is_instrumentation_deopt);
+        is_patched_instrumentation);
     frame_iter = frame_iter->previous;
   }
 
   // For instrumentation deopts where the bytecode's C call completed
   // (reason != kPeriodicTaskFailure), push its return value onto the
   // operand stack on top of the pre-instruction state restored by reifyStack.
-  if (is_instrumentation_deopt) {
+  if (is_patched_instrumentation) {
     if (deopt_meta.reason != DeoptReason::kPeriodicTaskFailure &&
         !PyErr_Occurred()) {
       PyObject* retval = reinterpret_cast<PyObject*>(
@@ -249,7 +272,8 @@ DeoptResult prepareForDeopt(
         break;
       }
       case DeoptReason::kRaise:
-      case DeoptReason::kYieldFrom: {
+      case DeoptReason::kYieldFrom:
+      case DeoptReason::kInstrumentation: {
         break;
       }
       case DeoptReason::kUnhandledNullField:
@@ -366,7 +390,19 @@ PyObject* resumeInInterpreter(
 
     setupTraceForDeoptedFrame(frame, tstate);
 
+#if PY_VERSION_HEX < 0x030C0000
+    // Pin the continuation to the evaluator that started this frame.
+    // _PyEval_EvalFrame() dispatches through interp->eval_frame at CALL
+    // time, so a PEP 523 client installed while machine code was running
+    // would retroactively receive the reified mid-frame -- and with it
+    // this branch's entry-frame clear-and-pop contract, which is anchored
+    // to the vendored 3.11 evaluator's return protocol.  Changing the
+    // evaluator affects future entries; a frame already in flight is
+    // finished by the interpreter that launched it.
+    result = Ci_EvalFrameDefault_311(tstate, frame, err_occurred);
+#else
     result = _PyEval_EvalFrame(tstate, frame, err_occurred);
+#endif
 
     // If exception occurred before RETURN_GENERATOR, the generator was never
     // returned to anyone. The JIT created the generator early, but the caller
@@ -374,6 +410,24 @@ PyObject* resumeInInterpreter(
     if (result == nullptr && gen_to_cleanup != nullptr) {
       Py_DECREF(gen_to_cleanup);
     }
+
+#if PY_VERSION_HEX < 0x030C0000
+    // Stock 3.11 leaves entry-frame ownership with the caller: eval's
+    // exit paths return without clearing or popping the frame they were
+    // entered with (is_entry), and _PyEval_Vector performs the
+    // clear-and-pop afterwards.  Do that caller duty here, mirroring
+    // _PyEvalFrameClearAndPop (including the recursion_remaining dance so
+    // destructors run under the same headroom); without it every
+    // exception deopt leaks the reified frame's references and later
+    // datastack pushes reuse the never-cleared slots.  3.12+ eval pops
+    // the entry frame itself, so this block must not exist there.
+    if (frame->owner == FRAME_OWNED_BY_THREAD) {
+      tstate->recursion_remaining--;
+      _PyFrame_Clear(frame);
+      tstate->recursion_remaining++;
+      _PyThreadState_PopFrame(tstate, frame);
+    }
+#endif
 
     frame = prev_frame;
 
