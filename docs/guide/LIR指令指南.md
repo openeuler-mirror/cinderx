@@ -122,7 +122,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
                    Guard 0(0x0):64bit, 1(0x1):Object, RAX:Object, 0(0x0):Object, R12:Object, R14:Object, R13:Object
 ```
 
-解读：先把两个实参 move 到 x64 SysV 的 RDI/RSI，把 helper 函数指针装入 RAX，`Call` 后用 `Guard`（输入依次为 guard kind=0、deopt id=1、被查值 RAX、目标 Imm 0、live 值 R12/R14/R13）确保返回值非 NULL，否则 deopt。
+解读：先把两个实参 move 到 x64 SysV 的 RDI/RSI，把 helper 函数指针装入 RAX，`Call` 之后用 `Guard` 做异常检查（被查值 RAX，输入依次为 guard kind、deopt id、被查值、目标、live 值）。**注意**：guard kind 是 `InstrGuardKind` 枚举值（`kAlwaysFail`=0、`kHasType`=1、`kIs`=2、`kNotNegative`=3、`kNotZero`=4、`kZero`=5），dump 中的数值会随枚举漂移，阅读时应以符号语义为准——调用后的对象非空检查由 `emitExceptionCheck()` 选择 `kNotZero`（有符号返回选 `kNotNegative`，输出类型为 TBottom 时才是 `kAlwaysFail`）。上例摘自仓库 `guide.md` 的历史输出，其中的数值 `0` 按当前枚举对应 `kAlwaysFail`，不代表现代码的行为。
 
 ## 5. LIR pass 说明
 
@@ -148,7 +148,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 ### 6.2 调用类（7 条）
 
 - **`Call`**：通用 C 调用（x64 SysV / AArch64 AAPCS64）。函数指针可来自寄存器或 `MemImm`。返回值判错由后续 `Guard` 完成。
-- **`VectorCall`**：`_PyObject_Vectorcall` 专用形态：输入 0 为函数对象（必须物理寄存器），输入 1 为 flags 立即数，其余为实参。HIR VectorCall 的主要下降目标。
+- **`VectorCall`**：`_PyObject_Vectorcall` 形态。输入布局（按 `generator.cpp` 的下降顺序）：**[0] runtime helper 立即数**（`_PyObject_Vectorcall`；被调方非简单函数对象时改用带 eval breaker 检查的 `JITRT_Vectorcall`）、**[1] flags 立即数**、**[2] callable**（HIR 的第一个操作数）、[3..] 实参、**末尾** kwnames 或 Imm 0。HIR VectorCall 的主要下降目标。
 - **`VarArgCall`**：变长参数调用形态（配合 `VariadicPush`/`Cqo` 等）。
 - **`LoadAttrCachedFastPath`**：inline-cache 属性加载的快路径整体（call-like，含缓存探测）。
 - **`LoadArg`**：从进入约定位置读取第 N 个参数。HIR `LoadArg` 的下降产物。
@@ -157,7 +157,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 
 ### 6.3 Guard / deopt / OSR（3 条）
 
-- **`Guard`**：运行时守卫，失败跳转 deopt。输入布局（由 `generator.h` 的 `appendGuard` 生成）：[0] guard kind（Imm，取值见 3.4）、[1] deopt metadata id（Imm）、[2] 被检查值、[3] `GuardIs` 的目标对象 / `GuardType` 的类型对象（MemImm）或 Imm 0、[4..] deopt 所需 live 值。输入 2、3 必须物理寄存器。
+- **`Guard`**：运行时守卫，失败跳转 deopt。输入布局（由 `generator.h` 的 `appendGuard` 生成）：[0] guard kind（Imm，取值见 3.4）、[1] deopt metadata id（Imm）、[2] 被检查值、[3] `GuardIs` 的目标对象 / `GuardType` 的类型对象（MemImm）或 Imm 0、[4..] deopt 所需 live 值。输入 2、3 必须物理寄存器。调用后的异常检查 guard 由 `emitExceptionCheck()` 生成：有符号返回用 `kNotNegative`、其余用 `kNotZero`、输出 TBottom 用 `kAlwaysFail`。
 - **`DeoptPatchpoint`**：在指令流中预留可在运行时被改写成 deopt 跳转的补丁点（配合 `Jit/deopt_patcher.h`，用于依赖失效时打补丁）。输入 0、1 必须物理寄存器。
 - **`OSREntry`**：OSR 二级入口锚点（HIR OSREntry 下降产物）。
 
@@ -172,7 +172,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 ### 6.5 整数算术与移位（18 条）
 
 - **`Add`** / **`Sub`** / **`Mul`**：加减乘，置标志。Sub 输入跨指令存活（codegen 需在写输出后仍能读操作数）。
-- **`Div`** / **`DivUn`**：有符号/无符号除法；除数（输入 0）必须物理寄存器；x64 上配合 `Cdq/Cqo` 与 postalloc 的序列改写。
+- **`Div`** / **`DivUn`**：有符号/无符号除法。输入布局（`postalloc.cpp` 的 `rewriteDivide()`）：两输入形态为 `[被除数, 除数]`，三输入形态为 `[被除数高 32 位, 被除数低 32 位, 除数]`——**除数恒为最后一个输入**；x64 上重写为 RDX:RAX / 除数 的 idiv 序列，并配合 `Cdq/Cqo`。属性表中 `{1}`（输入槽 0 须物理寄存器）约束的是两输入形态下的被除数，不是除数。
 - **`And`** / **`Or`** / **`Xor`**：位运算，置标志。
 - **`Negate`**（取负，置标志）、**`Invert`**（按位取反）、**`Inc`** / **`Dec`**（自增/自减，置标志）。
 - **`MulAdd`**：三操作数乘加 `a*b + c`，64 位。
@@ -371,8 +371,8 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 
 三条代表性路径（详见 `Jit/lir/generator.cpp`）：
 
-1. **`BinaryOp<Add>`** → 查 `binaryfunc` 助手表得到 `PyNumber_Add` 地址 → `Call`（`MemImm` 函数指针 + 两个 VReg 实参）→ `Guard`（kNotZero 检查返回值非 NULL）。
-2. **`VectorCall`** → 优先 `TranslateSpecializedCall`（被调方已编译时直接特化）；否则生成 LIR `VectorCall`：输入 0 为函数对象 VReg、输入 1 为 flags Imm、其余实参逐个附着。
+1. **`BinaryOp<Add>`** → 查 `binaryfunc` 助手表得到 `PyNumber_Add` 地址 → `Call`（`MemImm` 函数指针 + 两个 VReg 实参）→ `Guard`（`kNotZero` 检查返回值非 NULL，kind 由 `emitExceptionCheck()` 按返回类型选择）。
+2. **`VectorCall`** → 若被调对象是编译期常量 `PyCFunction`（非 heap type、非 module 子类型）则 `TranslateSpecializedCall` 直接特化（如 builtin next、METH_NOARGS/METH_O 形态）；否则生成 LIR `VectorCall`：输入依次为 runtime helper（`_PyObject_Vectorcall` 或 `JITRT_Vectorcall`）、flags、callable、实参，末尾 kwnames 或 0。
 3. **可 deopt 指令**（GuardType/GuardIs/Check* 等）→ `appendGuard` 生成 `Guard`，输入依次为 kind、deopt id、被查值、目标（对象/类型 MemImm）与全部 live 值。
 
 ## 9. 延伸阅读
