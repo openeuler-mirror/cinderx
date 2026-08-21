@@ -131,6 +131,20 @@ class LIRGenerator {
       BasicBlockBuilder& bbb,
       const hir::DeoptBase& instr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Emit the test-only force-deopt check ahead of a real guard.  A runtime
+  // flag keeps the idle path out of the helper; when any site is armed, the
+  // helper returns nonzero for a due visit and the following kZero Guard
+  // takes the same deopt stub as a miss.  One check per HIR instruction:
+  // CheckInstrumentation issues two appendGuard calls on the same deopt id,
+  // and a second helper call would consume force_countdown twice.
+  void appendForcedDeoptCheck(
+      BasicBlockBuilder& bbb,
+      const hir::DeoptBase& hir_instr);
+
+  const hir::DeoptBase* forced_deopt_check_for_{nullptr};
+#endif
+
   template <class TOperand>
   void appendGuard(
       BasicBlockBuilder& bbb,
@@ -138,6 +152,9 @@ class LIRGenerator {
       const hir::DeoptBase& hir_instr,
       TOperand&& guard_var) {
     JIT_CHECK(kind != InstrGuardKind::kAlwaysFail, "Use appendGuardAlwaysFail");
+#if PY_VERSION_HEX < 0x030C0000
+    appendForcedDeoptCheck(bbb, hir_instr);
+#endif
     auto deopt_id = bbb.makeDeoptMetadata();
     auto instr = bbb.appendInstr(
         Instruction::kGuard,

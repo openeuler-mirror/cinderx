@@ -52,6 +52,8 @@ def test_snapshot_counts_only_unregistered_reasons_as_unknown(monkeypatch):
             "shadow_compile_success": 0,
             "shadow_specialized_opcodes_consumed": 0,
             "shadow_codegen_bytes": 0,
+            "forced_deopt_hits": 0,
+            "organic_deopt_hits": 0,
         },
     )
     monkeypatch.setattr(
@@ -96,6 +98,8 @@ def test_snapshot_keeps_dropped_events_out_of_request_classification(monkeypatch
             "shadow_compile_success": 2,
             "shadow_specialized_opcodes_consumed": 7,
             "shadow_codegen_bytes": 4096,
+            "forced_deopt_hits": 0,
+            "organic_deopt_hits": 0,
         },
     )
     monkeypatch.setattr(
@@ -136,6 +140,8 @@ def test_none_result_is_an_unknown_reject_not_a_success(monkeypatch):
             "shadow_compile_success": 0,
             "shadow_specialized_opcodes_consumed": 0,
             "shadow_codegen_bytes": 0,
+            "forced_deopt_hits": 0,
+            "organic_deopt_hits": 0,
         },
     )
     monkeypatch.setattr(
@@ -151,3 +157,35 @@ def test_none_result_is_an_unknown_reject_not_a_success(monkeypatch):
 
     assert snapshot["compile_rejected"] == 1
     assert snapshot["unknown_rejects"] == 1
+
+
+def test_snapshot_requires_deopt_counter_keys(monkeypatch):
+    monkeypatch.setattr(
+        report,
+        "_trigger_stats",
+        lambda: {
+            "compiled_function_creations": 0,
+            "machine_code_entries": 0,
+            "executable_alloc_calls": 0,
+            "executable_alloc_bytes": 0,
+            "shadow_compile_success": 0,
+            "shadow_specialized_opcodes_consumed": 0,
+            "shadow_codegen_bytes": 0,
+            "organic_deopt_hits": 0,
+        },
+    )
+    monkeypatch.setattr(
+        report,
+        "_observe_stats",
+        lambda: {"events": [], "events_dropped": 0},
+    )
+    monkeypatch.setattr(report, "_evaluator_installed", lambda: True)
+    monkeypatch.setattr(report, "_compiled_function_count", lambda: 0)
+    monkeypatch.setattr(report, "_peak_rss_bytes", lambda: 1)
+
+    try:
+        report.snapshot()
+    except KeyError as error:
+        assert error.args == ("forced_deopt_hits",)
+    else:
+        raise AssertionError("missing deopt counter was default-filled")

@@ -266,8 +266,9 @@ class InvocationArtifactScope {
 std::uintptr_t machineStackPointer311() {
   // pthread_getattr_np reports the OS thread stack.  A C local's address
   // is the ASAN fake stack and sits in a different mapping; using it
-  // here trips the hard margin on the first deep canary RuntimeTest that
-  // actually enters machine code.
+  // here trips the 16KiB hard margin on the first deep canary RuntimeTest
+  // that actually enters machine code
+  // (EnableKeepsParkedFunctionsAcrossFailures).
 #if defined(__aarch64__)
   std::uintptr_t sp;
   __asm__ volatile("mov %0, sp" : "=r"(sp));

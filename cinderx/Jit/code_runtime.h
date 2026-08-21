@@ -74,6 +74,19 @@ class alignas(16) CodeRuntime {
   // Get all deopt metadatas for the given CodeRuntime.
   const std::vector<DeoptMetadata>& deoptMetadatas() const;
 
+  // Arm the RFC site-deopt trigger on every metadata row with `site_id`.
+  // `n` is the 1-based visit count; `at_or_after` keeps forcing after N.
+  bool armForcedDeopt(uint64_t site_id, int n, bool at_or_after);
+
+  // Consume one visit to a forced-deopt site.  Generated code first reads
+  // forcedDeoptArmedAddress() and only calls this slow path while some site is
+  // armed.
+  bool consumeForcedDeopt(std::size_t deopt_id);
+
+  uint64_t* forcedDeoptArmedAddress() {
+    return &forced_deopt_armed_;
+  }
+
   // Add OSR metadata for a loop-header secondary entry point.
   // Returns the index of the newly added metadata.
   std::size_t addOSRMetadata(OSRMetadata&& osr_meta);
@@ -161,6 +174,11 @@ class alignas(16) CodeRuntime {
   // Metadata about deopt points.  Safe to use a vector as these are always
   // accessed by index.
   std::vector<DeoptMetadata> deopt_metadatas_;
+
+  // Process-local test instrumentation flag.  It is read directly by
+  // generated 3.11 code under the GIL; zero keeps the normal guard path out
+  // of the C helper entirely.
+  uint64_t forced_deopt_armed_{0};
 
   // OSR entry metadata (one per loop-header secondary entry point).
   std::vector<OSRMetadata> osr_metadatas_;

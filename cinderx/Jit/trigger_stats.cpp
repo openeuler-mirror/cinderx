@@ -18,6 +18,8 @@ std::atomic<uint64_t> s_shadow_codegen_bytes{0};
 std::atomic<uint64_t> s_code_destroyed_notifications{0};
 std::atomic<uint64_t> s_function_destroyed_notifications{0};
 std::atomic<uint64_t> s_resident_code_buffers{0};
+std::atomic<uint64_t> s_forced_deopt_hits{0};
+std::atomic<uint64_t> s_organic_deopt_hits{0};
 
 } // namespace
 
@@ -59,6 +61,14 @@ void triggerStatsOnCodeBufferReleased() {
   s_resident_code_buffers.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void triggerStatsOnForcedDeopt() {
+  s_forced_deopt_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void triggerStatsOnOrganicDeopt() {
+  s_organic_deopt_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
 TriggerStats triggerStatsSnapshot() {
   return TriggerStats{
       s_executable_alloc_calls.load(std::memory_order_relaxed),
@@ -71,6 +81,8 @@ TriggerStats triggerStatsSnapshot() {
       s_code_destroyed_notifications.load(std::memory_order_relaxed),
       s_function_destroyed_notifications.load(std::memory_order_relaxed),
       s_resident_code_buffers.load(std::memory_order_relaxed),
+      s_forced_deopt_hits.load(std::memory_order_relaxed),
+      s_organic_deopt_hits.load(std::memory_order_relaxed),
   };
 }
 

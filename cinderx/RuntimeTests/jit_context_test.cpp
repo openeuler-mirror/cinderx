@@ -137,14 +137,11 @@ TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
 TEST_F(JITContextTest, CanaryExecutesUnspecializedForms) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // The contract behind force_compile_warm(): "warm" is warmed interpreter
-  // state, not specialized input.  Consuming a specialized instruction is
-  // what creates a speculative guard, and guard and deopt metadata belong
-  // to MR-07 -- so the executing mode must compile the unspecialized
-  // forms, and the attribute-cache arm stays closed until MR-09.  If
-  // either flag is found open here, the warm entry has silently started
+  // MR-07 turns specialized opcode consumption on so organic type-change
+  // deopt is a real GuardFailure, not a synthetic force.  Attribute-cache
+  // IC remains MR-09; if that flag is found open here, canary has started
   // claiming a dimension this milestone does not deliver.
-  EXPECT_FALSE(jit::getConfig().specialized_opcodes);
+  EXPECT_TRUE(jit::getConfig().specialized_opcodes);
   EXPECT_FALSE(jit::getConfig().attr_caches);
 }
 #endif

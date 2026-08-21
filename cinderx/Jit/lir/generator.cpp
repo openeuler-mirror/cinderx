@@ -1555,6 +1555,9 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
 void LIRGenerator::appendGuardAlwaysFail(
     BasicBlockBuilder& bbb,
     const hir::DeoptBase& hir_instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  appendForcedDeoptCheck(bbb, hir_instr);
+#endif
   auto deopt_id = bbb.makeDeoptMetadata();
   Instruction* instr = bbb.appendInstr(
       Instruction::kGuard,
@@ -1564,6 +1567,48 @@ void LIRGenerator::appendGuardAlwaysFail(
       Imm{0});
   addLiveRegOperands(bbb, instr, hir_instr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void LIRGenerator::appendForcedDeoptCheck(
+    BasicBlockBuilder& bbb,
+    const hir::DeoptBase& hir_instr) {
+  if (forced_deopt_check_for_ == &hir_instr) {
+    return;
+  }
+  if (!isForceableDeoptInstr(hir_instr)) {
+    return;
+  }
+  forced_deopt_check_for_ = &hir_instr;
+  auto deopt_id = bbb.makeDeoptMetadata();
+
+  Instruction* armed = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      MemImm{env_->code_rt->forcedDeoptArmedAddress()});
+  BasicBlock* slow = bbb.allocateBlock();
+  BasicBlock* cont = bbb.allocateBlock();
+  bbb.appendBranch(Instruction::kCondBranch, armed, slow, cont);
+
+  bbb.switchBlock(slow);
+  Instruction* flag = bbb.appendCallInstruction(
+      OutVReg{DataType::k64bit},
+      JITRT_ConsumeForcedDeopt,
+      env_->code_rt,
+      static_cast<uint64_t>(deopt_id));
+  // kZero: the helper returns 0 when the site is idle.  Deopt only when it
+  // returns nonzero (armed).  kNotZero would deopt on the idle 0 and abort
+  // every CheckExc AlwaysFail with "unhandled exception without error set".
+  Instruction* instr = bbb.appendInstr(
+      Instruction::kGuard,
+      Imm{static_cast<uint64_t>(InstrGuardKind::kZero)},
+      Imm{deopt_id},
+      VReg{flag},
+      Imm{0});
+  addLiveRegOperands(bbb, instr, hir_instr);
+  bbb.appendBranch(Instruction::kBranch, cont);
+  bbb.switchBlock(cont);
+}
+#endif
 
 void LIRGenerator::addLiveRegOperands(
     BasicBlockBuilder& bbb,

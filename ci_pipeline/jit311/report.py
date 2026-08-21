@@ -42,8 +42,8 @@ Field sources:
   executable_alloc_calls     trigger stats (supplementary, not in the minimal
   executable_alloc_bytes     schema but required by the MR-02 gate proof)
   compiled_function_creations trigger stats (supplementary, see above)
-  forced_deopt_hits          0 until the site-deopt runner lands (MR-07)
-  organic_deopt_hits         0 until deopt counters land (MR-07)
+  forced_deopt_hits          site-deopt visits that a test armed
+  organic_deopt_hits         real guard / helper failures
 
 Harness-owned fields (filled by runners, None until then):
 
@@ -263,8 +263,8 @@ def snapshot() -> dict[str, Any]:
         "compiled_function_creations": int(
             trigger["compiled_function_creations"]
         ),
-        "forced_deopt_hits": 0,
-        "organic_deopt_hits": 0,
+        "forced_deopt_hits": int(trigger["forced_deopt_hits"]),
+        "organic_deopt_hits": int(trigger["organic_deopt_hits"]),
     }
     for field in HARNESS_FIELDS:
         report[field] = None

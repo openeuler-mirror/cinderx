@@ -331,20 +331,11 @@ PassConfig createConfig() {
   set(hir_opts.tree_iter_state_machine, PassConfig::kTreeIterStateMachine);
 
 #if PY_VERSION_HEX < 0x030C0000
-  // MR-04 excludes speculative guards, and Simplify is where they come
-  // from once quickened opcodes are already out of the picture: the
-  // compact-long comparison and arithmetic fast paths, float division and
-  // the bounds checks all install a Guard with a deopt behind it.
-  //
-  // Refusing every function that would get one would empty the execute
-  // surface -- a plain `while i < b` loop is exactly the shape that picks
-  // up the compact-long compare guard -- so the executing mode compiles
-  // without the pass instead, and the artifact scan downstream stays as
-  // the backstop for anything that still slips through.  Generated code is
-  // slower; that is the right trade for a milestone whose subject is
-  // correctness, and Simplify returns with the guard metadata in MR-07.
+  // FloatAccumulatorPromotion still stays off in the executing mode: it
+  // is a speculative rewrite whose deopt metadata is not yet the MR-07
+  // subject.  Simplify returns so compact-long / float / x**2 guards
+  // ship with stable site ids.
   if (getConfig().state == State::kRunning) {
-    result &= ~static_cast<uint64_t>(PassConfig::kSimplify);
     result &= ~static_cast<uint64_t>(PassConfig::kFloatAccumulatorPromotion);
   }
 #endif
@@ -485,47 +476,20 @@ std::optional<CompiledFunctionData> Compiler::Compile(
 #if PY_VERSION_HEX < 0x030C0000
   // Any reason left by an earlier attempt belongs to that attempt.
   setLast311ExecuteRefusal(nullptr);
-  // MR-04 excludes speculative guards, and an eligibility check on the
-  // bytecode cannot see them: the optimizer introduces its own.  Simplify
-  // rewrites `x ** 2` into a float multiply behind a GuardType, for one,
-  // and that is a deopt point on an unaudited path just as much as a
-  // quickened opcode's guard would be.  So the rule is stated where it can
-  // actually be checked -- on the artifact about to be emitted -- and a
-  // violation refuses the compile rather than shipping the guard.
+  // Guard / GuardIs / GuardType / Deopt are the MR-07 restore surface.
+  // DeoptPatchpoint is the IC / watcher patch hook and stays refused
+  // until MR-09.
   if (getConfig().state == State::kRunning) {
-    // All three of HIR's deopt guards, not just the typed ones: Simplify
-    // emits the untyped Guard directly for compact-long comparisons,
-    // float division and the in-place long paths, and that is a deopt on
-    // an unaudited path exactly like the others.
-    // Every opcode that installs a deopt exit of its own, not just the
-    // three reachable today.  Deopt and DeoptPatchpoint are currently
-    // unreachable because the whitelist excludes the opcodes that emit
-    // them and Simplify is off -- but a backstop resting on someone
-    // else's invariant is not a backstop.  Widen the surface or re-enable
-    // the pass and this still holds.
-    // CheckInstrumentation is deliberately not in this list: it is an
-    // audited-path exit like the error checks -- it asserts nothing
-    // about values, and the instrumentation poll above inserts it on
-    // purpose.  The refusal is about SPECULATIVE deopt points.
-    static constexpr hir::Opcode kSpeculativeGuards[] = {
-        hir::Opcode::kDeopt,
-        hir::Opcode::kDeoptPatchpoint,
-        hir::Opcode::kGuard,
-        hir::Opcode::kGuardIs,
-        hir::Opcode::kGuardType,
-    };
-    for (hir::Opcode op : kSpeculativeGuards) {
-      int count = hir_opcode_counts[static_cast<size_t>(op)];
-      if (count > 0) {
-        setLast311ExecuteRefusal("REFUSE_SHAPE_SPECULATIVE_GUARD");
-        JIT_DLOG(
-            "Refusing MR-04 execution for {}: optimized HIR holds {} {} "
-            "instruction(s); speculative guards are MR-07 work",
-            fullname,
-            count,
-            hir::hirOpcodeName(op));
-        return std::nullopt;
-      }
+    int count =
+        hir_opcode_counts[static_cast<size_t>(hir::Opcode::kDeoptPatchpoint)];
+    if (count > 0) {
+      setLast311ExecuteRefusal("REFUSE_SHAPE_SPECULATIVE_GUARD");
+      JIT_DLOG(
+          "Refusing MR-07 execution for {}: optimized HIR holds {} "
+          "DeoptPatchpoint instruction(s); IC patchpoints are MR-09 work",
+          fullname,
+          count);
+      return std::nullopt;
     }
   }
 #endif

@@ -11,6 +11,7 @@ CodeAllocatorTest
 CopyGraphTest
 CopyPropagationTest
 DataFlowTest
+DeoptSiteIdTest
 FuncTypeCheckTest
 HIRBuildTest
 InstrusiveListTest

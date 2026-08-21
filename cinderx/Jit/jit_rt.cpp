@@ -1081,6 +1081,13 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id) {
+  if (code_rt == nullptr) {
+    return 0;
+  }
+  return code_rt->consumeForcedDeopt(static_cast<std::size_t>(deopt_id));
+}
+
 PyObject* JITRT_LoadGlobalModuleValue(
     PyObject* globals,
     PyObject* name,

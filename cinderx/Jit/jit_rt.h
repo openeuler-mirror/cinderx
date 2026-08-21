@@ -159,6 +159,11 @@ PyObject* JITRT_LoadGlobalModuleValue(
     PyObject* name,
     uint32_t keys_version,
     Py_ssize_t index);
+
+// Returns 1 when this visit should take the deopt stub because a test
+// armed the site.  The subsequent Guard/AlwaysFail uses the same
+// DeoptMetadata, so forced and organic hits share one restore.
+int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
 #endif
 
 /*

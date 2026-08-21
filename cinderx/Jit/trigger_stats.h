@@ -43,6 +43,11 @@ struct TriggerStats {
   // registry but kept alive by an external reference still holds its
   // machine code, and must still count.
   uint64_t resident_code_buffers;
+  // Frame-level deopt hits, split by how the site was entered.  Forced
+  // counts test-armed site-deopt; organic counts real guard / helper
+  // failures.  Both go through the same restore.
+  uint64_t forced_deopt_hits;
+  uint64_t organic_deopt_hits;
 };
 
 // Increment sites.  Relaxed atomics: the counters order nothing.
@@ -56,6 +61,8 @@ void triggerStatsOnCodeDestroyed();
 void triggerStatsOnFunctionDestroyed();
 void triggerStatsOnCodeBufferAcquired();
 void triggerStatsOnCodeBufferReleased();
+void triggerStatsOnForcedDeopt();
+void triggerStatsOnOrganicDeopt();
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();

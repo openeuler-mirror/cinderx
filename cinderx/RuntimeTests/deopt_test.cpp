@@ -955,6 +955,59 @@ TEST_F(DeoptReasonNameTest, Raise) {
   EXPECT_STREQ(name, "Raise");
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+class DeoptSiteIdTest : public RuntimeTest {};
+
+TEST_F(DeoptSiteIdTest, SameInputsRepeat) {
+  const char* src = R"(
+def test():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  uint64_t first = jit::computeDeoptSiteId(
+      code, BCOffset{0}, jit::DeoptReason::kGuardFailure, 0, 0);
+  uint64_t second = jit::computeDeoptSiteId(
+      code, BCOffset{0}, jit::DeoptReason::kGuardFailure, 0, 0);
+  EXPECT_EQ(first, second);
+}
+
+TEST_F(DeoptSiteIdTest, EmptyMetadataIsNotForceable) {
+  const char* src = R"(
+def test():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  jit::CodeRuntime rt(func);
+  jit::DeoptMetadata empty;
+  empty.reason = jit::DeoptReason::kGuardFailure;
+  empty.forceable = true;
+  ASSERT_TRUE(empty.frame_meta.empty());
+  rt.addDeoptMetadata(std::move(empty));
+  EXPECT_FALSE(rt.armForcedDeopt(0, 1, false));
+}
+
+TEST_F(DeoptSiteIdTest, InlinePathDimensionChangesTheId) {
+  const char* src = R"(
+def test():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  uint64_t empty_path = jit::computeDeoptSiteId(
+      code, BCOffset{8}, jit::DeoptReason::kGuardFailure, 0, 0);
+  uint64_t inlined = jit::computeDeoptSiteId(
+      code, BCOffset{8}, jit::DeoptReason::kGuardFailure, 1, 0);
+  EXPECT_NE(empty_path, inlined);
+  uint64_t other_kind = jit::computeDeoptSiteId(
+      code, BCOffset{8}, jit::DeoptReason::kRaise, 0, 0);
+  EXPECT_NE(empty_path, other_kind);
+}
+#endif
+
 class LiveValueTest : public RuntimeTest {};
 
 TEST_F(LiveValueTest, SourceNameLoadMethod) {

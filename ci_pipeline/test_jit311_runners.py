@@ -501,6 +501,22 @@ def test_pyperformance_sitecustomize_loads_cinderx_from_host_site():
     assert "k.startswith('PIP_')" in spec.payload
 
 
+def test_pyperformance_canary_rejects_deopt_storms():
+    spec = runners.pyperformance_completeness_runner(
+        mode="canary", benchmarks=["nbody"]
+    )
+    if spec is None:
+        return
+    assert "_organic <= _entered" in spec.payload
+    assert "_worker_organic_deopts < _worker_entries" in spec.payload
+    errors = [
+        error
+        for judge in spec.judges
+        for error in judge({"organic_deopt_hits": 1})
+    ]
+    assert any("organic_deopt_hits == 0" in error for error in errors)
+
+
 def test_libtest_target_manifest_is_wellformed():
     sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
     import libtest_diff_311 as lt
@@ -847,6 +863,24 @@ def test_expected_deopt_missing_turns_red():
     result = runners.run(spec)
     assert not result.ok
     assert any("forced_deopt_hits" in err for err in result.errors)
+
+
+def test_unexpected_organic_deopt_turns_red():
+    errors = [
+        error
+        for judge in runners.execute_holds()
+        for error in judge({"organic_deopt_hits": 1})
+    ]
+    assert any("organic_deopt_hits == 0" in error for error in errors)
+
+
+def test_stdlib_organic_deopt_count_drift_turns_red():
+    errors = [
+        error
+        for judge in runners.stdlib_canary_runner().judges
+        for error in judge({"organic_deopt_hits": 6})
+    ]
+    assert any("organic_deopt_hits == 5" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):

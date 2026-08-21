@@ -5049,9 +5049,7 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     const jit::BytecodeInstruction& bc_instr,
     int name_idx,
     Register* result) {
-  if (!getConfig().stable_frame || !getConfig().specialized_opcodes ||
-      getConfig().state == jit::State::kRunning ||
-      bc_instr.opcode() != LOAD_GLOBAL) {
+  if (!getConfig().stable_frame || bc_instr.opcode() != LOAD_GLOBAL) {
     return false;
   }
 
@@ -5130,6 +5128,19 @@ void HIRBuilder::emitLoadGlobal(
   int name_idx = loadGlobalIndex(bc_instr.oparg());
   Register* result = temps_.AllocateStack();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Snapshot the pre-opcode stack so a GuardFailure re-executes
+  // LOAD_GLOBAL without a second PUSH_NULL.  The NULL (oparg & 1) is
+  // pushed only after the guard succeeds.
+  bool fast = tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
+  if (bc_instr.oparg() & 1) {
+    emitPushNull(tc);
+  }
+  if (!fast) {
+    tc.emit<LoadGlobal>(result, name_idx, tc.frame);
+  }
+  tc.frame.stack.push(result);
+#else
   if constexpr (PY_VERSION_HEX < 0x030E0000) {
     if (bc_instr.oparg() & 1) {
       emitPushNull(tc);
@@ -5137,9 +5148,6 @@ void HIRBuilder::emitLoadGlobal(
   }
 
   auto try_fast_path = [&] {
-#if PY_VERSION_HEX < 0x030C0000
-    return tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
-#else
     if (!getConfig().stable_frame) {
       return false;
     }
@@ -5158,7 +5166,6 @@ void HIRBuilder::emitLoadGlobal(
     BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
     guard->setDescr(fmt::format("LOAD_GLOBAL: {}", PyUnicode_AsUTF8(name)));
     return true;
-#endif
   };
 
   if (!try_fast_path()) {
@@ -5172,6 +5179,7 @@ void HIRBuilder::emitLoadGlobal(
       emitPushNull(tc);
     }
   }
+#endif
 }
 
 void HIRBuilder::emitMakeFunction(

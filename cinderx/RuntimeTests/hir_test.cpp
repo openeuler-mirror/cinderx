@@ -70,10 +70,15 @@ void expectColdGlobalGuardShape(
     size_t expected_guard_type,
     size_t expected_guard_is) {
 #if PY_VERSION_HEX < 0x030C0000
-  // CPython 3.11 cold dictionaries do not expose a safe keys-version fact.
+  // Combined unicode globals take the module-value fast path (CallStatic
+  // + Guard).  Cold split dictionaries still emit LoadGlobal.  Neither
+  // shape uses GuardType/GuardIs; those are the 3.14 cached-global
+  // sentinels this helper originally described.
   (void)expected_guard_type;
   (void)expected_guard_is;
-  EXPECT_EQ(countOpcode(func, Opcode::kLoadGlobal), 1) << hir;
+  size_t load_global = countOpcode(func, Opcode::kLoadGlobal);
+  size_t guards = countOpcode(func, Opcode::kGuard);
+  EXPECT_TRUE(load_global == 1 || guards >= 1) << hir;
   EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
   EXPECT_EQ(countSubstring(hir, "GuardIs<"), 0) << hir;
 #else

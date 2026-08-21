@@ -6,6 +6,11 @@
 # so heap misuse in the compile pipeline and the execution scaffolding
 # fails loudly instead of compiling quietly.
 set -euo pipefail
+# ASAN frames are several times larger than unsanitized ones.  The 3.11
+# C-stack hard limit is derived from the thread's mapped stack; keep the
+# main thread from sitting inside that margin during canary lifecycle
+# tests that compile and enter machine code.
+ulimit -s unlimited || true
 # Same execution hygiene as the green gate: C collation for every manifest
 # comparison, and no inherited GTEST_*/TESTBRIDGE_* that could shard or
 # filter away the population this leg is supposed to instrument.
@@ -54,6 +59,9 @@ from cmake_options import cmake_feature_options
 opts = cmake_feature_options(py_version="3.11")
 print(" ".join(f"-D{k}={v}" for k, v in sorted(opts.items())))
 ' "$REPO_ROOT/ci_pipeline")
+if [ -n "${CINDERX_LOCAL_DEPS_DIR:-}${CINDERX_LOCAL_DEPS:-}" ]; then
+  FLAGS="$FLAGS -DCINDERX_LOCAL_DEPS_DIR=${CINDERX_LOCAL_DEPS_DIR:-$CINDERX_LOCAL_DEPS}"
+fi
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER="$ASAN_CC" -DCMAKE_CXX_COMPILER="$ASAN_CXX" \
   -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
@@ -74,6 +82,13 @@ echo "asan build ok: $BUILD_DIR"
 # _Py_CheckSlotResult), which a release libpython does not export, so no
 # executable can link.  The compile-only arm above keeps that assertion
 # coverage; this arm keeps the sanitizer coverage of code that actually runs.
+#
+# Leak detection stays off for the whole executed arm, not just the later
+# gtest invocations.  CMake's gtest_discover_tests POST_BUILD runs the
+# instrumented binary under a timeout helper that looks like ptrace to
+# LeakSanitizer; LSAN then fatals after listing tests and make deletes
+# the binary.  detect_leaks=0 is the same contract as the run below.
+export ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0"
 EXEC_DIR="$BUILD_DIR-exec"
 cmake -S "$REPO_ROOT" -B "$EXEC_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER="$ASAN_CC" -DCMAKE_CXX_COMPILER="$ASAN_CXX" \

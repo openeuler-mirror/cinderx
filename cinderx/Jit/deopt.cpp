@@ -431,7 +431,7 @@ void releaseRefs(const DeoptMetadata& meta, const void* base) {
   releaseRefs(meta, MemoryView{regs});
 }
 
-static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
+DeoptReason deoptReasonFor(const jit::hir::DeoptBase& instr) {
   switch (instr.opcode()) {
     case jit::hir::Opcode::kCheckVar: {
       return DeoptReason::kUnhandledUnboundLocal;
@@ -465,6 +465,17 @@ static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
     default: {
       return DeoptReason::kUnhandledException;
     }
+  }
+}
+
+bool isForceableDeoptInstr(const jit::hir::DeoptBase& instr) {
+  switch (instr.opcode()) {
+    case jit::hir::Opcode::kGuard:
+    case jit::hir::Opcode::kGuardIs:
+    case jit::hir::Opcode::kGuardType:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -574,7 +585,8 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
   }
 
   meta.nonce = instr.nonce();
-  meta.reason = getDeoptReason(instr);
+  meta.reason = deoptReasonFor(instr);
+  meta.forceable = isForceableDeoptInstr(instr);
   JIT_CHECK(
       meta.reason != DeoptReason::kUnhandledNullField ||
           meta.guilty_value != -1,
@@ -593,6 +605,31 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
   meta.descr = interned.c_str();
 
   return meta;
+}
+
+uint64_t computeDeoptSiteId(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset bc_offset,
+    DeoptReason reason,
+    size_t inline_depth,
+    uint32_t seq) {
+  auto mix = [](uint64_t h, uint64_t k) {
+    k ^= k >> 30;
+    k *= 0xbf58476d1ce4e5b9ULL;
+    k ^= k >> 27;
+    k *= 0x94d049bb133111ebULL;
+    k ^= k >> 31;
+    h ^= k;
+    h *= 0x9e3779b97f4a7c15ULL;
+    return h;
+  };
+  uint64_t h = mix(0xC1DE711ULL, reinterpret_cast<uintptr_t>(code.get()));
+  h = mix(h, static_cast<uint64_t>(bc_offset.value()));
+  h = mix(h, static_cast<uint64_t>(static_cast<unsigned char>(reason)));
+  // Inline path is empty this MR; keep the dimension in the mix.
+  h = mix(h, inline_depth);
+  h = mix(h, seq);
+  return h;
 }
 
 } // namespace jit

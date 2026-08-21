@@ -907,7 +907,7 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 static PyObject* get_trigger_stats(PyObject*, PyObject*) {
   jit::TriggerStats stats = jit::triggerStatsSnapshot();
   return Py_BuildValue(
-      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
       "executable_alloc_calls",
       static_cast<unsigned long long>(stats.executable_alloc_calls),
       "executable_alloc_bytes",
@@ -926,7 +926,11 @@ static PyObject* get_trigger_stats(PyObject*, PyObject*) {
       "code_destroyed_notifications",
       static_cast<unsigned long long>(stats.code_destroyed_notifications),
       "function_destroyed_notifications",
-      static_cast<unsigned long long>(stats.function_destroyed_notifications));
+      static_cast<unsigned long long>(stats.function_destroyed_notifications),
+      "forced_deopt_hits",
+      static_cast<unsigned long long>(stats.forced_deopt_hits),
+      "organic_deopt_hits",
+      static_cast<unsigned long long>(stats.organic_deopt_hits));
 }
 
 PyMethodDef _cinderx_methods[] = {
