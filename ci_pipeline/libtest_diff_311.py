@@ -164,6 +164,89 @@ else:
         print("cinderx evaluator not installed after install call",
               file=sys.stderr)
         os._exit(78)
+    ledger = os.environ.get("CINDERX_EXECUTE_TRIGGER_LEDGER")
+    if ledger:
+        # The execute differential needs proof that this arm actually ran
+        # machine code, not merely that the evaluator was installed.  Each
+        # process records its own counter at exit; the gate sums them.
+        import atexit
+
+        def _process_role():
+            # regrtest runs each test module in a worker spawned with
+            # --worker-args '<json [ns, test_name]>'.  Summing the whole
+            # process tree would let the scheduler process's own JIT stand
+            # in for the workers that actually run the tests, so the role
+            # and the module under test are recorded, not just the pid.
+            import sys as _sys
+
+            argv = _sys.argv
+            for index, arg in enumerate(argv):
+                if arg == "--worker-args" and index + 1 < len(argv):
+                    try:
+                        import json as _json
+
+                        _ns, test_name = _json.loads(argv[index + 1])
+                        return "worker", str(test_name)
+                    except Exception:
+                        return "worker", "?"
+                if arg.startswith("--worker-args="):
+                    return "worker", "?"
+            # Everything else -- the regrtest scheduler, a test's own
+            # subprocess -- is simply "not a worker".  The gate only needs
+            # that distinction, and guessing finer labels from argv would
+            # put a wrong one in the diagnostic.
+            return "other", "-"
+
+        def _own_compiled(test_name):
+            # How many compiled functions came from the module this worker
+            # was told to run.
+            #
+            # The process counters cannot answer that: they are totals, so
+            # sitecustomize, the import machinery and regrtest's own
+            # harness all count towards them, and a worker that compiled
+            # nothing but harness code would still report "entered machine
+            # code".  Matching the code objects' filename against the test
+            # module's own file is what makes the claim about the module.
+            try:
+                import cinderjit as _jit
+                import sys as _sys
+
+                module = _sys.modules.get(test_name) or _sys.modules.get(
+                    "test." + test_name
+                )
+                path = getattr(module, "__file__", None)
+                if path is None:
+                    return -1
+                return sum(
+                    1
+                    for fn in _jit.get_compiled_functions()
+                    if getattr(getattr(fn, "__code__", None), "co_filename", None)
+                    == path
+                )
+            except Exception:
+                return -1
+
+        def _record_trigger_stats():
+            try:
+                stats = _cinderx._get_trigger_stats()
+                role, test_name = _process_role()
+                own = _own_compiled(test_name) if role == "worker" else -1
+                with open(ledger, "a", encoding="utf-8") as fh:
+                    fh.write(
+                        "%d %s %s %d %d %d\\n"
+                        % (
+                            os.getpid(),
+                            role,
+                            test_name,
+                            stats["machine_code_entries"],
+                            stats["compiled_function_creations"],
+                            own,
+                        )
+                    )
+            except Exception:
+                pass
+
+        atexit.register(_record_trigger_stats)
     attest = os.environ.get("CINDERX_DIFF_ATTEST")
     if attest:
         try:
@@ -208,6 +291,50 @@ def case_state(tc: ET.Element) -> str:
     return "pass"
 
 
+# Everything in a diagnostic that legitimately differs between two runs of
+# the same interpreter.  Addresses, temporary paths, pids and ports say
+# nothing about behaviour, and leaving them in would make every failing
+# case an asymmetry.
+_DIAGNOSTIC_NOISE = (
+    (re.compile(r"0x[0-9a-fA-F]+"), "0xADDR"),
+    (re.compile(r"/(?:tmp|var/folders)/[^\s'\"]*"), "<tmp>"),
+    (re.compile(r"\b(?:pid|port)[= ]\d+", re.IGNORECASE), "<num>"),
+    (re.compile(r"\bat 0xADDR\b"), "at 0xADDR"),
+)
+
+
+def normalize_diagnostic(text: str) -> str:
+    for pattern, replacement in _DIAGNOSTIC_NOISE:
+        text = pattern.sub(replacement, text)
+    return " ".join(text.split())
+
+
+def case_diagnostic(tc: ET.Element) -> str | None:
+    """How a case failed, normalized, or None when it did not.
+
+    The state tag alone answers "did it fail", not "did it fail the same
+    way".  Two runs that both raise TypeError for entirely different
+    reasons are both `failure`, and a comparator that stops at the tag
+    calls them identical -- while the correctness contract this gate
+    exists for names the exception type and message explicitly.
+
+    The junit `message` attribute carries the exception's own text; the
+    element body carries the traceback, whose file paths and line numbers
+    are not part of the contract and are deliberately left out.
+    """
+    for child in tc:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag in ("failure", "error"):
+            kind = child.get("type") or tag
+            message = child.get("message") or ""
+            return normalize_diagnostic(f"{kind}: {message}")
+        if tag == "skipped":
+            # A skip reason is a behavioural fact too: skipping for a
+            # different reason is a different outcome.
+            return normalize_diagnostic(f"skipped: {child.get('message') or ''}")
+    return None
+
+
 def _normalize(name: str) -> str:
     return name[5:] if name.startswith("test.") else name
 
@@ -242,8 +369,15 @@ def make_module_resolver(requested: list[str]):
     return resolve
 
 
-def parse_junit(path: Path) -> dict[str, str]:
+def parse_junit(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Per-case states, and per-case diagnostics for the ones that did not pass.
+
+    Two maps rather than one record: the JIT-off differential compares
+    states and only states, and its contract does not change because the
+    execute differential wants more.
+    """
     cases: dict[str, str] = {}
+    diagnostics: dict[str, str] = {}
     root = ET.parse(path).getroot()
     for ts in root.iter():
         if ts.tag.rsplit("}", 1)[-1] != "testcase":
@@ -255,7 +389,10 @@ def parse_junit(path: Path) -> dict[str, str]:
         # leading dot.
         key = f"{classname}.{name}" if classname else name
         cases[key] = case_state(ts)
-    return cases
+        diagnostic = case_diagnostic(ts)
+        if diagnostic is not None:
+            diagnostics[key] = diagnostic
+    return cases, diagnostics
 
 
 SANITIZED_ENV_KEYS = (
@@ -326,7 +463,7 @@ def run_arm(args: argparse.Namespace) -> int:
             cmd, env=env, text=True, stdout=sink, stderr=subprocess.STDOUT
         )
 
-    cases = parse_junit(junit) if junit.is_file() else {}
+    cases, diagnostics = parse_junit(junit) if junit.is_file() else ({}, {})
     log_text = (out / "regrtest.log").read_text(errors="replace")
     verdicts = parse_regrtest_modules(log_text, tests)
     modules: dict[str, str] = {name: verdicts.get(name, "no_result") for name in tests}
@@ -349,6 +486,7 @@ def run_arm(args: argparse.Namespace) -> int:
         },
         "modules": modules,
         "cases": cases,
+        "diagnostics": diagnostics,
     }
     (out / "result.json").write_text(json.dumps(result, indent=1, sort_keys=True))
     completion_error = arm_run_completed(proc.returncode, log_text)
@@ -456,6 +594,103 @@ def diff_results(a: dict, b: dict) -> dict:
     }
 
 
+EXECUTE_JIT_COVERAGE = (
+    Path(__file__).parent / "jit311" / "data" / "execute_jit_coverage.txt"
+)
+
+
+def load_execute_jit_coverage(path: Path) -> set[str]:
+    """Target modules that must each compile a function of their own."""
+    if not path.is_file():
+        return set()
+    return {
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+
+
+EXECUTE_BASELINE = (
+    Path(__file__).parent / "jit311" / "data" / "execute_diff_baseline.json"
+)
+
+
+def load_execute_baseline(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    doc = json.loads(path.read_text())
+    return doc.get("asymmetries", {})
+
+
+def diff_results_symmetric(a: dict, b: dict, allowed: dict) -> dict:
+    """Compare two arms for isomorphism, not for regressions.
+
+    diff_results() answers "did anything that used to pass stop passing".
+    That is the right question for the JIT-off gate, where the two arms are
+    the same interpreter and an improvement is not a defect.  It is the
+    wrong question here: under Auto-JIT a case that FAILS in stock and
+    PASSES under execute, a case that changes how it fails, and a case that
+    only one arm ran at all are each a semantic difference the execute mode
+    is supposed not to produce, and each is invisible to a comparator that
+    only walks stock's passing cases.
+
+    So this one requires the two result sets to be identical -- same case
+    identities, same state for each -- and carries a frozen baseline for
+    the asymmetries that are genuinely environmental.  A baseline entry
+    that no longer reproduces is reported too: an allowance nobody can
+    justify any more is how a gate stops gating.
+    """
+    differences: dict[str, dict[str, str]] = {}
+
+    for mod in sorted(set(a.get("modules", {})) | set(b.get("modules", {}))):
+        averdict = a.get("modules", {}).get(mod, "missing")
+        bverdict = b.get("modules", {}).get(mod, "missing")
+        if averdict != bverdict:
+            differences[f"<module> {mod}"] = {
+                "stock": averdict,
+                "execute": bverdict,
+            }
+
+    acases, bcases = a.get("cases", {}), b.get("cases", {})
+    for key in sorted(set(acases) | set(bcases)):
+        astate = acases.get(key, "missing")
+        bstate = bcases.get(key, "missing")
+        if astate != bstate:
+            differences[key] = {"stock": astate, "execute": bstate}
+            # The states already differ; also reporting the diagnostic
+            # would say the same thing twice.
+            continue
+        if astate == "pass":
+            continue
+        adiag = a.get("diagnostics", {}).get(key, "")
+        bdiag = b.get("diagnostics", {}).get(key, "")
+        if adiag != bdiag:
+            # Same verdict, different reason.  Two TypeErrors raised for
+            # unrelated reasons are both `failure`; the contract names the
+            # exception type and message, so the tag alone is not enough.
+            differences[f"<diagnostic> {key}"] = {
+                "stock": adiag,
+                "execute": bdiag,
+            }
+
+    unexpected = {
+        key: value
+        for key, value in differences.items()
+        if allowed.get(key) != value
+    }
+    stale = {
+        key: value
+        for key, value in allowed.items()
+        if differences.get(key) != value
+    }
+    return {
+        "differences": differences,
+        "unexpected": unexpected,
+        "stale_baseline": stale,
+        "allowed": len(allowed),
+    }
+
+
 def cmd_diff(args: argparse.Namespace) -> int:
     report = diff_results(load(args.a), load(args.b))
     out = Path(args.report) if args.report else None
@@ -501,6 +736,79 @@ def read_stock_attest(path: Path) -> tuple[int, bool]:
     return len(lines), bool(lines) and all(ln == "clean" for ln in lines)
 
 
+def provision_dual_arms(
+    args,
+    out: Path,
+    *,
+    label: str,
+    arm_dir: str,
+    shared: dict,
+    cinderx_env: list[str],
+    precreate: list[Path] = (),
+):
+    """Provision both arms' startups and attestation files, run them, and
+    enforce stock purity.
+
+    The stock arm is a CONTROL with its own startup whose only job is to
+    attest, per process, that no cinderx module ever loaded; a polluted
+    control (external sitecustomize, inherited environment) would fake
+    neutrality symmetrically.  Returns (rc, attest_path); rc is nonzero
+    when an arm failed or the control was not pure.
+    """
+    startup = out / "startup"
+    startup.mkdir(parents=True, exist_ok=True)
+    (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
+    attest = out / arm_dir / "attest.log"
+    attest.parent.mkdir(parents=True, exist_ok=True)
+    for path in precreate:
+        path.unlink(missing_ok=True)
+        path.touch()
+        os.chmod(path, 0o666)
+
+    stock_startup = out / "startup-stock"
+    stock_startup.mkdir(parents=True, exist_ok=True)
+    (stock_startup / "sitecustomize.py").write_text(STOCK_SITECUSTOMIZE)
+    stock_attest = out / "stock" / "attest-stock.log"
+    stock_attest.parent.mkdir(parents=True, exist_ok=True)
+    stock_attest.unlink(missing_ok=True)
+    stock_attest.touch()
+    os.chmod(stock_attest, 0o666)
+
+    a = argparse.Namespace(**{
+        **shared,
+        "out": str(out / "stock"),
+        "env": [f"CINDERX_STOCK_ATTEST={stock_attest}"],
+        "pythonpath_prepend": [str(stock_startup)],
+        "attest_file": None,
+    })
+    b = argparse.Namespace(**{
+        **shared,
+        "out": str(out / arm_dir),
+        **({} if cinderx_env is None else {"env": cinderx_env}),
+        "pythonpath_prepend": [str(startup)] + list(args.pythonpath_prepend or []),
+        "attest_file": str(attest),
+    })
+    if run_arm(a) or run_arm(b):
+        return 2, attest
+
+    # Structural stock-arm purity: it has no evaluator startup, so an
+    # evaluator attestation there means the arms were misrouted.
+    stray = out / "stock" / "attest.log"
+    if stray.exists():
+        print(f"{label}: stock arm unexpectedly attested an evaluator: {stray}")
+        return 3, attest
+    # Positive purity: fewer than two records means not even the regrtest
+    # main process plus one worker reported.
+    stock_count, stock_clean = read_stock_attest(stock_attest)
+    if stock_count < 2 or not stock_clean:
+        print(
+            f"{label}: stock arm purity not attested "
+            f"({stock_count} records, clean={stock_clean}): {stock_attest}"
+        )
+        return 3, attest
+    return 0, attest
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     out = Path(args.out)
     if not args.tests and args.exclude:
@@ -512,59 +820,16 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return 2
     out.mkdir(parents=True, exist_ok=True)
 
-    # The gate provisions its own startup for the CinderX arm: every
-    # interpreter installs the evaluator, attests to it per process, and
-    # dies loudly if installation fails.
-    startup = out / "startup"
-    startup.mkdir(parents=True, exist_ok=True)
-    (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
-    attest = out / "cinderx" / "attest.log"
-
-    # The stock arm is a CONTROL: it gets its own startup whose only job
-    # is to attest, per process, that no cinderx module ever loaded.  A
-    # polluted control (external sitecustomize, inherited environment)
-    # would otherwise fake neutrality symmetrically.
-    stock_startup = out / "startup-stock"
-    stock_startup.mkdir(parents=True, exist_ok=True)
-    (stock_startup / "sitecustomize.py").write_text(STOCK_SITECUSTOMIZE)
-    stock_attest = out / "stock" / "attest-stock.log"
-    stock_attest.parent.mkdir(parents=True, exist_ok=True)
-    stock_attest.unlink(missing_ok=True)
-    stock_attest.touch()
-    os.chmod(stock_attest, 0o666)
-
-    a = argparse.Namespace(**{
-        **vars(args),
-        "out": str(out / "stock"),
-        "env": [f"CINDERX_STOCK_ATTEST={stock_attest}"],
-        "pythonpath_prepend": [str(stock_startup)],
-        "attest_file": None,
-    })
-    b = argparse.Namespace(**{
-        **vars(args),
-        "out": str(out / "cinderx"),
-        "pythonpath_prepend": [str(startup)] + list(args.pythonpath_prepend or []),
-        "attest_file": str(attest),
-    })
-    if run_arm(a) or run_arm(b):
-        return 2
-
-    # Structural stock-arm purity: it has no evaluator startup, so an
-    # evaluator attestation there means the arms were misrouted.
-    stray = out / "stock" / "attest.log"
-    if stray.exists():
-        print(f"GATE: stock arm unexpectedly attested an evaluator: {stray}")
-        return 3
-    # Positive stock purity: every stock process must have attested that
-    # no cinderx module ever loaded.  Fewer than two records means not
-    # even the regrtest main process plus one worker reported.
-    stock_count, stock_clean = read_stock_attest(stock_attest)
-    if stock_count < 2 or not stock_clean:
-        print(
-            f"GATE: stock arm purity not attested "
-            f"({stock_count} records, clean={stock_clean}): {stock_attest}"
-        )
-        return 3
+    rc, _attest = provision_dual_arms(
+        args,
+        out,
+        label="GATE",
+        arm_dir="cinderx",
+        shared=vars(args),
+        cinderx_env=None,
+    )
+    if rc:
+        return rc
 
     args2 = argparse.Namespace(a=str(out / "stock" / "result.json"),
                                b=str(out / "cinderx" / "result.json"),
@@ -611,6 +876,218 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return rc
 
 
+def load_stdlib72_modules() -> list[str]:
+    """The 72-module confirmed surface, from its single definition."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from ci_pipeline.jit311.runners import STDLIB_SHADOW_MODULES
+
+    modules = list(STDLIB_SHADOW_MODULES)
+    if len(modules) != 72:
+        raise SystemExit(
+            f"the confirmed stdlib surface is {len(modules)} modules, not 72"
+        )
+    return modules
+
+
+def read_trigger_ledger(path: Path) -> dict:
+    """Per-role trigger evidence for one arm.
+
+    Rows are "pid role test entries creations".  The roles are kept apart
+    on purpose: regrtest's scheduler process runs plenty of Python of its
+    own, so a tree-wide sum would let its JIT activity stand in for the
+    workers that actually execute the test modules -- exactly the "identical
+    for the wrong reason" pass this leg exists to refuse.
+    """
+    empty = {
+        "rows": 0,
+        "workers": 0,
+        "worker_entries": 0,
+        "worker_creations": 0,
+        "worker_tests": set(),
+        "executing_tests": set(),
+        "compiling_tests": set(),
+        "unattributed_tests": set(),
+    }
+    if not path.is_file():
+        return empty
+    rows = [line.split() for line in path.read_text().splitlines() if line.strip()]
+    rows = [row for row in rows if len(row) == 6]
+    workers = [row for row in rows if row[1] == "worker"]
+    return {
+        "rows": len(rows),
+        "workers": len(workers),
+        "worker_entries": sum(int(row[3]) for row in workers),
+        "worker_creations": sum(int(row[4]) for row in workers),
+        "worker_tests": {row[2] for row in workers},
+        # Workers whose process counters moved.  Process-wide, so this
+        # says the worker ran machine code, not that the module did.
+        "executing_tests": {row[2] for row in workers if int(row[3]) > 0},
+        # Workers that compiled a function defined in the module they were
+        # told to run.  This is the attributed claim.
+        "compiling_tests": {row[2] for row in workers if int(row[5]) > 0},
+        # Workers that could not be attributed at all -- the module was
+        # not importable by name at exit, so the count is unknown rather
+        # than zero.  Kept separate so an unknown never reads as evidence.
+        "unattributed_tests": {row[2] for row in workers if int(row[5]) < 0},
+    }
+
+
+def cmd_execute_gate(args: argparse.Namespace) -> int:
+    """Run the 72-module confirmed surface under stock and under
+    CINDERX_JIT_MODE=execute, and require the per-testcase results to be
+    identical.
+
+    The import canary that preceded this leg only proved the modules could
+    be imported with the JIT executing.  Importing test_call is not running
+    test_call: a testcase that behaves differently under Auto-JIT would
+    sail through it.  This leg runs the tests themselves and compares
+    outcomes case by case, and it demands trigger proof so a silently
+    interpreted arm cannot pass by being identical for the wrong reason.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    modules = load_stdlib72_modules()
+    ledger = out / "execute" / "trigger.log"
+
+    rc, attest = provision_dual_arms(
+        args,
+        out,
+        label="EXECUTE-GATE",
+        arm_dir="execute",
+        shared={**vars(args), "tests": modules, "exclude": []},
+        cinderx_env=[
+            "CINDERX_JIT_MODE=execute",
+            f"PYTHONJITAUTO={args.threshold}",
+            f"CINDERX_EXECUTE_TRIGGER_LEDGER={ledger}",
+        ],
+        precreate=[out / "execute" / "attest.log", ledger],
+    )
+    if rc:
+        return rc
+    attest_count, attest_clean = read_attest(attest)
+    if attest_count < 2 or not attest_clean:
+        print(
+            f"EXECUTE-GATE: execute arm evaluator not attested "
+            f"({attest_count} records, clean={attest_clean})"
+        )
+        return 3
+
+    # Trigger proof, attributed to the processes that ran the tests.
+    proof = read_trigger_ledger(ledger)
+    executing = proof["executing_tests"] & set(modules)
+    compiling = proof["compiling_tests"] & set(modules)
+    unattributed = proof["unattributed_tests"] & set(modules)
+    print(
+        f"EXECUTE-GATE: execute arm {proof['rows']} process(es), "
+        f"{proof['workers']} test worker(s), "
+        f"{proof['worker_entries']} worker machine-code entries, "
+        f"{proof['worker_creations']} worker compiled function(s), "
+        f"{len(executing)}/{len(modules)} target module(s) in a worker that "
+        f"entered machine code, "
+        f"{len(compiling)}/{len(modules)} with a compiled function of their "
+        f"own"
+        + (
+            f", {len(unattributed)} unattributed"
+            if unattributed
+            else ""
+        )
+    )
+    if proof["workers"] <= 0:
+        print(
+            "EXECUTE-GATE: no regrtest worker reported; the arm cannot "
+            "attest anything about the modules it was supposed to run"
+        )
+        return 5
+    if proof["worker_entries"] <= 0 or proof["worker_creations"] <= 0:
+        print(
+            "EXECUTE-GATE: the test workers never entered machine code. "
+            "The scheduler process's own JIT activity does not count: an "
+            "arm whose workers all interpreted would agree with stock for "
+            "the wrong reason"
+        )
+        return 5
+    if not executing:
+        print(
+            "EXECUTE-GATE: machine code was entered, but not by any worker "
+            f"running a target module (workers seen: {sorted(proof['worker_tests'])[:5]})"
+        )
+        return 5
+    if not compiling:
+        # Every worker's counters are process-wide, so "this worker ran
+        # machine code" can be satisfied entirely by sitecustomize, the
+        # import machinery and regrtest's harness.  At least one target
+        # module has to have had a function of its own compiled, or the
+        # arm proves only that CinderX ran, not that it ran the surface.
+        print(
+            "EXECUTE-GATE: no target module had a function of its own "
+            "compiled; the arm's machine-code entries are all harness and "
+            "import machinery"
+        )
+        return 5
+    # Per-module, not "at least one anywhere": the modules that are known
+    # to reach the JIT have to keep reaching it, each of them.  A module
+    # that stops is a coverage regression even while the differential
+    # stays green, because the arm goes on proving equivalence for a
+    # surface the JIT no longer touches.
+    expected_jit = load_execute_jit_coverage(
+        Path(args.jit_coverage) if args.jit_coverage else EXECUTE_JIT_COVERAGE
+    ) & set(modules)
+    lost = sorted(expected_jit - compiling)
+    if lost:
+        print(
+            f"EXECUTE-GATE: {len(lost)} module(s) that used to compile a "
+            f"function of their own no longer do: {lost}"
+        )
+        return 5
+    gained = sorted(compiling - expected_jit)
+    if gained:
+        # Not a failure -- more coverage is the direction we want -- but
+        # it has to be recorded, or the pinned list decays into a subset
+        # nobody notices is stale.
+        print(
+            f"EXECUTE-GATE: {len(gained)} module(s) now compile a function "
+            f"of their own and are not in the pinned list: {gained}"
+        )
+
+    baseline_path = Path(args.baseline) if args.baseline else EXECUTE_BASELINE
+    report = diff_results_symmetric(
+        load(str(out / "stock" / "result.json")),
+        load(str(out / "execute" / "result.json")),
+        load_execute_baseline(baseline_path),
+    )
+    text = json.dumps(report, indent=1, sort_keys=True)
+    (out / "diff.json").write_text(text)
+    if args.write_baseline:
+        Path(args.write_baseline).write_text(
+            json.dumps(
+                {
+                    "comment": (
+                        "Frozen stock-vs-execute asymmetries for the "
+                        "confirmed 72-module surface.  Every entry needs a "
+                        "reason that is about the environment, not about "
+                        "the JIT; an entry that stops reproducing is "
+                        "reported by the gate and must be deleted."
+                    ),
+                    "asymmetries": report["differences"],
+                },
+                indent=1,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        print(f"EXECUTE-GATE: wrote baseline to {args.write_baseline}")
+        return 0
+    print(text if len(text) < 8000
+          else text[:8000] + "\n... (truncated, see report file)")
+    print(
+        f"EXECUTE-GATE: {len(report['differences'])} asymmetry(ies), "
+        f"{report['allowed']} allowed by baseline, "
+        f"{len(report['unexpected'])} unexpected, "
+        f"{len(report['stale_baseline'])} stale baseline entry(ies)"
+    )
+    return 1 if report["unexpected"] or report["stale_baseline"] else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -643,6 +1120,34 @@ def main(argv: list[str] | None = None) -> int:
     p_gate = sub.add_parser("gate", help="run both arms and diff")
     common(p_gate)
     p_gate.add_argument("--out", required=True)
+
+    p_exec = sub.add_parser(
+        "execute-gate",
+        help="72-module stock vs CINDERX_JIT_MODE=execute differential",
+    )
+    common(p_exec)
+    p_exec.add_argument("--out", required=True)
+    p_exec.add_argument(
+        "--threshold",
+        default="50",
+        help="PYTHONJITAUTO for the execute arm (default: 50)",
+    )
+    p_exec.add_argument(
+        "--jit-coverage",
+        help="modules that must each compile a function of their own "
+             "(default: jit311/data/execute_jit_coverage.txt)",
+    )
+    p_exec.add_argument(
+        "--baseline",
+        help="frozen stock-vs-execute asymmetries "
+             "(default: jit311/data/execute_diff_baseline.json)",
+    )
+    p_exec.add_argument(
+        "--write-baseline",
+        help="record this run's asymmetries as the baseline instead of "
+             "judging against one; every entry still needs a reason",
+    )
+    p_exec.set_defaults(func=cmd_execute_gate)
     p_gate.set_defaults(func=cmd_gate)
 
     args = parser.parse_args(argv)

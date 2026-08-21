@@ -2816,15 +2816,25 @@ void JITRT_FormatAwaitableError(
   _PyErr_Format(tstate, PyExc_TypeError, msg, type->tp_name);
 }
 
+// See ref.cpp: the 3.12 helpers do not exist on 3.11, where the total is
+// a process-wide global.
 void JITRT_IncRefTotal() {
 #ifdef Py_REF_DEBUG
+#if PY_VERSION_HEX >= 0x030C0000
   _Py_INCREF_IncRefTotal();
+#else
+  _Py_RefTotal++;
+#endif
 #endif
 }
 
 void JITRT_DecRefTotal() {
 #ifdef Py_REF_DEBUG
+#if PY_VERSION_HEX >= 0x030C0000
   _Py_DECREF_DecRefTotal();
+#else
+  _Py_RefTotal--;
+#endif
 #endif
 }
 

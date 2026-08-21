@@ -670,7 +670,7 @@ def run_libtest_module(
             encoding="utf-8",
         )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    cases = parse_junit(junit) if junit.is_file() else {}
+    cases, _ = parse_junit(junit) if junit.is_file() else ({}, {})
     verdict = infer_libtest_verdict(
         name, log_text, returncode, cases, timed_out
     )
@@ -815,7 +815,7 @@ def _run_test_cinderx_pass(
                 sink.write(
                     f"\n[shadow-surface] timeout after {slice_timeout}s\n"
                 )
-        cases = parse_junit(junit) if junit.is_file() else {}
+        cases, _ = parse_junit(junit) if junit.is_file() else ({}, {})
         prefixed = {f"{name}::{key}": state for key, state in cases.items()}
         snaps = _load_snapshots(reports) if mode == "shadow" else []
         verdict = pytest_process_verdict(returncode, cases, timed_out)

@@ -49,6 +49,16 @@ void finalize();
  */
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+// CPython 3.11 execute mode: register `outer` as the outer function of the
+// nested code objects in its constants, arming the death watch that keeps
+// the registration honest.  A nested artifact compiled afterwards is
+// anchored by `outer`'s __cinderx_nested_compiled_funcs__ list -- the
+// residency 3.12+ gets from the function-creation watcher -- so it outlives
+// the fresh function objects that come and go.
+void trackOuterFunction311(BorrowedRef<PyFunctionObject> outer);
+#endif
+
 void recordDeoptForRoiBackoff(
     CodeRuntime* code_runtime,
     DeoptReason reason,
@@ -61,7 +71,17 @@ bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
  *
  * On success, positional only calls to func will use the JIT compiled version.
  */
-Result compileFunction(BorrowedRef<PyFunctionObject> func);
+// Compile `func`.
+//
+// `expected_code` fixes the subject: the compile refuses with CODE_MOVED
+// the moment the function stops holding it, at every boundary that can
+// run Python.  Pass nullptr to compile whatever the function holds, which
+// pins it at entry instead -- the caller then has no opinion about which
+// code object it asked for, but the compile still may not switch subjects
+// halfway through.
+Result compileFunction(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> expected_code = nullptr);
 
 void uncompile(BorrowedRef<PyFunctionObject> func);
 

@@ -24,6 +24,16 @@
 #define CI_CODE_EXTRA_ROI_ROUND_SHIFT 24
 #define CI_CODE_EXTRA_ROI_ROUND_MASK 0x0F000000u
 
+// jit311_ctl bit layout for the CPython 3.11 auto-JIT (execute mode):
+//   bit 31: automatic compilation is disabled for this code object -- its
+//           one scheduling attempt failed or was refused, and the scheduler
+//           must never ask again (explicit force_compile is unaffected).
+//   bits 0-15: fresh function objects that were attached to the code's
+//              published artifact, counted against the per-code budget.
+// Unused on 3.12+, where function watchers deliver the same information.
+#define CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT 0x80000000u
+#define CI_CODE_EXTRA_JIT311_ATTACH_MASK 0x0000FFFFu
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -56,6 +66,10 @@ typedef struct CodeExtra {
   // feedback and intentionally do not participate in StructureKey identity.
   uint32_t roi_deopt_count;
   uint32_t roi_ctl;
+  // CPython 3.11 auto-JIT bookkeeping (CI_CODE_EXTRA_JIT311_*).  Sits in
+  // the padding before roi_recompile_floor, so the block keeps its size on
+  // every version; only the 3.11 scheduler reads or writes it.
+  uint32_t jit311_ctl;
   uint64_t roi_recompile_floor;
 } CodeExtra;
 
@@ -212,6 +226,31 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
 }
 
 #endif
+
+// The 3.11 scheduler runs under the GIL and never on a free-threaded
+// build, so plain accesses are the whole story here.
+static inline int Ci_code_extra_jit311_auto_disabled(const CodeExtra* extra) {
+  return (extra->jit311_ctl & CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT) != 0;
+}
+
+static inline void Ci_code_extra_jit311_disable_auto(CodeExtra* extra) {
+  extra->jit311_ctl |= CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT;
+}
+
+static inline uint32_t Ci_code_extra_jit311_attach_count(
+    const CodeExtra* extra) {
+  return extra->jit311_ctl & CI_CODE_EXTRA_JIT311_ATTACH_MASK;
+}
+
+// Saturating: the budget is far below the field's range, and a saturated
+// count still reads as "exhausted".
+static inline void Ci_code_extra_jit311_note_attach(CodeExtra* extra) {
+  uint32_t count = extra->jit311_ctl & CI_CODE_EXTRA_JIT311_ATTACH_MASK;
+  if (count < CI_CODE_EXTRA_JIT311_ATTACH_MASK) {
+    extra->jit311_ctl =
+        (extra->jit311_ctl & ~CI_CODE_EXTRA_JIT311_ATTACH_MASK) | (count + 1);
+  }
+}
 
 #ifdef __cplusplus
 }

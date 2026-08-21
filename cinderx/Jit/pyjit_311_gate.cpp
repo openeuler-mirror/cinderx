@@ -1,15 +1,21 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// CPython 3.11 observe/shadow compilation gate.  Observe terminates at a
-// capability refusal. Shadow runs synchronously under the GIL through
+// CPython 3.11 observe/shadow/execute compilation gate.  Observe terminates
+// at a capability refusal. Shadow runs synchronously under the GIL through
 // bytecode, HIR, optimization, LIR, register allocation, target codegen and
 // relocation, then discards the artifact without publishing an entry point.
+// Execute (the product auto-JIT, MR-11; "canary" is its test-only spelling)
+// compiles, installs and runs machine code, hands fresh function objects the
+// artifact their code already has, and records a failed automatic attempt
+// on the code object so it is never scheduled again.
 
 #include "cinderx/python.h"
 
 #include "cinderx/Interpreter/3.11/eval_hook.h"
 
 #if PY_VERSION_HEX < 0x030C0000
+
+#include "internal/pycore_frame.h"
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/code_extra.h"
@@ -19,6 +25,7 @@
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/3.11/observe.h"
+#include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
@@ -32,8 +39,10 @@
 #include "cinderx/module_state.h"
 
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <string_view>
+#include <utility>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -51,10 +60,19 @@ const char* functionName(BorrowedRef<PyFunctionObject> func) {
 
 constexpr int kRequiredCodeFlags = CO_OPTIMIZED | CO_NEWLOCALS;
 
-// On 3.11 State::kRunning is reachable only through the canary (MR-04)
-// initialization path, so it doubles as the execute-mode predicate.
-bool canaryMode() {
+// Live state: answers "may machine code run right now".  The wrong
+// question for choosing which PROTOCOL a request follows -- a pause makes
+// it false and the execute protocol must handle a pause; use
+// configuredExecuteMode() there.
+bool executeMode() {
   return jit::getConfig().state == jit::State::kRunning;
+}
+
+// Which protocol this process runs under -- a configuration, not a state,
+// so a pause does not change it.  disable() lowers the capability; it does
+// not turn an execute-mode process into a shadow-mode one.
+bool configuredExecuteMode() {
+  return Ci_Observe311_Mode() == CI_JIT_MODE_311_EXECUTE;
 }
 
 bool unicodeEquals311(BorrowedRef<> value, const char* expected) {
@@ -106,7 +124,7 @@ bool isImportlibBootstrap311(BorrowedRef<PyFunctionObject> func) {
 }
 
 const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
-  if ((!jit::isJitShadow() && !canaryMode()) ||
+  if ((!jit::isJitShadow() && !executeMode()) ||
       cinderx::getModuleState() == nullptr ||
       cinderx::getModuleState()->jit_context == nullptr) {
     return CI_OBSERVE_311_REFUSAL;
@@ -163,13 +181,12 @@ const char* unsupportedArgumentShape311(BorrowedRef<PyFunctionObject>) {
   return nullptr;
 }
 
-// One compiled artifact, one owning function.  MR-05's death
-// notifications (weakref watch for functions, co_extra freefunc for
-// code) retire the original freed-pointer hazard, but the single-owner
-// publication policy stays: the guarded entry resolves its artifact
-// through the code object's ledger, and admitting a second owner would
-// let one function's lifecycle events (uncompile, __code__ replacement,
-// death) invalidate machine code another function is still advertising.
+// One published artifact per code object: CodeExtra carries exactly one
+// (artifact, globals, builtins) triple, so a second publication under a
+// different namespace would overwrite the first owner's.  A second
+// function over the SAME key is the fresh instance 3.11 creates per
+// closure/lambda/comprehension; it attaches instead of compiling again,
+// with membership kept honest by the function death watch.
 const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
   auto* ctx =
       static_cast<jit::Context*>(cinderx::getModuleState()->jit_context.get());
@@ -177,20 +194,14 @@ const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
     return nullptr;
   }
   BorrowedRef<PyCodeObject> code{func->func_code};
-  // One published artifact per code object -- not per compilation key.  The
-  // execute ledger is CodeExtra, and it carries exactly one
-  // (artifact, globals, builtins) triple per code object; a second artifact
-  // for the same code under a different namespace would be published by
-  // overwriting the first owner's triple, leaving that owner registered but
-  // never executed and the two ledgers contradicting each other.  Refusing
-  // the second publication keeps the code object's ledger single-writer;
-  // one code serving several namespaces is MR-05 lifecycle work.
   CodeExtra* extra = codeExtraIfExists(code);
   auto* published = extra == nullptr
       ? nullptr
       : reinterpret_cast<jit::CompiledFunction*>(
             _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
-  if (published != nullptr && !published->functions().contains(func)) {
+  if (published != nullptr && !published->functions().contains(func) &&
+      (extra->jit_globals != func->func_globals ||
+       extra->jit_builtins != func->func_builtins)) {
     // The artifact's member set is the ownership oracle, and it lives
     // entirely in C++: a deopt removes the installation but not the
     // membership, so a parked function passes this check on re-enable, and
@@ -201,21 +212,6 @@ const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
     // ownership and reopened the ledger overwrite this refusal exists to
     // prevent.
     return "REFUSE_SHAPE_CODE_ARTIFACT_ALREADY_PUBLISHED";
-  }
-  // Backstop for the same-key second owner while the code-extra cache is
-  // not populated: the registry itself may already hold an artifact whose
-  // owner is someone else.
-  BorrowedRef<jit::CompiledFunction> compiled = ctx->lookupCode(
-      code,
-      reinterpret_cast<PyDictObject*>(func->func_builtins),
-      reinterpret_cast<PyDictObject*>(func->func_globals));
-  if (compiled == nullptr) {
-    return nullptr;
-  }
-  for (BorrowedRef<PyFunctionObject> owner : compiled->functions()) {
-    if (owner != func) {
-      return "REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE";
-    }
   }
   return nullptr;
 }
@@ -396,6 +392,13 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
   if (!Ci_EvalHook311_IsInstalled()) {
     return nullptr;
   }
+  // Fail closed unless the JIT is usable right now: a publication in
+  // flight can finish after a disable() and would install this entry
+  // point behind its back.  The newer decision wins; enable() makes the
+  // same published artifact serve again.
+  if (!jit::isJitUsable()) {
+    return nullptr;
+  }
   // Fail closed under legacy tracing.  MR-04 implements no instrumentation,
   // and machine code delivers none of the call, line and return events a
   // registered trace or profile function is owed -- so while either is
@@ -473,62 +476,195 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }
 
+namespace {
+
+// Is this refusal a property of the CODE OBJECT?  Only those are
+// verdicts: a verdict is recorded permanently on the code object, so a
+// refusal that actually describes the FUNCTION (a namespace twin, say)
+// must not take the code down with it.  An allowlist, not a denylist --
+// an unlisted reason costs a re-attempt at worst, where the opposite
+// default silently disables a code object nobody meant to disable.
+bool isCodeScopedRefusal311(const char* reason) {
+  static constexpr const char* kCodeScoped[] = {
+      // co_flags / co_filename / code shape -- true of the code wherever
+      // it is used, and true again next time.
+      "REFUSE_SHAPE_ASYNC_CODE",
+      "REFUSE_SHAPE_JIT_SUPPRESSED",
+      "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
+      "REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP",
+      "REFUSE_SHAPE_NON_FUNCTION_SCOPE",
+      "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED",
+      "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED",
+      "REFUSE_SHAPE_INVALID_UTF8_NAME",
+      // The compiler could not produce an artifact for this code.
+      "REFUSE_SHAPE_CODEGEN_SPAN",
+      "REFUSE_SHAPE_SPECULATIVE_GUARD",
+      "SUPPORTED_OPCODE_FAILURE",
+  };
+  for (const char* known : kCodeScoped) {
+    if (std::strcmp(reason, known) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Does this code object already carry a published artifact?
+//
+// Attachability follows this, not the verdict text: a function refused
+// because the artifact belongs to another namespace still leaves the
+// artifact there for the namespace it does belong to.
+bool codeHasArtifact311(BorrowedRef<PyCodeObject> code) {
+  CodeExtra* extra = codeExtraIfExists(code);
+  return extra != nullptr &&
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled) != nullptr;
+}
+
+// The attempt was withheld because the function stopped holding the code
+// it was counted for.  Distinct from every refusal, which describes a code
+// object; this describes a function that changed underneath one.
+constexpr const char* kCodeMoved311 = "__code_moved__";
+
+// Defined below, next to the frame-entry attachment it also serves.
+int attachFreshImpl311(PyFunctionObject* raw_func);
+
+const char* requestExecute311(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> code) {
+  if (codeAutoJitDisabled311(code)) {
+    return "REFUSE_SHAPE_AUTO_JIT_DISABLED";
+  }
+  if ((code->co_flags & CO_GENERATOR) != 0) {
+    // Generators compile on request only: the measured verdict is that
+    // compiling them automatically loses to both compiling them all and
+    // interpreting them all, so the auto default stays off (MR-11).
+    return "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED";
+  }
+  if (const char* execute_reason = Ci_JitShell311_ExecuteRefusal(func)) {
+    return execute_reason;
+  }
+  if (isJitCompiled(func)) {
+    return CI_JIT_RESULT_311_INSTALLED;
+  }
+  // Everything above reads Python objects and can therefore allocate,
+  // collect and run a finalizer.  Compilation takes the function, not the
+  // code, so a __code__ assignment landing in that stretch would compile
+  // and install whatever the function holds now -- code that has not run
+  // a single frame, from a threshold another code object earned.
+  if (func->func_code != code) {
+    return kCodeMoved311;
+  }
+  // An existing artifact makes this a fresh ATTACHMENT, not a compile,
+  // and it must go through the same budget door the frame-entry
+  // attachment uses; force_compile() keeps its own unbudgeted way in.
+  int attached = attachFreshImpl311(func);
+  if (attached > 0) {
+    return CI_JIT_RESULT_311_INSTALLED;
+  }
+  if (attached < 0) {
+    return "REFUSE_SHAPE_FRESH_ATTACH_BUDGET";
+  }
+  try {
+    // The subject travels with the request: every boundary inside that
+    // can run Python re-checks it, and a function that moved comes back
+    // as CODE_MOVED rather than as a refusal about this code object.
+    jit::Result result = jit::compileFunction(func, code);
+    if (result == jit::Result::OK) {
+      return CI_JIT_RESULT_311_INSTALLED;
+    }
+    PyErr_Clear();
+    if (result == jit::Result::CODE_MOVED) {
+      // Transient state of the FUNCTION, not a verdict about the code.
+      // Routing it through the compile-failure reason below would spend
+      // this code object's one automatic attempt on something it did not
+      // do, and disable it for good.
+      return kCodeMoved311;
+    }
+    if (const char* compiler_reason = Ci_JitShell311_TakeExecuteRefusal()) {
+      return compiler_reason;
+    }
+    JIT_LOG(
+        "execute compile returned {} for {}",
+        static_cast<int>(result),
+        functionName(func));
+    return "SUPPORTED_OPCODE_FAILURE";
+  } catch (const std::bad_alloc&) {
+    PyErr_Clear();
+    JIT_LOG("execute compile ran out of memory for {}", functionName(func));
+    return "SUPPORTED_OPCODE_FAILURE";
+  } catch (const std::exception& exc) {
+    PyErr_Clear();
+    JIT_LOG(
+        "execute compile failed for {}: {}", functionName(func), exc.what());
+    return "SUPPORTED_OPCODE_FAILURE";
+  } catch (...) {
+    PyErr_Clear();
+    JIT_LOG(
+        "execute compile failed for {}: unknown exception", functionName(func));
+    return "SUPPORTED_OPCODE_FAILURE";
+  }
+}
+
+} // namespace
+
 extern "C" const char* Ci_JitShell311_RequestCompile(
-    PyFunctionObject* raw_func) {
+    PyFunctionObject* raw_func,
+    PyCodeObject* raw_expected_code) {
   BorrowedRef<PyFunctionObject> func{raw_func};
+  BorrowedRef<PyCodeObject> expected_code{raw_expected_code};
   try {
     // Eligibility reads Python objects (co_names, flags, namespaces) and must
     // stay inside the same exception boundary as CompileShadow: a legal
     // CodeType can still raise from the C-API, and that must never escape
     // into the interpreted call.
     const char* reason = eligibilityReason(func);
+    if (configuredExecuteMode()) {
+      // Everything since the count allocated, so `__code__` may have
+      // moved.  The attempt belongs to the code that earned it; a
+      // function pointing elsewhere is not this attempt's subject.
+      if (expected_code != nullptr && func->func_code != expected_code) {
+        return CI_JIT_RESULT_311_DEFERRED;
+      }
+      // Ask before anything is spent: an allocation above can run a
+      // finalizer that reaches the control plane, and that refusal says
+      // nothing about this code object.
+      if (Ci_JitShell311_DispatchDeferred()) {
+        return CI_JIT_RESULT_311_DEFERRED;
+      }
+      // One attempt per code object; the verdict lives on the code so
+      // every door sees it, and force_compile() stays available.  The
+      // subject is the PINNED code, captured before the attempt: the
+      // attempt runs arbitrary Python, a __code__ swap inside it must
+      // neither be compiled on a threshold it did not earn nor recorded
+      // as this code's verdict, and 3.11 has no watcher to notice.
+      BorrowedRef<PyCodeObject> code{
+          expected_code != nullptr
+              ? expected_code
+              : BorrowedRef<PyCodeObject>{func->func_code}};
+      const char* verdict =
+          reason != nullptr ? reason : requestExecute311(func, code);
+      if (verdict == kCodeMoved311) {
+        // The function moved mid-attempt.  Nothing was compiled and
+        // nothing is judged: the code that earned the threshold keeps its
+        // attempt, and the code that did not earn it gets no verdict.
+        return CI_JIT_RESULT_311_DEFERRED;
+      }
+      if (std::strcmp(verdict, CI_JIT_RESULT_311_INSTALLED) != 0) {
+        // The one site that writes the verdict.  A disable() landing
+        // inside the attempt turns the answer into the capability
+        // refusal, which says nothing about this code: report the attempt
+        // withheld rather than making a reversible state permanent.
+        if (Ci_JitShell311_DispatchDeferred()) {
+          return CI_JIT_RESULT_311_DEFERRED;
+        }
+        if (isCodeScopedRefusal311(verdict)) {
+          disableCodeAutoJit311(code);
+        }
+      }
+      return verdict;
+    }
     if (reason != nullptr) {
       return reason;
-    }
-
-    if (canaryMode()) {
-      BorrowedRef<PyCodeObject> code{func->func_code};
-      if ((code->co_flags & CO_GENERATOR) != 0) {
-        return "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED";
-      }
-      // canary: compile, install and let the next call execute machine code.
-      // The execute surface is narrower than the shadow surface; refusals
-      // report their registered reason so observe accounting stays closed.
-      // Ask the same predicate the compile choke point uses, so a refusal
-      // is reported with its registered reason instead of surfacing later as
-      // an opaque compile failure.
-      if (const char* execute_reason = Ci_JitShell311_ExecuteRefusal(func)) {
-        return execute_reason;
-      }
-      if (isJitCompiled(func)) {
-        return "installed";
-      }
-      try {
-        jit::Result result = jit::compileFunction(func);
-        if (result == jit::Result::OK) {
-          return "installed";
-        }
-        PyErr_Clear();
-        if (const char* compiler_reason = Ci_JitShell311_TakeExecuteRefusal()) {
-          return compiler_reason;
-        }
-        JIT_LOG(
-            "canary compile returned {} for {}",
-            static_cast<int>(result),
-            functionName(func));
-        return "SUPPORTED_OPCODE_FAILURE";
-      } catch (const std::exception& exc) {
-        PyErr_Clear();
-        JIT_LOG(
-            "canary compile failed for {}: {}", functionName(func), exc.what());
-        return "SUPPORTED_OPCODE_FAILURE";
-      } catch (...) {
-        PyErr_Clear();
-        JIT_LOG(
-            "canary compile failed for {}: unknown exception",
-            functionName(func));
-        return "SUPPORTED_OPCODE_FAILURE";
-      }
     }
 
     // Preloaders collect Python-object facts on this GIL-holding thread and
@@ -564,6 +700,425 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
         "shadow compile failed for {}: unknown exception", functionName(func));
     return "SUPPORTED_OPCODE_FAILURE";
   }
+}
+
+extern "C" int Ci_JitShell311_CodeHasArtifact(PyCodeObject* code) {
+  return code != nullptr && codeHasArtifact311(code) ? 1 : 0;
+}
+
+extern "C" int Ci_JitShell311_CodeAutoJitDisabled(PyCodeObject* code) {
+  return code != nullptr && codeAutoJitDisabled311(code);
+}
+
+// The transient conditions shared by every scheduling door: under a trace
+// or profile function a publication would immediately fall back and be
+// reported as a failed attempt, and inside an import/setup scope nothing
+// says the code is hot.  Neither says anything about the code object, so
+// neither may spend an attempt or a budget.
+static bool autoJitTransientHold311(void) {
+  PyThreadState* tstate = PyThreadState_Get();
+  if (tstate == nullptr || tstate->c_tracefunc != nullptr ||
+      tstate->c_profilefunc != nullptr) {
+    return true;
+  }
+  return jit::autoJitImportDepth() > 0 || jit::autoJitSetupDepth() > 0;
+}
+
+extern "C" int Ci_JitShell311_DispatchDeferred(void) {
+  // Called only from the execute-mode dispatch, which gates on the
+  // CONFIGURED mode.  This predicate must not gate on executeMode()
+  // itself: that reads the live JIT state, which is exactly what a pause
+  // changes -- asking it here would answer "nothing to defer" in the one
+  // situation the deferral exists for.
+  if (jit::isJitPaused() || !jit::isJitUsable()) {
+    // A paused JIT refuses every request with the capability reason.
+    // Dispatching into that would burn the code object's one attempt on a
+    // state the next enable() undoes.
+    return 1;
+  }
+  if (!Ci_EvalHook311_IsInstalled()) {
+    // Without our evaluator nothing runs compiled, so an install would be
+    // published and never entered.
+    return 1;
+  }
+  return autoJitTransientHold311() ? 1 : 0;
+}
+
+namespace {
+
+// Whether `needle` is a code object nested (up to `depth` levels down)
+// inside `haystack`'s constants.  Identity only, no eligibility filter, no
+// allocation: this runs on the scheduling path, once per hot nested code
+// object and caller-chain entry.
+bool codeContains311(
+    BorrowedRef<PyCodeObject> haystack,
+    BorrowedRef<PyCodeObject> needle,
+    int depth) {
+  BorrowedRef<> consts{haystack->co_consts};
+  if (consts == nullptr || !PyTuple_CheckExact(consts)) {
+    return false;
+  }
+  Py_ssize_t size = PyTuple_GET_SIZE(consts.get());
+  for (Py_ssize_t i = 0; i < size; i++) {
+    PyObject* item = PyTuple_GET_ITEM(consts.get(), i);
+    if (!PyCode_Check(item)) {
+      continue;
+    }
+    if (item == reinterpret_cast<PyObject*>(needle.get())) {
+      return true;
+    }
+    if (depth > 1 &&
+        codeContains311(
+            reinterpret_cast<PyCodeObject*>(item), needle, depth - 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A nested function is normally called by its outer or by something the
+// outer called a few frames down; three levels cover a lambda inside a
+// comprehension inside a function.
+//
+// This is a search, not an answer, and the distinction matters: 3.11 does
+// not record which function object created another, so the anchor has to
+// be recognised from the outside.  What the search cannot see is a nested
+// function whose outer function is neither on the caller chain nor bound
+// in the namespace -- a closure built by a factory, handed to a queue and
+// called from an unrelated thread, say.  The consequence is bounded and
+// benign: the instance that was compiled keeps its machine code, and the
+// rest of the instances interpret.  Nothing is misattributed, because the
+// anchor is only ever accepted when the candidate's own constants contain
+// the code object.
+//
+// The exact answer is a lexical one -- stamp the creating function on the
+// function object at MAKE_FUNCTION -- which means touching the vendored
+// evaluator and the function layout, and is deliberately left as its own
+// change rather than folded into the scheduler.
+constexpr int kOuterWalkFrames = 8;
+constexpr int kOuterWalkNesting = 3;
+
+bool sameNamespace311(
+    BorrowedRef<PyFunctionObject> candidate,
+    BorrowedRef<PyFunctionObject> func) {
+  return candidate->func_globals == func->func_globals &&
+      candidate->func_builtins == func->func_builtins;
+}
+
+// The outer function of a nested code object, found where it normally
+// lives: bound to a name in the module namespace, or a method in a class
+// bound there.  A closure returned by a factory and called from elsewhere
+// has no trace of its outer in the caller chain, but the factory itself is
+// a module attribute (or a method) for as long as the module lives -- and
+// that is exactly the lifetime the artifact should have.  The walk itself
+// runs no Python, so the dictionaries cannot change underneath it; the
+// result is returned OWNING, because what happens next (arming the death
+// watch) allocates, and an allocation can collect and run a finalizer that
+// drops the very binding this was found through.
+Ref<PyFunctionObject> findOuterInNamespace311(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> code) {
+  BorrowedRef<> globals{func->func_globals};
+  if (globals == nullptr || !PyDict_CheckExact(globals)) {
+    return {};
+  }
+  auto consider = [&](PyObject* value) -> BorrowedRef<PyFunctionObject> {
+    if (value == nullptr) {
+      return nullptr;
+    }
+    // A factory bound as a staticmethod or classmethod is the wrapper, not
+    // the function: `C.factory` in the class dictionary is a descriptor
+    // object.  Unwrap the two exact types -- their `__func__` is a plain
+    // member, so reading it runs no Python and cannot disturb the walk.
+    // (A subclass could override attribute access, so only exact types are
+    // unwrapped; other wrappers -- functools.wraps and friends -- are not
+    // reachable this way and rely on the caller chain.)
+    Ref<> unwrapped;
+    if (Py_TYPE(value) == &PyStaticMethod_Type ||
+        Py_TYPE(value) == &PyClassMethod_Type) {
+      unwrapped = Ref<>::steal(PyObject_GetAttrString(value, "__func__"));
+      if (unwrapped == nullptr) {
+        PyErr_Clear();
+        return nullptr;
+      }
+      value = unwrapped.get();
+    }
+    if (!PyFunction_Check(value)) {
+      return nullptr;
+    }
+    BorrowedRef<PyFunctionObject> candidate{value};
+    BorrowedRef<PyCodeObject> candidate_code{candidate->func_code};
+    if (candidate_code == nullptr || candidate_code == code ||
+        !sameNamespace311(candidate, func) ||
+        !codeContains311(candidate_code, code, kOuterWalkNesting)) {
+      return nullptr;
+    }
+    return candidate;
+  };
+  Py_ssize_t pos = 0;
+  PyObject* key = nullptr;
+  PyObject* value = nullptr;
+  while (PyDict_Next(globals, &pos, &key, &value)) {
+    if (BorrowedRef<PyFunctionObject> outer = consider(value)) {
+      return Ref<PyFunctionObject>::create(outer);
+    }
+    if (!PyType_Check(value)) {
+      continue;
+    }
+    // Methods: one level into the class namespace, where `consider`
+    // unwraps an exact staticmethod/classmethod binding.
+    BorrowedRef<> type_dict{reinterpret_cast<PyTypeObject*>(value)->tp_dict};
+    if (type_dict == nullptr || !PyDict_Check(type_dict)) {
+      continue;
+    }
+    Py_ssize_t type_pos = 0;
+    PyObject* member_key = nullptr;
+    PyObject* member = nullptr;
+    while (PyDict_Next(type_dict, &type_pos, &member_key, &member)) {
+      if (BorrowedRef<PyFunctionObject> outer = consider(member)) {
+        return Ref<PyFunctionObject>::create(outer);
+      }
+    }
+  }
+  return {};
+}
+
+} // namespace
+
+// The outer-function walk proper; the exported entry point below is its
+// exception boundary.  Registration allocates (the outer-function map, the
+// nested-code walk's containers), and the caller is a C translation unit
+// compiled without exception support: a std::bad_alloc crossing back into
+// it would skip the observer's own cleanup and unwind into frames with no
+// landing pads.  Losing the anchoring is survivable; escaping is not.
+namespace {
+
+void trackOuterFromFrameImpl311(
+    PyFunctionObject* raw_func,
+    _PyInterpreterFrame* frame) {
+  // `frame` may be null (an explicit request without a frame to walk from):
+  // the namespace lookup still runs, only the caller chain is skipped.
+  if (!executeMode() || raw_func == nullptr || !PyFunction_Check(raw_func)) {
+    return;
+  }
+  BorrowedRef<PyFunctionObject> func{raw_func};
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if ((code->co_flags & CO_NESTED) == 0) {
+    // A top-level function's artifact is anchored by the function itself,
+    // and a module keeps its functions alive; there is no outer to find.
+    return;
+  }
+  // The namespace binding is the stable owner; the caller chain is the
+  // fallback for an outer that is not bound anywhere (a nested factory, a
+  // script's module body).  In the chain, prefer the outermost function
+  // that contains the code: the intermediate levels (a comprehension
+  // function, say) are themselves fresh per call and would anchor nothing
+  // for long.
+  // OWNING, and held until the death watch is armed: registration
+  // allocates (a weak reference, its callback, the map rows), an
+  // allocation can collect, and a finalizer can drop the binding this
+  // outer was found through -- `del globals["factory"]` is enough.  The
+  // rows recorded below are borrowed and only the watch makes them
+  // honest, so the function must not be freed before the watch exists.
+  Ref<PyFunctionObject> outer = findOuterInNamespace311(func, code);
+  // The frame being entered is not linked yet: the evaluator sets
+  // frame->previous when it starts running the frame, after this hook.
+  // The caller chain therefore starts at the thread's current frame, and
+  // the entering frame itself is skipped should it already be there.
+  PyThreadState* tstate = PyThreadState_GET();
+  _PyInterpreterFrame* caller =
+      frame != nullptr && tstate != nullptr && tstate->cframe != nullptr
+      ? tstate->cframe->current_frame
+      : nullptr;
+  if (caller != nullptr && caller == frame) {
+    caller = caller->previous;
+  }
+  int walked = 0;
+  for (; outer == nullptr && caller != nullptr && walked < kOuterWalkFrames;
+       caller = caller->previous, walked++) {
+    PyFunctionObject* candidate = caller->f_func;
+    if (candidate == nullptr || !PyFunction_Check(candidate)) {
+      continue;
+    }
+    BorrowedRef<PyFunctionObject> candidate_func{candidate};
+    BorrowedRef<PyCodeObject> candidate_code{candidate->func_code};
+    if (candidate_code == code || !sameNamespace311(candidate_func, func)) {
+      // Recursion, or a namespace the artifact is not compiled for: the
+      // publication would not anchor on it anyway.
+      continue;
+    }
+    if (codeContains311(candidate_code, code, kOuterWalkNesting)) {
+      // Keep walking: a containing caller further up is outer still.
+      Ref<PyFunctionObject> outermost =
+          Ref<PyFunctionObject>::create(candidate_func);
+      for (_PyInterpreterFrame* above = caller->previous;
+           above != nullptr && walked < kOuterWalkFrames;
+           above = above->previous, walked++) {
+        PyFunctionObject* higher = above->f_func;
+        if (higher == nullptr || !PyFunction_Check(higher)) {
+          continue;
+        }
+        BorrowedRef<PyFunctionObject> higher_func{higher};
+        BorrowedRef<PyCodeObject> higher_code{higher->func_code};
+        if (higher_code != code && sameNamespace311(higher_func, func) &&
+            codeContains311(higher_code, code, kOuterWalkNesting)) {
+          outermost = Ref<PyFunctionObject>::create(higher_func);
+        }
+      }
+      outer = std::move(outermost);
+      break;
+    }
+  }
+  if (outer != nullptr) {
+    jit::trackOuterFunction311(outer);
+  }
+}
+
+} // namespace
+
+extern "C" void Ci_JitShell311_TrackOuterFromFrame(
+    PyFunctionObject* raw_func,
+    _PyInterpreterFrame* frame) {
+  try {
+    trackOuterFromFrameImpl311(raw_func, frame);
+  } catch (const std::exception& exc) {
+    JIT_LOG("outer-function tracking failed: {}", exc.what());
+  } catch (...) {
+    JIT_LOG("outer-function tracking failed: unknown exception");
+  }
+}
+
+// The attachment proper; the exported entry point below is its exception
+// boundary (see trackOuterFromFrameImpl311 -- the eligibility scan and the
+// publication both allocate, and the caller cannot catch).
+namespace {
+
+int attachFreshImpl311(PyFunctionObject* raw_func) {
+  // The answer contract: 1 attached, 0 nothing this time, -1 never again
+  // for this code object.  Everything before the publication is a cheap
+  // read; the publication itself runs only for a function that will run
+  // machine code afterwards.
+  if (!executeMode() || raw_func == nullptr || !PyFunction_Check(raw_func)) {
+    return 0;
+  }
+  if (jit::isJitPaused() || !jit::isJitUsable() ||
+      !Ci_EvalHook311_IsInstalled()) {
+    // A paused JIT re-attaches its parked members on enable(); a fresh
+    // instance simply waits.  Without our evaluator nothing runs compiled.
+    return 0;
+  }
+  BorrowedRef<PyFunctionObject> func{raw_func};
+  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra == nullptr) {
+    return 0;
+  }
+  if (Ci_code_extra_jit311_auto_disabled(extra)) {
+    return -1;
+  }
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr) {
+    // Uncompiled, or the artifact died with its last anchor: nothing to
+    // attach to (and nothing will be compiled again automatically).
+    return 0;
+  }
+  if (compiled->functions().contains(func)) {
+    // A member that fell back to the interpreter for this call (tracing,
+    // a foreign evaluator in between) -- not a fresh instance.
+    return 0;
+  }
+  if (extra->jit_globals != func->func_globals ||
+      extra->jit_builtins != func->func_builtins) {
+    // A namespace twin; the artifact is not compiled for it.
+    return 0;
+  }
+  uint32_t budget = jit::getConfig().fresh_attach_budget;
+  if (Ci_code_extra_jit311_attach_count(extra) >= budget) {
+    return -1;
+  }
+  if (autoJitTransientHold311()) {
+    // Fresh attachment is a scheduling door too, reached BEFORE the
+    // threshold path; the same transient treatment applies, and nothing
+    // is spent -- the next clean call attaches.
+    return 0;
+  }
+  if (Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+    return 0;
+  }
+  // Pin the artifact across the publication: finalizeFunc() allocates, an
+  // allocation can collect, and a collection can drop the last anchor of
+  // an artifact whose only members were fresh instances that are already
+  // gone -- freeing the artifact mid-publication (the spike's use-after-
+  // free).  The pin outlives every step below.
+  Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  auto* ctx =
+      static_cast<jit::Context*>(cinderx::getModuleState()->jit_context.get());
+  if (ctx == nullptr) {
+    return 0;
+  }
+  bool published = false;
+  try {
+    published = ctx->finalizeFunc(func, compiled);
+  } catch (const std::exception& exc) {
+    JIT_LOG(
+        "fresh attachment failed for {}: {}", functionName(func), exc.what());
+    published = false;
+  } catch (...) {
+    JIT_LOG(
+        "fresh attachment failed for {}: unknown exception",
+        functionName(func));
+    published = false;
+  }
+  if (!published) {
+    PyErr_Clear();
+    return 0;
+  }
+  // finalizeFunc() reports a refusal as "nothing to do", so its answer
+  // cannot distinguish a refusal from a publication; membership can, and
+  // this function was not a member before the attempt.
+  //
+  // Membership, not the entry predicate.  The two say different things: a
+  // disable() landing inside the publication -- finalizeFunc() allocates,
+  // an allocation can collect, a finalizer can reach the control plane --
+  // leaves the association standing while the entry predicate answers "not
+  // runnable right now", and the next enable() makes this member run
+  // machine code.  Charging the budget on runnability would let that
+  // member in for free and lift the per-code cap by one for every
+  // publication a disable() lands in.
+  if (!compiled->functions().contains(func)) {
+    return 0;
+  }
+  // The subject of an attachment is the code object whose artifact is
+  // being attached and whose per-code budget pays for it.  Publication
+  // allocates, an allocation can collect, and a finalizer can reassign
+  // `__code__`, so the function may no longer be about this code at all
+  // -- and `extra` is that code's block, so charging it here would spend
+  // one of its lifetime attachments on a function that is not its
+  // instance any more.  The entry point already answers by the current
+  // code, so nothing runs wrong; the budget is what must not drift.
+  if (reinterpret_cast<PyCodeObject*>(func->func_code) != code) {
+    return 0;
+  }
+  Ci_code_extra_jit311_note_attach(extra);
+  return 1;
+}
+
+} // namespace
+
+extern "C" int Ci_JitShell311_AttachFresh(PyFunctionObject* raw_func) {
+  try {
+    return attachFreshImpl311(raw_func);
+  } catch (const std::exception& exc) {
+    PyErr_Clear();
+    JIT_LOG("fresh attachment failed: {}", exc.what());
+  } catch (...) {
+    PyErr_Clear();
+    JIT_LOG("fresh attachment failed: unknown exception");
+  }
+  // Nothing was attached, but the failure says nothing about the code
+  // object: a later call may try again.
+  return 0;
 }
 
 #endif // PY_VERSION_HEX < 0x030C0000

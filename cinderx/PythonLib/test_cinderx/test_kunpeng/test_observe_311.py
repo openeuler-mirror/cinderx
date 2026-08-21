@@ -1,11 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""Eval/Observe runtime mode on CPython 3.11.
+"""The CPython 3.11 runtime modes: off, observe, shadow and execute.
 
 Hot counting at the frame entry, exactly one scheduling request per hot code
-object, the typed refusal at the compile entry point, and the startup
-controls that select the mode.  Every test runs its scenario in a child
-interpreter because the mode is parsed from the environment at install time.
+object, the typed refusal at the compile entry point, the execute mode that
+installs machine code from the same request, and the startup controls that
+select the mode.  Every test runs its scenario in a child interpreter because
+the mode is parsed from the environment at install time.
 """
 
 import json
@@ -295,7 +296,7 @@ print(json.dumps(_cinderx._get_observe_stats()))
         self.assertFalse(payload["enabled"])
         self.assertEqual(payload["events"], [])
 
-    def test_execute_mode_refuses_the_takeover(self) -> None:
+    def test_unknown_mode_refuses_the_takeover(self) -> None:
         payload = run_child(
             """\
 import json
@@ -311,13 +312,106 @@ except RuntimeError as exc:
 print(json.dumps({
     "installed": _cinderx.is_frame_evaluator_installed(),
     "message": message,
+    "stats": _cinderx._get_observe_stats(),
 }))
 """,
-            CINDERX_JIT_MODE="execute",
+            CINDERX_JIT_MODE="turbo",
         )
         # The stock entry point stays in place and the reason is explicit.
         self.assertFalse(payload["installed"])
         self.assertIn("not accepted", payload["message"])
+        # The accepted spellings are all named, and nothing was configured.
+        for spelling in ("off", "observe", "shadow", "execute", "canary"):
+            self.assertIn(spelling, payload["message"])
+        self.assertFalse(payload["stats"]["enabled"])
+        self.assertEqual(payload["stats"]["mode"], "off")
+
+    EXECUTE_PROBE = PREAMBLE + """\
+import cinderjit
+
+def hot(a, b):
+    total = a - a
+    i = total
+    while i < b:
+        total = total + a
+        i = i + 1
+    return total
+
+before = _cinderx._get_trigger_stats()["machine_code_entries"]
+values = [hot(i, 4) for i in range(@T@ + 5)]
+after = _cinderx._get_trigger_stats()["machine_code_entries"]
+stats = _cinderx._get_observe_stats()
+print(json.dumps({
+    "values_ok": values == [i * 4 for i in range(@T@ + 5)],
+    "events": [e for e in stats["events"] if e["qualname"] == "hot"],
+    "mode": stats["mode"],
+    "requested_mode": stats["requested_mode"],
+    "enabled": stats["enabled"],
+    "threshold": stats["threshold"],
+    "compiled": cinderjit.is_jit_compiled(hot),
+    "entries": after - before,
+    "jit_enabled": cinderjit.is_enabled(),
+}))
+"""
+
+    def test_canary_is_the_test_spelling_of_execute(self) -> None:
+        # Same machinery, same policy, reported under its own name so the
+        # earlier gate legs keep their configuration and their evidence.
+        payload = run_child(self.EXECUTE_PROBE, CINDERX_JIT_MODE="canary")
+        self.assertEqual(payload["mode"], "execute")
+        self.assertEqual(payload["requested_mode"], "canary")
+        self.assertEqual(payload["events"][0]["result"], "installed")
+        self.assertEqual(payload["entries"], 5)
+
+    def test_disable_switch_outranks_the_execute_mode(self) -> None:
+        # PYTHONJITDISABLE / CINDERX_JIT_DISABLE are the product's "no
+        # machine code" switch: with either set, execute is off -- no
+        # counting, no compilation, no cinderjit module.
+        for switch in ("PYTHONJITDISABLE", "CINDERX_JIT_DISABLE"):
+            with self.subTest(switch=switch):
+                payload = run_child(
+                    PREAMBLE
+                    + """\
+def hot(a):
+    return a + 1
+
+for i in range(@T@ * 2):
+    hot(i)
+try:
+    import cinderjit
+except ImportError:
+    cinderjit = None
+stats = _cinderx._get_observe_stats()
+print(json.dumps({
+    "stats": stats,
+    "cinderjit": cinderjit is not None,
+    "trigger": _cinderx._get_trigger_stats(),
+}))
+""",
+                    CINDERX_JIT_MODE="execute",
+                    **{switch: "1"},
+                )
+                self.assertFalse(payload["stats"]["enabled"])
+                self.assertEqual(payload["stats"]["mode"], "off")
+                self.assertEqual(payload["stats"]["requested_mode"], "execute")
+                self.assertEqual(payload["stats"]["events"], [])
+                self.assertFalse(payload["cinderjit"])
+                self.assertTrue(all(v == 0 for v in payload["trigger"].values()))
+
+    def test_execute_mode_refuses_the_auto_classifier(self) -> None:
+        # The 3.12+ behaviour classifier is not part of this port: the
+        # environment spelling is refused by the threshold parser, and the
+        # -X option is refused by the mode initialization itself.
+        from test.support.script_helper import assert_python_failure
+
+        rc, out, err = assert_python_failure(
+            "-X",
+            "jit-auto=auto:4",
+            "-c",
+            "import _cinderx",
+            CINDERX_JIT_MODE="execute",
+        )
+        self.assertIn(b"classification is not supported", err)
 
     def test_unusable_threshold_refuses_the_takeover(self) -> None:
         payload = run_child(
@@ -411,6 +505,47 @@ print(json.dumps({"names": names}))
             "-c", probe, CINDERX_PLUGIN_ENABLE="1", CINDERX_EVAL_MODE="stock"
         )
         self.assertFalse(json.loads(out.decode().strip().splitlines()[-1]))
+
+    def test_startup_control_publishes_cinderjit_only_in_execute(self) -> None:
+        probe = (
+            "import _cinderx_auto, json; "
+            "print(json.dumps({"
+            "'cinderjit': _cinderx_auto.cinderjit is not None, "
+            "'installed': _cinderx_auto._cinderx.is_frame_evaluator_installed(), "
+            "'mode': _cinderx_auto._cinderx._get_observe_stats()['mode']}))"
+        )
+        expectations = {
+            "execute": (True, "execute"),
+            "canary": (True, "execute"),
+            "shadow": (False, "shadow"),
+            "observe": (False, "observe"),
+            "off": (False, "off"),
+        }
+        for mode, (has_cinderjit, resolved) in expectations.items():
+            with self.subTest(mode=mode):
+                rc, out, err = assert_python_ok(
+                    "-c",
+                    probe,
+                    CINDERX_PLUGIN_ENABLE="1",
+                    CINDERX_EVAL_MODE="cinder",
+                    CINDERX_JIT_MODE=mode,
+                )
+                payload = json.loads(out.decode().strip().splitlines()[-1])
+                self.assertEqual(payload["cinderjit"], has_cinderjit)
+                self.assertTrue(payload["installed"])
+                self.assertEqual(payload["mode"], resolved)
+        # The disable switch wins at startup too.
+        rc, out, err = assert_python_ok(
+            "-c",
+            probe,
+            CINDERX_PLUGIN_ENABLE="1",
+            CINDERX_EVAL_MODE="cinder",
+            CINDERX_JIT_MODE="execute",
+            PYTHONJITDISABLE="1",
+        )
+        payload = json.loads(out.decode().strip().splitlines()[-1])
+        self.assertFalse(payload["cinderjit"])
+        self.assertEqual(payload["mode"], "off")
 
     def test_startup_control_refuses_unknown_modes(self) -> None:
         from test.support.script_helper import assert_python_failure

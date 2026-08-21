@@ -615,13 +615,31 @@ def _is_autojit_classification_value(value: object) -> bool:
     return isinstance(value, str) and (value == "auto" or value.startswith("auto:"))
 
 
+def _autojit_scheduling_is_configured() -> bool:
+    """Whether a mode that schedules automatically is configured.
+
+    On 3.12+ that is the auto[:N] classifier, which is also what asks for
+    the import and setup providers.  CPython 3.11 refuses that spelling --
+    its threshold is a plain count -- and names the mode separately, so
+    the providers have to key off the mode there.  Keying off the
+    classifier alone left them off in exactly the configuration that
+    schedules: CINDERX_JIT_MODE=execute with a numeric PYTHONJITAUTO,
+    which is the product configuration and the one the matrix tests.
+    """
+    if _is_autojit_classification_value(
+        environ.get("PYTHONJITAUTO")
+    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+        return True
+    if sys.version_info[:2] == (3, 11):
+        return environ.get("CINDERX_JIT_MODE") in ("execute", "canary")
+    return False
+
+
 def _autojit_import_provider() -> str:
     provider = environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER")
     if provider is not None:
         return provider
-    if _is_autojit_classification_value(
-        environ.get("PYTHONJITAUTO")
-    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+    if _autojit_scheduling_is_configured():
         return "find_and_load"
     return "off"
 
@@ -630,9 +648,7 @@ def _autojit_setup_provider() -> str:
     provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER")
     if provider is not None:
         return provider
-    if _is_autojit_classification_value(
-        environ.get("PYTHONJITAUTO")
-    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+    if _autojit_scheduling_is_configured():
         return "lib2to3_main,multiprocessing_pool"
     return "off"
 
@@ -813,23 +829,58 @@ def _maybe_install_autojit_setup_provider_for_module(
             _install_autojit_multiprocessing_pool_provider(module)
 
 
-def _make_autojit_import_wrapper(original: object, provider: str) -> object:
-    setup_provider = _autojit_setup_provider()
+# The wrapper below replaces importlib._bootstrap._find_and_load, so it
+# becomes a frame in every import.  `warnings` decides which frame to
+# blame with stacklevel, and it skips the import machinery by filename:
+#
+#     def _is_internal_frame(frame):
+#         filename = frame.f_code.co_filename
+#         return 'importlib' in filename and '_bootstrap' in filename
+#
+# A wrapper defined here carries THIS file's name, so it is not skipped
+# and every import-time warning gets blamed on cinderx instead of on the
+# code that imported the module.  Compiling the wrapper under the name of
+# the machinery it stands in for keeps that attribution where it was.
+_AUTOJIT_IMPORT_WRAPPER_FILENAME = "<frozen importlib._bootstrap>"
 
-    def wrapper(*args: object, **kwargs: object) -> object:
-        _autojit_import_enter()
+_AUTOJIT_IMPORT_WRAPPER_SOURCE = """
+def _make(original, provider, setup_provider, enter, leave, install, marker):
+    def wrapper(*args, **kwargs):
+        enter()
         try:
-            # pyre-ignore[29]: The wrapped import callable is dynamically chosen.
             module = original(*args, **kwargs)
         finally:
-            _autojit_import_leave()
+            leave()
         if setup_provider and args and isinstance(args[0], str):
-            _maybe_install_autojit_setup_provider_for_module(
-                args[0], setup_provider
-            )
+            install(args[0], setup_provider)
         return module
 
-    setattr(wrapper, _AUTOJIT_IMPORT_PROVIDER_MARKER, provider)
+    setattr(wrapper, marker, provider)
+    return wrapper
+"""
+
+
+def _make_autojit_import_wrapper(original: object, provider: str) -> object:
+    setup_provider = _autojit_setup_provider()
+    namespace: dict[str, object] = {}
+    exec(
+        compile(
+            _AUTOJIT_IMPORT_WRAPPER_SOURCE,
+            _AUTOJIT_IMPORT_WRAPPER_FILENAME,
+            "exec",
+        ),
+        namespace,
+    )
+    # pyre-ignore[29]: Built by the exec above.
+    wrapper = namespace["_make"](
+        original,
+        provider,
+        setup_provider,
+        _autojit_import_enter,
+        _autojit_import_leave,
+        _maybe_install_autojit_setup_provider_for_module,
+        _AUTOJIT_IMPORT_PROVIDER_MARKER,
+    )
     return wrapper
 
 

@@ -20,10 +20,11 @@ void Ci_InitOpcodes() {}
 // libpython's own copy.
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
-  // Observe/shadow mode's whole disabled-path budget is this predictable flag
-  // test; counting and discard-only compilation never change frame results.
+  // The counting modes' whole disabled-path budget is this predictable flag
+  // test; counting, discard-only compilation and execute-mode scheduling
+  // never change frame results.
   if (Ci_Observe311_Enabled) {
-    Ci_Observe311_OnFrame(frame->f_func);
+    Ci_Observe311_OnFrame(frame->f_func, frame->f_code, frame);
   }
   return Ci_EvalFrameDefault_311(tstate, frame, throwflag);
 }

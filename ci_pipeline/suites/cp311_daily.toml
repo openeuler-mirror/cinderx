@@ -73,6 +73,46 @@ command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-ch
 name = "jit311_pyperf_canary"
 command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-canary'"
 
+# MR-11 acceptance: the execute completion leg covers the full applicable
+# set in the product spelling, three consecutive rounds, zero worker
+# crashes in every round.  Each worker attests its mode; a round that
+# crashes or leaves the ledger open is red on its own.
+[[jobs]]
+name = "jit311_pyperf_execute"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-execute-all --rounds 3'"
+
+# MR-11 acceptance 11: the 72-module confirmed surface under
+# CINDERX_JIT_MODE=execute must produce the same per-testcase results as
+# stock.  The import canary that preceded this leg only proved the modules
+# could be imported while the JIT executed -- importing test_call is not
+# running test_call, so a testcase that behaved differently under Auto-JIT
+# went unseen.  This leg runs the tests and compares case by case, and it
+# fails closed unless the execute arm actually entered machine code.
+[[jobs]]
+name = "libtest_execute_diff_72"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py execute-gate --out \"{run_dir}/libtest-execute\"'"
+
+# MR-11 acceptance 14: the reference-leak hunt the item actually names.
+#
+# THIS LEG CURRENTLY FAILS, on a defect it did not introduce.  With the
+# JIT genuinely running -- which it did not do until the attestation
+# below was added -- regrtest -R reports reference leaks on the execute
+# path.  They are confined to execute mode, they are steady-state, and
+# the MR-10 base leaks MORE of them than this branch does (sum=63 vs 51
+# on test_bool).  The leg is kept red rather than tuned green: see
+# docs/design/cp311-execute-compatibility-deviations.md for the
+# measurements and what is known.
+# regrtest -R needs sys.gettotalrefcount, so the leg builds a Py_DEBUG
+# CPython 3.11.6 and builds CinderX against it (both cached in the work
+# directory; only the first run pays).  It fails closed on its own
+# premises first -- a non-debug interpreter, a CinderX that did not load,
+# an evaluator that did not install, or a run that never reached machine
+# code -- because a clean -R over an interpreted arm is clean for the
+# wrong reason.
+[[jobs]]
+name = "jit311_refleak_execute"
+command = "bash -lc 'ci_pipeline/scripts/run_refleak_311.sh \"{run_dir}/refleak\"'"
+
 [[jobs]]
 name = "jit311_shadow_surface"
 command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --shadow-surface --out \"{run_dir}/shadow-surface\"'"

@@ -50,7 +50,7 @@ INTERP_ONLY_PSEUDO_SLOT = "dispatch slot is never emitted into co_code"
 
 [refusal_reasons.shape]
 REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED = "synchronous generator execution is disabled by the CPython 3.11 capability switch"
-REFUSE_SHAPE_GENERATOR_AUTO_DISABLED = "automatic synchronous-generator compilation stays disabled until MR-11"
+REFUSE_SHAPE_GENERATOR_AUTO_DISABLED = "synchronous generators compile on explicit request only; automatic generator compilation is off by policy (MR-11)"
 REFUSE_SHAPE_ASYNC_CODE = "coroutine and async-generator execution is not eligible"
 REFUSE_SHAPE_NON_FUNCTION_SCOPE = "module, class, and REPL code is not eligible"
 REFUSE_SHAPE_NAMESPACE_UNSUPPORTED = "function globals or builtins namespace cannot be safely preloaded"
@@ -65,8 +65,9 @@ REFUSE_SHAPE_VARIADIC_ARGS_UNAUDITED = "retired: generated prologue binds *args 
 REFUSE_SHAPE_KEYWORD_ARGS_UNAUDITED = "retired: generated prologue binds keyword-only parameters (kept for observe id stability)"
 REFUSE_SHAPE_ARG_DEFAULTS_UNAUDITED = "retired: generated prologue rebinds live defaults (kept for observe id stability)"
 REFUSE_SHAPE_SPECULATIVE_GUARD = "the optimized artifact holds a DeoptPatchpoint; IC patchpoints stay refused until MR-09"
-REFUSE_SHAPE_CODE_ARTIFACT_ALREADY_PUBLISHED = "the code object already has a published compiled artifact owned by another function; one artifact per code object until the MR-05 lifecycle"
-REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE = "a compiled artifact already belongs to another function; sharing needs the MR-05 function-destroy notification"
+REFUSE_SHAPE_CODE_ARTIFACT_ALREADY_PUBLISHED = "the code object already has a published compiled artifact under a different globals/builtins namespace; one artifact per code object (same-namespace functions attach to it)"
+REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE = "retired: same-namespace functions share the code object's artifact since MR-11 (kept for observe id stability)"
+REFUSE_SHAPE_AUTO_JIT_DISABLED = "automatic compilation of the code object was disabled after its one failed or refused automatic attempt (execute mode)"
 REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP = "import machinery is kept interpreted on 3.11; compiling it taxes startup and is not a steady-state win"
 REFUSE_SHAPE_CINDER_MODULE = "compiling cinderx keeps the extension module alive past finalize"
 

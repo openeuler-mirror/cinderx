@@ -567,6 +567,13 @@ void Context::finalizeMultiThreadedCompile() {
   deferred_finalizations_.clear();
 }
 
+namespace {
+// Thrown to abandon a publication whose subject moved: it unwinds to the
+// same restore path an allocation failure takes, without borrowing that
+// failure's meaning (no MemoryError is set for it).
+struct PublicationSubjectMoved {};
+} // namespace
+
 bool Context::finalizeFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
@@ -680,6 +687,28 @@ bool Context::finalizeFunc(
     }
     return false;
   }
+  // The association may have run Python: a fresh function has no
+  // __dict__, so the association allocates one, an allocation can
+  // collect, and a finalizer can reach the control plane -- retiring
+  // this very artifact (force_uncompile on any member takes the artifact
+  // away from all of them).  Completing the publication onto a retired
+  // artifact would leave registry entries its retirement already walked
+  // past, and CompiledFunction::clear() short-circuits on a null owner,
+  // so nothing would ever remove them.  Unwind instead.
+  if (compiled->owner() != this) {
+    if (func->func_dict != nullptr) {
+      if (PyDict_DelItem(func->func_dict, kCompiledFunctionKey) < 0) {
+        PyErr_Clear();
+      }
+      if (displaced_anchor != nullptr &&
+          PyDict_SetItem(
+              func->func_dict, kCompiledFunctionKey, displaced_anchor) < 0) {
+        PyErr_Clear();
+      }
+    }
+    compiled->removeFunction(func);
+    return false;
+  }
   // The association succeeded; the container writes that follow can
   // still throw std::bad_alloc.  An exception here must not escape with
   // the dictionary anchor already written: the artifact would be alive,
@@ -691,7 +720,43 @@ bool Context::finalizeFunc(
   // same channel as an association failure.
   bool installed = false;
   bool failed_allocation = false;
+#if PY_VERSION_HEX < 0x030C0000
+  // Arm the death watch HERE, before the validation: arming allocates
+  // and can run arbitrary Python, and doing it after the validation
+  // would put that Python between the validation and the commit --
+  // exactly what the validation exists to exclude.
+  // Only an arm this call created is taken back down on the unwind.
+  bool watch_created = !func_death_watch_.contains(func.get());
+  bool watch_failed = !watchFunctionDeath(func);
+#else
+  bool watch_created = false;
+  bool watch_failed = false;
+#endif
+
+  // Everything below is the irreversible half of the publication, so
+  // the last look at the subject goes here: the association and the
+  // death watch both allocated, so `__code__` may have moved, and an
+  // artifact that is no longer this function's code must not reach the
+  // registry, the entry point, or the attachment budget.  Leaving
+  // `installed` false runs the allocation-failure unwind.
+  bool subject_moved = false;
+#if PY_VERSION_HEX < 0x030C0000
+  // Both halves of the subject: the code this artifact was built for, and
+  // the artifact still being ours to publish.  A finalizer that retired
+  // it has already run its teardown, so committing a pointer to it would
+  // file a registry row against an object that has stopped maintaining
+  // its own.
+  subject_moved = compiled->owner() != this || compiled->runtime() == nullptr ||
+      reinterpret_cast<PyObject*>(func->func_code) !=
+          compiled->runtime()->code();
+#endif
   try {
+    if (watch_failed) {
+      throw std::bad_alloc();
+    }
+    if (subject_moved) {
+      throw PublicationSubjectMoved{};
+    }
     // Record the claim in the association map, in lockstep with the
     // artifact's member set the association just updated, then the
     // installed registry.  Both writes overwrite the prior claim in
@@ -705,10 +770,17 @@ bool Context::finalizeFunc(
       compiled_funcs_[func] = compiled;
       installed = true;
     } else {
-      installed = addCompiledFunc(func, compiled);
+      installed = commitCompiledFunc(func, compiled);
     }
+  } catch (const PublicationSubjectMoved&) {
+    // installed stays false; the unwind below restores the prior state.
   } catch (const std::bad_alloc&) {
     failed_allocation = true;
+  }
+  if ((failed_allocation || !installed) && watch_created) {
+    // Only an arm this call created.  A function already under the watch
+    // for another artifact keeps it.
+    forgetFunctionDeathWatch(func);
   }
   if (failed_allocation || !installed) {
     // Either an allocation failed mid-transaction, or -- unreachable
@@ -1128,6 +1200,33 @@ void Context::forgetCodeForArtifact(
 }
 #endif
 
+// Take `compiled` back out of `outer`'s nested-artifact list.  The list is
+// how an outer function keeps a nested artifact resident, so the entry has
+// to come out on every path that abandons the artifact -- otherwise the
+// code buffer lives as long as the outer function with nothing able to
+// reach it.  The caller must hold its own reference to `compiled`: the
+// removal drops the list's.
+void removeNestedAnchor(
+    BorrowedRef<PyFunctionObject> outer,
+    BorrowedRef<CompiledFunction> compiled) {
+  if (outer == nullptr || compiled == nullptr || outer->func_dict == nullptr) {
+    return;
+  }
+  Ref<> nested_list = getDictRef(outer->func_dict, kNestedCompiledFunctionsKey);
+  if (nested_list == nullptr || !PyList_CheckExact(nested_list.get())) {
+    return;
+  }
+  for (Py_ssize_t i = PyList_GET_SIZE(nested_list.get()) - 1; i >= 0; i--) {
+    if (PyList_GET_ITEM(nested_list.get(), i) ==
+        reinterpret_cast<PyObject*>(compiled.get())) {
+      if (PyList_SetSlice(nested_list.get(), i, i + 1, nullptr) < 0) {
+        PyErr_Clear();
+      }
+      break;
+    }
+  }
+}
+
 void Context::forgetCodeEntry(
     UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>>::iterator it,
     BorrowedRef<PyFunctionObject> func) {
@@ -1146,23 +1245,7 @@ void Context::forgetCodeEntry(
   BorrowedRef<PyCodeObject> code{it->first.code};
   auto outer_it = code_outer_funcs_.find(code);
   if (outer_it != code_outer_funcs_.end() && outer_it->second != func) {
-    BorrowedRef<PyFunctionObject> outer = outer_it->second;
-    PyObject* outer_dict = outer->func_dict;
-    if (outer_dict != nullptr) {
-      Ref<> nested_list = getDictRef(outer_dict, kNestedCompiledFunctionsKey);
-      if (nested_list != nullptr && PyList_CheckExact(nested_list.get())) {
-        for (Py_ssize_t i = PyList_GET_SIZE(nested_list.get()) - 1; i >= 0;
-             i--) {
-          if (PyList_GET_ITEM(nested_list.get(), i) ==
-              reinterpret_cast<PyObject*>(cf.get())) {
-            if (PyList_SetSlice(nested_list.get(), i, i + 1, nullptr) < 0) {
-              PyErr_Clear();
-            }
-            break;
-          }
-        }
-      }
-    }
+    removeNestedAnchor(outer_it->second, cf);
   }
 
   clearCachedCompiledIfMatches(code, cf.get());
@@ -1596,6 +1679,15 @@ void Context::drainDeferredAnchorReleases() {
 }
 #endif
 
+// Record the borrowed artifact pointer.  Runs no Python and allocates
+// only the map node, so it cannot collect: callers that have already
+// validated the subject can rely on it still being valid here.
+bool Context::commitCompiledFunc(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<CompiledFunction> compiled) {
+  return compiled_funcs_.emplace(func, compiled).second;
+}
+
 bool Context::addCompiledFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
@@ -1603,12 +1695,16 @@ bool Context::addCompiledFunc(
   // Arm the watch before recording the borrowed pointer; failure fails
   // the publication (MemoryError via the transaction).  Only an arm this
   // call created is taken back down on a later failure.
+  //
+  // finalizeFunc() does not come through here: it arms the watch itself,
+  // before its last validation, so that no arbitrary Python runs between
+  // that validation and the commit.
   bool was_watched = func_death_watch_.contains(func.get());
   if (!watchFunctionDeath(func)) {
     throw std::bad_alloc();
   }
   try {
-    if (!compiled_funcs_.emplace(func, compiled).second) {
+    if (!commitCompiledFunc(func, compiled)) {
       if (!was_watched) {
         forgetFunctionDeathWatch(func);
       }
@@ -1622,7 +1718,7 @@ bool Context::addCompiledFunc(
   }
   return true;
 #else
-  return compiled_funcs_.emplace(func, compiled).second;
+  return commitCompiledFunc(func, compiled);
 #endif
 }
 
@@ -1676,11 +1772,31 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
 
   // If the registered outer func for the code is different than the func we
   // will register the CompiledCode on the outer most function.
+  // The outer anchoring below is what keeps a nested artifact resident.
+  // Everything after it can still fail, and an abandoned artifact left in
+  // the list would stay alive for as long as the outer function -- in no
+  // registry, reachable by nothing.  Undo it on the way out unless the
+  // publication completes.  (Before MR-11 `outer` was always null on 3.11,
+  // so none of these paths could leak.)
+  [[maybe_unused]] BorrowedRef<PyFunctionObject> anchored_outer;
   if (outer != nullptr && outer->func_globals == key.globals &&
-      outer->func_builtins == key.builtins &&
-      !associateFunctionWithCompiled(outer, compiled, true)) {
-    return nullptr;
+      outer->func_builtins == key.builtins) {
+    if (!associateFunctionWithCompiled(outer, compiled, true)) {
+      return nullptr;
+    }
+    anchored_outer = outer;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // The local `compiled` reference outlives every unwind below, so the
+  // removal cannot run the artifact's destructor.  Scoped to 3.11: the
+  // 3.14 bailout paths are the reference line's own and are left exactly
+  // as they are.
+  auto unwind_anchor = [&]() {
+    if (anchored_outer != nullptr) {
+      removeNestedAnchor(anchored_outer, compiled);
+    }
+  };
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
   // finalizeFunc() reports a refusal as "nothing to do", which is right
@@ -1689,6 +1805,16 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
   // whose only strong reference is the local one about to expire.  Refuse
   // before anything is published.
   if (func != nullptr && Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+    unwind_anchor();
+    return nullptr;
+  }
+  // The artifact was built for key.code; a `__code__` assignment since
+  // the compile would file it under code it was not compiled from.  The
+  // entry point fails closed on the mismatch, so the damage would be
+  // bookkeeping only -- still, refuse before anything is published.
+  if (func != nullptr &&
+      reinterpret_cast<PyObject*>(func->func_code) != key.code) {
+    unwind_anchor();
     return nullptr;
   }
   // Reserve the execute ledger before anything publishes.  Everything after
@@ -1699,6 +1825,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
   // ledger the entry reads was never written.  An empty pre-reserved block
   // is harmless if compilation fails later.
   if (codeExtraOrError(reinterpret_cast<PyCodeObject*>(key.code)) == nullptr) {
+    unwind_anchor();
     return nullptr;
   }
 #endif
@@ -1718,10 +1845,12 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
             reinterpret_cast<PyCodeObject*>(key.code)->co_qualname));
   } catch (const std::bad_alloc&) {
     PyErr_NoMemory();
+    unwind_anchor();
     return nullptr;
   }
   if (func != nullptr && !finalizeFunc(func, compiled)) {
     compiled_codes_.erase(key);
+    unwind_anchor();
     return nullptr;
   }
   cacheCompiledOnCode(key, compiled);

@@ -15,6 +15,7 @@ They need a CPython 3.11 interpreter with the cinderx wheel importable
 (the gate runs them on the venv the wheel job builds).
 """
 
+import inspect
 import json
 import sys
 
@@ -287,13 +288,190 @@ GATE_REQUIRED_JOBS = {
     "trigger_stats_gate", "jit311_runner_selftests",
     "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
     "observe_gate", "shadow_compile_gate", "release_canary_execute",
-    "generator_corpus_canary",
+    "generator_corpus_canary", "execute_gate",
 }
 DAILY_REQUIRED_JOBS = {
     "asan_build_311", "debug_build_311", "runtime_tests_311_census",
     "jit311_drivers", "jit311_pyperf_completeness", "jit311_pyperf_canary",
-    "jit311_shadow_surface",
+    "jit311_pyperf_execute", "jit311_shadow_surface",
+    "libtest_execute_diff_72",
 }
+
+
+def test_execute_differential_covers_the_confirmed_surface():
+    # MR-11 acceptance 11 is a behaviour differential over the 72-module
+    # confirmed surface, not an import canary: the leg must run the tests
+    # under stock and under execute and compare per-testcase outcomes.
+    sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
+    import libtest_diff_311 as lt
+
+    # One definition of the surface, shared with the import canary.
+    assert lt.load_stdlib72_modules() == list(runners.STDLIB_SHADOW_MODULES)
+    assert len(lt.load_stdlib72_modules()) == 72
+    # Trigger proof: identical results prove nothing if the execute arm
+    # never executed.
+    assert "never entered machine code" in inspect.getsource(lt.cmd_execute_gate)
+    daily = (
+        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
+    ).read_text()
+    assert "libtest_diff_311.py execute-gate" in daily
+
+
+def test_execute_differential_trigger_proof_is_worker_attributed(tmp_path):
+    # The whole point of the ledger is that the regrtest scheduler process
+    # cannot stand in for the workers: it runs plenty of Python of its own,
+    # so a tree-wide sum would pass an arm whose workers all interpreted.
+    sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
+    import libtest_diff_311 as lt
+
+    # Fields: pid role test entries creations own_compiled.  `own_compiled`
+    # is how many compiled functions came from the module the worker was
+    # told to run -- the counters before it are process-wide, so they also
+    # count sitecustomize, the import machinery and regrtest's harness.
+    ledger = tmp_path / "trigger.log"
+    ledger.write_text(
+        "100 other - 999999 42 -1\n"       # scheduler: must not count
+        "101 worker test_int 5 2 3\n"
+        "102 worker test_dis 0 0 0\n"      # a worker that never executed
+        "103 other - 1234 7 -1\n"          # a test's own subprocess
+    )
+    proof = lt.read_trigger_ledger(ledger)
+    assert proof["workers"] == 2
+    assert proof["worker_entries"] == 5
+    assert proof["worker_creations"] == 2
+    assert proof["executing_tests"] == {"test_int"}
+    assert proof["compiling_tests"] == {"test_int"}
+    # A ledger with only a busy scheduler process proves nothing.
+    only_main = tmp_path / "main.log"
+    only_main.write_text("100 other - 999999 42 -1\n")
+    assert lt.read_trigger_ledger(only_main)["workers"] == 0
+    assert lt.read_trigger_ledger(only_main)["worker_entries"] == 0
+    # A missing or empty ledger reads as no proof, never as a default pass.
+    assert lt.read_trigger_ledger(tmp_path / "absent.log")["workers"] == 0
+
+
+def test_execute_differential_refuses_a_scheduler_only_arm():
+    sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
+    import libtest_diff_311 as lt
+
+    src = inspect.getsource(lt.cmd_execute_gate)
+    # The three fail-closed arms: no workers, no worker execution, and
+    # execution that belongs to no target module.
+    assert "no regrtest worker reported" in src
+    assert "test workers never entered machine code" in src
+    assert "not by any worker" in src
+    # And the fourth: worker execution that belongs entirely to the
+    # harness, with no target module compiling a function of its own.
+    assert "had a function of its own" in src
+    assert '"--worker-args"' in lt.STARTUP_SITECUSTOMIZE
+
+
+def test_execute_drivers_are_registered_in_run_all(monkeypatch):
+    # MR-11: run_all carries the product-spelling child and the five
+    # execute rows of the configuration matrix; the matrix's very-high
+    # threshold row is the armed-but-interpreting control.
+    seen = []
+    monkeypatch.setattr(
+        runners,
+        "run",
+        lambda spec, python=None: (seen.append(spec) or runners.RunResult(
+            spec.name, True, [], {}, 0)),
+    )
+    runners.run_all()
+    by_name = {spec.name: spec for spec in seen}
+    assert by_name["execute_auto"].env == {
+        "CINDERX_JIT_MODE": "execute",
+        "PYTHONJITAUTO": "8",
+        "PYTHONMALLOC": "debug",
+    }
+    assert by_name["execute_auto"].asserted_env == {"CINDERX_JIT_MODE": "execute"}
+    execute_rows = [
+        spec for spec in seen
+        if spec.name.startswith("config_matrix_")
+        and spec.env.get("CINDERX_JIT_MODE") == "execute"
+    ]
+    assert [row.env.get("PYTHONJITAUTO") for row in execute_rows] == [
+        "1", "2", "4", None, "1000000000",
+    ]
+    for row in execute_rows:
+        assert row.asserted_env == row.env
+        assert "_stats['mode'] == 'execute'" in row.payload
+
+
+def test_execute_matrix_rows_pin_the_threshold_crossing():
+    rows = [
+        spec for spec in runners.config_matrix_runner()
+        if spec.env.get("CINDERX_JIT_MODE") == "execute"
+    ]
+    by_threshold = {spec.env.get("PYTHONJITAUTO"): spec for spec in rows}
+    # The default threshold is asserted as the literal 50 inside the child.
+    assert "_stats['threshold'] == 50" in by_threshold[None].payload
+    assert "count=50, result='installed'" in by_threshold[None].payload
+    assert "count=4, result='installed'" in by_threshold["4"].payload
+    # The control row expects no event and nothing compiled.
+    assert "assert _hot == [], _hot" in by_threshold["1000000000"].payload
+    control_judges = by_threshold["1000000000"].judges
+    errors = []
+    snap = {
+        "evaluator_installed": True, "executable_alloc_calls": 0,
+        "executable_alloc_bytes": 0, "compiled_function_creations": 0,
+        "machine_code_entries": 0, "machine_code_installed": 0,
+        "forced_deopt_hits": 0, "organic_deopt_hits": 0, "events_dropped": 0,
+        "supported_opcode_failures": 0, "unknown_rejects": 0,
+        "live_compiled_functions_at_exit": 0, "worker_crashes": 0,
+        "compile_requests": 3,
+    }
+    for judge in control_judges:
+        errors += judge(snap)
+    assert any("compile_requests == 0" in err for err in errors)
+
+
+def test_execute_rounds_flag_runs_every_round(monkeypatch):
+    # --pyperf-execute-all runs the full applicable set N times in the
+    # product spelling; one failed round fails the leg.
+    monkeypatch.setattr(
+        runners, "discover_all_pyperf_benchmarks", lambda: ["nbody", "richards"]
+    )
+    monkeypatch.setattr(
+        runners,
+        "pyperformance_completeness_runner",
+        lambda mode="shadow", benchmarks=None: runners.RunnerSpec(
+            name=f"pyperformance_completeness_{mode}",
+            payload="pass\n",
+            env={"CINDERX_JIT_MODE": mode},
+        ),
+    )
+    seen = []
+
+    def fake_run(spec, python=None):
+        seen.append(spec)
+        ok = "round_2" not in spec.name
+        return runners.RunResult(spec.name, ok, [] if ok else ["boom"], {}, 0)
+
+    monkeypatch.setattr(runners, "run", fake_run)
+    assert runners.main(["--pyperf-execute-all", "--rounds", "3"]) == 1
+    assert [spec.name for spec in seen] == [
+        "pyperformance_completeness_execute_round_1_of_3",
+        "pyperformance_completeness_execute_round_2_of_3",
+        "pyperformance_completeness_execute_round_3_of_3",
+    ]
+    assert all(spec.env == {"CINDERX_JIT_MODE": "execute"} for spec in seen)
+    seen.clear()
+    monkeypatch.setattr(
+        runners, "run",
+        lambda spec, python=None: (seen.append(spec) or runners.RunResult(
+            spec.name, True, [], {}, 0)),
+    )
+    assert runners.main(["--pyperf-execute-all"]) == 0
+    assert len(seen) == 3
+    assert runners.main(["--pyperf-execute-all", "--rounds", "0"]) == 2
+
+
+def test_daily_execute_job_runs_three_rounds_of_the_full_set():
+    daily = (
+        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
+    ).read_text()
+    assert "runners --pyperf-execute-all --rounds 3" in daily
 
 
 def _suite_jobs(path):
@@ -555,12 +733,21 @@ def test_pyperformance_canary_rejects_deopt_storms():
         return
     assert "_organic <= _entered" in spec.payload
     assert "_worker_organic_deopts < _worker_entries" in spec.payload
+    # The driver process is held to the same storm bound: deopts must stay
+    # below machine-code entries (an exact pin would track the benchmark
+    # list, not the JIT).
     errors = [
         error
         for judge in spec.judges
-        for error in judge({"organic_deopt_hits": 132})
+        for error in judge({"organic_deopt_hits": 5, "machine_code_entries": 5})
     ]
-    assert any("organic_deopt_hits == 131" in error for error in errors)
+    assert any("deopt storm" in error for error in errors)
+    errors = [
+        error
+        for judge in spec.judges
+        for error in judge({"organic_deopt_hits": 4, "machine_code_entries": 5})
+    ]
+    assert not any("deopt storm" in error for error in errors)
 
 
 def test_libtest_target_manifest_is_wellformed():
@@ -922,7 +1109,8 @@ def test_unexpected_organic_deopt_turns_red():
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
     # Each milestone re-pins the leg (MR-09's guarded attribute sites put
-    # it at 336); any drift off the pinned constant must still turn red.
+    # it at 333, MR-10's generator round at 336, which the MR-11 base
+    # keeps); any drift off the pinned constant must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges

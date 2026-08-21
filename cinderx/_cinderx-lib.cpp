@@ -907,7 +907,7 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 static PyObject* get_trigger_stats(PyObject*, PyObject*) {
   jit::TriggerStats stats = jit::triggerStatsSnapshot();
   return Py_BuildValue(
-      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
       "executable_alloc_calls",
       static_cast<unsigned long long>(stats.executable_alloc_calls),
       "executable_alloc_bytes",
@@ -916,6 +916,10 @@ static PyObject* get_trigger_stats(PyObject*, PyObject*) {
       static_cast<unsigned long long>(stats.compiled_function_creations),
       "machine_code_entries",
       static_cast<unsigned long long>(stats.machine_code_entries),
+      "resident_code_buffers",
+      static_cast<unsigned long long>(stats.resident_code_buffers),
+      "resident_code_extra_blocks",
+      static_cast<unsigned long long>(liveCodeExtraBlocks()),
       "shadow_compile_success",
       static_cast<unsigned long long>(stats.shadow_compile_success),
       "shadow_specialized_opcodes_consumed",

@@ -281,6 +281,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * Adds a compiled function to the Context. Returns false if the function was
    * previously added.
    */
+  // Record the artifact for a function.  Allocates only the map node and
+  // runs no Python, so a subject validated before the call is still valid
+  // inside it.
+  bool commitCompiledFunc(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+
   bool addCompiledFunc(
       BorrowedRef<PyFunctionObject> func,
       BorrowedRef<CompiledFunction> compiled);

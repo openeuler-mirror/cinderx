@@ -43,6 +43,12 @@ class TriggerStatsGateTest(unittest.TestCase):
                 "function_destroyed_notifications",
                 "machine_code_entries",
                 "organic_deopt_hits",
+                # Residency gauges, not counters: they come back down.
+                # Both measure allocations no Python object census can see
+                # -- an executable mapping and a raw code-extra block --
+                # which is what makes them usable as lifecycle invariants.
+                "resident_code_buffers",
+                "resident_code_extra_blocks",
                 "shadow_codegen_bytes",
                 "shadow_compile_success",
                 "shadow_specialized_opcodes_consumed",
