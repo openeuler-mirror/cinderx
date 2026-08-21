@@ -1,7 +1,11 @@
 # CinderX HIR 指令完整指南
 
 > 适用范围：本仓库 `cinderx/Jit/hir/` 下的 HIR（High-level Intermediate Representation，高层中间表示）。
-> 指令全集以 `cinderx/Jit/hir/hir_ops.h` 中的 `FOREACH_OPCODE` 宏为准，当前共 **183 条** opcode；各指令的类定义、操作数与注释位于 `cinderx/Jit/hir/hir.h`（约 4200 行）。
+> 指令全集以 `cinderx/Jit/hir/hir_ops.h` 中的 `FOREACH_OPCODE` 宏为准，当前共 **186 条** opcode；各指令的类定义、操作数与注释位于 `cinderx/Jit/hir/hir.h`（约 4200 行）。
+
+## 摘要
+
+本文档梳理了 CinderX JIT 编译器中高层中间表示（HIR）的概念、在编译管线中的位置，以及完整指令说明，旨在为该 IR 的使用者提供一份完整、准确的参考文档。HIR 是介于 CPython 字节码与 LIR 之间的机器无关表示，以"贴近 Python、显式化隐式逻辑（引用计数、null/异常检查）、易于下降"为核心设计准则，经 SSA 变换后用于类型特化、内联、去优化（deopt）等优化。文档首先说明 HIR 在编译管线中的位置与 pass 顺序，接下来讨论其设计原则与核心概念（指令/操作数、DeoptBase 与 FrameState、类型系统、终结指令），并说明 dump 方法与输出格式。此后，给出 186 条 HIR 指令按功能分组的完整说明，最后给出 HIR 到 LIR 的下降要点。读者可参考本文档，结合具体代码实现，为后续在该 IR 层面上的工作提供帮助。
 
 ## 1. HIR 是什么
 
@@ -132,7 +136,7 @@ fun __main__:f {
 - `<...>` 内是该指令的编译期属性（如 `BinaryOp<Add>` 的运算种类、`CondBranch<1, 2>` 的真/假目标块号）；
 - 可 deopt 指令后的 `{ ... }` 是 deopt 元数据（LiveValues、CurInstrOffset、FrameState）。
 
-## 5. 全量指令参考（183 条）
+## 5. 全量指令参考（186 条）
 
 指令条目格式：**名称**`<编译期属性> (Register 操作数) → 输出`——尖括号内是构造时固化的编译期字段（打印时出现在指令名的 `<...>` 中），圆括号内才是运行时的 Register 操作数；无输出则省略 `→`。标注 `deopt` 表示继承 DeoptBase（可去优化）。"来源"指通常生成该指令的字节码或 pass。操作数数量与输出有无均与 `hir.h` 中 `INSTR_CLASS`/`DEFINE_SIMPLE_INSTR` 的 `Operands<N>`/`HasOutput` 声明一致。
 
@@ -206,7 +210,7 @@ fun __main__:f {
 
 ### 5.7 调用类（10 条）
 
-- **`VectorCall`**`<flags>` `(func, args...) → dst` ·deopt：**最常用的调用指令**。操作数 0 为被调对象，其余为实参；flags 支持 KwArgs（kwargs 以 `name=value` 形式附加）。来源：CALL/CALL_KW 等字节码。当被调对象是编译期常量 `PyCFunction`（非 heap type、非 module 子类型，如 builtin `next` 或 METH_NOARGS/METH_O 形态）时，lowering 的 `TranslateSpecializedCall` 会直接把入口烧进代码；Static Python 的静态直接调用则由独立的 invoke-static 路径生成 `InvokeStaticFunction`，与本指令无关。
+- **`VectorCall`**`<flags>` `(func, args..., [kwnames]) → dst` ·deopt：**最常用的调用指令**。操作数 0 为被调对象，其余为实参；flags 支持 KwArgs——此时 keyword 的 value 作为普通实参附加，**末尾额外携带一个 kwnames tuple 操作数**（builder 按"value 逐个入参 + 末尾 kwnames"构建，而非 name=value 对）。来源：CALL/CALL_KW 等字节码。当被调对象是编译期常量 `PyCFunction`（非 heap type、非 module 子类型，如 builtin `next` 或 METH_NOARGS/METH_O 形态）时，lowering 的 `TranslateSpecializedCall` 会直接把入口烧进代码；Static Python 的静态直接调用则由独立的 invoke-static 路径生成 `InvokeStaticFunction`，与本指令无关。
 - **`CallEx`**`<flags>` `(func, pargs, kwargs) → dst` ·deopt：实参已打包为 tuple/dict 的调用（CALL_FUNCTION_EX）。
 - **`CallMethod`**`<flags>` `(func, self, args...) → dst` ·deopt：与 LoadMethod 配对的方法调用；操作数 1 是方法查找时的 receiver。
 - **`CallInd`**`<name, ret_type>` `(funcptr, args...) → dst` ·deopt：经寄存器中的 C 函数指针间接调用。返回值判错约定：PyObject 返回 NULL 即错误；返回原始类型时以 RDX（int）或 XMM1（float）是否为零判错。
@@ -256,14 +260,18 @@ fun __main__:f {
 - **`MakeCell`** `(value) → dst` ·deopt：新建持有 value 的 cell（`PyCell_New`，隐式 incref）。
 - **`SetFunctionAttr`**`<field>` `(value, base)`：写函数对象的 closure/annotations/kwdefaults/defaults/annotate（3.14+）字段。MAKE_FUNCTION 的配套。
 
-### 5.10 容器构造（17 条）
+### 5.10 容器构造（19 条）
 
-- **`MakeList`** `(elements...) → dst` ·deopt：构造 list（BUILD_LIST）。
-- **`MakeTuple`** `(elements...) → dst` ·deopt：构造 tuple（BUILD_TUPLE / LOAD_CONST tuple 展开）。
+容器构造采用**两阶段模型**：`Make*` 只负责按 nvalues 分配空容器，元素写入由独立的 `Init*Elements` 完成（影响对 HIR 副作用与引用生命周期的理解）。
+
+- **`MakeList`**`<nvalues>` `() → dst` ·deopt：仅分配能容纳 nvalues 个元素的空 list（BUILD_LIST）；元素由 `InitListElements` 写入。
+- **`MakeTuple`**`<nvalues>` `() → dst` ·deopt：仅分配空 tuple（BUILD_TUPLE / LOAD_CONST tuple 展开）；元素由 `InitTupleElements` 写入。
+- **`InitListElements`** `(list, elements...) → dst`：填充已分配 list 的 `ob_item` 数组——操作数 0 为容器，1..N 为要写入的元素。
+- **`InitTupleElements`** `(tuple, elements...) → dst`：同上，tuple 版。
 - **`MakeTupleFromList`** `(list) → dst` ·deopt：由 list 构造 tuple。
 - **`MakeDict`**`<capacity>` `() → dst` ·deopt：构造空 dict（BUILD_MAP），capacity=0 用默认值。
 - **`MakeCheckedDict`**`<capacity, dict_type>` `() → dst` ·deopt：构造 Static Python CheckedDict。
-- **`MakeCheckedList`**`<list_type>` `(elements...) → dst` ·deopt：构造 Static Python CheckedList。
+- **`MakeCheckedList`**`<list_type, nvalues>` `() → dst` ·deopt：按两阶段模式分配 Static Python CheckedList（仅分配，元素经 InitListElements 写入）。
 - **`MakeSet`** `() → dst` ·deopt：构造空 set（BUILD_SET）。
 - **`MakeFunction`** `(code, qualname) → dst` ·deopt：构造函数对象（MAKE_FUNCTION）。
 - **`TpAlloc`**`<pytype>` `() → dst` ·deopt：按 `tp_alloc` 分配指定类型的实例（Static Python `__new__` 快速路径）。
@@ -345,7 +353,7 @@ fun __main__:f {
 - **`UnpackExToTuple`**`<before, after>` `(seq) → dst` ·deopt：UNPACK_EX 解包为 tuple（before/after 指定 `a, *b, c` 两侧数量）。
 - **`UnpackSequence`**`<count>` `(seq, items_ptr) → dst`：经迭代协议解包恰好 count 项到 items_ptr 指向的数组（UNPACK_SEQUENCE 慢路径）。配套的 **`ReserveStack`**`<num_words>` `() → dst`：在调用参数区下方预留指针大小临时数组的栈空间，输出指向该空间的 CPtr（无 Register 操作数）。
 
-### 5.17 引用计数（5 条，RefcountInsertion pass 生成）
+### 5.17 引用计数与存活（6 条，RefcountInsertion pass 生成）
 
 引用计数的插入策略详见 `Jit/hir/refcount_insertion.md`。
 
@@ -354,6 +362,7 @@ fun __main__:f {
 - **`XIncref`** `(opt_reg)`：可为 NULL 的 Incref。
 - **`XDecref`** `(opt_reg)`：可为 NULL 的 Decref。
 - **`BatchDecref`** `(regs...)`：批量递减（连续多个 Decref 的合并形态）。
+- **`UseObj`** `(obj)`：无输出。保持对象存活，防止 RefcountInsertion 在（例如数组 load 与 store 之间）过早插入 decref。
 
 ### 5.18 运行时协作（3 条）
 
@@ -388,7 +397,7 @@ fun __main__:f {
 HIR 到 LIR 的下降在 `Jit/lir/generator.cpp` 的 `LIRGenerator::TranslateOneBasicBlock` 中按 HIR opcode 逐条 switch 完成，两条代表性路径：
 
 - `BinaryOp<Add>` → 查 `binaryfunc` 助手表（`PyNumber_Add` 等）→ LIR `Call`（返回值后跟 LIR `Guard` 判 NULL）；
-- `VectorCall` → 若被调对象是编译期常量 `PyCFunction`（非 heap type/module 子类型）则 `TranslateSpecializedCall` 直接特化（如 builtin next、METH_NOARGS/METH_O）；否则生成 LIR `VectorCall`，输入依次为 runtime helper 立即数（`_PyObject_Vectorcall` 或 `JITRT_Vectorcall`）、flags、callable 与实参、末尾 kwnames 或 0；
+- `VectorCall` → 若被调对象是编译期常量 `PyCFunction`（非 heap type/module 子类型）则 `TranslateSpecializedCall` 直接特化（如 builtin next、METH_NOARGS/METH_O）；否则生成 LIR `VectorCallTstate`，输入依次为 runtime helper 立即数（`_PyObject_VectorcallTstate` 或 `JITRT_VectorcallTstate`）、flags、tstate、callable 与实参、末尾 kwnames 或 0；
 - 可 deopt 指令 → `appendGuard` 生成 LIR `Guard`（输入为 guard kind、deopt id、被查值、目标对象/类型、live 值列表）。
 
 ## 7. 延伸阅读
