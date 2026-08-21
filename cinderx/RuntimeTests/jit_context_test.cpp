@@ -49,13 +49,13 @@
 
 #if PY_VERSION_HEX < 0x030C0000
 // A milestone gate, not a mode gate.  These cases assert a surface the 3.11
-// port has not opened in either mode -- generators and coroutines, the
-// opcodes outside the MR-04 execute whitelist, the Static Python runtime
-// cache, or control-plane entry points the canary does not publish -- so
-// the executing mode refuses to compile them by design.  Running them there
-// would only assert that a deliberate refusal is a failure.  The reason
-// names the surface the case waits on, so that widening the surface makes
-// the skip visible instead of leaving it inert.
+// port has not opened in either mode -- opcodes outside the execute
+// whitelist, the Static Python runtime cache, or control-plane entry
+// points the canary does not publish -- so the executing mode refuses to
+// compile them by design.  Running them there would only assert that a
+// deliberate refusal is a failure.  The reason names the surface the case
+// waits on, so that widening the surface makes the skip visible instead of
+// leaving it inert.
 #define SKIP_311_UNTIL_SURFACE(reason)                                    \
   do {                                                                    \
     GTEST_SKIP() << "3.11 has not opened this surface yet: " << (reason); \
@@ -1493,7 +1493,7 @@ def add(a, b):
 }
 
 TEST_F(JITFrameTest, CompileAndRunGeneratorFunc) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -1628,7 +1628,7 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2086,7 +2086,7 @@ TEST_F(JITGenDataFooterTest, GenDataFooterDefaults) {
 }
 
 TEST_F(JITGenDataFooterTest, CompileGeneratorAndCheckRuntime) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2520,7 +2520,7 @@ class JITGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(JITGeneratorTest, CompileGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2547,7 +2547,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorAndCheck) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2570,7 +2570,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndRunGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2600,7 +2600,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorWithArg) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen(n: int):
@@ -2639,7 +2639,7 @@ def gen(n: int):
 
 
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2662,7 +2662,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndIterateGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2700,7 +2700,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, CompileCoroutine) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 async def coro():
@@ -2715,7 +2715,11 @@ async def coro():
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_EQ(comp_result, jit::Result::CANNOT_SPECIALIZE);
+#else
   ASSERT_EQ(comp_result, jit::Result::OK);
+#endif
 }
 
 TEST_F(JITGeneratorTest, GeneratorClose) {
@@ -2748,7 +2752,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -3328,7 +3332,7 @@ def run():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGeneratorSendAndYieldFrom) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def inner():
@@ -4161,6 +4165,27 @@ def drive(callee, helper, box):
   PyErr_Clear();
   EXPECT_EQ(PyList_GET_SIZE(box), 0)
       << "CALL_FUNCTION_EX-after mutation ran; eval breaker was deferred";
+}
+
+TEST_F(JITLifecycle311Test, GeneratorCapabilityHasStableRefusal) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def gen():
+    yield 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "gen"));
+  ASSERT_NE(func, nullptr);
+
+  bool saved = jit::getConfig().sync_generator_jit;
+  SCOPE_EXIT(jit::getMutableConfig().sync_generator_jit = saved);
+  jit::getMutableConfig().sync_generator_jit = true;
+  EXPECT_EQ(Ci_JitShell311_ExecuteRefusal(func), nullptr);
+
+  jit::getMutableConfig().sync_generator_jit = false;
+  EXPECT_STREQ(
+      Ci_JitShell311_ExecuteRefusal(func),
+      "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED");
 }
 
 #if defined(__linux__)

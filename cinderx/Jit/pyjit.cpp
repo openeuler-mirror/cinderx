@@ -817,6 +817,15 @@ FlagProcessor initFlagProcessor() {
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
 
+#if PY_VERSION_HEX < 0x030C0000
+  flag_processor.addOption(
+      "jit-generator",
+      "PYTHONJITGENERATOR",
+      getMutableConfig().sync_generator_jit,
+      "Enable explicit CPython 3.11 synchronous-generator JIT execution; "
+      "automatic generator compilation remains disabled");
+#endif
+
   flag_processor.addOption(
       "jit-auto-roi-backoff",
       "CINDERX_AUTOJIT_ROI_BACKOFF",
@@ -1784,7 +1793,7 @@ JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
     return JitEligibility::Ineligible;
   }
 #if PY_VERSION_HEX < 0x030C0000
-  if (code->co_flags & kCoFlagsAnyGenerator) {
+  if (code->co_flags & kCoFlagsAsyncCode) {
     return JitEligibility::Ineligible;
   }
 #endif
@@ -1826,7 +1835,7 @@ JitEligibility getCompilationEligibility(
     return JitEligibility::Ineligible;
   }
 #if PY_VERSION_HEX < 0x030C0000
-  if (code->co_flags & kCoFlagsAnyGenerator) {
+  if (code->co_flags & kCoFlagsAsyncCode) {
     return JitEligibility::Ineligible;
   }
 #endif
@@ -2523,6 +2532,19 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
   if (!isJitUsable() || isJitCompiled(func)) {
     Py_RETURN_FALSE;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (const char* reason = Ci_JitShell311_ExecuteRefusal(func)) {
+    // MR-10 publishes stable shape reasons for the generator capability
+    // boundary and for async-code refusal.  Preserve the historical generic
+    // CANNOT_SPECIALIZE result for every other execute-surface refusal.
+    if (std::strcmp(reason, "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED") == 0 ||
+        std::strcmp(reason, "REFUSE_SHAPE_ASYNC_CODE") == 0) {
+      PyErr_SetString(PyExc_RuntimeError, reason);
+      return nullptr;
+    }
+  }
+#endif
 
   if (Ci_InitFrameEvalFunc() < 0) {
     return nullptr;
@@ -4425,6 +4447,13 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Arm a deopt site so the Nth visit (or at-or-after N) "
                "enters the real guard-failure restore.")},
+    // MR-10 generator suspension evidence needs the existing test-only
+    // deopt entry point on the restricted 3.11 control plane as well.
+    {"_deopt_gen",
+     deopt_gen,
+     METH_O,
+     PyDoc_STR("Deopt a suspended JIT generator so its next resume runs in "
+               "the interpreter; intended only for tests.")},
     {"get_attr_cache_stats",
      get_attr_cache_stats,
      METH_NOARGS,
@@ -5164,6 +5193,21 @@ int initialize() {
     }
     jitCtx()->setCinderJitModule(Ref<>::steal(canary_mod));
   }
+  // Sync generators now compile to machine code; copy stock gen/coro
+  // methods onto JitGen and install the dealloc hook that pairs the 3.11
+  // gi_code extra ref. Shadow still skips this: it never instantiates a
+  // JitGen object.
+  {
+    cinderx::ModuleState* canary_types = cinderx::getModuleState();
+    if (canary_types->gen_type == nullptr ||
+        canary_types->coro_type == nullptr) {
+      PyErr_SetString(
+          PyExc_RuntimeError,
+          "the CPython 3.11 canary is missing JitGen/JitCoro types");
+      return -1;
+    }
+  }
+  jit::init_jit_genobject_type();
   // The canary is an execution mode, not a library a harness assembles:
   // without the frame evaluator, the interpreter's specialized CALL pushes
   // the callee frame inline and never consults the vectorcall entry, so a
@@ -5859,6 +5903,19 @@ Result compilePreloaderImpl(
     return Result::CANNOT_SPECIALIZE;
   }
   constexpr int forbidden_flags = CO_ASYNC_GENERATOR;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 keeps native / iterable coroutines and async generators off the
+  // execute surface.  compilePreloaderImpl is reachable from RuntimeTests
+  // without going through the observe gate, so the same async refuse must
+  // hold here rather than only in eligibilityReason().
+  if (code->co_flags & kCoFlagsAsyncCode) {
+    JIT_DLOG(
+        "Cannot JIT compile {} as it has async code flags: 0x{:x}",
+        preloader.fullname(),
+        code->co_flags & kCoFlagsAsyncCode);
+    return Result::CANNOT_SPECIALIZE;
+  }
+#endif
   if (code->co_flags & forbidden_flags) {
     JIT_DLOG(
         "Cannot JIT compile {} as it has prohibited code flags: 0x{:x}",

@@ -188,6 +188,11 @@ struct Config {
   // the interpreter
   bool support_instrumentation{false};
 
+  // Permit CPython 3.11 synchronous generators on the canary execute
+  // surface.  Explicit force/canary compilation is enabled for MR-10;
+  // automatic compilation remains separately gated until MR-11.
+  bool sync_generator_jit{true};
+
   // Add RefineType instructions for Static Python values before they get
   // typechecked.  Enabled by default as HIR doesn't pass through Static Python
   // types very well right now.  Disable to expose new typing opportunities in

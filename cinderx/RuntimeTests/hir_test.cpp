@@ -1080,9 +1080,6 @@ class ClosureBox:
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     InferredSelfGuardFrameStateAfterGeneratorSetup) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 generator HIR remains disabled until MR-10";
-#endif
   const char* src = R"(
 class YieldBox:
     def values(self):
@@ -1104,9 +1101,6 @@ class YieldBox:
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     InferredSelfGuardFrameStateAfterInitialYieldPop) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 generator HIR remains disabled until MR-10";
-#endif
   const char* src = R"(
 class YieldBox:
     def values(self):
@@ -1192,8 +1186,10 @@ TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 generator execution remains disabled until MR-10";
+  if (jit::getConfig().state != jit::State::kRunning) {
+    GTEST_SKIP() << "3.11 executes machine code only in canary mode; "
+                    "set CINDERX_JIT_MODE=canary to run this";
+  }
 #endif
   const char* src = R"(
 class YieldBox:

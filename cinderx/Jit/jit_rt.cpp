@@ -881,6 +881,13 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
       co, spill_words * sizeof(uint64_t) + sizeof(jit::GenDataFooter));
 
   gen->gi_frame_state = FRAME_CREATED;
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock 3.11 make_gen() holds gi_code independently of the frame's
+  // f_code.  The two refs are balanced on clear/deopt/dealloc; omitting
+  // this one leaves g.gi_code NULL and leaks the code object the frame
+  // does not own.
+  gen->gi_code = reinterpret_cast<PyCodeObject*>(Py_NewRef(func->func_code));
+#endif
   gen->gi_weakreflist = nullptr;
   gen->gi_exc_state.exc_value = nullptr;
   gen->gi_exc_state.previous_item = nullptr;
