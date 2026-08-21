@@ -1585,6 +1585,165 @@ test = B.__dict__["f"].__func__
   EXPECT_EQ(load_method_super_count, 1);
 }
 
+TEST_F(HIRBuildTest, CallFunction311LowersToCallMethod) {
+  const char* src = R"(
+def test(x):
+    return abs(x)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCallMethod), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kVectorCall), 0) << hir;
+
+  const CallMethod* call = nullptr;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallMethod()) {
+        call = static_cast<const CallMethod*>(&instr);
+      }
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  EXPECT_EQ(call->NumArgs(), 1u);
+  ASSERT_NE(call->func(), nullptr);
+  ASSERT_NE(call->func()->instr(), nullptr);
+  // buildHIR() is not SSA: Register::type() stays TTop. Inspect the def.
+  ASSERT_TRUE(call->func()->instr()->IsLoadConst()) << hir;
+  EXPECT_TRUE(
+      static_cast<const LoadConst*>(call->func()->instr())->type() <= TNullptr)
+      << hir;
+  ASSERT_NE(call->self(), nullptr);
+  ASSERT_NE(call->self()->instr(), nullptr);
+  EXPECT_TRUE(call->self()->instr()->IsLoadGlobal()) << hir;
+  EXPECT_NE(call->frameState(), nullptr);
+}
+
+TEST_F(HIRBuildTest, LoadMethodCall311PreservesReceiverPair) {
+  const char* src = R"(
+class Box:
+    def add(self, value):
+        return value
+
+def test(obj):
+    return obj.add(1)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadMethod), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCallMethod), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kVectorCall), 0) << hir;
+
+  const CallMethod* call = nullptr;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallMethod()) {
+        call = static_cast<const CallMethod*>(&instr);
+      }
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  EXPECT_EQ(call->NumArgs(), 1u);
+  ASSERT_NE(call->func(), nullptr);
+  ASSERT_NE(call->func()->instr(), nullptr);
+  EXPECT_TRUE(call->func()->instr()->IsLoadMethod()) << hir;
+  ASSERT_NE(call->self(), nullptr);
+  ASSERT_NE(call->self()->instr(), nullptr);
+  EXPECT_TRUE(call->self()->instr()->IsGetSecondOutput()) << hir;
+  EXPECT_NE(call->frameState(), nullptr);
+}
+
+TEST_F(HIRBuildTest, KwNamesCall311SetsKwArgsFlag) {
+  const char* src = R"(
+def test(fn, a):
+    return fn(a, k=1)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCallMethod), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kVectorCall), 0) << hir;
+
+  const CallMethod* call = nullptr;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallMethod()) {
+        call = static_cast<const CallMethod*>(&instr);
+      }
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  EXPECT_TRUE(call->flags() & CallFlags::KwArgs) << hir;
+  EXPECT_NE(call->frameState(), nullptr);
+}
+
+TEST_F(HIRBuildTest, CallFunctionEx311LowersToCallEx) {
+  const char* src = R"(
+def test(fn, args):
+    return fn(*args)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCallEx), 1) << hir;
+
+  const CallEx* call = nullptr;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallEx()) {
+        call = static_cast<const CallEx*>(&instr);
+      }
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  EXPECT_FALSE(call->flags() & CallFlags::KwArgs) << hir;
+  EXPECT_NE(call->frameState(), nullptr);
+}
+
+TEST_F(HIRBuildTest, CallFunctionExKw311SetsKwArgsFlag) {
+  const char* src = R"(
+def test(fn, args, kw):
+    return fn(*args, **kw)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCallEx), 1) << hir;
+
+  const CallEx* call = nullptr;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallEx()) {
+        call = static_cast<const CallEx*>(&instr);
+      }
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  EXPECT_TRUE(call->flags() & CallFlags::KwArgs) << hir;
+  EXPECT_NE(call->frameState(), nullptr);
+}
+
 TEST_F(HIRBuildTest, InPlaceBinaryOpSpecialization311DoesNotGuardLongs) {
   _Py_CODEUNIT bc[] = {
       _Py_MAKE_CODEUNIT(LOAD_FAST, 0),

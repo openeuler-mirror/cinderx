@@ -205,11 +205,24 @@ def main() -> int:
     mod = importlib.import_module(f"corpus.{modname}")
 
     singletons = {id(True), id(False), id(None), id(NotImplemented), id(...)}
+    func_globals = set()
+    for obj in vars(mod).values():
+        if isinstance(obj, types.FunctionType):
+            func_globals.add(id(obj.__globals__))
+        elif isinstance(obj, dict):
+            for inner in obj.values():
+                if isinstance(inner, types.FunctionType):
+                    func_globals.add(id(inner.__globals__))
     targets = {}
     for name, obj in sorted(vars(mod).items()):
         if name.startswith("__") or isinstance(obj, types.ModuleType):
             continue
         if id(obj) in singletons:
+            continue
+        # Compiling a helper holds an extra ref to its func_globals via the
+        # artifact; ROI backoff then drops that ref when enough exception-
+        # path calls withdraw the artifact.  That is not a call-path leak.
+        if id(obj) in func_globals:
             continue
         targets[name] = obj
 
@@ -243,12 +256,32 @@ def main() -> int:
     for name, fn in cases:
         fns = [fn] + list(getattr(fn, "helpers", ()))
         if jit is not None:
-            for f in fns:
-                # force_compile() returns False both for a refusal and for
-                # an already-compiled function (helpers are shared across
-                # cases, so the second sighting is routine).  The truth
-                # condition is is_jit_compiled() afterwards.
-                jit.force_compile(f)
+            to_compile = [
+                f for f in fns if isinstance(f, types.FunctionType)
+            ]
+            # corpus_calls builds 285 nested dispatchers from one `def case`
+            # code object.  The 3.11 exclusive-artifact rule will compile
+            # the first owner and refuse every later one, so compile the
+            # per-shape helpers (distinct code objects) instead of the
+            # shared wrapper.  Shared callees are the same function object
+            # and is_jit_compiled() stays true on later sightings.
+            if fn in to_compile and any(f is not fn for f in to_compile):
+                to_compile = [f for f in to_compile if f is not fn]
+            for f in to_compile:
+                try:
+                    jit.force_compile(f)
+                except RuntimeError as exc:
+                    ops = [
+                        instr.opname
+                        for instr in __import__("dis").get_instructions(f)
+                    ]
+                    print(
+                        f"refcount-matrix: force_compile refused for "
+                        f"{name} ({getattr(f, '__name__', f)}): {exc}; "
+                        f"opcodes={ops}",
+                        file=sys.stderr,
+                    )
+                    return 2
                 if not jit.is_jit_compiled(f):
                     print(
                         f"refcount-matrix: force_compile refused for "

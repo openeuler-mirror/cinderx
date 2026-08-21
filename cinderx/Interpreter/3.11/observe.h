@@ -57,6 +57,12 @@ const char* Ci_JitShell311_ExecuteRefusal(PyFunctionObject* func);
 // cast it back to jit::CompiledFunction*.
 void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func);
 
+// The artifact pinned for the in-flight GuardedEntry invocation, or NULL.
+// Keyword binding can run arbitrary Python, so helpers must not re-query
+// InstalledArtifact after they have started; this snapshot is the code
+// that this call already committed to.
+void* Ci_JitShell311_InvocationArtifact(void);
+
 // The vectorcall entry installed on a function whose artifact may execute.
 // It re-checks the predicate above on every call and falls back to the
 // interpreter entry when anything has moved, so a function that leaves the

@@ -900,9 +900,9 @@ void GenerateArgcountCheckBlocks(
     // Two blocks:
     //   kw_dispatch: test kwnames → if null, branch to argcount_check;
     //                otherwise call JITRT_CallWithKeywordArgs → exit.
-    //   argcount_check: cmp nargsf with numArgs → if equal, branch to
-    //                   next_block; otherwise call incorrect-argcount
-    //                   helper → exit.
+    //   argcount_check: cmp nargsf with numArgs.  On 3.11 a match
+    //                   re-enters the body after Py_EnterRecursiveCall;
+    //                   a mismatch calls the incorrect-argcount helper.
     auto* kw_dispatch = lir_func->allocateBasicBlock();
     auto* argcount_check = lir_func->allocateBasicBlock();
 
@@ -945,16 +945,42 @@ void GenerateArgcountCheckBlocks(
         nullptr,
         PhyReg{nargsf_reg, OperandBase::k32bit},
         PhyReg{kwnames_reg, OperandBase::k32bit});
-    argcount_check->allocateInstr(
-        Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
+#if PY_VERSION_HEX < 0x030C0000
+    // 3.11: a matching count is a successful bind.  Consume recursion at
+    // body reentry instead of jumping into the body from GuardedEntry
+    // without an Enter.  Primitive-double returns keep the old jump;
+    // that ABI is not the canary vectorcall.
+    if (!returns_primitive_double) {
+      auto* wrong_count = lir_func->allocateBasicBlock();
+      argcount_check->allocateInstr(
+          Instruction::kBranchNE, nullptr, Lbl{wrong_count});
+      argcount_check->addSuccessor(wrong_count);
+      argcount_check->allocateInstr(
+          Instruction::kCall,
+          nullptr,
+          Imm{reinterpret_cast<uint64_t>(JITRT_ReenterAfterBind)});
+      argcount_check->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
-    // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
-    auto helper = returns_primitive_double
-        ? reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)
-        : reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
-    argcount_check->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
-    argcount_check->allocateInstr(
-        Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+      emitAnnotation(wrong_count, "Fill defaults or fallback");
+      auto helper = reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
+      wrong_count->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
+      wrong_count->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+    } else
+#endif
+    {
+      argcount_check->allocateInstr(
+          Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
+
+      // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
+      auto helper = returns_primitive_double
+          ? reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)
+          : reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
+      argcount_check->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
+      argcount_check->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+    }
 
   } else {
     // have_varargs or kwonlyargcount > 0: always dispatch through the
@@ -4321,6 +4347,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               instr->GetOperand(0),
               instr->GetOperand(1),
               instr->GetOperand(2));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyDict_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
         } else {
           bbb.appendCallInstruction(
               instr->output(),
@@ -4494,6 +4527,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         if constexpr (kFreeThreadedBuild) {
           // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
           bbb.appendCallInstruction(
               instr->output(),
               PyList_Append,

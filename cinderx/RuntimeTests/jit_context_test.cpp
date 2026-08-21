@@ -21,6 +21,11 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 // A mode gate, not a version gate.  These cases compile and install
@@ -153,11 +158,12 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // artifact allocation, the code-extra reservation, and the post-compile
   // execute refusal all live below it.  Its answer is what lets the
   // compile entry stop reporting OK for a function that was never
-  // installed.  A keyword-only signature is a deterministic publication
-  // refusal, and an empty data block exercises the same early-return
-  // paths an allocation failure would take.
+  // installed.  LOAD_ATTR is still off the execute whitelist (keyword-only
+  // signatures are rebound by the generated prologue and are no longer a
+  // refusal).  An empty data block exercises the same early-return paths
+  // an allocation failure would take.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(*, flag=None): return flag", "func"));
+      compileAndGet("def func(obj): return obj.attr", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;
@@ -3723,6 +3729,27 @@ def forget_me():
 // Python.  Each of these was reported against a build where the Python-level
 // suite was already green: the Python surface can only see what the canary
 // control plane publishes, and the registries these cases read are not on it.
+
+namespace {
+
+PyObject* setAsyncExcThenNone(PyObject* /*self*/, PyObject* /*unused*/) {
+  unsigned long ident = PyThread_get_thread_ident();
+  int n = PyThreadState_SetAsyncExc(ident, PyExc_RuntimeError);
+  if (n < 0) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef kSetAsyncExcThenNone = {
+    "set_async_exc_then_none",
+    setAsyncExcThenNone,
+    METH_NOARGS,
+    nullptr,
+};
+
+} // namespace
+
 class JITLifecycle311Test : public RuntimeTest {};
 
 TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
@@ -3904,14 +3931,75 @@ self_referential.myself = self_referential
   EXPECT_EQ(ctx->watchedFunctionCount(), 0u);
 }
 
-TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {
+TEST_F(JITLifecycle311Test, DefaultArgSurvivesDefaultsRebind) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // Adding __defaults__ moves the function out of the argument shape the
-  // artifact was compiled for.  3.11 has no function watcher to notice, so
-  // the guarded entry has to notice on the next call -- and every reporter
-  // of "is this compiled" has to agree with it, or the state is compiled to
-  // one caller and interpreted to another.
+  // Stock INCREFs the default at bind.  Rebinding __defaults__ after
+  // bind must not free the value the compiled frame still holds.
+  // STORE_ATTR is off the execute whitelist, so the mutation lives in
+  // an interpreted helper reached by CALL.
+  const char* py_src = R"(
+class Boom:
+    pass
+
+def rebind():
+    victim.__defaults__ = ()
+
+def victim(x=Boom()):
+    rebind()
+    return x
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  Ref<PyFunctionObject> rebind(getGlobal("rebind"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_FALSE(isJitCompiled(rebind));
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  ASSERT_NE(got, nullptr);
+  EXPECT_STREQ(Py_TYPE(got)->tp_name, "Boom");
+}
+
+TEST_F(JITLifecycle311Test, KwOnlyDefaultSurvivesKwdefaultsClear) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // __kwdefaults__ is a live dict.  Clearing it after bind must not
+  // free the value sitting in arg_space.  LOAD_METHOD is off the
+  // execute whitelist, so the clear lives in an interpreted helper.
+  const char* py_src = R"(
+class Boom:
+    pass
+
+def clear_kw():
+    victim.__kwdefaults__.clear()
+
+def victim(*, x=Boom()):
+    clear_kw()
+    return x
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  Ref<PyFunctionObject> clear_kw(getGlobal("clear_kw"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_FALSE(isJitCompiled(clear_kw));
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  ASSERT_NE(got, nullptr);
+  EXPECT_STREQ(Py_TYPE(got)->tp_name, "Boom");
+}
+
+TEST_F(JITLifecycle311Test, DefaultsStayInstalledAndBindLive) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Adding __defaults__ used to take the function off the MR-04 exact
+  // positional surface.  MR-06 rebinds defaults in the generated
+  // vectorcall prologue, so the artifact stays installed and both
+  // reporters of "is this compiled" stay true.  A __code__ swap still
+  // clears them -- that is a different case.
   const char* py_src = R"(
 def defaulted(x):
     return x + 1
@@ -3933,12 +4021,10 @@ def defaulted(x):
   ASSERT_NE(defaults, nullptr);
   ASSERT_EQ(PyObject_SetAttrString(func, "__defaults__", defaults), 0);
 
-  // Both reporters must move together with the entry.
-  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
-  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_NE(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_TRUE(isJitCompiled(func));
 
-  // And the call still has to produce the right answer, through the
-  // interpreter.
+  auto entries_before = jit::triggerStatsSnapshot().machine_code_entries;
   auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(after, nullptr);
   EXPECT_EQ(PyLong_AsLong(after), 42);
@@ -3946,7 +4032,243 @@ def defaulted(x):
   auto defaulted = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
   ASSERT_NE(defaulted, nullptr);
   EXPECT_EQ(PyLong_AsLong(defaulted), 42);
+  EXPECT_EQ(
+      jit::triggerStatsSnapshot().machine_code_entries, entries_before + 2)
+      << "live defaults must still enter machine code";
 }
+
+TEST_F(JITLifecycle311Test, ExecuteRefusalDoesNotLeaveUtf8Exception) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A lone surrogate is a legal Python str and an illegal UTF-8 C string.
+  // The execute-refusal helpers must not convert through UTF-8, or a
+  // pending UnicodeEncodeError leaks into compileFunction / finalize.
+  const char* py_src = R"(
+def victim():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  ASSERT_NE(func, nullptr);
+  auto bad = Ref<>::steal(PyUnicode_FromOrdinal(0xD800));
+  ASSERT_NE(bad, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(func, "__module__", bad), 0);
+  PyErr_Clear();
+  const char* reason = Ci_JitShell311_ExecuteRefusal(func);
+  EXPECT_EQ(PyErr_Occurred(), nullptr)
+      << "execute refusal left a UTF-8 conversion exception";
+  (void)reason;
+}
+
+TEST_F(JITLifecycle311Test, BindFailureAtRecursionLimitMatchesStock) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // _Py_MakeRecCheck is post-decrement, so the innermost admitted
+  // frame runs at recursion_remaining == 0.  Stock formats a missing
+  // argument via PyObject_Repr, which Enter-fails as RecursionError.
+  // Too-many-positional still formats TypeError.  Bind must not invert
+  // that.
+  const char* py_src = R"(
+def needed(a):
+    return a
+def none():
+    return 1
+def with_def(a, b=1):
+    return a
+)";
+  Ref<PyFunctionObject> needed(compileAndGet(py_src, "needed"));
+  Ref<PyFunctionObject> none(getGlobal("none"));
+  Ref<PyFunctionObject> with_def(getGlobal("with_def"));
+  ASSERT_NE(needed, nullptr);
+
+  auto callAtLimit = [](PyObject* fn, PyObject* args) {
+    PyThreadState* tstate = PyThreadState_GET();
+    int saved = tstate->recursion_remaining;
+    tstate->recursion_remaining = 0;
+    auto result = Ref<>::steal(PyObject_Call(fn, args, nullptr));
+    tstate->recursion_remaining = saved;
+    EXPECT_EQ(result, nullptr);
+    PyObject* type = nullptr;
+    PyObject* value = nullptr;
+    PyObject* tb = nullptr;
+    PyErr_Fetch(&type, &value, &tb);
+    std::string tp =
+        type != nullptr ? reinterpret_cast<PyTypeObject*>(type)->tp_name : "";
+    std::string msg;
+    if (value != nullptr) {
+      auto s = Ref<>::steal(PyObject_Str(value));
+      if (s != nullptr) {
+        const char* utf8 = PyUnicode_AsUTF8(s);
+        if (utf8 != nullptr) {
+          msg = utf8;
+        }
+      }
+    }
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(tb);
+    return std::make_pair(tp, msg);
+  };
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto one = makeLong(1);
+  auto two = makeLong(2);
+  auto three = makeLong(3);
+  auto extra = Ref<>::steal(PyTuple_Pack(1, one.get()));
+  auto three_args =
+      Ref<>::steal(PyTuple_Pack(3, one.get(), two.get(), three.get()));
+
+  auto missing_interp = callAtLimit(needed, no_args);
+  auto extra_interp = callAtLimit(none, extra);
+  auto def_interp = callAtLimit(with_def, three_args);
+
+  ASSERT_EQ(jit::compileFunction(needed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(none), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(with_def), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(needed));
+
+  auto missing_jit = callAtLimit(needed, no_args);
+  auto extra_jit = callAtLimit(none, extra);
+  auto def_jit = callAtLimit(with_def, three_args);
+  EXPECT_EQ(missing_jit, missing_interp);
+  EXPECT_EQ(missing_jit.first, "RecursionError");
+  EXPECT_EQ(extra_jit, extra_interp);
+  EXPECT_EQ(def_jit, def_interp);
+
+  PyThreadState* tstate = PyThreadState_GET();
+  int saved = tstate->recursion_remaining;
+  tstate->recursion_remaining = 0;
+  auto ok_args = Ref<>::steal(PyTuple_Pack(1, one.get()));
+  auto ok = Ref<>::steal(PyObject_Call(needed, ok_args, nullptr));
+  tstate->recursion_remaining = saved;
+  EXPECT_EQ(ok, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
+      << "a successful bind must still consume a recursion slot";
+  PyErr_Clear();
+}
+
+TEST_F(JITLifecycle311Test, CallDeliversAsyncExcBeforeNextStatement) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython 3.11 CALL runs CHECK_EVAL_BREAKER after a C callable
+  // returns.  A successful helper that armed SetAsyncExc must raise
+  // before the next Python statement, matching stock.
+  const char* py_src = R"(
+def drive(helper, box):
+    helper()
+    box.append(1)
+    return box
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "drive"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  auto helper = Ref<>::steal(PyCFunction_New(&kSetAsyncExcThenNone, nullptr));
+  ASSERT_NE(helper, nullptr);
+  auto box = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(box, nullptr);
+  auto args = Ref<>::steal(PyTuple_Pack(2, helper.get(), box.get()));
+  ASSERT_NE(args, nullptr);
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  EXPECT_EQ(result, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError))
+      << "async exception must be delivered at the CALL boundary";
+  PyErr_Clear();
+  EXPECT_EQ(PyList_GET_SIZE(box), 0)
+      << "CALL-after mutation ran; eval breaker was deferred";
+}
+
+TEST_F(JITLifecycle311Test, CallExDeliversAsyncExcBeforeNextStatement) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CALL_FUNCTION_EX checks the eval breaker after do_call_core even
+  // when the callee is a Python function.  A C helper that arms
+  // SetAsyncExc inside that Python callee must still stop the caller
+  // before the next statement.
+  const char* py_src = R"(
+def callee(helper):
+    helper()
+    return None
+
+def drive(callee, helper, box):
+    callee(*[helper])
+    box.append(1)
+    return box
+)";
+  Ref<PyFunctionObject> drive(compileAndGet(py_src, "drive"));
+  Ref<PyFunctionObject> callee(getGlobal("callee"));
+  ASSERT_NE(drive, nullptr);
+  ASSERT_EQ(jit::compileFunction(drive), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(drive));
+  ASSERT_FALSE(isJitCompiled(callee));
+
+  auto helper = Ref<>::steal(PyCFunction_New(&kSetAsyncExcThenNone, nullptr));
+  ASSERT_NE(helper, nullptr);
+  auto box = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(box, nullptr);
+  auto args =
+      Ref<>::steal(PyTuple_Pack(3, callee.get(), helper.get(), box.get()));
+  ASSERT_NE(args, nullptr);
+  auto result = Ref<>::steal(PyObject_Call(drive, args, nullptr));
+  EXPECT_EQ(result, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError))
+      << "async exception must be delivered on the CALL_FUNCTION_EX path";
+  PyErr_Clear();
+  EXPECT_EQ(PyList_GET_SIZE(box), 0)
+      << "CALL_FUNCTION_EX-after mutation ran; eval breaker was deferred";
+}
+
+#if defined(__linux__)
+TEST_F(JITLifecycle311Test, CStackLargeGuardRaisesRecursionError) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython's usable stack base is pthread stack_addr + guard_size.
+  // A thread with a large guard region must still raise RecursionError
+  // rather than SIGSEGV into the guard page.
+  struct Payload {
+    int rc = 1;
+  } payload;
+
+  auto worker = +[](void* raw) -> void* {
+    auto* p = static_cast<Payload*>(raw);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    p->rc = PyRun_SimpleString(R"PY(
+import sys
+import cinderjit
+
+def rec(f, n):
+    if n:
+        return f(f, n - 1)
+    return 0
+
+assert cinderjit.force_compile(rec) is True
+old = sys.getrecursionlimit()
+sys.setrecursionlimit(10 ** 6)
+try:
+    rec(rec, 100000)
+    raise SystemExit("expected RecursionError")
+except RecursionError:
+    pass
+finally:
+    sys.setrecursionlimit(old)
+)PY");
+    PyGILState_Release(gstate);
+    return nullptr;
+  };
+
+  pthread_attr_t attr;
+  ASSERT_EQ(pthread_attr_init(&attr), 0);
+  ASSERT_EQ(pthread_attr_setguardsize(&attr, 64 * 1024), 0);
+  ASSERT_EQ(pthread_attr_setstacksize(&attr, 2 * 1024 * 1024), 0);
+  pthread_t thread;
+  ASSERT_EQ(pthread_create(&thread, &attr, worker, &payload), 0);
+  pthread_attr_destroy(&attr);
+  int join_rc;
+  Py_BEGIN_ALLOW_THREADS join_rc = pthread_join(thread, nullptr);
+  Py_END_ALLOW_THREADS ASSERT_EQ(join_rc, 0);
+  EXPECT_EQ(payload.rc, 0);
+}
+#endif
 
 TEST_F(JITLifecycle311Test, ReplacingCodeStopsTheOldMachineCode) {
   SKIP_311_EXECUTABLE_COMPILE();

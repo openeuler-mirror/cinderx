@@ -1291,22 +1291,31 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
 
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
-  // The MR-04 execute surface: machine code may only run for functions
-  // whose every instruction sits inside this audited whitelist --
-  // positional/local data flow, basic arithmetic and comparisons, control
-  // flow, and iteration over already-materialized iterables.  Everything
-  // the plan defers stays out by construction: no CALL family, no attr or
-  // subscript ICs, no LOAD_GLOBAL (3.11 has no global-cache story yet),
-  // no cells/closures, no exception table, no generators.  The decoder
+  // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
+  // family (including LOAD_GLOBAL without a speculative cache Guard,
+  // container builders used by CALL_FUNCTION_EX, MAKE_FUNCTION for
+  // genexp call sites, LOAD_DEREF/LOAD_CLOSURE/COPY_FREE_VARS/MAKE_CELL
+  // for nested-function cells).  Still out: attr or subscript ICs,
+  // STORE_DEREF, the exception table, generator *bodies*.  The decoder
   // yields unspecialized opcodes, so quickened forms cannot slip past.
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     switch (bc_it->opcode()) {
       case BINARY_OP:
+      case BUILD_CONST_KEY_MAP:
+      case BUILD_LIST:
+      case BUILD_MAP:
+      case BUILD_SET:
+      case BUILD_TUPLE:
+      case CALL:
+      case CALL_FUNCTION_EX:
       case COMPARE_OP:
       case CONTAINS_OP:
       case COPY:
+      case COPY_FREE_VARS:
       case DELETE_FAST:
+      case DICT_MERGE:
+      case DICT_UPDATE:
       case EXTENDED_ARG:
       case FOR_ITER:
       case GET_ITER:
@@ -1314,8 +1323,19 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case JUMP_BACKWARD:
       case JUMP_BACKWARD_NO_INTERRUPT:
       case JUMP_FORWARD:
+      case KW_NAMES:
+      case LIST_APPEND:
+      case LIST_EXTEND:
+      case LIST_TO_TUPLE:
+      case LOAD_CLOSURE:
       case LOAD_CONST:
+      case LOAD_DEREF:
       case LOAD_FAST:
+      case LOAD_GLOBAL:
+      case LOAD_METHOD:
+      case MAKE_CELL:
+      case MAKE_FUNCTION:
+      case MAP_ADD:
       case NOP:
       case POP_JUMP_BACKWARD_IF_FALSE:
       case POP_JUMP_BACKWARD_IF_NONE:
@@ -1326,14 +1346,19 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case POP_JUMP_FORWARD_IF_NOT_NONE:
       case POP_JUMP_FORWARD_IF_TRUE:
       case POP_TOP:
+      case PRECALL:
+      case PUSH_NULL:
       case RESUME:
       case RETURN_VALUE:
+      case SET_ADD:
       case STORE_FAST:
       case SWAP:
       case UNARY_INVERT:
       case UNARY_NEGATIVE:
       case UNARY_NOT:
       case UNARY_POSITIVE:
+      case UNPACK_EX:
+      case UNPACK_SEQUENCE:
         break;
       default:
         return "REFUSE_SHAPE_EXECUTE_SURFACE";
@@ -4064,7 +4089,8 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (!getConfig().specialized_opcodes ||
+  if (getConfig().state == jit::State::kRunning ||
+      !getConfig().specialized_opcodes ||
       bc_instr.specializedOpcode() != LOAD_METHOD_WITH_VALUES) {
     return false;
   }
@@ -5024,6 +5050,7 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     int name_idx,
     Register* result) {
   if (!getConfig().stable_frame || !getConfig().specialized_opcodes ||
+      getConfig().state == jit::State::kRunning ||
       bc_instr.opcode() != LOAD_GLOBAL) {
     return false;
   }

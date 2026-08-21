@@ -88,6 +88,17 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     size_t nargsf,
     PyObject* kwnames);
 
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 canary: consume a recursion slot after a successful positional
+// bind, then re-enter the compiled body.  Used by the generated
+// equal-argcount prologue so GuardedEntry does not Enter before binding.
+PyObject* JITRT_ReenterAfterBind(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames);
+#endif
+
 // On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a
 // hidden first parameter for the return pointer, shifting all visible
 // arguments. Return PyObject* instead to keep register assignments correct.

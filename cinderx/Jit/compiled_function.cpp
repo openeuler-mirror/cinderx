@@ -41,10 +41,10 @@ bool isJitCompiled(const PyFunctionObject* func) {
   // __code__ swap.
   if (reinterpret_cast<void*>(func->vectorcall) ==
       reinterpret_cast<void*>(Ci_JitShell311_GuardedEntry)) {
-    // Exactly the predicate the entry uses, so this cannot report a
-    // function as compiled while every call to it is handed to the
-    // interpreter -- the state after a __code__ swap, or after defaults
-    // appeared, is "not compiled" for both.
+    // Exactly the predicate the entry uses for function state, so this
+    // cannot report a function as compiled after a __code__ swap that
+    // already sent every call to the interpreter.  Live defaults are
+    // rebound by the generated prologue and do not clear the artifact.
     return Ci_JitShell311_InstalledArtifact(
                const_cast<PyFunctionObject*>(func)) != nullptr;
   }

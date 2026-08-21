@@ -3116,9 +3116,9 @@ PyObject* read_jit_list(PyObject* /* self */, PyObject* arg) {
 
 // The registry as it stands, unfiltered.  get_compiled_functions() answers
 // the logical question -- will a call run machine code -- and a function
-// that temporarily fell back (its defaults changed, say) drops out of it
-// while its artifact and code buffer are still very much resident.  Telling
-// the two apart is what makes a lifecycle report mean anything.
+// that temporarily fell back (its code or globals changed, say) drops out
+// of it while its artifact and code buffer are still very much resident.
+// Telling the two apart is what makes a lifecycle report mean anything.
 PyObject* get_resident_compiled_functions(PyObject* /* self */, PyObject*) {
   // A physical measurement, so it must not depend on the JIT's current
   // state OR its registries: pausing does not release a code buffer, and
@@ -3162,10 +3162,10 @@ PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
     if (jitCtx()->isFunctionDeathPending(func_and_compiled.first)) {
       continue;
     }
-    // Report what is actually installed.  A function whose code, globals or
-    // defaults changed since it compiled still holds a registry entry, but
-    // every call to it now goes to the interpreter, so listing it here
-    // would contradict is_jit_compiled() and inflate the installed count.
+    // Report what is actually installed.  A function whose code or globals
+    // changed since it compiled still holds a registry entry, but every
+    // call to it now goes to the interpreter, so listing it here would
+    // contradict is_jit_compiled() and inflate the installed count.
     if (!isJitCompiled(func_and_compiled.first)) {
       continue;
     }

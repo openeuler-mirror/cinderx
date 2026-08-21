@@ -91,9 +91,9 @@ const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code);
 // opcode/front-end policy in code, or nullptr when checkTranslate() may run.
 const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code);
 
-// MR-04 execute surface: nullptr when every instruction of the code object
-// is inside the audited machine-code execution whitelist, otherwise the
-// registered shape-refusal reason.
+// Execute surface: nullptr when every instruction of the code object is
+// inside the audited machine-code whitelist (MR-04 leaf ops plus the
+// MR-06 CALL family), otherwise the registered shape-refusal reason.
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code);
 
 // Inlining merges all of the different callee Returns (which terminate blocks,
