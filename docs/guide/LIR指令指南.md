@@ -66,7 +66,7 @@ Operand 包装类由 `Jit/lir/operand.h` 生成，作为 `addOperands(...)` 的�
 | `Stk(slot, ty)` / `OutStk` | 栈槽 | `stack[n]` |
 | `VReg(def_instr)` | 虚拟寄存器，指向定义它的 LIR 指令 | `%42:Object` |
 | `Imm(v, ty)` / `FPImm(d)` | 整数/双精度立即数 | `123(0x7b):64bit` |
-| `MemImm(addr)` | 固定内存地址（函数指针、常量对象） | `17124416(0x1054c40):Object` |
+| `MemImm(addr)` | 固定内存地址（常量对象地址，如 Guard 的目标对象/类型） | `17124416(0x1054c40):Object` |
 | `Lbl(block)` / `AsmLbl(label)` | 基本块标签 / asmjit 标签 | `BB%3` |
 | `Ind(base, index, mult, offset)` | 间接寻址 base+index*scale+offset | `[R14 + RAX*8 + 0x10]` |
 
@@ -147,7 +147,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 
 ### 6.2 调用类（7 条）
 
-- **`Call`**：通用 C 调用（x64 SysV / AArch64 AAPCS64）。函数指针可来自寄存器或 `MemImm`。返回值判错由后续 `Guard` 完成。
+- **`Call`**：通用 C 调用（x64 SysV / AArch64 AAPCS64）。函数指针由 `appendCallInstructionInternal()` 以 **Imm**（kObject）内联在输入 0，后续 pass 才可能将其搬入寄存器（如先 Move 到 RAX 再 Call）。返回值判错由后续 `Guard` 完成。
 - **`VectorCall`**：`_PyObject_Vectorcall` 形态。输入布局（按 `generator.cpp` 的下降顺序）：**[0] runtime helper 立即数**（`_PyObject_Vectorcall`；被调方非简单函数对象时改用带 eval breaker 检查的 `JITRT_Vectorcall`）、**[1] flags 立即数**、**[2] callable**（HIR 的第一个操作数）、[3..] 实参、**末尾** kwnames 或 Imm 0。HIR VectorCall 的主要下降目标。
 - **`VarArgCall`**：变长参数调用形态（配合 `VariadicPush`/`Cqo` 等）。
 - **`LoadAttrCachedFastPath`**：inline-cache 属性加载的快路径整体（call-like，含缓存探测）。
@@ -172,7 +172,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 ### 6.5 整数算术与移位（18 条）
 
 - **`Add`** / **`Sub`** / **`Mul`**：加减乘，置标志。Sub 输入跨指令存活（codegen 需在写输出后仍能读操作数）。
-- **`Div`** / **`DivUn`**：有符号/无符号除法。输入布局（`postalloc.cpp` 的 `rewriteDivide()`）：两输入形态为 `[被除数, 除数]`，三输入形态为 `[被除数高 32 位, 被除数低 32 位, 除数]`——**除数恒为最后一个输入**；x64 上重写为 RDX:RAX / 除数 的 idiv 序列，并配合 `Cdq/Cqo`。属性表中 `{1}`（输入槽 0 须物理寄存器）约束的是两输入形态下的被除数，不是除数。
+- **`Div`** / **`DivUn`**：有符号/无符号除法。输入布局（`postalloc.cpp` 的 `rewriteDivide()`）：两输入形态为 `[被除数, 除数]`，三输入形态为 `[被除数高半部, 被除数低半部, 除数]`——**半部宽度跟随操作数**（支持 16/32/64 位），**除数恒为最后一个输入**。x64 上重写为 idiv 序列，按宽度使用 DX:AX（16 位，配 `Cwd`）、EDX:EAX（32 位，配 `Cdq`）、RDX:RAX（64 位，配 `Cqo`）——低半部固定占用 A 系累加器、高半部固定占用 D 系寄存器；8 位除法特殊处理为 16 位 AX 形态。属性表中 `{1}`（输入槽 0 须物理寄存器）约束的是两输入形态下的被除数，不是除数。
 - **`And`** / **`Or`** / **`Xor`**：位运算，置标志。
 - **`Negate`**（取负，置标志）、**`Invert`**（按位取反）、**`Inc`** / **`Dec`**（自增/自减，置标志）。
 - **`MulAdd`**：三操作数乘加 `a*b + c`，64 位。
@@ -236,7 +236,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 
 ### 6.13 TreeIter 状态机（13 条）
 
-与 HIR 同名指令一一对应（操作 JIT 帧 footer 中的 heap 状态结构），全部为 essential 副作用指令：
+与 HIR 同名指令一一对应（操作 JIT 帧 footer 中的 heap 状态结构）；除 `LoadPhase`、`LoadPoppedPhase`、`LoadStackTop` 三条纯读取指令（is_essential=false）外，其余 10 条均为 essential 副作用指令（以属性总表为准）：
 
 - **`EnsureTreeIterState`**：确保状态结构已分配（失败抛 MemoryError）。
 - **`SaveCurrentNode`** / **`LoadCurrentNode`**：写 / 读（带 incref）当前树节点。
@@ -371,7 +371,7 @@ python -X jit-all -X jit-dump-lir -X jit-dump-lir-origin demo.py
 
 三条代表性路径（详见 `Jit/lir/generator.cpp`）：
 
-1. **`BinaryOp<Add>`** → 查 `binaryfunc` 助手表得到 `PyNumber_Add` 地址 → `Call`（`MemImm` 函数指针 + 两个 VReg 实参）→ `Guard`（`kNotZero` 检查返回值非 NULL，kind 由 `emitExceptionCheck()` 按返回类型选择）。
+1. **`BinaryOp<Add>`** → 查 `binaryfunc` 助手表得到 `PyNumber_Add` 地址 → `Call`（函数指针由 `appendCallInstructionInternal()` 构建为 **Imm**（kObject）附着在输入 0，后续 pass 才可能搬入寄存器——如 §4.2 示例中先 Move 到 RAX；另有两个 VReg 实参）→ `Guard`（`kNotZero` 检查返回值非 NULL，kind 由 `emitExceptionCheck()` 按返回类型选择）。
 2. **`VectorCall`** → 若被调对象是编译期常量 `PyCFunction`（非 heap type、非 module 子类型）则 `TranslateSpecializedCall` 直接特化（如 builtin next、METH_NOARGS/METH_O 形态）；否则生成 LIR `VectorCall`：输入依次为 runtime helper（`_PyObject_Vectorcall` 或 `JITRT_Vectorcall`）、flags、callable、实参，末尾 kwnames 或 0。
 3. **可 deopt 指令**（GuardType/GuardIs/Check* 等）→ `appendGuard` 生成 `Guard`，输入依次为 kind、deopt id、被查值、目标（对象/类型 MemImm）与全部 live 值。
 
