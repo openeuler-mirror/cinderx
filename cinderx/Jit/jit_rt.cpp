@@ -2937,7 +2937,10 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
     }
     PyErr_Clear();
   }
-  Py_INCREF(&JITRT_IterDoneSentinel);
+  // The sentinel is a borrowed address marker: consumers only compare
+  // the pointer and nothing in the tree decrefs it.  On 3.11 it is
+  // MORTAL, so an incref here leaked one reference per exhausted loop
+  // (on 3.12+ it is immortal and an incref was merely a no-op).
   return &JITRT_IterDoneSentinel;
 }
 

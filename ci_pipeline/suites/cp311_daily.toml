@@ -94,14 +94,23 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.
 
 # MR-11 acceptance 14: the reference-leak hunt the item actually names.
 #
-# THIS LEG CURRENTLY FAILS, on a defect it did not introduce.  With the
-# JIT genuinely running -- which it did not do until the attestation
-# below was added -- regrtest -R reports reference leaks on the execute
-# path.  They are confined to execute mode, they are steady-state, and
-# the MR-10 base leaks MORE of them than this branch does (sum=63 vs 51
-# on test_bool).  The leg is kept red rather than tuned green: see
-# docs/design/cp311-execute-compatibility-deviations.md for the
-# measurements and what is known.
+# THIS LEG STILL FAILS, but no longer on references.
+#
+# Running it found a real defect: JITRT_IterDoneSentinel is a borrowed
+# address marker that JITRT_InvokeIterNext increfed and nobody decrefed.
+# From 3.12 on the sentinel is immortal so the incref is a no-op; on 3.11
+# it is mortal, so every for-loop that ran to exhaustion in compiled code
+# leaked exactly one reference.  That is fixed, and with it every
+# reference leak across all ten modules -- eight of the ten now pass.
+#
+# What is left is a memory-BLOCK leak in test_listcomps (8 per
+# repetition) and test_unpack (3), with zero reference growth.  It is not
+# a JIT defect: it reproduces identically with CINDERX_JIT_MODE=off, is
+# absent when the plugin is not enabled, and is absent on stock CPython
+# 3.11.6 -- so it belongs to the vendored evaluator in
+# cinderx/Interpreter/3.11/, not to anything this MR touches.  The leg is
+# kept red rather than narrowed to hide it.  See
+# docs/design/cp311-execute-compatibility-deviations.md.
 # regrtest -R needs sys.gettotalrefcount, so the leg builds a Py_DEBUG
 # CPython 3.11.6 and builds CinderX against it (both cached in the work
 # directory; only the first run pays).  It fails closed on its own
