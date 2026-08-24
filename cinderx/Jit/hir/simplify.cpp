@@ -742,6 +742,9 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   Type ty = receiver->type();
   if (receiver->isA(TType)) {
+    // On 3.11 the entry is pull-validated in getValueHelper against the
+    // owner type's version AND the metaclass identity/version, so the
+    // inline "type pointer matches" arm cannot serve a stale answer.
     return simplifyLoadTypeMethodCached(env, load_meth);
   }
   BorrowedRef<PyTypeObject> type{ty.runtimePyType()};
@@ -2093,6 +2096,16 @@ Register* simplifyLoadAttrGenericDescriptor(Env& env, const DescrInfo& info) {
 Register* simplifyLoadAttrInstanceReceiver(
     Env& env,
     const LoadAttr* load_attr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The receiver specializations below bake type facts into machine code
+  // and lean on DeoptPatchpoint/TypeDeoptPatcher -- push invalidation a
+  // watcherless 3.11 can never deliver (and the running mode structurally
+  // refuses patchpoint-bearing artifacts).  3.11 attribute access goes
+  // through the pull-validated helper caches instead.
+  (void)env;
+  (void)load_attr;
+  return nullptr;
+#else
   Register* receiver = load_attr->GetOperand(0);
   Type type = receiver->type();
   BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};
@@ -2135,6 +2148,7 @@ Register* simplifyLoadAttrInstanceReceiver(
     }
   }
   return nullptr;
+#endif
 }
 
 Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
@@ -2142,6 +2156,22 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
   if (!receiver->isA(TType)) {
     return nullptr;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 has no type watcher, so the inline "cached type pointer matches"
+  // fast path below would serve stale answers: the pointer still matches
+  // after the class, its metaclass or the value's type is mutated.  The
+  // helper IS the seam -- LoadTypeAttrCache::invoke re-proves the owner,
+  // metaclass and descriptor facts on every call and only then returns the
+  // cached value -- so the site is lowered as a plain helper call with no
+  // inline arm.  The saving is the MRO walk, not a memory load.
+  {
+    const int cache_id = env.func.env.allocateLoadTypeAttrCache();
+    env.emit<UseType>(receiver, TType);
+    return env.emit<FillTypeAttrCache>(
+        receiver, load_attr->name_idx(), cache_id, *load_attr->frameState());
+  }
+#endif
 
   const int cache_id = env.func.env.allocateLoadTypeAttrCache();
   env.emit<UseType>(receiver, TType);
@@ -2240,6 +2270,13 @@ Register* simplifyIsNegativeAndErrOccurred(
 }
 
 bool simplifyStoreAttrInstanceReceiver(Env& env, const StoreAttr* store_attr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Baked member-descriptor stores have no pull seam either; see
+  // simplifyLoadAttrInstanceReceiver.
+  (void)env;
+  (void)store_attr;
+  return false;
+#endif
   Register* receiver = store_attr->GetOperand(0);
   Type type = receiver->type();
   BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};

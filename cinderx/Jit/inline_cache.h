@@ -67,6 +67,14 @@ struct DataDescrMutator {
 
   BorrowedRef<> descr;
   BorrowedRef<PyTypeObject> descr_type;
+#if PY_VERSION_HEX < 0x030C0000
+  // The descriptor type's tp_version_tag captured at fill.  The kind
+  // selection baked descr_type's tp_descr_get/tp_descr_set into the
+  // dispatch, and mutating the DESCRIPTOR's type (del D.__set__) never
+  // touches the receiver type's version -- so a hit must pull-validate
+  // this tag as well (see AttributeMutator::descrVersionMatches).
+  uint32_t descr_type_version{0};
+#endif
 };
 
 // Mutator for a member descriptor
@@ -172,6 +180,44 @@ class AttributeMutator {
         offsetof(AttributeMutator, split_));
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Pull-based validity on 3.11 (no type watchers exist there): the
+  // receiver type's tp_version_tag captured at fill time.  A hit requires
+  // the live receiver's tag to equal this; PyType_Modified zeroes the tag
+  // and reassignment draws a fresh number from a monotonic global stream,
+  // so a stale -- or dead-and-reallocated -- type can never revalidate.
+  bool typeVersionMatches(PyTypeObject* live_type) const {
+    return live_type->tp_version_tag == type_version_;
+  }
+
+  // Second half of the 3.11 pull validation, for the one kind whose
+  // dispatch bakes in another type's protocol: kDataDescr captured
+  // descr_type's tp_descr_get/tp_descr_set at fill, and deleting
+  // D.__set__ mutates D -- not the receiver -- so the receiver-version
+  // gate cannot see it.  The stale entry would misroute precedence
+  // (an instance shadow must win once the descriptor stops being a data
+  // descriptor) or call a now-NULL slot.
+  //
+  // The POINTER comparison comes first and gates the version load:
+  // d.__class__ = D2 swaps the descriptor's type without touching the
+  // receiver or D1's version -- and can leave the captured descr_type
+  // pointing at a dead type if the swap dropped D1's last reference.
+  // Py_TYPE(descr) is safe to read (typeVersionMatches passing means the
+  // receiver still holds the descriptor), the captured pointer is only
+  // compared, and the version is loaded through Py_TYPE(descr) itself
+  // only after they are proven identical.  Other kinds need no tag:
+  // kDescrOrClassVar re-reads the slots on every call, and kMemberDescr
+  // only ever captures the immutable PyMemberDescr_Type.
+  bool descrVersionMatches() const {
+    if (get_kind() != Kind::kDataDescr) {
+      return true;
+    }
+    PyTypeObject* live_descr_type = Py_TYPE(data_descr_.descr.get());
+    return live_descr_type == data_descr_.descr_type &&
+        live_descr_type->tp_version_tag == data_descr_.descr_type_version;
+  }
+#endif
+
  private:
   void set_type(PyTypeObject* type, Kind kind);
   Kind get_kind() const {
@@ -181,6 +227,9 @@ class AttributeMutator {
   uintptr_t type_; // This value stores both a PyTypeObject* for the type object
                    // and the Kind enum value which are bitpacked together to
                    // reduce memory consumption
+#if PY_VERSION_HEX < 0x030C0000
+  uint32_t type_version_{0};
+#endif
   union {
     SplitMutator split_;
     CombinedMutator combined_;
@@ -291,13 +340,52 @@ class LoadTypeAttrCache {
  private:
   PyObject* invokeSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
 
-  void fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value);
+  // `metatype` and `value_guard_type` carry the 3.11 pull-validation facts
+  // (see the members below); both are ignored on 3.12+, where the type
+  // watcher retires entries instead.
+  void fill(
+      BorrowedRef<PyTypeObject> type,
+      BorrowedRef<> value,
+      [[maybe_unused]] BorrowedRef<PyTypeObject> metatype,
+      [[maybe_unused]] BorrowedRef<PyTypeObject> value_guard_type);
   void reset();
 
   // Cached type and value, stored as raw pointers so codegen can access them by
   // address.
   PyTypeObject* type_;
   PyObject* value_;
+
+#if PY_VERSION_HEX < 0x030C0000
+ public:
+  // Pull-based validity on 3.11, which has no type watcher to retire this
+  // entry.  type_getattro's cached answer rests on three mutable facts, and
+  // a hit must re-prove all of them:
+  //
+  //   * the OWNER type's MRO still resolves the name the same way
+  //     (type_version_);
+  //   * the METATYPE still routes through type_getattro and still has no
+  //     data descriptor of this name (metatype_ + metatype_version_) --
+  //     mutating the metaclass never touches the owner's version;
+  //   * the cached value is still a non-descriptor, when that is what made
+  //     it cachable (value_guard_type_ + value_guard_version_); a heap type
+  //     that later gains __get__ turns the plain value into a descriptor.
+  //
+  // Entries whose facts cannot all be pinned (a type without a valid
+  // version tag) are simply not filled, so the site keeps using the
+  // generic path rather than a half-guarded cache.
+  bool hitIsValid311(BorrowedRef<PyTypeObject> receiver) const;
+
+ private:
+  uint32_t type_version_{0};
+  PyTypeObject* metatype_{nullptr};
+  uint32_t metatype_version_{0};
+  // nullptr when the cachability decision did not depend on a mutable
+  // descriptor protocol (plain functions and staticmethods are pinned to
+  // static builtin types that cannot gain __get__ from Python).
+  PyTypeObject* value_guard_type_{nullptr};
+  uint32_t value_guard_version_{0};
+  bool pull_valid_{false};
+#endif
 };
 
 #define FOREACH_CACHE_MISS_REASON(V) \
@@ -330,6 +418,10 @@ class LoadMethodCache {
     BorrowedRef<PyTypeObject> type;
     BorrowedRef<> value;
     uint32_t keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+    // Pull-based validity (see AttributeMutator::typeVersionMatches).
+    uint32_t type_version{0};
+#endif
 
     bool isValidKeysVersion(BorrowedRef<> obj);
   };
@@ -401,6 +493,24 @@ class LoadTypeMethodCache {
   BorrowedRef<> value_;
   std::unique_ptr<CacheStats> cache_stats_;
   bool is_unbound_meth_;
+#if PY_VERSION_HEX < 0x030C0000
+  // Pull-based validity: the receiver type's tag at fill time, plus the
+  // attribute name so a stale fast-path hit (getValueHelper receives only
+  // the receiver) can re-run the full lookup.  The name is borrowed from
+  // co_names of the code object whose site owns this cache; the owning
+  // CodeRuntime keeps that code alive.
+  //
+  // The METATYPE is guarded too: every fill below happened only because
+  // the metatype routes through type_getattro and holds no data descriptor
+  // of this name, and mutating a metaclass never bumps the owner class's
+  // own version tag.  Without this pair, adding a same-named data
+  // descriptor to the metaclass would leave the class-dict method cached
+  // and winning, while stock hands the metaclass descriptor the call.
+  uint32_t type_version_{0};
+  BorrowedRef<> name_;
+  PyTypeObject* metatype_{nullptr};
+  uint32_t metatype_version_{0};
+#endif
 };
 
 // A cache for an individual LoadModuleAttrCached instruction.
@@ -460,6 +570,32 @@ class LoadModuleMethodCache {
 
 // Invalidate all load/store attr caches for type
 void notifyICsTypeChanged(BorrowedRef<PyTypeObject> type);
+
+#if PY_VERSION_HEX < 0x030C0000
+// MR-09 observability: per-class cache tallies for the pull-validated 3.11
+// arms.  A hit consumed a validated entry; a miss took the slow path with
+// no usable entry; a fill wrote an entry; an invalidation is a pull check
+// retiring a stale entry.  Monotonic counters, read through
+// cinderjit.get_attr_cache_stats().
+struct AttrCacheClassStats {
+  uint64_t fills{0};
+  uint64_t hits{0};
+  uint64_t misses{0};
+  uint64_t invalidations{0};
+};
+
+struct AttrCacheStats311 {
+  AttrCacheClassStats load_attr;
+  AttrCacheClassStats store_attr;
+  AttrCacheClassStats load_method;
+  AttrCacheClassStats load_type_attr;
+  AttrCacheClassStats load_type_method;
+  AttrCacheClassStats load_module_attr;
+  AttrCacheClassStats load_module_method;
+};
+
+AttrCacheStats311& attrCacheStats311();
+#endif
 
 } // namespace jit
 

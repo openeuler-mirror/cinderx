@@ -1,4 +1,5 @@
 AliasClassTest
+AttrCache311Test
 BasicBlockTest
 BehaviorClassifierTest
 BitVectorTest

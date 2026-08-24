@@ -58,7 +58,7 @@ EXPECTED = [interpreted_oracle(i, 9, 1) for i in range(7)]
 
 
 def main() -> int:
-    assert cinderjit.is_attr_caches_enabled() is False
+    assert cinderjit.is_attr_caches_enabled() is True
     assert cinderjit.force_compile(hot) is True
     assert cinderjit.force_compile(raiser) is True
 

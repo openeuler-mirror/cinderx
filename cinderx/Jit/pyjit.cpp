@@ -2921,11 +2921,48 @@ PyObject* is_enabled(PyObject* /* self */, PyObject* /* args */) {
 }
 
 PyObject* is_attr_caches_enabled(PyObject* /* self */, PyObject* /* args */) {
-  // Read-only config export so the MR-04 acceptance ("the 3.11 default
-  // keeps inline attribute caches off until MR-09") is attested inside
-  // the child process rather than assumed.
+  // Read-only config export so the attribute-cache default (off from
+  // MR-04 until the MR-09 acceptance, on since) is attested inside the
+  // child process rather than assumed.
   return PyBool_FromLong(getConfig().attr_caches);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* get_attr_cache_stats(PyObject* /* self */, PyObject* /* args */) {
+  // MR-09 observability: per-class fill/hit/miss/invalidation tallies of
+  // the pull-validated 3.11 cache arms.  Monotonic counters; tests take
+  // before/after snapshots.
+  auto make_class = [](const jit::AttrCacheClassStats& s) {
+    return Py_BuildValue(
+        "{s:K,s:K,s:K,s:K}",
+        "fills",
+        static_cast<unsigned long long>(s.fills),
+        "hits",
+        static_cast<unsigned long long>(s.hits),
+        "misses",
+        static_cast<unsigned long long>(s.misses),
+        "invalidations",
+        static_cast<unsigned long long>(s.invalidations));
+  };
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+  return Py_BuildValue(
+      "{s:N,s:N,s:N,s:N,s:N,s:N,s:N}",
+      "load_attr",
+      make_class(stats.load_attr),
+      "store_attr",
+      make_class(stats.store_attr),
+      "load_method",
+      make_class(stats.load_method),
+      "load_type_attr",
+      make_class(stats.load_type_attr),
+      "load_type_method",
+      make_class(stats.load_type_method),
+      "load_module_attr",
+      make_class(stats.load_module_attr),
+      "load_module_method",
+      make_class(stats.load_module_method));
+}
+#endif
 
 PyObject* count_interpreted_calls(PyObject* /* self */, PyObject* arg) {
   BorrowedRef<PyFunctionObject> func =
@@ -4388,6 +4425,11 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("Arm a deopt site so the Nth visit (or at-or-after N) "
                "enters the real guard-failure restore.")},
+    {"get_attr_cache_stats",
+     get_attr_cache_stats,
+     METH_NOARGS,
+     PyDoc_STR("Per-class fill/hit/miss/invalidation tallies of the "
+               "pull-validated attribute caches.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -5014,10 +5056,11 @@ int initialize() {
     }
   });
 
-  // The 3.11 attribute-cache default is explicitly OFF until the MR-09
-  // pull-based invalidation acceptance; neither shadow nor canary may walk
-  // an unaccepted IC arm (dev plan MR-04).
-  getMutableConfig().attr_caches = false;
+  // The 3.11 attribute-cache default was explicitly OFF from MR-04 until
+  // the MR-09 pull-based invalidation acceptance.  The caches are now
+  // pull-validated on every hit (no watcher exists on 3.11), so the
+  // shared default -- and the -X jit-attr-caches / PYTHONJITATTRCACHES
+  // override, which the off-arm comparison legs use -- applies as-is.
   // Artifact sharing across functions stays off as policy: the death
   // watch removed the old safety hazard, but twin adoption is scheduling
   // policy with its own acceptance, outside this milestone.

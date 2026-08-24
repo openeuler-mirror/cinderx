@@ -138,11 +138,12 @@ TEST_F(JITContextTest, CanaryExecutesUnspecializedForms) {
   SKIP_311_EXECUTABLE_COMPILE();
 
   // MR-07 turns specialized opcode consumption on so organic type-change
-  // deopt is a real GuardFailure, not a synthetic force.  Attribute-cache
-  // IC remains MR-09; if that flag is found open here, canary has started
-  // claiming a dimension this milestone does not deliver.
+  // deopt is a real GuardFailure, not a synthetic force.  MR-09 accepts
+  // the pull-validated attribute caches, so their default is on too; the
+  // canary claiming either dimension without these flags would be
+  // claiming machinery that is not armed.
   EXPECT_TRUE(jit::getConfig().specialized_opcodes);
-  EXPECT_FALSE(jit::getConfig().attr_caches);
+  EXPECT_TRUE(jit::getConfig().attr_caches);
 }
 #endif
 
@@ -155,12 +156,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // artifact allocation, the code-extra reservation, and the post-compile
   // execute refusal all live below it.  Its answer is what lets the
   // compile entry stop reporting OK for a function that was never
-  // installed.  LOAD_ATTR is still off the execute whitelist (keyword-only
-  // signatures are rebound by the generated prologue and are no longer a
-  // refusal).  An empty data block exercises the same early-return paths
-  // an allocation failure would take.
+  // installed.  BINARY_SUBSCR is still off the execute whitelist
+  // (attribute access joined it in MR-09).  An empty data block exercises
+  // the same early-return paths an allocation failure would take.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(obj): return obj.attr", "func"));
+      compileAndGet("def func(obj): return obj[0]", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;
@@ -4395,8 +4395,10 @@ def paused(x):
   EXPECT_TRUE(jit::isJitPaused());
   EXPECT_FALSE(isJitCompiled(func));
   EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
-  // Resident, not installed: the artifact outlives the entry.
-  EXPECT_EQ(ctx->compiledCodes().size(), resident_before);
+  // Resident, not installed: the artifact outlives the entry.  disable()
+  // first compiles the pending queue (the hot cinderx.jit wrappers since
+  // the MR-09 attribute surface), so residency can grow but never shrink.
+  EXPECT_GE(ctx->compiledCodes().size(), resident_before);
   EXPECT_EQ(ctx->deoptedFuncs().count(func), 1u);
 
   auto arg = makeLong(5);
@@ -4755,7 +4757,11 @@ class Downer:
   callJitOneArg(mod, "disable", deopt_all);
   ASSERT_FALSE(isJitCompiled(alpha));
   ASSERT_FALSE(isJitCompiled(bravo));
-  ASSERT_EQ(ctx->deoptedFuncs().size(), 2u);
+  // Membership, not set size: disable() first compiles the pending queue,
+  // and since the MR-09 attribute surface the hot cinderx.jit wrappers
+  // legitimately park alongside the fixtures.
+  ASSERT_EQ(ctx->deoptedFuncs().count(alpha), 1u);
+  ASSERT_EQ(ctx->deoptedFuncs().count(bravo), 1u);
 
   // Plant the trigger at bravo's anchor key; the reattachment displaces
   // it, and the deferred release fires after the walk.
@@ -4773,7 +4779,6 @@ class Downer:
   EXPECT_EQ(jit::getConfig().state, jit::State::kPaused);
   EXPECT_FALSE(isJitCompiled(alpha));
   EXPECT_FALSE(isJitCompiled(bravo));
-  EXPECT_EQ(ctx->deoptedFuncs().size(), 2u);
   EXPECT_EQ(ctx->deoptedFuncs().count(alpha), 1u);
   EXPECT_EQ(ctx->deoptedFuncs().count(bravo), 1u);
 
@@ -5339,12 +5344,16 @@ def parked(x):
 
   auto weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
   ASSERT_NE(weak, nullptr);
+  PyFunctionObject* raw = func.get();
   runStockCode("del parked");
   func.reset();
 
   ASSERT_EQ(PyWeakref_GetObject(weak), Py_None)
       << "the parked function did not die; the parked set is still owning it";
-  EXPECT_EQ(ctx->deoptedFuncs().size(), 0u)
+  // Membership, not set size: other hot functions (the cinderx.jit
+  // wrappers since the MR-09 attribute surface) may be legitimately
+  // parked alongside; the dead one must be gone.
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u)
       << "a dead function is still parked; enable() would walk it";
 
   // Re-enabling must be uneventful rather than fatal.

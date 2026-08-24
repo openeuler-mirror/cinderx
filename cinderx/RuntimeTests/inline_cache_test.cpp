@@ -215,6 +215,11 @@ module_meth = functools._unwrap_partial
       << "Expected functools to be cached as an obj";
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
+// The two tests below exercise the push-invalidation registry
+// (notifyICsTypeChanged clearing entries through the TypeWatcher maps).
+// 3.11 has no type watchers: the registry is deliberately inert there and
+// entries retire by pull instead -- AttrCache311Test covers that side.
 TEST_F(InlineCacheTest, LoadAttrCacheKeepsSharedDescrTypeWatcher) {
   runStockCode(R"(
 class Descr:
@@ -298,3 +303,4 @@ obj.foo = "cached"
   jit::notifyICsTypeChanged(type);
   EXPECT_EQ(countEntriesForType(cache.get(), type), 0);
 }
+#endif // PY_VERSION_HEX >= 0x030C0000

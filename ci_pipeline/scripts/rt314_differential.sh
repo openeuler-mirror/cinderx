@@ -137,7 +137,16 @@ build_and_run() {
   local bin
   bin=$(find "$WORK/$tag-build" -name runtime_tests -type f | head -1)
   set +e
-  (cd "$tree/cinderx" && "$bin") > "$WORK/$tag-tests.log" 2>&1
+  # Bytecode caches must be symmetric: the head side runs from the live
+  # checkout (which carries __pycache__ from ordinary development) while
+  # the base side runs from a pristine archive.  That asymmetry alone
+  # flips StaticSanityTest-class outcomes (measured: 6/6 green without
+  # the caches, 3/6 red with them), so both sides read and write their
+  # bytecode under the work dir and never touch the tree's caches.
+  (cd "$tree/cinderx" && \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPYCACHEPREFIX="$WORK/$tag-pycache" \
+    "$bin") > "$WORK/$tag-tests.log" 2>&1
   echo $? > "$WORK/$tag-exit"
   set -e
   # A run that did not reach the gtest epilogue crashed or was killed;

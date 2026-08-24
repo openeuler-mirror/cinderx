@@ -186,6 +186,7 @@ int BytecodeInstruction::specializedOpcode() const {
 #if PY_VERSION_HEX < 0x030C0000
     case LOAD_ATTR_INSTANCE_VALUE:
     case LOAD_METHOD_WITH_VALUES:
+    case LOAD_METHOD_MODULE:
     case LOAD_GLOBAL_MODULE:
 #endif
     case LOAD_ATTR_MODULE:

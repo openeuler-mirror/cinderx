@@ -369,8 +369,8 @@ def hot(a, b, one):
 
 CANARY_ATTEST = """\
 import cinderjit
-assert cinderjit.is_attr_caches_enabled() is False, (
-    'the 3.11 attribute-cache default must stay off until MR-09')
+assert cinderjit.is_attr_caches_enabled() is True, (
+    'the 3.11 attribute-cache default is on since the MR-09 acceptance')
 """
 
 CHURN = """\
@@ -544,10 +544,13 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         "      '%d silent' % (len(_covered), len(_targets), len(_silent)))\n"
         "assert not _silent, _silent\n"
     )
-    # Six organic deopts: five from the MR-07 era, plus one newly compiled
-    # exception path in the stdlib sweep once MR-08 opens the exception
-    # opcode family (verified deterministic across reruns).
-    default = execute_holds(expected_organic_deopts=6) + [
+    # The stdlib sweep's organic count steps with each milestone: five in
+    # the MR-07 era, one more when MR-08 opened the exception family, and
+    # 333 once MR-09's pull-validated attribute caches guard attribute
+    # sites across 72 importing modules (import-time class mutation
+    # retires receiver-version guards by design).  Verified deterministic
+    # across reruns; the exact pin keeps the fail-closed drift guard.
+    default = execute_holds(expected_organic_deopts=333) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -767,13 +770,14 @@ def canary_execute_runner(
         "assert hot(4, 5, 1) == 20\n"
         "assert hot(6, 5, 1) == 25\n"
     )
-    # Two organic deopts, both from the child preamble's import machinery:
-    # with the MR-08 exception surface open, importlib/os helpers that the
-    # auto threshold compiles no longer refuse over their exception
-    # opcodes, and their EAFP raise paths deopt once each by design.
-    # Verified deterministic and preamble-attributed (payload-free child
-    # reproduces exactly 2).
-    default = execute_holds(expected_organic_deopts=2) + [
+    # Thirty-seven organic deopts, all from the child preamble's import
+    # machinery under the auto threshold: MR-08 opened the exception
+    # opcode family (EAFP raise paths deopt by design), and MR-09's
+    # pull-validated attribute caches add guarded attribute sites whose
+    # receiver-version guards organically retire as import-time types
+    # mutate.  Verified deterministic across reruns; the exact pin keeps
+    # the fail-closed drift guard.
+    default = execute_holds(expected_organic_deopts=37) + [
         expect("compile_requests", ">", 0)
     ]
     return RunnerSpec(

@@ -1352,15 +1352,18 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   // RERAISE, WITH_EXCEPT_START) are reachable only through the exception
   // table, which HIR never translates.  RAISE_VARARGS,
   // LOAD_ASSERTION_ERROR and BEFORE_WITH do run in normal flow and have
-  // translations.  Only normal-flow-reachable instructions are checked:
-  // an opcode that occurs solely inside a handler region executes in the
-  // interpreter after the deopt regardless of what it is, so holding it
-  // to the machine-code whitelist would refuse functions this milestone
-  // fully supports.  Still out (on the reachable surface): attr or
-  // subscript ICs, STORE_DEREF, generator *bodies*, except* and pattern
-  // matching (the latter two refused earlier by the whole-code translate
-  // scan, keeping their audited refusals).  The decoder yields
-  // unspecialized opcodes, so quickened forms cannot slip past.
+  // translations.  MR-09 adds LOAD_ATTR and STORE_ATTR: attribute access
+  // executes through the pull-validated helper caches (or their
+  // guarded/generic fallbacks).  Only normal-flow-reachable instructions
+  // are checked: an opcode that occurs solely inside a handler region
+  // executes in the interpreter after the deopt regardless of what it
+  // is, so holding it to the machine-code whitelist would refuse
+  // functions this milestone fully supports.  Still out (on the
+  // reachable surface): subscripts, DELETE_ATTR, STORE_DEREF, generator
+  // *bodies*, except* and pattern matching (the latter two refused
+  // earlier by the whole-code translate scan, keeping their audited
+  // refusals).  The decoder yields unspecialized opcodes, so quickened
+  // forms cannot slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
     return "REFUSE_SHAPE_EXECUTE_SURFACE";
@@ -1400,6 +1403,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case LIST_EXTEND:
       case LIST_TO_TUPLE:
       case LOAD_ASSERTION_ERROR:
+      case LOAD_ATTR:
       case LOAD_CLOSURE:
       case LOAD_CONST:
       case LOAD_DEREF:
@@ -1428,6 +1432,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case RESUME:
       case RETURN_VALUE:
       case SET_ADD:
+      case STORE_ATTR:
       case STORE_FAST:
       case SWAP:
       case UNARY_INVERT:
@@ -4179,6 +4184,20 @@ void HIRBuilder::emitLoadMethod(
   if (tryEmitLoadMethodWithValues311(tc, bc_instr)) {
     return;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Mirror the LOAD_ATTR_MODULE pattern: a quickened module-method site
+  // guards the receiver as a module, which is the type proof the
+  // pull-validated LoadModuleMethodCached rewrite needs.  A non-module
+  // receiver fails the guard and re-executes LOAD_METHOD in the
+  // interpreter.
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == LOAD_METHOD_MODULE) {
+    Register* receiver = tc.frame.stack.pop();
+    Type type = Type::fromTypeExact(&PyModule_Type);
+    auto guard = tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+    tc.frame.stack.push(guard->output());
+  }
+#endif
   emitLoadMethod(tc, bc_instr.oparg());
 }
 

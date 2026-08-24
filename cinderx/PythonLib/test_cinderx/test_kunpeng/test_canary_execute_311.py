@@ -38,8 +38,8 @@ CHILD = textwrap.dedent(
     _cinderx.install_frame_evaluator()
     import cinderjit
 
-    assert cinderjit.is_attr_caches_enabled() is False, (
-        "3.11 attribute caches must default off until MR-09")
+    assert cinderjit.is_attr_caches_enabled() is True, (
+        "3.11 attribute caches default on since the MR-09 acceptance")
 
     def hot(a, b, one):
         total = a - a
@@ -96,15 +96,16 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_attr(a):
-                return a.foo
+            def uses_subscr(a):
+                return a[0]
 
             try:
-                cinderjit.force_compile(uses_attr)
+                cinderjit.force_compile(uses_subscr)
             except RuntimeError as exc:
                 assert "CANNOT_SPECIALIZE" in str(exc), exc
             else:
-                raise SystemExit("execute surface failed to refuse LOAD_ATTR")
+                raise SystemExit(
+                    "execute surface failed to refuse BINARY_SUBSCR")
             """
         )
         proc = subprocess.run(
@@ -6258,6 +6259,1151 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("injection sweep matched", proc.stdout)
+
+
+    # ------------------------------------------------------------------
+    # MR-09: pull-validated attribute caches.  3.11 has no dict/type
+    # watchers, so every cache entry proves its own validity at use time
+    # (captured tp_version_tag, keys versions, module dict version).
+    # These tests hold mutation visibility, object-protocol ordering,
+    # reentrancy and the observability contract with the caches on --
+    # and the off arm equal to the on arm.
+
+    def test_attr_cache_off_arm_matches_the_on_arm(self):
+        # -X jit-attr-caches / PYTHONJITATTRCACHES=0 is the comparison
+        # arm: identical answers with the caches off, and the tallies
+        # prove the off arm really ran uncached.
+        base = textwrap.dedent(
+            """
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x * 2
+
+            def work(p, v):
+                p.x = v
+                return p.ping() + p.x
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    work(p, p.x)
+            assert cinderjit.force_compile(work) is True
+            out = [work(p, i) for i, p in enumerate(ps)]
+            P.ping = lambda self: -self.x
+            out += [work(p, i + 10) for i, p in enumerate(ps)]
+            stats = cinderjit.get_attr_cache_stats()
+            total = sum(sum(cls.values()) for cls in stats.values())
+            print("JOURNAL " + json.dumps(
+                {"out": out, "cached": total, "enabled":
+                 cinderjit.is_attr_caches_enabled()}))
+            """
+        )
+
+        def run_arm(env_extra):
+            env = dict(os.environ)
+            env["CINDERX_JIT_MODE"] = "canary"
+            env["PYTHONJITAUTO"] = "1000000"
+            env.update(env_extra)
+            proc = subprocess.run(
+                [sys.executable, "-c", base],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            for line in proc.stdout.splitlines():
+                if line.startswith("JOURNAL "):
+                    return json.loads(line[len("JOURNAL "):])
+            self.fail(f"no JOURNAL line: {proc.stdout!r}")
+
+        on = run_arm({})
+        off = run_arm({"PYTHONJITATTRCACHES": "0"})
+        self.assertEqual(on["out"], off["out"])
+        self.assertTrue(on["enabled"])
+        self.assertFalse(off["enabled"])
+        self.assertGreater(on["cached"], 0)
+        self.assertEqual(off["cached"], 0, "the off arm walked a cache")
+
+    def test_class_and_descriptor_mutation_matches_the_interpreter_arm(self):
+        # Every mutation must be visible on the very next call: method
+        # redefinition, a data descriptor (property) appearing over a
+        # plain method, its removal, and a non-data descriptor being
+        # shadowed -- with the caches retiring entries by pull.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return ("method", self.x)
+
+            def read(p):
+                return p.ping()
+
+            def read_attr(p):
+                return p.x
+
+            ps = [P(i) for i in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+                    read_attr(p)
+            compile_all(read, read_attr)
+            journal = []
+            journal.append([read(p) for p in ps])
+
+            P.ping = lambda self: ("redefined", self.x)
+            journal.append([read(p) for p in ps])
+
+            # The property returns a callable so read()'s p.ping() call
+            # goes through the descriptor and then invokes its result.
+            P.ping = property(
+                lambda self: (lambda: ("property", self.x)))
+            journal.append([read(p) for p in ps])
+
+            del P.ping
+            def late_ping(self):
+                return ("late", self.x)
+            P.ping = late_ping
+            journal.append([read(p) for p in ps])
+
+            # Data descriptor over the instance attribute: the property
+            # must win over any instance shadow.
+            ps[0].__dict__["y"] = "shadow"
+            P.y = property(lambda self: "descr")
+            def read_y(p):
+                return p.y
+            compile_all(read_y)
+            journal.append([read_y(p) for p in ps])
+            del P.y
+            journal.append([getattr(ps[0], "y", None),
+                            getattr(ps[1], "y", None)])
+
+            still_compiled(read, read_attr, read_y)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_instance_shadow_and_dict_migration_matches_interp(self):
+        # Instance dict transitions: live inline values, a shadow added
+        # and deleted, vars() materializing the dict mid-stream, and new
+        # attributes growing the shared keys -- reads must track stock
+        # through every transition.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x
+
+            def read(p):
+                return (p.ping(), p.x)
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            journal = [[read(p) for p in ps]]
+
+            ps[0].ping = lambda: "inst"
+            journal.append(read(ps[0]))
+            del ps[0].ping
+            journal.append(read(ps[0]))
+
+            # vars() materializes the managed dict; the cache must follow.
+            vars(ps[1])["x"] = 77
+            journal.append(read(ps[1]))
+            ps[1].x = 78
+            journal.append(read(ps[1]))
+
+            # Grow the instance storage attribute by attribute.
+            for i in range(24):
+                setattr(ps[2], "extra_%d" % i, i)
+            journal.append(read(ps[2]))
+            journal.append(sorted(vars(ps[2]).items())[:3])
+
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_module_attr_mutation_matches_the_interpreter_arm(self):
+        # Module attribute loads and method calls are version-validated
+        # against the module dict; set, delete and restore must all be
+        # visible immediately.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import types
+
+            mod = types.ModuleType("mr9_mod")
+            mod.value = 1
+            mod.get = lambda: "get-1"
+
+            def read(m):
+                return (m.value, m.get())
+
+            for _ in range(40):
+                read(mod)
+            compile_all(read)
+            journal = [read(mod)]
+            mod.value = 2
+            journal.append(read(mod))
+            mod.get = lambda: "get-2"
+            journal.append(read(mod))
+            del mod.value
+            try:
+                read(mod)
+            except AttributeError as exc:
+                journal.append(str(exc))
+            mod.value = 3
+            journal.append(read(mod))
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_getattr_hook_and_ordering_match_the_interpreter_arm(self):
+        # __getattr__ fires only when normal lookup fails; a non-data
+        # descriptor loses to an instance shadow; both must survive the
+        # cached path and its refills.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class NonData:
+                def __get__(self, obj, objtype=None):
+                    return "descr"
+
+            class P:
+                nd = NonData()
+
+                def __init__(self, x):
+                    self.x = x
+
+                def __getattr__(self, name):
+                    return ("getattr", name)
+
+            def read_missing(p):
+                return p.absent
+
+            def read_nd(p):
+                return p.nd
+
+            ps = [P(i) for i in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read_missing(p)
+                    read_nd(p)
+            compile_all(read_missing, read_nd)
+            journal = [[read_missing(p) for p in ps],
+                       [read_nd(p) for p in ps]]
+
+            ps[0].absent = "present-now"
+            journal.append(read_missing(ps[0]))
+            del ps[0].absent
+            journal.append(read_missing(ps[0]))
+
+            ps[1].nd = "shadowed"
+            journal.append([read_nd(p) for p in ps])
+
+            still_compiled(read_missing, read_nd)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_reentrant_mutation_during_cached_access_is_safe(self):
+        # A __del__ fired by a cached store, mutating the class mid-store,
+        # must neither crash nor leave a stale entry serving the old
+        # layout.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self):
+                    self.slot = None
+
+                def ping(self):
+                    return "orig"
+
+            class Bomb:
+                def __del__(self):
+                    P.ping = lambda self: "mutated-by-del"
+
+            def store(p, v):
+                p.slot = v
+                return p.ping()
+
+            ps = [P() for _ in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    store(p, object())
+            assert cinderjit.force_compile(store) is True
+
+            for p in ps:
+                p.slot = Bomb()
+            results = [store(p, None) for p in ps]
+            assert results[0] in ("orig", "mutated-by-del"), results
+            assert results[-1] == "mutated-by-del", results
+            assert store(ps[0], 1) == "mutated-by-del"
+            assert cinderjit.is_jit_compiled(store)
+            print("reentrant mutation safe")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("reentrant mutation safe", proc.stdout)
+
+    def test_descriptor_type_demotion_matches_the_interpreter_arm(self):
+        # Deleting D.__set__ mutates the DESCRIPTOR's type, not the
+        # receiver, so the receiver-version guard alone cannot see it:
+        # the cache must pull-validate the descriptor type as well.
+        # After demotion an instance shadow wins (non-data precedence)
+        # and stores land in the instance dict instead of the vanished
+        # tp_descr_set; a get-side deletion must likewise never reach a
+        # NULL tp_descr_get.  Re-adding __set__ promotes it back.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class D:
+                def __get__(self, obj, objtype=None):
+                    return ("data", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("descr-set", value)
+
+            class C:
+                x = D()
+
+                def __init__(self, tag):
+                    self.tag = tag
+
+            def read(c):
+                return c.x
+
+            def write(c, v):
+                c.x = v
+
+            cs = [C(i) for i in range(3)]
+            for c in cs:
+                # Plant instance shadows while the descriptor is data:
+                # they stay invisible until the demotion flips precedence.
+                c.__dict__["x"] = ("shadow", c.tag)
+            for _ in range(40):
+                for c in cs:
+                    read(c)
+                    write(c, 1)
+            compile_all(read, write)
+
+            journal = []
+            journal.append([read(c) for c in cs])
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            del D.__set__
+            # Demoted: the planted shadows win the very next load, and
+            # tp_descr_set is NULL -- a stale kDataDescr dispatch would
+            # call it.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 9)
+            journal.append([c.__dict__["x"] for c in cs])
+            journal.append([read(c) for c in cs])
+
+            D.__set__ = lambda self, obj, value: obj.__dict__.__setitem__(
+                "log", ("re-promoted-set", value))
+            # Promoted back to a data descriptor: it wins over the
+            # instance entries again, for loads and stores alike.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 11)
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            class G:
+                def __get__(self, obj, objtype=None):
+                    return "get-side"
+
+                def __set__(self, obj, value):
+                    obj.__dict__["glog"] = value
+
+            class H:
+                y = G()
+
+            def read_y(h):
+                return h.y
+
+            hs = [H() for _ in range(3)]
+            for _ in range(40):
+                for h in hs:
+                    read_y(h)
+            compile_all(read_y)
+            journal.append([read_y(h) for h in hs])
+            del G.__get__
+            # tp_descr_get is NULL now; the descriptor object itself is
+            # returned by the full lookup (set-only descriptors have no
+            # instance shadow here).
+            journal.append(
+                [type(read_y(h)).__name__ for h in hs])
+
+            still_compiled(read, write, read_y)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_raising_dict_key_eq_propagates_from_cached_loads(self):
+        # PyDict_GetItem swallows exceptions; stock's GenericGetAttr uses
+        # PyDict_GetItemWithError and PROPAGATES a raising __eq__ from a
+        # hash-colliding non-unicode instance-dict key.  Every cached
+        # load path must do the same instead of folding the error into
+        # "attribute absent" and running descriptor/__getattr__ logic.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class K:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    raise RuntimeError("eq boom")
+
+            journal = []
+
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            # Managed receiver, non-data descriptor: the shadow peek runs
+            # the dict lookup that trips K.__eq__.
+            class P:
+                def x(self):
+                    return "method"
+
+            def read(p):
+                return p.x
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            for _ in range(3):
+                # Post-compile calls FILL the per-site cache and then hit
+                # it; without these the bomb below only meets the cold
+                # slow path (PyObject_GetAttr), which was never broken.
+                for p in ps:
+                    read(p)
+            bomb = P()
+            bomb.__dict__[K("x")] = 1
+            journal.append(observe(read, bomb))
+
+            # Non-managed receiver (tp_dictoffset): the combined-dict
+            # cached load runs the same lookup.
+            class E(Exception):
+                pass
+
+            def read_attr(e):
+                return e.attr
+
+            es = []
+            for _ in range(3):
+                e = E()
+                e.attr = "v"
+                es.append(e)
+            for _ in range(40):
+                for e in es:
+                    read_attr(e)
+            compile_all(read_attr)
+            for _ in range(3):
+                for e in es:
+                    read_attr(e)
+            eb = E()
+            eb.__dict__[K("attr")] = 1
+            journal.append(observe(read_attr, eb))
+
+            # The caches must still serve clean receivers afterwards.
+            journal.append([read(p) is P.x.__get__(p, P) or "bound"
+                            for p in ps][:1])
+            journal.append([read_attr(e) for e in es])
+            still_compiled(read, read_attr)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_dict_swapping_eq_keeps_the_found_value_alive(self):
+        # A hash-colliding key whose __eq__ replaces obj.__dict__ leaves
+        # the OLD dict alive only through the lookup's temporary
+        # reference.  Stock strengthens the found value BEFORE dropping
+        # the dict; the cached peek must use the same ordering or the
+        # returned pointer dangles (the ASAN leg turns a regression here
+        # into a hard failure).
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class Swapper:
+                def __init__(self, target, holder):
+                    self.target = target
+                    self.holder = holder
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    self.holder["obj"].__dict__ = {}
+                    return other == self.target
+
+            class P:
+                def x(self):
+                    return "method"
+
+            def read(p):
+                return p.x
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            for _ in range(3):
+                # Fill the per-site cache post-compile so the swapper
+                # exercises the cached hit path, not the cold slow path.
+                for p in ps:
+                    read(p)
+
+            class Canary:
+                deleted = False
+
+                def __del__(self):
+                    Canary.deleted = True
+
+            holder = {}
+            victim = P()
+            holder["obj"] = victim
+            # The dict holds the ONLY reference to the canary: after the
+            # swap, the old dict lives solely through the lookup's
+            # temporary, and dropping it before strengthening the found
+            # value destroys the canary mid-lookup.  Stock's ordering
+            # keeps it alive.
+            victim.__dict__[Swapper("x", holder)] = Canary()
+            got = read(victim)
+            journal = [
+                type(got).__name__,
+                Canary.deleted,
+                victim.__dict__ == {},
+            ]
+            del got
+            journal.append(Canary.deleted)
+            journal.append([callable(read(p)) for p in ps])
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_descriptor_class_swap_matches_the_interpreter_arm(self):
+        # d.__class__ = D2 swaps the descriptor's type without touching
+        # the receiver OR D1's version: only a pointer guard on
+        # Py_TYPE(descr) can see it.  After the swap to a get-only type
+        # the planted instance shadows win loads and stores land in the
+        # instance dict (a stale kDataDescr dispatch would call D2's NULL
+        # tp_descr_set); swapping to another data-descriptor type must
+        # re-route through its slots.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class D1:
+                def __get__(self, obj, objtype=None):
+                    return ("d1-get", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("d1-set", value)
+
+            class D2:
+                def __get__(self, obj, objtype=None):
+                    return ("d2-get", obj.tag)
+
+            class D3:
+                def __get__(self, obj, objtype=None):
+                    return ("d3-get", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("d3-set", value)
+
+            class C:
+                x = D1()
+
+                def __init__(self, tag):
+                    self.tag = tag
+
+            def read(c):
+                return c.x
+
+            def write(c, v):
+                c.x = v
+
+            cs = [C(i) for i in range(3)]
+            for c in cs:
+                c.__dict__["x"] = ("shadow", c.tag)
+            for _ in range(40):
+                for c in cs:
+                    read(c)
+                    write(c, 1)
+            compile_all(read, write)
+            for _ in range(3):
+                for c in cs:
+                    read(c)
+                    write(c, 2)
+
+            journal = []
+            journal.append([read(c) for c in cs])
+
+            d = C.__dict__["x"]
+            d.__class__ = D2
+            # Demoted by instance mutation alone: shadows win, stores go
+            # to the instance dict.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 9)
+            journal.append([c.__dict__["x"] for c in cs])
+            journal.append([read(c) for c in cs])
+
+            d.__class__ = D3
+            # Data descriptor again, through the NEW type's slots.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 11)
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            still_compiled(read, write)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_attribute_error_from_eq_follows_the_hook_protocol(self):
+        # Stock's slot_tp_getattr_hook runs the generic lookup
+        # UNSUPPRESSED and clears any escaping AttributeError into
+        # __getattr__ -- whether the colliding key's __eq__ raised on an
+        # absent OR a present name; on receivers WITHOUT __getattr__ it
+        # propagates like any error.  The cached paths must reproduce
+        # all three outcomes.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class KAttr:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    raise AttributeError("eq attr boom")
+
+            journal = []
+
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            class H:
+                def __getattr__(self, name):
+                    return ["hooked", name]
+
+                def x(self):
+                    return "method"
+
+            def read_missing(h):
+                return h.missing
+
+            def read_x(h):
+                return h.x
+
+            hs = [H() for _ in range(3)]
+            for _ in range(40):
+                for h in hs:
+                    read_missing(h)
+                    read_x(h)
+            compile_all(read_missing, read_x)
+            if mode == "jit":
+                stats_before = cinderjit.get_attr_cache_stats()["load_attr"]
+            for _ in range(3):
+                for h in hs:
+                    read_missing(h)
+                    read_x(h)
+            if mode == "jit":
+                # The hook cache family must actually serve these calls:
+                # a silently-disabled family (object_getattribute once
+                # went uninitialized on 3.11 and every hook fill bailed)
+                # would leave this test green-but-vacuous on the stock
+                # slow path.
+                stats_after = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert stats_after["fills"] > stats_before["fills"], (
+                    "hook-receiver loads never filled the cache",
+                    stats_before, stats_after)
+                assert stats_after["hits"] > stats_before["hits"], (
+                    "hook-receiver loads never hit the cache",
+                    stats_before, stats_after)
+
+            hb = H()
+            hb.__dict__[KAttr("missing")] = 1
+            # Absent name: suppressed and routed to __getattr__.
+            journal.append(observe(read_missing, hb))
+
+            hb2 = H()
+            hb2.__dict__[KAttr("x")] = 1
+            # Present name: 3.11's hook runs the generic part
+            # unsuppressed and clears ANY escaping AttributeError into
+            # __getattr__ -- the probe's error wins over the descriptor.
+            got = observe(read_x, hb2)
+            journal.append([got[0], callable(got[1])])
+
+            class E(Exception):
+                pass
+
+            def read_attr(e):
+                return e.attr
+
+            es = []
+            for _ in range(3):
+                e = E()
+                e.attr = "v"
+                es.append(e)
+            for _ in range(40):
+                for e in es:
+                    read_attr(e)
+            compile_all(read_attr)
+            for _ in range(3):
+                for e in es:
+                    read_attr(e)
+            eb = E()
+            eb.__dict__[KAttr("attr")] = 1
+            # No hook: the AttributeError propagates.
+            journal.append(observe(read_attr, eb))
+
+            still_compiled(read_missing, read_x, read_attr)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_hook_unpublished_during_lookup_uses_the_pinned_hook(self):
+        # Stock INCREFs the __getattr__ it will use BEFORE the generic
+        # part runs: a colliding key's __eq__ that deletes P.__getattr__
+        # mid-probe neither changes which hook answers THIS call nor
+        # leaves the cached borrowed pointer dangling (the deleted
+        # function's only other reference was the class dict).
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                pass
+
+            def old_hook(self, name):
+                return ["old-hook", name]
+
+            P.__getattr__ = old_hook
+
+            class Killer:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    del P.__getattr__
+                    return False
+
+            def read_missing(p):
+                return p.missing
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read_missing(p)
+            compile_all(read_missing)
+            for _ in range(3):
+                for p in ps:
+                    read_missing(p)
+
+            del old_hook
+            pb = P()
+            pb.__dict__[Killer("missing")] = 1
+            result = read_missing(pb)
+            journal = [result]
+            # The hook is gone for FUTURE calls on both arms.
+            try:
+                read_missing(P())
+                journal.append("no-raise")
+            except AttributeError:
+                journal.append("AttributeError")
+            still_compiled(read_missing)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_audited_member_read_raises_the_event_on_every_access(self):
+        # Stock member_get() raises the object.__getattr__ audit event
+        # for PY_AUDIT_READ members (traceback.tb_frame) BEFORE
+        # PyMember_GetOne; a cached hit would silently drop it.  Audited
+        # member reads are therefore fail-closed -- never filled, every
+        # access runs the stock path -- while a plain member on the SAME
+        # receiver (tb_lasti) still fills and hits.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def read_frame(tb):
+                return tb.tb_frame
+
+            def read_lasti(tb):
+                return tb.tb_lasti
+
+            def make_tb():
+                try:
+                    raise ValueError("boom")
+                except ValueError as exc:
+                    return exc.__traceback__
+
+            tbs = [make_tb() for _ in range(3)]
+            for _ in range(40):
+                for tb in tbs:
+                    read_frame(tb)
+                    read_lasti(tb)
+            compile_all(read_frame, read_lasti)
+
+            if mode == "jit":
+                b = cinderjit.get_attr_cache_stats()["load_attr"]
+            for _ in range(3):
+                for tb in tbs:
+                    read_lasti(tb)
+            if mode == "jit":
+                # The un-audited member on the same receiver type caches:
+                # the audit gate must be narrow, not a blanket member ban.
+                a = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert a["hits"] > b["hits"], ("tb_lasti never cached", b, a)
+
+                # The audited member never fills or hits.
+                b2 = cinderjit.get_attr_cache_stats()["load_attr"]
+                for _ in range(4):
+                    read_frame(tbs[0])
+                a2 = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert a2["fills"] == b2["fills"], ("tb_frame filled", b2, a2)
+                assert a2["hits"] == b2["hits"], ("tb_frame hit", b2, a2)
+
+            events = []
+
+            def hook(event, args):
+                if event == "object.__getattr__" and args[1] == "tb_frame":
+                    events.append(args[1])
+
+            sys.addaudithook(hook)
+            results = [read_frame(tbs[0]) is tbs[0].tb_frame
+                       for _ in range(4)]
+            # Each compiled read fires one event; the `is` comparison's
+            # own tb_frame read fires another -- eight total, every
+            # access audited, none swallowed by a cache hit.
+            journal = [len(events), results]
+            still_compiled(read_frame, read_lasti)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_type_receiver_method_stays_on_the_generic_path(self):
+        # Type-receiver loads must stay correct under a metaclass
+        # takeover.  The type caches are pull-validated for exactly this
+        # (owner version + metaclass identity/version), and on 3.11 no IR
+        # shape reaches them anyway -- guarded global/builtin loads carry
+        # no object spec, so type(obj) never yields a static TType.  Both
+        # facts are asserted: the metaclass descriptor wins on the very
+        # next call, and the type-cache counters stay at zero.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Meta(type):
+                pass
+
+            class T(metaclass=Meta):
+                @classmethod
+                def cm(cls):
+                    return "class-cm"
+
+            def call_tm(o):
+                return type(o).cm()
+
+            def main():
+                t = T()
+                for _ in range(40):
+                    assert call_tm(t) == "class-cm"
+                assert cinderjit.force_compile(call_tm) is True
+                for _ in range(3):
+                    assert call_tm(t) == "class-cm"
+
+                # A metaclass data descriptor takes precedence over the
+                # class-dict classmethod; the receiver class version does
+                # not change, so only the generic path answers this
+                # correctly.
+                Meta.cm = property(
+                    lambda cls: (lambda: "meta-descr"))
+                assert call_tm(t) == "meta-descr", call_tm(t)
+
+                stats = cinderjit.get_attr_cache_stats()["load_type_method"]
+                assert stats["fills"] == 0 and stats["hits"] == 0, (
+                    "the 3.11 fail-closed gate leaked a type-method "
+                    "cache: %r" % (stats,))
+                assert cinderjit.is_jit_compiled(call_tm)
+                print("type receiver stayed generic")
+
+            main()
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("type receiver stayed generic", proc.stdout)
+
+    def test_mutation_hammer_stays_correct_over_100_rounds(self):
+        # 100 rounds of class mutation, instance shadowing and deletion
+        # interleaved with compiled access: values stay right, the
+        # artifact stays installed, and the pull checks keep retiring
+        # entries.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return ("gen", 0, self.x)
+
+            def read(p):
+                return p.ping()
+
+            def write(p, v):
+                p.x = v
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+                    write(p, p.x)
+            assert cinderjit.force_compile(read) is True
+            assert cinderjit.force_compile(write) is True
+
+            before = cinderjit.get_attr_cache_stats()
+            for round_no in range(100):
+                def make(round_no=round_no):
+                    def ping(self):
+                        return ("gen", round_no, self.x)
+                    return ping
+                P.ping = make()
+                for i, p in enumerate(ps):
+                    write(p, round_no * 10 + i)
+                    assert read(p) == ("gen", round_no, round_no * 10 + i)
+                shadowed = ps[round_no % 4]
+                shadowed.ping = lambda r=round_no: ("shadow", r)
+                assert read(shadowed) == ("shadow", round_no)
+                del shadowed.ping
+                assert read(shadowed)[0] == "gen"
+            after = cinderjit.get_attr_cache_stats()
+            assert cinderjit.is_jit_compiled(read)
+            assert cinderjit.is_jit_compiled(write)
+            inv = sum(
+                after[c]["invalidations"] - before[c]["invalidations"]
+                for c in after)
+            assert inv >= 100, ("mutations did not retire entries", inv)
+            print("mutation hammer survived")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("mutation hammer survived", proc.stdout)
+
+    def test_attr_cache_stats_cover_every_cache_class(self):
+        # The acceptance requires per-class fill/hit/miss/invalidation
+        # reporting; drive one workload through each class and require
+        # fills and hits to move where they must.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import math
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x
+
+                @staticmethod
+                def make():
+                    return "made"
+
+            # Cold compiles keep LOAD_ATTR unspecialized, so the loads go
+            # through the helper caches rather than the quickened guarded
+            # fast path.
+            ns = {"P": P, "math": math}
+            exec(
+                "def load(p):\\n"
+                "    return p.x\\n"
+                "def store(p, v):\\n"
+                "    p.x = v\\n"
+                "def method(p):\\n"
+                "    return p.ping()\\n"
+                "def type_method():\\n"
+                "    return P.make()\\n"
+                "def module_attr():\\n"
+                "    return math.pi\\n"
+                # A global receiver compiles as LOAD_ATTR + CALL (served
+                # by the module *attr* cache); the module *method* cache
+                # needs a LOAD_METHOD site, which an argument receiver
+                # quickened to LOAD_METHOD_MODULE provides.
+                "def module_method(m, v):\\n"
+                "    return m.sqrt(v)\\n",
+                ns,
+            )
+            fns = {k: ns[k] for k in (
+                "load", "store", "method", "type_method",
+                "module_attr", "module_method")}
+            # The module caches need the receiver proven to be a module,
+            # which the quickened LOAD_ATTR_MODULE / LOAD_METHOD_MODULE
+            # guard provides -- warm only those two; the instance-facing
+            # functions stay cold so their unspecialized loads drive the
+            # helper caches.
+            for _ in range(40):
+                fns["module_attr"]()
+                fns["module_method"](math, 16.0)
+            for fn in fns.values():
+                assert cinderjit.force_compile(fn) is True
+
+            p = P(4)
+            before = cinderjit.get_attr_cache_stats()
+            for _ in range(32):
+                assert fns["load"](p) == p.x
+                fns["store"](p, 4)
+                assert fns["method"](p) == 4
+                assert fns["type_method"]() == "made"
+                assert fns["module_attr"]() == math.pi
+                assert fns["module_method"](math, 16.0) == 4.0
+            after = cinderjit.get_attr_cache_stats()
+
+            expectations = {
+                "load_attr": True,
+                "store_attr": True,
+                "load_method": True,
+                # The type-receiver caches ARE implemented and
+                # pull-validated (owner version + metaclass identity and
+                # version; see AttrCache311Test), but no 3.11 IR shape
+                # hands them a statically-typed receiver: guarded global
+                # and builtin loads carry no object spec, so the
+                # type(obj) / isinstance / len specializations that would
+                # produce a TType never fire.  Zero traffic is therefore
+                # the honest expectation here, and it is a reachability
+                # fact, not a correctness gate.
+                "load_type_method": False,
+                "load_type_attr": False,
+                "load_module_attr": True,
+                "load_module_method": True,
+            }
+            for cls, must_move in expectations.items():
+                delta_hits = after[cls]["hits"] - before[cls]["hits"]
+                delta_fills = after[cls]["fills"] - before[cls]["fills"]
+                if must_move:
+                    assert delta_hits > 0 or delta_fills > 0, (
+                        cls, before[cls], after[cls])
+                else:
+                    assert sum(after[cls].values()) == 0, (cls, after[cls])
+            # The type-receiver fixture still ran -- through the generic
+            # method path, counted as misses.
+            assert after["load_method"]["misses"] > (
+                before["load_method"]["misses"])
+            print("stats cover every class")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("stats cover every class", proc.stdout)
 
 
 if __name__ == "__main__":

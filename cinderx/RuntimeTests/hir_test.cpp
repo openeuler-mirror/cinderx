@@ -1819,7 +1819,7 @@ def test():
   EXPECT_EQ(load_global_cached_count, 0);
 }
 
-TEST_F(HIRBuildTest, ColdLoadGlobalModule311FallsBackToGenericLoad) {
+TEST_F(HIRBuildTest, ColdLoadGlobalModule311UsesTheSharedVersionAllocator) {
   const char* src = R"(
 value = object()
 
@@ -1850,12 +1850,14 @@ def test():
     }
   }
 
-  // A cold 3.11 dict can have an unassigned keys version.  The JIT cannot
-  // safely allocate CPython's private version tag, so it must keep the
-  // generic load until the adaptive cache publishes an indexed value.
-  EXPECT_EQ(call_static_count, 0);
-  EXPECT_EQ(guard_count, 0);
-  EXPECT_EQ(load_global_count, 1);
+  // A cold 3.11 dict starts with an unassigned keys version, but since
+  // MR-09 the JIT shares the vendored specializer's allocator
+  // (Ci_GetDictKeysVersion_311, issuing from the top half of the 32-bit
+  // range), so even a cold module global load can version the keys and
+  // take the guarded fast path.
+  EXPECT_EQ(call_static_count, 1);
+  EXPECT_EQ(guard_count, 1);
+  EXPECT_EQ(load_global_count, 0);
   EXPECT_EQ(load_global_cached_count, 0);
 }
 

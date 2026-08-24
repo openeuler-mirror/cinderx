@@ -26,6 +26,16 @@ PyObject* _Py_HOT_FUNCTION Ci_EvalFrameDefault_311(
 // with an exception set.
 int Ci_EvalFrameHandlePending_311(PyThreadState* tstate);
 
+// The single in-process dict-keys version allocator (specialize_wrapper.c).
+// Assigns from the top half of the 32-bit range -- disjoint from libpython's
+// private bottom-up counter -- and returns 0 at exhaustion, which every
+// consumer treats as "cannot be versioned, do not cache".  Both the vendored
+// specializer and the JIT's pull-validated attribute caches must use this
+// stream: a version proves identity only while no two keys objects can hold
+// the same number.
+struct _dictkeysobject;
+uint32_t Ci_GetDictKeysVersion_311(struct _dictkeysobject* keys);
+
 #ifdef __cplusplus
 }
 #endif
