@@ -43,7 +43,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import textwrap
 
 from ci_pipeline.jit311.lifecycle_snapshot import CAPACITY_PATHS, value_at
 from ci_pipeline.jit311.execution_acceptance import ExecutionAcceptanceRunner
@@ -97,45 +96,6 @@ GENERATOR_ANCHOR_TEST = (
 # The suspended-generator pin probe, shared by the LIFECYCLE anchor's ASAN
 # twin (MEMSAFE target 3).  Same contract as the canonical Python test,
 # runnable directly under an instrumented extension.
-GENERATOR_PIN_PROBE = textwrap.dedent(
-    """
-    import gc
-    import _cinderx, cinderx
-    cinderx.init()
-    _cinderx.install_frame_evaluator()
-    import cinderjit
-
-    namespace = {}
-    exec(
-        "def wave(base):\\n    yield base\\n    yield base + 1\\n",
-        namespace,
-        namespace,
-    )
-    wave = namespace.pop("wave")
-    assert cinderjit.force_compile(wave) is True
-    generator = wave(10)
-    assert next(generator) == 10
-    held = _cinderx._get_trigger_stats()["resident_code_buffers"]
-    assert cinderjit.force_uncompile(wave) is True
-    del wave, namespace
-    gc.collect(); gc.collect()
-    assert _cinderx._get_trigger_stats()["resident_code_buffers"] == held
-    assert generator.send(None) == 11
-    try:
-        next(generator)
-    except StopIteration:
-        pass
-    else:
-        raise AssertionError("generator did not finish")
-    del generator
-    gc.collect(); gc.collect()
-    assert _cinderx._get_trigger_stats()["resident_code_buffers"] == held - 1
-    assert cinderjit._jit311_lifecycle_invariants()["ok"] is True
-    print("generator-pin-probe: ok")
-    """
-)
-
-
 def judge_penetration_path(classification: dict | None) -> list[str]:
     """The stdlib regression's JIT path proof (review P0-1).
 
@@ -729,7 +689,7 @@ class LifecycleAcceptanceRunner:
         commands.append("71-acceptance-ASAN-T3-generator-pin")
         pin_rc = self.base._run(
             "71-acceptance-ASAN-T3-generator-pin",
-            [str(self.base.python), "-c", GENERATOR_PIN_PROBE],
+            [str(self.base.python), "-m", "unittest", "-v", GENERATOR_ANCHOR_TEST],
             env=env,
         )
         results["T3_generator_pin"] = {

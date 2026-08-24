@@ -498,20 +498,6 @@ class ExecutionAcceptanceRunner:
         (self.output / "execution_result.json").write_text(
             json.dumps(convergence, indent=2, sort_keys=True) + "\n"
         )
-        (self.output / "CP311_JIT_EXECUTION_CONVERGENCE_REPORT.md").write_text(
-            "# Execution Final Convergence\n\n"
-            + "The machine-readable source of truth is `execution_result.json`.\n\n"
-            + "- 72-module classification: "
-            + f"{sum(module_counts.values())}/72; uncovered {module_counts.get('UNCOVERED', 0)}\n"
-            + f"- UNKNOWN_REFUSAL: {function_counts.get('unknown_refusal', 0)}\n"
-            + f"- Tracing T1-T8: {(c.get('tracing') or {}).get('result', 'NOT_RUN')}\n"
-            + f"- Generator signal/yield-from: {(c.get('generator') or {}).get('result', 'NOT_RUN')}\n"
-            + f"- test_dis adaptive-only probe: {(c.get('dis_deviation_probe') or {}).get('result', 'NOT_RUN')}\n"
-            + f"- W families: {w_counts.get('families', 0)}/17\n"
-            + f"- Approved deviations: {len(deviations)}\n"
-            + f"- Unexpected differences: {len(unexpected)}\n"
-            + f"- Final: **{final}**\n"
-        )
         return final
 
     def run(self) -> str:
