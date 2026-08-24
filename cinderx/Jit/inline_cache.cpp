@@ -286,10 +286,21 @@ BorrowedRef<> getGetAttrForCaching(BorrowedRef<PyTypeObject> type) {
 
 // Call a __getattr__ method with the given object and attribute name.
 // Replicates CPython's call_attribute() logic from typeobject.c.
+//
+// The hook is strengthened for the duration of the call: stock
+// slot_tp_getattr_hook holds its Py_INCREF across call_attribute(), and
+// the code running here -- a native hook's tp_descr_get, or the call
+// itself -- can delete the owner class's __getattr__ entry, which may be
+// the hook's last reference, while the hook's own C frame is still
+// executing.  Several callers hand in a borrowed pointer (a type-dict
+// lookup, a fill-time cached hook), so the pin lives at this choke point
+// and covers every dispatch arm at once; no caller runs user code
+// between resolving the hook and calling in here.
 PyObject* callGetAttr(
     BorrowedRef<> getattr_method,
     BorrowedRef<> obj,
     BorrowedRef<> name) {
+  auto hook_guard = Ref<>::create(getattr_method);
   BorrowedRef<PyTypeObject> attr_type = Py_TYPE(getattr_method);
   if (PyType_HasFeature(attr_type, Py_TPFLAGS_METHOD_DESCRIPTOR)) {
     PyObject* args[] = {obj, name};
@@ -1161,12 +1172,29 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 #endif
     }
     case AttributeMutator::Kind::kMemberDescr: {
+#if PY_VERSION_HEX < 0x030C0000
+      // Same pinned-hook protocol as the other dispatch kinds: stock
+      // slot_tp_getattr_hook pins the __getattr__ BEFORE the generic
+      // part runs.  The member read itself runs no user code, but the
+      // hook's own call can delete its owner entry mid-flight, so the
+      // fill-time cached hook (its identity is proven by the
+      // receiver-version hit check) is strengthened up front.  The live
+      // tp_getattro re-check tryGetAttrFallback performs is subsumed by
+      // that same version proof.
+      GetAttrHookSnapshot311 hook(member_descr_.getattr_method);
+      PyObject* result = member_descr_.getAttr(obj);
+      if (result == nullptr && hook.suppressAttributeError()) {
+        result = hook.call(obj, name);
+      }
+      return result;
+#else
       PyObject* result = member_descr_.getAttr(obj);
       if (result == nullptr && member_descr_.getattr_method != nullptr) {
         result =
             tryGetAttrFallback(type(), member_descr_.getattr_method, obj, name);
       }
       return result;
+#endif
     }
     case AttributeMutator::Kind::kDescrOrClassVar: {
 #if PY_VERSION_HEX < 0x030C0000

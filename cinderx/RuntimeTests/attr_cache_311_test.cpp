@@ -10,6 +10,9 @@
 
 #include "internal/pycore_object.h"
 
+// PyMemberDef and T_OBJECT_EX for the kMemberDescr dispatch fixtures.
+#include <structmember.h>
+
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/inline_cache.h"
@@ -449,6 +452,346 @@ inst = C()
 
   run_arm(/*is_store=*/false);
   run_arm(/*is_store=*/true);
+}
+
+// --- __getattr__ hook ownership -------------------------------------------
+//
+// The MR review found dispatch arms handing a BORROWED __getattr__ hook to
+// callGetAttr(): the split value-miss fallback, the GetAttrMutator
+// valid-keys hit, and the kMemberDescr AttributeError route.  A native
+// hook whose call deletes the owner class's __getattr__ entry -- possibly
+// the hook's last reference -- must survive its own call frame, exactly
+// as stock slot_tp_getattr_hook guarantees by holding a strong reference
+// across call_attribute().  The died_mid_call latch turns the
+// use-after-free into a Release-visible verdict (the ASAN leg gives the
+// memory one).
+
+namespace {
+
+struct SelfDeletingHook {
+  PyObject_HEAD long payload;
+};
+
+long sdh_dealloc_count = 0;
+bool sdh_died_mid_call = false;
+bool sdh_armed = false;
+PyObject* sdh_owner = nullptr; // borrowed: the class owning __getattr__
+
+void sdh_dealloc(PyObject* self) {
+  sdh_dealloc_count++;
+  PyObject_Free(self);
+}
+
+PyObject* sdh_call(PyObject* self, PyObject* args, PyObject* /* kwargs */) {
+  // Read the payload while `self` is provably alive; after the armed
+  // deletion the object may already be gone and must not be touched.
+  long payload = reinterpret_cast<SelfDeletingHook*>(self)->payload;
+  PyObject* name = PyTuple_GET_ITEM(args, 0);
+  if (sdh_armed) {
+    long before = sdh_dealloc_count;
+    if (PyObject_DelAttrString(sdh_owner, "__getattr__") < 0) {
+      return nullptr;
+    }
+    if (sdh_dealloc_count != before) {
+      sdh_died_mid_call = true;
+      return PyUnicode_FromString("died");
+    }
+  }
+  return PyUnicode_FromFormat("hook:%ld:%U", payload, name);
+}
+
+PyTypeObject SelfDeletingHook_Type = {
+    PyVarObject_HEAD_INIT(nullptr, 0) //
+};
+
+// Installs a fresh hook instance as `klass.__getattr__`, leaving the
+// class dict as the hook's ONLY reference, and resets the latch state.
+void installSelfDeletingHook(BorrowedRef<> klass, long payload) {
+  if (SelfDeletingHook_Type.tp_name == nullptr) {
+    SelfDeletingHook_Type.tp_name = "SelfDeletingHook";
+    SelfDeletingHook_Type.tp_basicsize = sizeof(SelfDeletingHook);
+    SelfDeletingHook_Type.tp_dealloc = sdh_dealloc;
+    SelfDeletingHook_Type.tp_flags = Py_TPFLAGS_DEFAULT;
+    SelfDeletingHook_Type.tp_call = sdh_call;
+    JIT_CHECK(
+        PyType_Ready(&SelfDeletingHook_Type) >= 0, "hook type init failed");
+  }
+  SelfDeletingHook* hook =
+      PyObject_New(SelfDeletingHook, &SelfDeletingHook_Type);
+  JIT_CHECK(hook != nullptr, "hook allocation failed");
+  hook->payload = payload;
+  int set = PyObject_SetAttrString(
+      klass, "__getattr__", reinterpret_cast<PyObject*>(hook));
+  Py_DECREF(hook);
+  JIT_CHECK(set == 0, "installing __getattr__ failed");
+  sdh_owner = klass;
+  sdh_armed = false;
+  sdh_died_mid_call = false;
+  sdh_dealloc_count = 0;
+}
+
+// A C base type exposing a T_OBJECT_EX member, so a Python subclass with
+// __getattr__ reaches the kMemberDescr dispatch arm.
+struct MemberHost {
+  PyObject_HEAD PyObject* slotval;
+};
+
+PyMemberDef member_host_members[] = {
+    {"slotval", T_OBJECT_EX, offsetof(MemberHost, slotval), 0, nullptr},
+    {nullptr, 0, 0, 0, nullptr}};
+
+void member_host_dealloc(PyObject* self) {
+  Py_XDECREF(reinterpret_cast<MemberHost*>(self)->slotval);
+  Py_TYPE(self)->tp_free(self);
+}
+
+PyTypeObject MemberHost_Type = {
+    PyVarObject_HEAD_INIT(nullptr, 0) //
+};
+
+void ensureMemberHostType() {
+  if (MemberHost_Type.tp_name != nullptr) {
+    return;
+  }
+  MemberHost_Type.tp_name = "MemberHost";
+  MemberHost_Type.tp_basicsize = sizeof(MemberHost);
+  MemberHost_Type.tp_dealloc = member_host_dealloc;
+  MemberHost_Type.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+  MemberHost_Type.tp_members = member_host_members;
+  MemberHost_Type.tp_new = PyType_GenericNew;
+  JIT_CHECK(PyType_Ready(&MemberHost_Type) >= 0, "member host init failed");
+}
+
+} // namespace
+
+TEST_F(AttrCache311Test, GetAttrHookSurvivesDeletingItselfMidCall) {
+  const char* src = R"(
+class C:
+    def __init__(self):
+        self.x = 1
+
+inst = C()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> klass = PyDict_GetItemString(globals, "C");
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "inst");
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(inst, nullptr);
+  installSelfDeletingHook(klass, 5);
+
+  // Pre-version the shared keys so the fill records a NONZERO keys
+  // version: the armed call must go down the valid-keys hit arm, which
+  // calls the fill-time cached hook, not the zero-version peek arm
+  // (that one pins through GetAttrHookSnapshot311 already).
+  PyDictKeysObject* keys = reinterpret_cast<PyHeapTypeObject*>(
+                               reinterpret_cast<PyTypeObject*>(klass.get()))
+                               ->ht_cached_keys;
+  ASSERT_NE(keys, nullptr);
+  ASSERT_GE(
+      dictGetKeysVersion(PyInterpreterState_Get(), keys), UINT32_C(1) << 31);
+  ASSERT_NE(*_PyObject_ValuesPointer(inst.get()), nullptr);
+
+  auto name = Ref<>::steal(PyUnicode_InternFromString("missing"));
+  auto cache = makeLoadAttrCache();
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  // Cold call: the slow path resolves through the (unarmed) hook and
+  // fills the kGetAttr entry.
+  uint64_t fills = stats.load_attr.fills;
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "hook:5:missing"), 0);
+  ASSERT_EQ(stats.load_attr.fills, fills + 1)
+      << "the __getattr__ entry never filled; the rest is vacuous";
+
+  // Armed hit: the valid-keys arm calls the cached hook, and the hook's
+  // call deletes the class's __getattr__ entry -- its own last
+  // reference.  The pin must keep it alive through its call frame.
+  sdh_armed = true;
+  uint64_t hits = stats.load_attr.hits;
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(second, "hook:5:missing"), 0);
+  ASSERT_EQ(stats.load_attr.hits, hits + 1);
+
+  EXPECT_FALSE(sdh_died_mid_call)
+      << "the __getattr__ hook was deallocated during its own call";
+  EXPECT_EQ(sdh_dealloc_count, 1);
+  sdh_armed = false;
+  sdh_owner = nullptr;
+}
+
+TEST_F(AttrCache311Test, SplitMissHookSurvivesDeletingItselfMidCall) {
+  const char* src = R"(
+class S:
+    def __init__(self, with_x):
+        if with_x:
+            self.x = 11
+
+filled = S(True)
+victim = S(False)
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> klass = PyDict_GetItemString(globals, "S");
+  BorrowedRef<> filled_inst = PyDict_GetItemString(globals, "filled");
+  BorrowedRef<> victim = PyDict_GetItemString(globals, "victim");
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(filled_inst, nullptr);
+  ASSERT_NE(victim, nullptr);
+  installSelfDeletingHook(klass, 7);
+
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto cache = makeLoadAttrCache();
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  // Cold call on the populated instance fills the kSplit entry ("x"
+  // lives in the shared keys).
+  uint64_t fills = stats.load_attr.fills;
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), filled_inst, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 11);
+  ASSERT_EQ(stats.load_attr.fills, fills + 1)
+      << "the split entry never filled; the rest is vacuous";
+
+  // Armed hit on the victim: its value slot is empty, so the fallback
+  // resolves __getattr__ from the type dict as a borrowed pointer and
+  // calls it; the call deletes the entry holding the last reference.
+  ASSERT_NE(*_PyObject_ValuesPointer(victim.get()), nullptr);
+  sdh_armed = true;
+  uint64_t hits = stats.load_attr.hits;
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), victim, name));
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(second, "hook:7:x"), 0);
+  ASSERT_EQ(stats.load_attr.hits, hits + 1);
+
+  EXPECT_FALSE(sdh_died_mid_call)
+      << "the __getattr__ hook was deallocated during its own call";
+  EXPECT_EQ(sdh_dealloc_count, 1);
+  sdh_armed = false;
+  sdh_owner = nullptr;
+}
+
+TEST_F(AttrCache311Test, MemberDescrMissRoutesToThePinnedHook) {
+  ensureMemberHostType();
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  ASSERT_EQ(
+      PyDict_SetItemString(
+          globals,
+          "MemberHost",
+          reinterpret_cast<PyObject*>(&MemberHost_Type)),
+      0);
+  const char* src = R"(
+class N(MemberHost):
+    pass
+
+full = N()
+full.slotval = "present"
+empty = N()
+)";
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> klass = PyDict_GetItemString(globals, "N");
+  BorrowedRef<> full = PyDict_GetItemString(globals, "full");
+  BorrowedRef<> empty = PyDict_GetItemString(globals, "empty");
+  ASSERT_NE(klass, nullptr);
+  ASSERT_NE(full, nullptr);
+  ASSERT_NE(empty, nullptr);
+  installSelfDeletingHook(klass, 9);
+
+  auto name = Ref<>::steal(PyUnicode_InternFromString("slotval"));
+  auto cache = makeLoadAttrCache();
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  // Cold call on the populated instance fills the kMemberDescr entry
+  // (the member is a data descriptor from the C base) and caches the
+  // hook alongside it.
+  uint64_t fills = stats.load_attr.fills;
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), full, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "present"), 0);
+  ASSERT_EQ(stats.load_attr.fills, fills + 1)
+      << "the member entry never filled; the rest is vacuous";
+
+  // Armed hit on the empty instance: the T_OBJECT_EX read raises
+  // AttributeError, which routes to the pinned cached hook; the hook's
+  // call deletes the class's __getattr__ entry -- its last reference.
+  sdh_armed = true;
+  uint64_t hits = stats.load_attr.hits;
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), empty, name));
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(second, "hook:9:slotval"), 0);
+  ASSERT_EQ(stats.load_attr.hits, hits + 1);
+
+  EXPECT_FALSE(sdh_died_mid_call)
+      << "the __getattr__ hook was deallocated during its own call";
+  EXPECT_EQ(sdh_dealloc_count, 1);
+  sdh_armed = false;
+  sdh_owner = nullptr;
+}
+
+TEST_F(AttrCache311Test, MemberDescrMissWithoutHookPropagatesAttributeError) {
+  ensureMemberHostType();
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  ASSERT_EQ(
+      PyDict_SetItemString(
+          globals,
+          "MemberHost",
+          reinterpret_cast<PyObject*>(&MemberHost_Type)),
+      0);
+  const char* src = R"(
+class P(MemberHost):
+    pass
+
+full = P()
+full.slotval = "present"
+empty = P()
+)";
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> full = PyDict_GetItemString(globals, "full");
+  BorrowedRef<> empty = PyDict_GetItemString(globals, "empty");
+  ASSERT_NE(full, nullptr);
+  ASSERT_NE(empty, nullptr);
+
+  auto name = Ref<>::steal(PyUnicode_InternFromString("slotval"));
+  auto cache = makeLoadAttrCache();
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  uint64_t fills = stats.load_attr.fills;
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), full, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "present"), 0);
+  ASSERT_EQ(stats.load_attr.fills, fills + 1)
+      << "the member entry never filled; the rest is vacuous";
+
+  // With no __getattr__ on the receiver, the cached member read must
+  // propagate the AttributeError instead of clearing it.
+  uint64_t hits = stats.load_attr.hits;
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), empty, name));
+  ASSERT_EQ(second, nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_AttributeError));
+  PyErr_Clear();
+  ASSERT_EQ(stats.load_attr.hits, hits + 1);
 }
 
 // --- Type-receiver caches -------------------------------------------------
