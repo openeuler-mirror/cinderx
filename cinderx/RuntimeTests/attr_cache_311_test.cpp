@@ -10,13 +10,13 @@
 
 #include "internal/pycore_object.h"
 
-// PyMemberDef and T_OBJECT_EX for the kMemberDescr dispatch fixtures.
-#include <structmember.h>
-
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+// PyMemberDef and T_OBJECT_EX for the kMemberDescr dispatch fixtures.
+#include <structmember.h>
 
 #include <memory>
 #include <new>
@@ -689,9 +689,7 @@ TEST_F(AttrCache311Test, MemberDescrMissRoutesToThePinnedHook) {
   ASSERT_NE(globals, nullptr);
   ASSERT_EQ(
       PyDict_SetItemString(
-          globals,
-          "MemberHost",
-          reinterpret_cast<PyObject*>(&MemberHost_Type)),
+          globals, "MemberHost", reinterpret_cast<PyObject*>(&MemberHost_Type)),
       0);
   const char* src = R"(
 class N(MemberHost):
@@ -751,9 +749,7 @@ TEST_F(AttrCache311Test, MemberDescrMissWithoutHookPropagatesAttributeError) {
   ASSERT_NE(globals, nullptr);
   ASSERT_EQ(
       PyDict_SetItemString(
-          globals,
-          "MemberHost",
-          reinterpret_cast<PyObject*>(&MemberHost_Type)),
+          globals, "MemberHost", reinterpret_cast<PyObject*>(&MemberHost_Type)),
       0);
   const char* src = R"(
 class P(MemberHost):
