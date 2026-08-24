@@ -79,34 +79,11 @@ rm -rf "$WORK/venv"
 "$WORK/venv/bin/pip" install -q "$WHEEL"
 VENV_PY="$WORK/venv/bin/python"
 
-# Build sanity only: this shows the debug build CAN run the JIT.  It is
-# NOT the trigger proof -- that has to come from the -R processes
-# themselves, and does, below.
-CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" "$VENV_PY" - <<'PROBE' > "$WORK/probe.log" 2>&1
-import sys
-import _cinderx, cinderx
-assert hasattr(sys, "gettotalrefcount"), "not a Py_DEBUG interpreter"
-cinderx.init()
-_cinderx.install_frame_evaluator()
-assert _cinderx.is_frame_evaluator_installed(), "evaluator did not install"
-import cinderjit
-
-def hot(a, b):
-    total = a - a
-    i = total
-    while i < b:
-        total = total + a
-        i = i + 1
-    return total
-
-for i in range(200):
-    hot(i, 2)
-assert cinderjit.is_jit_compiled(hot), "nothing compiled in the refleak arm"
-stats = _cinderx._get_trigger_stats()
-assert stats["machine_code_entries"] > 0, "nothing entered machine code"
-print("refleak arm executes: entries=%d creations=%d"
-      % (stats["machine_code_entries"], stats["compiled_function_creations"]))
-PROBE
+# Build sanity only: this shows the debug build CAN run the JIT.  The
+# trigger proof comes from the -R processes themselves, below.
+CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+  "$VENV_PY" "$REPO_ROOT/ci_pipeline/scripts/refleak_probe_311.py" \
+  > "$WORK/probe.log" 2>&1
 cat "$WORK/probe.log"
 
 # Attestation for the -R run.  It only records; the evaluator is installed
@@ -116,36 +93,8 @@ LEDGER="$WORK/refleak-trigger.log"
 : > "$LEDGER"
 START="$WORK/startup"
 mkdir -p "$START"
-cat > "$START/sitecustomize.py" <<'PY'
-import atexit
-import os
-
-
-def _attest():
-    ledger = os.environ.get("CINDERX_REFLEAK_LEDGER")
-    if not ledger:
-        return
-    try:
-        import _cinderx
-
-        stats = _cinderx._get_trigger_stats()
-        line = "%d %s %d %d\n" % (
-            os.getpid(),
-            bool(_cinderx.is_frame_evaluator_installed()),
-            stats["machine_code_entries"],
-            stats["compiled_function_creations"],
-        )
-    except Exception:
-        line = "%d unavailable 0 0\n" % os.getpid()
-    try:
-        with open(ledger, "a", encoding="utf-8") as fh:
-            fh.write(line)
-    except OSError:
-        pass
-
-
-atexit.register(_attest)
-PY
+cp "$REPO_ROOT/ci_pipeline/scripts/refleak_attest_sitecustomize.py" \
+  "$START/sitecustomize.py"
 
 echo "running: python -m test -R $ROUNDS ${MODULES[*]}"
 set +e
@@ -157,19 +106,61 @@ env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
 RC=$?
 set -e
 tail -20 "$WORK/regrtest.log"
-if [ "$RC" != 0 ]; then
-  echo "refleak: regrtest -R reported failures (exit $RC)"
+
+# Reference leaks are the acceptance item's subject and are never excused.
+REF_LINES=$(grep -E "leaked \[[-0-9, ]+\] references" "$WORK/regrtest.log" || true)
+if [ -n "$REF_LINES" ]; then
+  echo "refleak: regrtest -R reported reference leaks"
+  echo "$REF_LINES"
   exit 1
 fi
-if grep -qE "leaked \[|references leaked|memory blocks leaked" "$WORK/regrtest.log"; then
-  echo "refleak: regrtest -R reported leaks"
-  grep -E "leaked \[|references leaked|memory blocks leaked" "$WORK/regrtest.log" | head
+if grep -qE "file descriptors leaked" "$WORK/regrtest.log"; then
+  echo "refleak: regrtest -R reported file-descriptor leaks"
+  grep -E "file descriptors leaked" "$WORK/regrtest.log"
+  exit 1
+fi
+
+# Block lines need verifying rather than believing.  regrtest computes
+# its block figure as getallocatedblocks() - _getquickenedcount(), and
+# that subtraction is unsound here: _Py_QuickenedCount is a file-local
+# symbol in the interpreter, so the vendored evaluator must define its
+# own copy.  Quickening then increments CinderX's counter while
+# code_dealloc decrements the interpreter's -- the one sys reports -- so
+# it only ever falls, and subtracting a negative inflates the figure.
+# quickened_artifact.py re-runs each flagged module recording both terms
+# and clears the line only when the raw block count is flat over a
+# settled tail AND the counter drift accounts for the reported figure.
+BLK_MODULES=$(grep -E "leaked \[[-0-9, ]+\] memory blocks" "$WORK/regrtest.log" \
+  | awk '{print $1}' | sort -u || true)
+if [ -n "$BLK_MODULES" ]; then
+  echo "refleak: verifying block lines for: $(echo "$BLK_MODULES" | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+       "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
+       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8; then
+    echo "refleak: a reported block figure is not the quickened-counter"
+    echo "artifact -- treating it as a real leak"
+    exit 1
+  fi
+elif [ "$RC" != 0 ]; then
+  echo "refleak: regrtest -R reported failures (exit $RC) with no leak lines"
   exit 1
 fi
 # A run that executed nothing would also print no leaks.
 if ! grep -qE "^Result: SUCCESS|== Tests result: SUCCESS" "$WORK/regrtest.log"; then
-  echo "refleak: regrtest did not report success; refusing to read that as clean"
-  exit 1
+  # A FAILURE line is acceptable only when every failing test is one whose
+  # block figure was verified above; anything else is a real failure.
+  FAILED=$(sed -n '/tests* failed:/,/^$/p' "$WORK/regrtest.log" \
+    | grep -oE '^ +[a-z_0-9]+' | tr -d ' ' | sort -u || true)
+  UNEXPLAINED=$(comm -23 <(echo "$FAILED") <(echo "$BLK_MODULES" | sort -u) || true)
+  if [ -n "$UNEXPLAINED" ]; then
+    echo "refleak: regrtest failed on tests beyond the verified block"
+    echo "artifact: $(echo "$UNEXPLAINED" | tr '\n' ' ')"
+    exit 1
+  fi
+  echo "refleak: the only failures were block figures verified as the"
+  echo "quickened-counter artifact"
 fi
 
 # The proof, from the -R run itself.
