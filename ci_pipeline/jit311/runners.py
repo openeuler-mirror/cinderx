@@ -386,13 +386,13 @@ for i in range(2000):
     del fn
 """
 
-# Loaded by every interpreter spawned by pyperformance.  The pyperformance
-# manager deliberately creates worker processes, so the outer runner's
-# counters cannot prove that benchmark code itself reached shadow codegen.
-# A temporary sitecustomize writes one frozen report per nested process; the
-# payload below rejects missing reports, supported-opcode failures, dropped
-# events and every machine-code side effect.
-PYPERFORMANCE_SITECUSTOMIZE = """\
+# Loaded by every interpreter spawned by pyperformance. Only benchmark workers
+# may initialize CinderX: venv-management processes also import sitecustomize,
+# and running ensurepip/pip under the canary evaluator can crash before the
+# benchmark starts. A temporary sitecustomize writes one frozen report per
+# worker; the payload below rejects missing reports, supported-opcode failures,
+# dropped events and every machine-code side effect.
+_PYPERFORMANCE_WORKER_PROBE = """\
 import atexit
 import json
 import os
@@ -428,10 +428,7 @@ def _jit311_nested_emit():
     snap = _jit311_report.snapshot()
     snap["machine_code_installed"] = _installed_at_exit
     snap["evaluator_installed"] = installed
-    # The manager and venv-management processes also import sitecustomize.
-    # Mark the actual benchmark workers so manager-only activity cannot make
-    # this full-program gate look successful.
-    snap["pyperformance_worker"] = "--worker" in sys.argv
+    snap["pyperformance_worker"] = True
     # Attest the configuration this worker actually ran under.  Inheritance
     # through pyperformance's venv indirection is exactly the thing that
     # silently breaks, so the leg asserts these rather than assuming them.
@@ -454,6 +451,14 @@ def _jit311_nested_emit():
 
 atexit.register(_jit311_nested_emit)
 """
+PYPERFORMANCE_SITECUSTOMIZE = (
+    "import sys\n"
+    "if '--worker' in sys.argv:\n"
+    + "\n".join(
+        f"    {line}" for line in _PYPERFORMANCE_WORKER_PROBE.splitlines()
+    )
+    + "\n"
+)
 
 # RFC appendix B: immutable full-program-surface accounting list.  The
 # stdlib runner imports these exact 72 Lib/test modules; a missing module is

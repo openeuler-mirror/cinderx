@@ -536,6 +536,17 @@ def test_pyperformance_sitecustomize_loads_cinderx_from_host_site():
     assert "k.startswith('PIP_')" in spec.payload
 
 
+def test_pyperformance_sitecustomize_skips_venv_management(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["python", "-m", "pip", "install"])
+    monkeypatch.delenv("JIT311_REPO_ROOT", raising=False)
+    monkeypatch.delenv("JIT311_CINDERX_SITE", raising=False)
+    monkeypatch.delenv("JIT311_WORKER_REPORT_DIR", raising=False)
+
+    # Packaging subprocesses import sitecustomize too. They must not initialize
+    # CinderX or require worker-only configuration.
+    exec(runners.PYPERFORMANCE_SITECUSTOMIZE, {})
+
+
 def test_pyperformance_canary_rejects_deopt_storms():
     spec = runners.pyperformance_completeness_runner(
         mode="canary", benchmarks=["nbody"]
