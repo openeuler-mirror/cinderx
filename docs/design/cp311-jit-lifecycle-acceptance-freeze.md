@@ -18,7 +18,7 @@ The freeze criteria (all of them, none waived):
 | LIFECYCLE_OWNERSHIP PASS | L1 function death ×100 · L2 code swap ×100 · L3 observer smoke ×1000 · L4 generator anchor · invariants at every checkpoint, non-vacuity proven |
 | SHUTDOWN_STABILITY PASS | S1 park/die/re-enable ×100 (phase evidence judged) · S2 multithread batch · S3 six-state exit matrix 200/200 poisoned+entropy, multithread-completed passing on its own |
 | NATIVE_MEMORY_SAFETY PASS | seven targeted ASAN legs against a verified-instrumented extension, zero sanitizer reports; the ASAN executed arm also runs the full green-family population |
-| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 474 211 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
+| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 464 257 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
 | execution regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged) |
 | runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the lifecycle prerequisite validates the frozen evidence from the frozen commit itself (`git show <frozen>:<historical path>`), so the freeze pins history rather than present-day file names |
 | lifecycle blockers | none |
@@ -27,14 +27,14 @@ The freeze criteria (all of them, none waived):
 ## Frozen identity
 
 ```text
-frozen_commit            a41f535c97d091577d10e8bc9dda3118e1603775
+frozen_commit            2ff2d160adf5bcbb788ca3de7699c1d02b6c7235
 wheel                    cinderx-2026.8.24.0-cp311-cp311-linux_aarch64.whl
-wheel_sha256             780012afa03ea3ebac52a685dc12b4d06db3fdec1409e6b39c65643f3cc3d0ba
-wheel_embedded_git_sha   a41f535c97d091577d10e8bc9dda3118e1603775
+wheel_sha256             78bb60ae29f55c2553905b697858560703d38dc787d7b360864a8e75bacede56
+wheel_embedded_git_sha   2ff2d160adf5bcbb788ca3de7699c1d02b6c7235
 canonical_report         CP311_JIT_LIFECYCLE_REPORT.md
-canonical_report_sha256  09159a02b2333317c9f8bc33a12266de74fa5d43190d2885c1c2ea3efe304ef5
+canonical_report_sha256  e7c2a3e18ce32369f2dae1b2ce87a392c5fe2da88f74e4cf344a6aeebbfadc41
 canonical_result         lifecycle_result.json
-canonical_result_sha256  779d0bc19cd3b6abe558b0eab72bcaa7ac1f5abf4ee946718916f4f7f90f3504
+canonical_result_sha256  2ecb9ded2e6fc2910b816c769411b2746f9598777ad535ad07ff2cf6cfa2b495
 ```
 
 The MR closes the development phase.  The chain sits on the execute-mode
@@ -46,11 +46,15 @@ ledgers and the mirrored RuntimeTests registry retired behind
 rt311_required_tests.txt, source-form meta-tests replaced by the
 behavior-proving fail-close set, the runner scenarios owned elsewhere
 removed with their owners named, the case vocabulary finished in every
-runner, and the lifecycle discovery orchestration folded into the
+runner, the lifecycle discovery orchestration folded into the
 self-contained acceptance entry (`python -m
-ci_pipeline.jit311.lifecycle_acceptance`), whose probes -- the snapshot
-schema, the churn matrix, the shutdown exit matrix and the census --
-are untouched.
+ci_pipeline.jit311.lifecycle_acceptance`), and the harness converged
+per external review: the autocompile case proves only what nothing else
+owns, the duplicate scheduler-configuration program and the per-probe
+Markdown renderers are gone, the probe pairs run through one dual-probe
+helper, and the discovery-only churn scenarios retired.  The probes the
+acceptance drives -- the snapshot schema, the churn matrix, the
+shutdown exit matrix and the census -- keep their semantics untouched.
 
 The acceptance profile is hardened per review: the stdlib regression
 fails without a JIT path proof and judges the semantic leg incomplete
