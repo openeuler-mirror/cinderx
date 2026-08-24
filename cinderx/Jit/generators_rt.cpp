@@ -1102,7 +1102,7 @@ bool deopt_jit_gen_with_footer(
     int resume_offset = static_cast<int>(
         (frame->prev_instr + 1 - _PyCode_CODE(ledger_code)) *
         sizeof(_Py_CODEUNIT));
-    a2TransitionLedgerRecord(
+    runtimeTransitionLedgerRecord(
         ledger_code,
         "generator-deopt",
         deoptReasonName(deopt_meta.reason),

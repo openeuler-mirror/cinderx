@@ -3297,7 +3297,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("identity guard, not invalidation", proc.stdout)
 
     def test_instrumentation_support_is_enabled_by_canary(self):
-        # A1 adopts the Meta-style policy: settrace/setprofile pause new
+        # The execution acceptance adopts the Meta-style policy: settrace/setprofile pause new
         # compilation, park published entries, and re-enable them after the
         # callback is removed.  The 3.11 canary enables this policy
         # unconditionally; the legacy configuration flag remains accepted.

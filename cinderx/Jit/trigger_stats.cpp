@@ -171,7 +171,7 @@ TriggerStats triggerStatsSnapshot() {
   };
 }
 
-void a1EntryLedgerReset() {
+void executionEntryLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
   s_a1_entry_ledger_enabled.store(false, std::memory_order_relaxed);
   s_a1_entry_ledger.clear();
@@ -181,7 +181,7 @@ void a1EntryLedgerReset() {
 #endif
 }
 
-void a1EntryLedgerDisable() {
+void executionEntryLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
   s_a1_entry_ledger_enabled.store(false, std::memory_order_relaxed);
   s_a1_entry_ledger.clear();
@@ -189,7 +189,7 @@ void a1EntryLedgerDisable() {
 #endif
 }
 
-PyObject* a1EntryLedgerSnapshot() {
+PyObject* executionEntryLedgerSnapshot() {
 #if PY_VERSION_HEX < 0x030C0000
   bool was_enabled =
       s_a1_entry_ledger_enabled.exchange(false, std::memory_order_relaxed);
@@ -242,12 +242,12 @@ PyObject* a1EntryLedgerSnapshot() {
 #else
   PyErr_SetString(
       PyExc_NotImplementedError,
-      "the A1 per-code entry ledger exists only on CPython 3.11");
+      "the execution per-code entry ledger exists only on CPython 3.11");
   return nullptr;
 #endif
 }
 
-void a2TransitionLedgerReset() {
+void runtimeTransitionLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
   s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
   s_a2_transition_ledger.clear();
@@ -256,14 +256,14 @@ void a2TransitionLedgerReset() {
 #endif
 }
 
-void a2TransitionLedgerDisable() {
+void runtimeTransitionLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
   s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
   s_a2_transition_ledger.clear();
 #endif
 }
 
-void a2TransitionLedgerRecord(
+void runtimeTransitionLedgerRecord(
     PyCodeObject* code,
     const char* transition,
     const char* reason,
@@ -308,7 +308,7 @@ void a2TransitionLedgerRecord(
 #endif
 }
 
-PyObject* a2TransitionLedgerSnapshot() {
+PyObject* runtimeTransitionLedgerSnapshot() {
 #if PY_VERSION_HEX < 0x030C0000
   bool was_enabled =
       s_a2_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
@@ -358,7 +358,7 @@ PyObject* a2TransitionLedgerSnapshot() {
 #else
   PyErr_SetString(
       PyExc_NotImplementedError,
-      "the A2 transition ledger exists only on CPython 3.11");
+      "the runtime-transition ledger exists only on CPython 3.11");
   return nullptr;
 #endif
 }

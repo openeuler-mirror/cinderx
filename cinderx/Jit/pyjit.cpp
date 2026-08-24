@@ -3046,22 +3046,22 @@ PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
 }
 
 PyObject* jit311_reset_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
-  jit::a1EntryLedgerReset();
+  jit::executionEntryLedgerReset();
   Py_RETURN_NONE;
 }
 
 PyObject* jit311_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
-  return jit::a1EntryLedgerSnapshot();
+  return jit::executionEntryLedgerSnapshot();
 }
 
 PyObject* jit311_reset_transition_ledger(
     PyObject* /* self */, PyObject* /* arg */) {
-  jit::a2TransitionLedgerReset();
+  jit::runtimeTransitionLedgerReset();
   Py_RETURN_NONE;
 }
 
 PyObject* jit311_transition_ledger(PyObject* /* self */, PyObject* /* arg */) {
-  return jit::a2TransitionLedgerSnapshot();
+  return jit::runtimeTransitionLedgerSnapshot();
 }
 #endif
 
@@ -5072,7 +5072,7 @@ PyMethodDef jit_methods_311_canary[] = {
     {"_jit311_lifecycle_snapshot",
      jit311_lifecycle_snapshot,
      METH_NOARGS,
-     PyDoc_STR("Return the private numeric CPython 3.11 A3 lifecycle census.")},
+     PyDoc_STR("Return the private numeric CPython 3.11 lifecycle census.")},
     {"_jit311_lifecycle_invariants",
      jit311_lifecycle_invariants,
      METH_NOARGS,
@@ -5084,20 +5084,20 @@ PyMethodDef jit_methods_311_canary[] = {
     {"_jit311_register_for_compile",
      jit311_register_for_compile,
      METH_O,
-     PyDoc_STR("Register a function for private A3 batch-compile testing.")},
+     PyDoc_STR("Register a function for private batch-compile testing.")},
     {"_jit311_multithreaded_compile_test",
      multithreaded_compile_test,
      METH_NOARGS,
-     PyDoc_STR("Run the private A3 multithreaded compile test.")},
+     PyDoc_STR("Run the private multithreaded compile test.")},
     {"_jit311_multithreaded_compile_test_enabled",
      is_multithreaded_compile_test_enabled,
      METH_NOARGS,
-     PyDoc_STR("Return whether private A3 multithreaded compile is enabled.")},
+     PyDoc_STR("Return whether private multithreaded compile is enabled.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,
      PyDoc_STR("Return the frozen-input numeric opcode whitelist used by the "
-               "private CPython 3.11 A1 gate.")},
+               "private CPython 3.11 execution gate.")},
     {"_jit311_reset_entry_ledger",
      jit311_reset_entry_ledger,
      METH_NOARGS,
@@ -5107,16 +5107,16 @@ PyMethodDef jit_methods_311_canary[] = {
      jit311_entry_ledger,
      METH_NOARGS,
      PyDoc_STR("Return exact code-object machine-entry counts and the dropped "
-               "evidence count for CPython 3.11 A1.")},
+               "evidence count for the CPython 3.11 execution acceptance.")},
     {"_jit311_reset_transition_ledger",
      jit311_reset_transition_ledger,
      METH_NOARGS,
-     PyDoc_STR("Reset and enable the private CPython 3.11 A2 transition "
+     PyDoc_STR("Reset and enable the private CPython 3.11 runtime-transition "
                "ledger.")},
     {"_jit311_transition_ledger",
      jit311_transition_ledger,
      METH_NOARGS,
-     PyDoc_STR("Return CPython 3.11 A2 deopt/generator transition rows and "
+     PyDoc_STR("Return CPython 3.11 deopt/generator transition rows and "
                "the dropped evidence count.")},
     // MR-05: the inverse of force_compile, and the only published way to
     // take a function back off machine code.  A call already inside the
@@ -5185,12 +5185,12 @@ PyMethodDef jit_methods_311_canary[] = {
     {"patched_sys_setprofile",
      _PyCFunction_CAST(patched_sys_setprofile),
      METH_FASTCALL,
-     PyDoc_STR("Private A1 wrapper that pauses or resumes the JIT after "
+     PyDoc_STR("Private test wrapper that pauses or resumes the JIT after "
                "sys.setprofile changes.")},
     {"patched_sys_settrace",
      _PyCFunction_CAST(patched_sys_settrace),
      METH_FASTCALL,
-     PyDoc_STR("Private A1 wrapper that pauses or resumes the JIT after "
+     PyDoc_STR("Private test wrapper that pauses or resumes the JIT after "
                "sys.settrace changes.")},
     // The physical half of the lifecycle: every function the registry still
     // holds an artifact for, whether or not a call would currently enter it.
@@ -5903,7 +5903,7 @@ int initialize() {
   // specialized opcode consumption is on so organic type-change deopt is
   // real.  OSR, audit instrumentation and the JIT list stay off.
   getMutableConfig().specialized_opcodes = true;
-  // A1 tracing policy follows the upstream integration model: activating
+  // The tracing policy follows the upstream integration model: activating
   // sys.settrace/sys.setprofile pauses new compilation, parks published
   // functions and lets the interpreter own monitoring semantics.  Normal
   // 3.11 frames still leave machine code through the existing per-bytecode
@@ -6105,8 +6105,8 @@ void finalize() {
 
   if (isJitShadow()) {
     getMutableConfig().state = State::kFinalizing;
-    jit::a1EntryLedgerDisable();
-    jit::a2TransitionLedgerDisable();
+    jit::executionEntryLedgerDisable();
+    jit::runtimeTransitionLedgerDisable();
 
     auto mod_state = cinderx::getModuleState();
     auto* context = static_cast<Context*>(mod_state->jit_context.get());
@@ -6137,8 +6137,8 @@ void finalize() {
   getMutableConfig().state = State::kFinalizing;
   setInterpreterJitFlag(false);
   syncOSRFlags();
-  jit::a1EntryLedgerDisable();
-  jit::a2TransitionLedgerDisable();
+  jit::executionEntryLedgerDisable();
+  jit::runtimeTransitionLedgerDisable();
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.

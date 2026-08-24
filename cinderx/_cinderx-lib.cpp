@@ -968,7 +968,7 @@ static PyObject* native_recursion_state_for_test(PyObject*, PyObject*) {
 }
 
 // Test-only native recursion probe.  It deliberately calls the public C API
-// directly, without going through Ci_EvalFrame, so A2 freeze validation can
+// directly, without going through Ci_EvalFrame, so the runtime-transition freeze validation can
 // compare Stock and JIT behavior at the last admitted Python frame.
 static PyObject* native_enter_recursive_call_for_test(PyObject*, PyObject*) {
   int before_remaining;

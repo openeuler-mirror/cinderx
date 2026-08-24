@@ -94,7 +94,7 @@ void Ci_Observe311_OnFrame(
 // count, result, post_publication_interpreted_frames).
 PyObject* Ci_Observe311_Stats(void);
 
-// Allocation-free numeric census used by the private A3 lifecycle snapshot.
+// Allocation-free numeric census used by the private lifecycle snapshot.
 void Ci_Observe311_GetLifecycleState(
     uint64_t* watched_codes,
     uint64_t* keyed_slots,

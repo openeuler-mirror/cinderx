@@ -69,19 +69,19 @@ void triggerStatsOnOrganicDeopt();
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();
 
-// CPython 3.11 A1 test-only per-code entry evidence.  Recording is disabled
+// CPython 3.11 execution-acceptance test-only per-code entry evidence.  Recording is disabled
 // by default so the product hot path pays one predictable false branch and no
 // map/string cost outside acceptance runs.  The snapshot owns code objects as
 // dictionary keys and reports any dropped first-entry allocation.
-void a1EntryLedgerReset();
-void a1EntryLedgerDisable();
-PyObject* a1EntryLedgerSnapshot();
+void executionEntryLedgerReset();
+void executionEntryLedgerDisable();
+PyObject* executionEntryLedgerSnapshot();
 
-// A2 test-only transition ledger.  Records are copied at the actual deopt or
+// Test-only runtime-transition ledger.  Records are copied at the actual deopt or
 // suspended-generator conversion point and never retain Python objects.
-void a2TransitionLedgerReset();
-void a2TransitionLedgerDisable();
-void a2TransitionLedgerRecord(
+void runtimeTransitionLedgerReset();
+void runtimeTransitionLedgerDisable();
+void runtimeTransitionLedgerRecord(
     PyCodeObject* code,
     const char* transition,
     const char* reason,
@@ -89,6 +89,6 @@ void a2TransitionLedgerRecord(
     int resume_offset,
     bool forced,
     bool instrumentation);
-PyObject* a2TransitionLedgerSnapshot();
+PyObject* runtimeTransitionLedgerSnapshot();
 
 } // namespace jit

@@ -232,17 +232,17 @@ TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
-TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
+TEST_F(JITContextTest, ExecutionEntryLedgerAttributesExactCodeObject) {
   SKIP_311_EXECUTABLE_COMPILE();
 
   Ref<PyFunctionObject> func(
       compileAndGet("def func(value):\n    return value + 1", "func"));
   ASSERT_NE(func, nullptr);
-  jit::a1EntryLedgerReset();
+  jit::executionEntryLedgerReset();
   auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
   jit::triggerStatsOnMachineCodeEntry(code);
   jit::triggerStatsOnMachineCodeEntry(code);
-  Ref<> snapshot = Ref<>::steal(jit::a1EntryLedgerSnapshot());
+  Ref<> snapshot = Ref<>::steal(jit::executionEntryLedgerSnapshot());
   ASSERT_NE(snapshot, nullptr);
   BorrowedRef<> entries = PyDict_GetItemString(snapshot, "entries");
   BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
@@ -255,20 +255,20 @@ TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
   ASSERT_NE(count, nullptr);
   EXPECT_EQ(PyLong_AsLongLong(count), 2);
   EXPECT_EQ(PyLong_AsLongLong(dropped), 0);
-  jit::a1EntryLedgerDisable();
+  jit::executionEntryLedgerDisable();
 }
 
-TEST_F(JITContextTest, A2TransitionLedgerRecordsExactResumeEvidence) {
+TEST_F(JITContextTest, RuntimeTransitionLedgerRecordsExactResumeEvidence) {
   SKIP_311_EXECUTABLE_COMPILE();
 
   Ref<PyFunctionObject> func(
       compileAndGet("def func(value):\n    return value + 1", "func"));
   ASSERT_NE(func, nullptr);
   auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
-  jit::a2TransitionLedgerReset();
-  jit::a2TransitionLedgerRecord(
+  jit::runtimeTransitionLedgerReset();
+  jit::runtimeTransitionLedgerRecord(
       code, "deopt", "GuardFailure", 4, 6, false, false);
-  Ref<> snapshot = Ref<>::steal(jit::a2TransitionLedgerSnapshot());
+  Ref<> snapshot = Ref<>::steal(jit::runtimeTransitionLedgerSnapshot());
   ASSERT_NE(snapshot, nullptr);
   BorrowedRef<> rows = PyDict_GetItemString(snapshot, "rows");
   BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
@@ -280,7 +280,7 @@ TEST_F(JITContextTest, A2TransitionLedgerRecordsExactResumeEvidence) {
   EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "cause_offset")), 4);
   EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "resume_offset")), 6);
   EXPECT_EQ(PyLong_AsLong(dropped), 0);
-  jit::a2TransitionLedgerDisable();
+  jit::runtimeTransitionLedgerDisable();
 }
 
 TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
@@ -6029,8 +6029,8 @@ TEST_F(JITLifecycle311Test, RetiredCodeRuntimeStorageIsRecycled) {
 
   // Artifact death must hand the CodeRuntime slot back: churning
   // independent code objects through compile and death reuses storage
-  // instead of growing the slab by one slot per compile (A3 blocker
-  // B7-RUNTIME).
+  // instead of growing the slab by one slot per compile (the
+  // CODERUNTIME_STORAGE_RETENTION blocker).
   jit::Context* ctx = jit::getContext();
   ASSERT_NE(ctx, nullptr);
   auto mod = importCinderJitModule();

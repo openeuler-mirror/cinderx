@@ -1,0 +1,13 @@
+{
+  "format": "cp311-jit-lifecycle-transition-prerequisite-v1",
+  "transition_frozen_commit": "65afe7ce8c3ed3fcedec759c80bcda32027a38a1",
+  "transition_result": "PASS_WITH_APPROVED_DEVIATIONS",
+  "freeze_state": "FROZEN",
+  "canonical_report_sha256": "7f271d877e74770343e5e3c6b48ad802fcb758702eacb63761c7f06c33240abd",
+  "canonical_result_sha256": "103f19f0c79265b2b2fd5f96ae7aab38e96f1ce91ad50fb667282e256491ada2",
+  "frozen_source_files": {
+    "ci_pipeline/jit311/a2_runner.py": "d5e02c6fa5a9c6bb655e39ba3a4b28997edb73d596a94a8d51d22da7d34e38be",
+    "ci_pipeline/jit311/a2_report.py": "536d0775d50fa2da84fe0def9cc04a4d14333a793bf01c3177905e7c30339dd7",
+    "ci_pipeline/jit311/a2_transition_probe.py": "7a3ff64d284167cbc85eeb0fc8905df6eeb04087a3638d5a3e1cee5ff6eff826"
+  }
+}
