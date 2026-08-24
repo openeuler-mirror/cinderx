@@ -815,7 +815,7 @@ static PyThreadState* allocate_and_link_interpreter_frame(
   // This helper is the 3.11 entry glue: every machine-code invocation of a
   // compiled function links its frame here, so this is the counting point
   // the trigger-stats contract promises (trigger_stats.h).
-  jit::triggerStatsOnMachineCodeEntry();
+  jit::triggerStatsOnMachineCodeEntry(co);
 #endif
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 

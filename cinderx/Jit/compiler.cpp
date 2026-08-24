@@ -170,16 +170,44 @@ void Compiler::runPasses(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-// Mid-flight tracing/profile transitions follow the RFC's versioned
-// compatibility semantics (3.3.4.5): a JIT frame already on the stack
-// keeps running natively to its natural return and its remaining
-// trace/profile events are not delivered; only NEW calls observe the
-// activation, at the guarded entry, and fall back to the interpreter.
-// No safepoint stack-level deoptimization exists, so the executing mode
-// inserts no bytecode-boundary instrumentation polls.  A frame that
-// deopts mid-function for an ordinary reason (guard, exception) while
-// tracing is already active gets its f_trace/f_trace_lines set at the
-// resume (RFC item 7) -- see setupTraceForDeoptedFrame.
+// Meta-style instrumentation fallback must also catch activation from inside
+// an already-running frame.  CPython 3.11 has no monitoring watcher and the
+// AArch64 normal-frame mode cannot patch native return addresses, so execute
+// mode carries a safe deopt point after every bytecode boundary.  The poll
+// runs before the normal pass pipeline so SSA/refcount insertion records the
+// complete live state needed by the interpreter continuation.
+void insertInstrumentationPolls311(hir::Function& irfunc) {
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      hir::Instr& instr = *it;
+      ++it;
+      if (instr.opcode() == hir::Opcode::kSnapshot) {
+        if (it == block.end()) {
+          continue;
+        }
+        auto& snapshot = static_cast<hir::Snapshot&>(instr);
+        hir::FrameState* state = snapshot.frameState();
+        if (state == nullptr) {
+          continue;
+        }
+        hir::Instr* check = hir::CheckInstrumentation::create(*state);
+        check->copyBytecodeOffset(instr);
+        check->InsertBefore(*it);
+      } else if (instr.opcode() == hir::Opcode::kRunPeriodicTasks) {
+        auto& periodic = static_cast<hir::DeoptBase&>(instr);
+        hir::FrameState* state = periodic.frameState();
+        // A following Snapshot gets its own target-boundary poll.  Only add
+        // the service-state poll when no such boundary exists.
+        if (state != nullptr && it != block.end() &&
+            it->opcode() != hir::Opcode::kSnapshot) {
+          hir::Instr* check = hir::CheckInstrumentation::create(*state);
+          check->copyBytecodeOffset(instr);
+          check->InsertBefore(*it);
+        }
+      }
+    }
+  }
+}
 
 PassConfig createConfig();
 
@@ -193,6 +221,9 @@ std::unique_ptr<hir::Function> compileToFinalHIRForTest(
   std::unique_ptr<hir::Function> irfunc(hir::buildHIR(*preloader));
   if (irfunc == nullptr) {
     return nullptr;
+  }
+  if (getConfig().state == State::kRunning) {
+    insertInstrumentationPolls311(*irfunc);
   }
   Compiler::runPasses(*irfunc, createConfig());
   return irfunc;
@@ -379,6 +410,12 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   if (nullptr != compilation_phase_timer) {
     irfunc->setCompilationPhaseTimer(std::move(compilation_phase_timer));
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state == State::kRunning) {
+    insertInstrumentationPolls311(*irfunc);
+  }
+#endif
 
   PassConfig config = createConfig();
   COMPILE_TIMER(

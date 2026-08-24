@@ -71,6 +71,73 @@ struct DeoptResult {
   bool is_instrumentation_deopt;
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+// Ci_EvalFrameDefault_311's throwflag entry normally emits PyTrace_CALL.
+// A frame resumed after a mid-flight instrumentation poll is not a new call:
+// its explicit local tracer is already installed, and Stock proceeds directly
+// to exception delivery.  Drop exactly that synthetic entry event, then put
+// the original callbacks back before the evaluator dispatches the exception.
+thread_local Py_tracefunc t_resume_tracefunc = nullptr;
+thread_local Py_tracefunc t_resume_profilefunc = nullptr;
+
+int suppressResumeCallTrace(
+    PyObject* object,
+    PyFrameObject* frame,
+    int event,
+    PyObject* argument) {
+  PyThreadState* tstate = PyThreadState_Get();
+  Py_tracefunc original = t_resume_tracefunc;
+  JIT_CHECK(original != nullptr, "missing trace callback for JIT resume");
+  t_resume_tracefunc = nullptr;
+  tstate->c_tracefunc = original;
+  if (event == PyTrace_CALL) {
+    return 0;
+  }
+  return original(object, frame, event, argument);
+}
+
+int suppressResumeCallProfile(
+    PyObject* object,
+    PyFrameObject* frame,
+    int event,
+    PyObject* argument) {
+  PyThreadState* tstate = PyThreadState_Get();
+  Py_tracefunc original = t_resume_profilefunc;
+  JIT_CHECK(original != nullptr, "missing profile callback for JIT resume");
+  t_resume_profilefunc = nullptr;
+  tstate->c_profilefunc = original;
+  if (event == PyTrace_CALL) {
+    return 0;
+  }
+  return original(object, frame, event, argument);
+}
+
+void suppressSyntheticResumeCallEvents(PyThreadState* tstate) {
+  JIT_CHECK(
+      t_resume_tracefunc == nullptr && t_resume_profilefunc == nullptr,
+      "nested JIT instrumentation resume callback suppression");
+  if (tstate->c_tracefunc != nullptr) {
+    t_resume_tracefunc = tstate->c_tracefunc;
+    tstate->c_tracefunc = suppressResumeCallTrace;
+  }
+  if (tstate->c_profilefunc != nullptr) {
+    t_resume_profilefunc = tstate->c_profilefunc;
+    tstate->c_profilefunc = suppressResumeCallProfile;
+  }
+}
+
+void restoreSyntheticResumeCallEvents(PyThreadState* tstate) {
+  if (t_resume_tracefunc != nullptr) {
+    tstate->c_tracefunc = t_resume_tracefunc;
+    t_resume_tracefunc = nullptr;
+  }
+  if (t_resume_profilefunc != nullptr) {
+    tstate->c_profilefunc = t_resume_profilefunc;
+    t_resume_profilefunc = nullptr;
+  }
+}
+#endif
+
 #define ASM_CHECK_THROW(exp)                         \
   {                                                  \
     auto err = (exp);                                \
@@ -467,7 +534,16 @@ PyObject* resumeInInterpreter(
     // to the vendored 3.11 evaluator's return protocol.  Changing the
     // evaluator affects future entries; a frame already in flight is
     // finished by the interpreter that launched it.
+    // The trace transition can coincide with a call that raises.  That exit
+    // is classified by the failing CALL (UnhandledException), not by the
+    // following instrumentation poll, but it is still a continuation of an
+    // already-running frame and must not synthesize a second call event.
+    if (err_occurred &&
+        (tstate->c_tracefunc != nullptr || tstate->c_profilefunc != nullptr)) {
+      suppressSyntheticResumeCallEvents(tstate);
+    }
     result = Ci_EvalFrameDefault_311(tstate, frame, err_occurred);
+    restoreSyntheticResumeCallEvents(tstate);
 #else
     result = _PyEval_EvalFrame(tstate, frame, err_occurred);
 #endif

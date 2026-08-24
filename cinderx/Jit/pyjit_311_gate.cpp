@@ -172,6 +172,8 @@ namespace {
 // once the passes have run.  Thread-local because compilation is
 // per-thread; consumed and cleared by the scheduling gate below.
 thread_local const char* t_last_execute_refusal = nullptr;
+thread_local int t_execute_refusal_opcode = -1;
+thread_local int t_execute_refusal_offset = -1;
 
 // Argument binding for defaults, keyword-only parameters and the
 // variadic collectors is handled by the generated vectorcall prologue
@@ -328,6 +330,8 @@ bool cStackSoftLimitReached311() {
 // which door a request came through.
 extern "C" const char* Ci_JitShell311_ExecuteRefusal(
     PyFunctionObject* raw_func) {
+  t_execute_refusal_opcode = -1;
+  t_execute_refusal_offset = -1;
   BorrowedRef<PyFunctionObject> func{raw_func};
   const char* reason = eligibilityReason(func);
   if (reason != nullptr) {
@@ -344,7 +348,22 @@ extern "C" const char* Ci_JitShell311_ExecuteRefusal(
   if (const char* share_reason = unsupportedSharedArtifact311(func)) {
     return share_reason;
   }
-  return jit::hir::unsupportedExecuteReason311(code);
+  jit::hir::ExecuteRefusal311 detail =
+      jit::hir::unsupportedExecuteDetail311(code);
+  t_execute_refusal_opcode = detail.opcode;
+  t_execute_refusal_offset = detail.offset;
+  return detail.reason;
+}
+
+extern "C" void Ci_JitShell311_GetExecuteRefusalDetail(
+    int* opcode,
+    int* offset) {
+  if (opcode != nullptr) {
+    *opcode = t_execute_refusal_opcode;
+  }
+  if (offset != nullptr) {
+    *offset = t_execute_refusal_offset;
+  }
 }
 
 extern "C" void Ci_JitShell311_SetExecuteRefusal(const char* reason) {

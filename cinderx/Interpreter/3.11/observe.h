@@ -163,6 +163,11 @@ void Ci_JitShell311_TrackOuterFromFrame(
 // wherever it surfaces.
 const char* Ci_JitShell311_ExecuteRefusal(PyFunctionObject* func);
 
+// Detail for the immediately preceding ExecuteRefusal call on this thread.
+// opcode/offset are -1 unless the reason is an ordinary execute-whitelist
+// refusal with an exact first rejected instruction.
+void Ci_JitShell311_GetExecuteRefusalDetail(int* opcode, int* offset);
+
 // The artifact currently installed for this function, or NULL.  "Installed"
 // means the next call runs machine code: the code object, globals, builtins,
 // argument shape and artifact ownership all still match what was compiled.

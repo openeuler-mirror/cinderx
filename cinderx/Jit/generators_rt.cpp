@@ -308,7 +308,7 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
   // JITRT_AllocateAndLinkInterpreterFrame(), the ordinary 3.11 counting
   // point.  Count at this unique resume dispatch so canary evidence covers
   // both the initial next() and later send()/throw()/close() resumes.
-  jit::triggerStatsOnMachineCodeEntry();
+  jit::triggerStatsOnMachineCodeEntry(_PyFrame_GetCode(frame));
 #endif
   Ref<> result = Ref<>::steal(gen_footer->resumeEntry(
       gen_obj, arg, 0 /* finish_yield_from (not used in 3.12+) */, tstate));

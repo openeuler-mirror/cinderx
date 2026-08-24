@@ -871,20 +871,12 @@ static bool should_snapshot(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  // The executing mode writes local mutations through to the observable
-  // frame (JITRT_StoreFrameLocal311).  Releasing the slot's previous value
-  // can run arbitrary __del__ code, so the store is not replayable and its
-  // boundary needs its own resume point -- without one, bindGuards finds
-  // no dominating FrameState for a following guard.
+  // Instrumentation can be activated by any Python callback, including a
+  // destructor inserted later by the refcount pass.  Execute mode therefore
+  // needs one resumable Snapshot at every non-terminator bytecode boundary;
+  // insertInstrumentationPolls311 turns those snapshots into deopt checks.
   if (getConfig().state == State::kRunning) {
-    switch (bci.opcode()) {
-      case STORE_FAST:
-      case STORE_FAST_LOAD_FAST:
-      case STORE_FAST_STORE_FAST:
-        return true;
-      default:
-        break;
-    }
+    return true;
   }
 #endif
 
@@ -1341,7 +1333,93 @@ bool collectNormalFlowReachable311(
 } // namespace
 #endif
 
-const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
+bool isExecuteOpcodeSupported311(int opcode) {
+#if PY_VERSION_HEX < 0x030C0000
+  switch (opcode) {
+    case BEFORE_WITH:
+    case BINARY_OP:
+    case BUILD_CONST_KEY_MAP:
+    case BUILD_LIST:
+    case BUILD_MAP:
+    case BUILD_SET:
+    case BUILD_TUPLE:
+    case CALL:
+    case CALL_FUNCTION_EX:
+    case CHECK_EXC_MATCH:
+    case COMPARE_OP:
+    case CONTAINS_OP:
+    case COPY:
+    case COPY_FREE_VARS:
+    case DELETE_FAST:
+    case DICT_MERGE:
+    case DICT_UPDATE:
+    case EXTENDED_ARG:
+    case FOR_ITER:
+    case GET_ITER:
+    case GET_YIELD_FROM_ITER:
+    case IS_OP:
+    case JUMP_BACKWARD:
+    case JUMP_BACKWARD_NO_INTERRUPT:
+    case JUMP_FORWARD:
+    case KW_NAMES:
+    case LIST_APPEND:
+    case LIST_EXTEND:
+    case LIST_TO_TUPLE:
+    case LOAD_ASSERTION_ERROR:
+    case LOAD_ATTR:
+    case LOAD_CLOSURE:
+    case LOAD_CONST:
+    case LOAD_DEREF:
+    case LOAD_FAST:
+    case LOAD_GLOBAL:
+    case LOAD_METHOD:
+    case MAKE_CELL:
+    case MAKE_FUNCTION:
+    case MAP_ADD:
+    case NOP:
+    case POP_JUMP_BACKWARD_IF_FALSE:
+    case POP_JUMP_BACKWARD_IF_NONE:
+    case POP_JUMP_BACKWARD_IF_NOT_NONE:
+    case POP_JUMP_BACKWARD_IF_TRUE:
+    case POP_JUMP_FORWARD_IF_FALSE:
+    case POP_JUMP_FORWARD_IF_NONE:
+    case POP_EXCEPT:
+    case POP_JUMP_FORWARD_IF_NOT_NONE:
+    case POP_JUMP_FORWARD_IF_TRUE:
+    case POP_TOP:
+    case PRECALL:
+    case PUSH_EXC_INFO:
+    case PUSH_NULL:
+    case RAISE_VARARGS:
+    case RERAISE:
+    case RESUME:
+    case RETURN_GENERATOR:
+    case RETURN_VALUE:
+    case SEND:
+    case SET_ADD:
+    case STORE_ATTR:
+    case STORE_FAST:
+    case SWAP:
+    case UNARY_INVERT:
+    case UNARY_NEGATIVE:
+    case UNARY_NOT:
+    case UNARY_POSITIVE:
+    case UNPACK_EX:
+    case UNPACK_SEQUENCE:
+    case WITH_EXCEPT_START:
+    case YIELD_VALUE:
+      return true;
+    default:
+      return false;
+  }
+#else
+  (void)opcode;
+  return false;
+#endif
+}
+
+ExecuteRefusal311 unsupportedExecuteDetail311(
+    BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
   // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
   // family (including LOAD_GLOBAL without a speculative cache Guard,
@@ -1369,95 +1447,28 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   // slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
-    return "REFUSE_SHAPE_EXECUTE_SURFACE";
+    return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
   }
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
     }
-    switch (bc_it->opcode()) {
-      case BEFORE_WITH:
-      case BINARY_OP:
-      case BUILD_CONST_KEY_MAP:
-      case BUILD_LIST:
-      case BUILD_MAP:
-      case BUILD_SET:
-      case BUILD_TUPLE:
-      case CALL:
-      case CALL_FUNCTION_EX:
-      case CHECK_EXC_MATCH:
-      case COMPARE_OP:
-      case CONTAINS_OP:
-      case COPY:
-      case COPY_FREE_VARS:
-      case DELETE_FAST:
-      case DICT_MERGE:
-      case DICT_UPDATE:
-      case EXTENDED_ARG:
-      case FOR_ITER:
-      case GET_ITER:
-      case GET_YIELD_FROM_ITER:
-      case IS_OP:
-      case JUMP_BACKWARD:
-      case JUMP_BACKWARD_NO_INTERRUPT:
-      case JUMP_FORWARD:
-      case KW_NAMES:
-      case LIST_APPEND:
-      case LIST_EXTEND:
-      case LIST_TO_TUPLE:
-      case LOAD_ASSERTION_ERROR:
-      case LOAD_ATTR:
-      case LOAD_CLOSURE:
-      case LOAD_CONST:
-      case LOAD_DEREF:
-      case LOAD_FAST:
-      case LOAD_GLOBAL:
-      case LOAD_METHOD:
-      case MAKE_CELL:
-      case MAKE_FUNCTION:
-      case MAP_ADD:
-      case NOP:
-      case POP_JUMP_BACKWARD_IF_FALSE:
-      case POP_JUMP_BACKWARD_IF_NONE:
-      case POP_JUMP_BACKWARD_IF_NOT_NONE:
-      case POP_JUMP_BACKWARD_IF_TRUE:
-      case POP_JUMP_FORWARD_IF_FALSE:
-      case POP_JUMP_FORWARD_IF_NONE:
-      case POP_EXCEPT:
-      case POP_JUMP_FORWARD_IF_NOT_NONE:
-      case POP_JUMP_FORWARD_IF_TRUE:
-      case POP_TOP:
-      case PRECALL:
-      case PUSH_EXC_INFO:
-      case PUSH_NULL:
-      case RAISE_VARARGS:
-      case RERAISE:
-      case RESUME:
-      case RETURN_GENERATOR:
-      case RETURN_VALUE:
-      case SEND:
-      case SET_ADD:
-      case STORE_ATTR:
-      case STORE_FAST:
-      case SWAP:
-      case UNARY_INVERT:
-      case UNARY_NEGATIVE:
-      case UNARY_NOT:
-      case UNARY_POSITIVE:
-      case UNPACK_EX:
-      case UNPACK_SEQUENCE:
-      case WITH_EXCEPT_START:
-      case YIELD_VALUE:
-        break;
-      default:
-        return "REFUSE_SHAPE_EXECUTE_SURFACE";
+    if (!isExecuteOpcodeSupported311(bc_it->opcode())) {
+      return {
+          "REFUSE_SHAPE_EXECUTE_SURFACE",
+          bc_it->opcode(),
+          bc_it->baseOffset().value()};
     }
   }
 #else
   (void)code;
 #endif
-  return nullptr;
+  return {};
+}
+
+const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
+  return unsupportedExecuteDetail311(code).reason;
 }
 
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {

@@ -232,11 +232,79 @@ TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
-// The bytecode-boundary instrumentation polls were removed per RFC
-// 3.3.4.5: a frame already running when tracing/profiling activates keeps
-// running natively to its natural return, so no poll ordering exists to
-// assert.  Mid-flight transition coverage lives in the RFC-exemption
-// oracles in test_canary_execute_311.py.
+TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  jit::a1EntryLedgerReset();
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  Ref<> snapshot = Ref<>::steal(jit::a1EntryLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> entries = PyDict_GetItemString(snapshot, "entries");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_NE(entries, nullptr);
+  ASSERT_NE(dropped, nullptr);
+  ASSERT_TRUE(PyList_Check(entries));
+  ASSERT_EQ(PyList_GET_SIZE(entries), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(entries.get(), 0);
+  BorrowedRef<> count = PyDict_GetItemString(row, "entries");
+  ASSERT_NE(count, nullptr);
+  EXPECT_EQ(PyLong_AsLongLong(count), 2);
+  EXPECT_EQ(PyLong_AsLongLong(dropped), 0);
+  jit::a1EntryLedgerDisable();
+}
+
+TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(compileAndGet(
+      "def func(a, b):\n"
+      "    a + b\n"
+      "    return 42",
+      "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Function> irfunc =
+      jit::compileToFinalHIRForTest(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  int polls = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    bool decref_since_poll = false;
+    const jit::hir::Instr* offender = nullptr;
+    for (const jit::hir::Instr& instr : block) {
+      switch (instr.opcode()) {
+        case jit::hir::Opcode::kDecref:
+        case jit::hir::Opcode::kXDecref:
+        case jit::hir::Opcode::kBatchDecref:
+          decref_since_poll = true;
+          offender = &instr;
+          break;
+        case jit::hir::Opcode::kCheckInstrumentation:
+          polls++;
+          decref_since_poll = false;
+          break;
+        case jit::hir::Opcode::kReturn:
+          EXPECT_FALSE(decref_since_poll)
+              << "a Decref (last: "
+              << (offender != nullptr
+                      ? jit::hir::hirOpcodeName(offender->opcode())
+                      : "?")
+              << ") can run __del__ after the last poll and before return";
+          break;
+        default:
+          break;
+      }
+    }
+    (void)offender;
+  }
+  EXPECT_GT(polls, 0);
+}
+
 TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
   SKIP_311_EXECUTABLE_COMPILE();
 

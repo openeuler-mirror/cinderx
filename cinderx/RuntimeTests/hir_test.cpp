@@ -2000,6 +2000,21 @@ def make_arange(n):
   EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 
+TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_TRUE(isExecuteOpcodeSupported311(LOAD_ATTR));
+  EXPECT_FALSE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def test(values):\n    return values[0]", "test"));
+  ASSERT_NE(func, nullptr);
+  ExecuteRefusal311 detail = unsupportedExecuteDetail311(func->func_code);
+  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_EXECUTE_SURFACE");
+  EXPECT_EQ(detail.opcode, BINARY_SUBSCR);
+  EXPECT_GE(detail.offset, 0);
+#endif
+}
+
 TEST_F(HIRBuildTest, OversizedBytecode311RefusesCodegenSpan) {
   // Mirrors test_compile.TestSpecifics.test_extended_arg at a size just
   // over the 64KiB shadow bytecode budget.
