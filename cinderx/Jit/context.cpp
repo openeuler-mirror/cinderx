@@ -1160,7 +1160,16 @@ void Context::forgetCodeEntry(
 
   clearCachedCompiledIfMatches(code, cf.get());
   dropDedupArtifact(code, cf);
+#if PY_VERSION_HEX < 0x030C0000
+  // A suspended generator may now be the retiring artifact's final owner.
+  // Detach the function-level state, but keep CodeRuntime references alive:
+  // dropping them can run Python finalizers, and the generator must publish
+  // stock state before that becomes observable. Its final artifact DECREF
+  // performs the full clear after deopt/completion.
+  cf->clear(false /* context_finalizing */, false /* release references */);
+#else
   cf->clear();
+#endif
   auto current = compiled_codes_.find(key);
   if (current != compiled_codes_.end() &&
       current->second.get() == retiring.get()) {

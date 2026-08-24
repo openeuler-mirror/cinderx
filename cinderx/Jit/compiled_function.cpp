@@ -400,7 +400,9 @@ void CompiledFunction::forgetFunctions() {
 }
 #endif
 
-void CompiledFunction::clear(bool context_finalizing) {
+void CompiledFunction::clear(
+    bool context_finalizing,
+    bool release_runtime_references) {
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {
@@ -442,8 +444,11 @@ void CompiledFunction::clear(bool context_finalizing) {
     owner_ = nullptr;
   }
 
-  // Clear all references held by the CodeRuntime.
-  if (data_.runtime != nullptr) {
+  // Clear all references held by the CodeRuntime. A retired 3.11 artifact can
+  // remain executable through a suspended generator after its function-level
+  // registries are gone. Keep these references until that generator converts
+  // to stock state and releases the artifact's final owner.
+  if (release_runtime_references && data_.runtime != nullptr) {
     data_.runtime->releaseReferences();
     data_.runtime = nullptr;
   }

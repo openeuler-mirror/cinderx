@@ -4407,7 +4407,7 @@ assert events == [
     ("send", 15),
     ("close", True),
     ("deopt", True),
-    ("deopt", True),
+    ("deopt", False),
 ], events
 )");
 }

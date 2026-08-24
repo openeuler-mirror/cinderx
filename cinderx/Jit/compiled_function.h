@@ -228,9 +228,13 @@ class CompiledFunction {
   // Traverse all GC-reachable objects for the GC.
   int traverse(visitproc visit, void* arg);
 
-  // Clear all references held by this CompiledFunction and deopt all
-  // associated functions.
-  void clear(bool context_finalizing = false);
+  // Deopt all associated functions and optionally clear the references held
+  // by the CodeRuntime. 3.11 retirement can leave a suspended generator as
+  // the artifact's final owner; that path keeps the runtime references until
+  // the generator publishes stock state and drops its owner.
+  void clear(
+      bool context_finalizing = false,
+      bool release_runtime_references = true);
 
  private:
   explicit CompiledFunction(CompiledFunctionData&& data)
