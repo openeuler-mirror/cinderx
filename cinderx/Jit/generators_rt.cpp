@@ -208,8 +208,8 @@ void jitgen_dealloc(PyObject* self) {
   } else if (
       gen_footer->yieldPoint == nullptr &&
       FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
-    clearGeneratorCompiledFunction(gen_footer);
     deopt_jit_gen_object_only(jit_gen);
+    clearGeneratorCompiledFunction(gen_footer);
   } else {
     deopted = deopt_jit_gen_with_footer(
         jit_gen, gen_footer, true /* tree_iter_cleared */);
@@ -326,7 +326,6 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
     if (FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
       jit_gen->gi_frame_state = FRAME_CLEARED;
       jitFrameClearExceptCode(frame);
-      clearGeneratorCompiledFunction(gen_footer);
     } else {
 #if PY_VERSION_HEX >= 0x030E0000
       jit_gen->gi_frame_state = gen_footer->yieldPoint->isYieldFrom()
@@ -496,7 +495,9 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     // owner so later stock deallocation never has to locate the footer through
     // FRAME_EXECUTABLE.  jitFrameClearExceptCode() already cleared the rest of
     // the frame, so only the preserved executable remains to be released.
+    GenDataFooter* gen_footer = gen->genDataFooter();
     deopt_jit_gen_object_only(gen);
+    clearGeneratorCompiledFunction(gen_footer);
     Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
   }
 #endif
@@ -1096,8 +1097,8 @@ bool deopt_jit_gen_with_footer(
   if (!tree_iter_cleared) {
     clearTreeIterState(gen_footer);
   }
-  clearGeneratorCompiledFunction(gen_footer);
   deopt_jit_gen_object_only(jit_gen);
+  clearGeneratorCompiledFunction(gen_footer);
 
   return true;
 }

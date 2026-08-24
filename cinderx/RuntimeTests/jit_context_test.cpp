@@ -7,6 +7,7 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
+#include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
@@ -4322,6 +4323,93 @@ def undo_me(x):
   auto recompiled = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(recompiled, nullptr);
   EXPECT_EQ(PyLong_AsLong(recompiled), 42);
+}
+
+TEST_F(JITLifecycle311Test, GeneratorPublishesStockBeforeArtifactRelease) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+import types
+from cinderx import jit
+
+events = []
+
+class Reenter:
+    def __init__(self, mode, gen):
+        self.mode = mode
+        self.gen = gen
+
+    def __del__(self):
+        events.append((self.mode, type(self.gen) is types.GeneratorType))
+        if self.mode == "send":
+            try:
+                self.gen.send(5)
+            except StopIteration as exc:
+                events.append((self.mode, exc.value))
+        elif self.mode == "close":
+            self.gen.close()
+        else:
+            events.append((self.mode, jit._deopt_gen(self.gen)))
+
+def lifecycle_gen():
+    received = yield 1
+    return received + 10
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lifecycle_gen"));
+  Ref<> reenter_type(getGlobal("Reenter"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(reenter_type, nullptr);
+  auto jit_mod = importCinderJitModule();
+
+  for (const char* mode : {"send", "close", "deopt"}) {
+    ASSERT_EQ(jit::compileFunction(func), jit::Result::OK) << mode;
+    auto args = Ref<>::steal(PyTuple_New(0));
+    Ref<> gen = Ref<>::steal(PyObject_Call(func, args, nullptr));
+    ASSERT_NE(gen, nullptr) << mode;
+
+    auto first = Ref<>::steal(PyIter_Next(gen));
+    ASSERT_NE(first, nullptr) << mode;
+    EXPECT_EQ(PyLong_AsLong(first), 1) << mode;
+    auto* jit_gen = jit::JitGenObject::cast(gen.get());
+    ASSERT_NE(jit_gen, nullptr) << mode;
+    jit::GenDataFooter* footer = jit_gen->genDataFooter();
+    ASSERT_NE(footer, nullptr) << mode;
+    ASSERT_NE(footer->compiled, nullptr) << mode;
+    jit::CompiledFunction* artifact = footer->compiled;
+    ASSERT_NE(artifact->runtime(), nullptr) << mode;
+
+    auto mode_obj = Ref<>::steal(PyUnicode_FromString(mode));
+    auto trigger = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reenter_type.get(), mode_obj.get(), gen.get(), nullptr));
+    ASSERT_NE(trigger, nullptr) << mode;
+    artifact->runtime()->addReference(trigger);
+    trigger.reset();
+
+    auto uncompiled = Ref<>::steal(
+        PyObject_CallMethod(jit_mod, "force_uncompile", "O", func.get()));
+    ASSERT_NE(uncompiled, nullptr) << mode;
+    EXPECT_EQ(uncompiled.get(), Py_True) << mode;
+    EXPECT_EQ(footer->compiled, artifact) << mode;
+    EXPECT_EQ(
+        Py_REFCNT(reinterpret_cast<PyObject*>(artifact)), 1)
+        << "the suspended generator is not the artifact's final owner: "
+        << mode;
+    EXPECT_EQ(jit::getContext()->lookupFunc(func), nullptr) << mode;
+
+    ASSERT_TRUE(jit::deopt_jit_gen(gen.get())) << mode;
+    EXPECT_TRUE(Py_IS_TYPE(gen.get(), &PyGen_Type)) << mode;
+  }
+
+  runCode(R"(
+assert events == [
+    ("send", True),
+    ("send", 15),
+    ("close", True),
+    ("deopt", True),
+    ("deopt", True),
+], events
+)");
 }
 
 namespace {
