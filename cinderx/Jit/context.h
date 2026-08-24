@@ -121,6 +121,27 @@ struct CompilationKey {
   constexpr bool operator==(const CompilationKey& other) const = default;
 };
 
+// Numeric-only test/diagnostic census for CPython 3.11 lifecycle discovery.
+// No field owns or returns a Python/runtime object.
+struct LifecycleSnapshot311 {
+  size_t compiled_codes{0};
+  size_t installed_functions{0};
+  size_t associated_functions{0};
+  size_t parked_functions{0};
+  size_t watched_functions{0};
+  size_t artifact_members{0};
+  size_t deferred_anchor_releases{0};
+  size_t active_compiles{0};
+  size_t completed_compiles{0};
+  size_t deferred_finalizations{0};
+  size_t orphaned_compiled_codes{0};
+  size_t code_dedup_entries{0};
+  size_t code_outer_functions{0};
+  size_t context_references{0};
+  size_t code_runtimes_allocated{0};
+  size_t code_runtimes_live{0};
+};
+
 } // namespace jit
 
 template <>
@@ -404,6 +425,17 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * deopted.
    */
   const UnorderedSet<BorrowedRef<PyFunctionObject>>& deoptedFuncs();
+
+  LifecycleSnapshot311 lifecycleSnapshot311();
+  std::vector<std::string> lifecycleInvariantErrors311() const;
+
+  // Hand a retired artifact's cleared CodeRuntime back to the slab for
+  // reuse, after purging every side table keyed by its address so the
+  // slot's next tenant cannot inherit the old one's state.
+  void recycleCodeRuntime(CodeRuntime* runtime) override;
+
+  // Whether the runtime lives in this context's slab storage.
+  bool ownsCodeRuntime(const CodeRuntime* runtime) const override;
 
   /*
    * Get the total time spent compiling functions thus far.

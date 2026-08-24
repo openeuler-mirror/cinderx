@@ -103,6 +103,18 @@ class Slab {
     return ptr;
   }
 
+  // Whether the pointer names an allocated slot of this slab.  Exact slot
+  // addresses only: the ownership checks built on this decide whether a
+  // runtime pointer may be dereferenced, and an interior pointer must
+  // never pass for a live object.
+  bool contains(const T* obj) const {
+    auto ptr = reinterpret_cast<const char*>(obj);
+    if (ptr < base_.get() || ptr >= fill_) {
+      return false;
+    }
+    return static_cast<size_t>(ptr - base_.get()) % increment_ == 0;
+  }
+
 #ifndef WIN32
   void mlock() {
     if (::mlock(base_.get(), kSlabSize) < 0) {

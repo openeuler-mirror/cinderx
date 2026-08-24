@@ -94,6 +94,14 @@ void Ci_Observe311_OnFrame(
 // count, result, post_publication_interpreted_frames).
 PyObject* Ci_Observe311_Stats(void);
 
+// Allocation-free numeric census used by the private A3 lifecycle snapshot.
+void Ci_Observe311_GetLifecycleState(
+    uint64_t* watched_codes,
+    uint64_t* keyed_slots,
+    uint64_t* table_capacity,
+    uint64_t* events,
+    uint64_t* post_publication_interpreted_frames);
+
 // Read the scheduler slot for one live code object without creating it.
 // Returns 1 when a slot exists, 0 otherwise. Output pointers are optional.
 int Ci_Observe311_GetCodeState(

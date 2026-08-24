@@ -834,6 +834,20 @@ static int stats_set_str(PyObject* dict, const char* key, const char* value) {
   return rc;
 }
 
+void Ci_Observe311_GetLifecycleState(
+    uint64_t* watched_codes,
+    uint64_t* keyed_slots,
+    uint64_t* table_capacity,
+    uint64_t* events,
+    uint64_t* post_publication_interpreted_frames) {
+  *watched_codes = ci_observe_watched;
+  *keyed_slots = ci_observe_live;
+  *table_capacity = ci_observe_capacity;
+  *events = (uint64_t)ci_observe_event_count;
+  *post_publication_interpreted_frames =
+      ci_observe_post_publication_interpreted_frames;
+}
+
 PyObject* Ci_Observe311_Stats(void) {
   // Reporting is bookkeeping, and it allocates: every dict, string and
   // list append below can collect, a collection runs finalizers, a
@@ -924,6 +938,7 @@ PyObject* Ci_Observe311_Stats(void) {
           "post_publication_interpreted_frames",
           ci_observe_post_publication_interpreted_frames) < 0 ||
       stats_set_uint(stats, "watched_codes", ci_observe_watched) < 0 ||
+      stats_set_uint(stats, "keyed_slots", ci_observe_live) < 0 ||
       stats_set_uint(stats, "table_capacity", ci_observe_capacity) < 0 ||
       PyDict_SetItemString(stats, "events", events) < 0) {
     Py_DECREF(stats);

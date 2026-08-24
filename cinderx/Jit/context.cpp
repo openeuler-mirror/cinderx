@@ -238,18 +238,35 @@ Context::~Context() {
   for (auto& compiled : pinned) {
     compiled->clear(true /* context_finalizing */);
   }
-
-  // Nothing borrowed is left for a notification to protect; drop the
-  // watches.  Dropping a weak reference runs no Python.
-  clearFunctionDeathWatch();
 #else
   for (auto& code : compiled_codes_) {
     code.second->clear(true /* context_finalizing */);
   }
 #endif
 
+  // Artifacts orphaned by clearForMultithreadedCompileTest() left every
+  // registry and lost their owner, so the walks above cannot reach them --
+  // yet a function-dictionary anchor can keep such an artifact alive long
+  // past this destructor, while its CodeRuntime pointer aims into
+  // code_runtimes_, which dies with this context.  The GC then walks
+  // tp_traverse or tp_clear (and ~CompiledFunction runs clear()) through
+  // the dangling pointer.  Sever them in the same window as every other
+  // artifact, and release the pins here rather than in member destruction,
+  // so a release-driven function death still has its watch to report
+  // through.
+  for (auto& compiled : orphaned_compiled_codes_) {
+    compiled->clear(true /* context_finalizing */);
+  }
+  orphaned_compiled_codes_.clear();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Nothing borrowed is left for a notification to protect; drop the
+  // watches.  Dropping a weak reference runs no Python.
+  clearFunctionDeathWatch();
+#endif
+
   // Retired 3.11 artifacts can be absent from every registry while a
-  // suspended generator still owns them. Stop their destructors from
+  // suspended generator still owns them.  Stop their destructors from
   // dereferencing this arena, then release every CodeRuntime's Python
   // references while the arena storage is still valid.
   code_runtime_lifetime_->alive.store(false, std::memory_order_release);
@@ -1359,6 +1376,156 @@ Context::compiledFuncs() {
 
 const UnorderedSet<BorrowedRef<PyFunctionObject>>& Context::deoptedFuncs() {
   return deopted_funcs_;
+}
+
+void Context::recycleCodeRuntime(CodeRuntime* runtime) {
+  JIT_CHECK(
+      runtime != nullptr && runtime->isCleared(),
+      "Only a cleared CodeRuntime husk may be recycled");
+  // ABA purge: the slot's next tenant answers to the same address, so
+  // every table keyed by that address must forget this one first.
+  {
+    std::lock_guard<std::mutex> lock{deopt_stats_mutex_};
+    deopt_stats_.erase(runtime);
+  }
+  if (!code_runtimes_.free(runtime)) {
+    // Best-effort reuse refused (free-list growth failed).  The cleared
+    // husk stays in the arena, exactly as an unrecycled slot would; the
+    // side-table purge above already ran, so nothing dangles.
+    JIT_DLOG("CodeRuntime slot not banked for reuse (allocation failure)");
+  }
+}
+
+bool Context::ownsCodeRuntime(const CodeRuntime* runtime) const {
+  return code_runtimes_.contains(runtime);
+}
+
+LifecycleSnapshot311 Context::lifecycleSnapshot311() {
+  LifecycleSnapshot311 snapshot;
+  snapshot.compiled_codes = compiled_codes_.size();
+  snapshot.installed_functions = compiled_funcs_.size();
+  snapshot.parked_functions = deopted_funcs_.size();
+  snapshot.active_compiles = active_compiles_.size();
+  snapshot.completed_compiles = completed_compiles_.size();
+  snapshot.deferred_finalizations = deferred_finalizations_.size();
+  snapshot.orphaned_compiled_codes = orphaned_compiled_codes_.size();
+  snapshot.code_dedup_entries = code_dedup_size_;
+  snapshot.code_outer_functions = code_outer_funcs_.size();
+  snapshot.context_references = references_.size();
+#if PY_VERSION_HEX < 0x030C0000
+  snapshot.associated_functions = associated_funcs_.size();
+  snapshot.watched_functions = func_death_watch_.size();
+  snapshot.deferred_anchor_releases = deferred_anchor_releases_.size();
+#endif
+  std::unordered_set<CompiledFunction*> artifacts;
+  for (const auto& [key, compiled] : compiled_codes_) {
+    artifacts.insert(compiled.get());
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  for (const auto& [func, compiled] : associated_funcs_) {
+    artifacts.insert(compiled.get());
+  }
+#endif
+  for (CompiledFunction* compiled : artifacts) {
+    snapshot.artifact_members += compiled->functions().size();
+  }
+  for (CodeRuntime& runtime : code_runtimes_) {
+    snapshot.code_runtimes_allocated++;
+    snapshot.code_runtimes_live += !runtime.isCleared();
+  }
+  return snapshot;
+}
+
+std::vector<std::string> Context::lifecycleInvariantErrors311() const {
+  std::vector<std::string> errors;
+#if PY_VERSION_HEX < 0x030C0000
+  auto watched = [&](PyFunctionObject* func) {
+    auto watch = func_death_watch_.find(func);
+    return watch != func_death_watch_.end() &&
+        PyWeakref_GET_OBJECT(watch->second.get()) != Py_None;
+  };
+  bool installed_association_error = false;
+  bool association_member_error = false;
+  bool member_association_error = false;
+  bool borrowed_watch_error = false;
+  bool detached_artifact_error = false;
+  bool code_extra_identity_error = false;
+  std::unordered_set<CompiledFunction*> artifacts;
+  for (const auto& [func, compiled] : compiled_funcs_) {
+    auto assoc = associated_funcs_.find(func);
+    installed_association_error |= assoc == associated_funcs_.end() ||
+        assoc->second.get() != compiled.get();
+    association_member_error |= !compiled->functions().contains(func);
+    borrowed_watch_error |= !watched(func.get());
+    artifacts.insert(compiled.get());
+  }
+  for (const auto& [func, compiled] : associated_funcs_) {
+    association_member_error |= !compiled->functions().contains(func);
+    borrowed_watch_error |= !watched(func.get());
+    detached_artifact_error |= compiled->owner() != this;
+    artifacts.insert(compiled.get());
+  }
+  for (BorrowedRef<PyFunctionObject> func : deopted_funcs_) {
+    borrowed_watch_error |= !watched(func.get());
+  }
+  for (const auto& [key, compiled] : compiled_codes_) {
+    detached_artifact_error |= compiled->owner() != this;
+    artifacts.insert(compiled.get());
+    CodeExtra* extra = codeExtraIfExists(
+        reinterpret_cast<PyCodeObject*>(key.code));
+    if (extra == nullptr) {
+      continue;
+    }
+    auto* cached = reinterpret_cast<CompiledFunction*>(
+        _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+    if (cached == nullptr) {
+      continue;
+    }
+    bool found = false;
+    for (const auto& [candidate_key, candidate] : compiled_codes_) {
+      if (candidate_key.code == key.code && candidate.get() == cached) {
+        found = true;
+        break;
+      }
+    }
+    code_extra_identity_error |= !found;
+  }
+  for (CompiledFunction* compiled : artifacts) {
+    for (BorrowedRef<PyFunctionObject> func : compiled->functions()) {
+      auto assoc = associated_funcs_.find(func);
+      member_association_error |= assoc == associated_funcs_.end() ||
+          assoc->second.get() != compiled;
+    }
+  }
+  if (installed_association_error) {
+    errors.emplace_back("I1 installed function lacks its exact association");
+  }
+  if (association_member_error) {
+    errors.emplace_back("I2 association is absent from artifact members");
+  }
+  if (member_association_error) {
+    errors.emplace_back("I2 artifact member lacks its exact association");
+  }
+  if (borrowed_watch_error) {
+    errors.emplace_back("I3 borrowed function registry lacks a live death watch");
+  }
+  if (detached_artifact_error) {
+    errors.emplace_back("I6 compiled registry contains a detached artifact");
+  }
+  if (code_extra_identity_error) {
+    errors.emplace_back("I7 CodeExtra cache names an unknown artifact");
+  }
+#endif
+  if (!active_compiles_.empty() || !completed_compiles_.empty() ||
+      !deferred_finalizations_.empty()) {
+    errors.emplace_back("I4 stable checkpoint retains compile transaction state");
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  if (!deferred_anchor_releases_.empty()) {
+    errors.emplace_back("I5 control-plane boundary retains deferred anchors");
+  }
+#endif
+  return errors;
 }
 
 void Context::addCompileTime(std::chrono::nanoseconds time) {

@@ -1,0 +1,24 @@
+# Paths whose change makes the REALWORLD-PENETRATION-HOOK required
+# (simplified A3-Core plan v1.1 §25).  Deliberately broad: the hook costs
+# about three minutes, and the one defect class it has ever been needed
+# for was reachable only through auto-scheduling over real stdlib modules
+# -- an under-trigger is expensive, an over-trigger is not.  The v1.1
+# draft's narrow list missed files the lifecycle fixes actually touched
+# (gen_data_footer.h, jit_rt.cpp, slab_arena.h, context_iface.h), so the
+# default here is the whole native surface plus the checker
+# implementation itself.
+#
+# Syntax: one glob per line; a trailing '/**' matches any file under the
+# prefix; '#' starts a comment.
+cinderx/Jit/**
+cinderx/Common/**
+cinderx/Interpreter/**
+cinderx/module_state.h
+cinderx/module_c_state.h
+cinderx/_cinderx-lib.cpp
+cinderx/PythonLib/cinderx/**
+# The census/invariant implementation guards the judges themselves; a
+# change here must re-prove the checker against the real program surface.
+ci_pipeline/jit311/a3_census.py
+ci_pipeline/jit311/a3_churn.py
+ci_pipeline/jit311/a3_core.py
