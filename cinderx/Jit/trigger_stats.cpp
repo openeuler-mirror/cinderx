@@ -9,6 +9,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 namespace jit {
 
@@ -40,6 +41,22 @@ std::atomic<uint64_t> s_a1_entry_ledger_dropped{0};
 std::unordered_map<PyCodeObject*, A1EntryLedgerRow> s_a1_entry_ledger;
 std::map<std::tuple<std::string, int, std::string>, uint64_t>
     s_a1_entry_ledger_archived;
+
+struct A2TransitionLedgerRow {
+  std::string filename;
+  std::string qualname;
+  std::string transition;
+  std::string reason;
+  int firstlineno;
+  int cause_offset;
+  int resume_offset;
+  bool forced;
+  bool instrumentation;
+};
+
+std::atomic<bool> s_a2_transition_ledger_enabled{false};
+std::atomic<uint64_t> s_a2_transition_ledger_dropped{0};
+std::vector<A2TransitionLedgerRow> s_a2_transition_ledger;
 #endif
 
 } // namespace
@@ -226,6 +243,122 @@ PyObject* a1EntryLedgerSnapshot() {
   PyErr_SetString(
       PyExc_NotImplementedError,
       "the A1 per-code entry ledger exists only on CPython 3.11");
+  return nullptr;
+#endif
+}
+
+void a2TransitionLedgerReset() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_a2_transition_ledger.clear();
+  s_a2_transition_ledger_dropped.store(0, std::memory_order_relaxed);
+  s_a2_transition_ledger_enabled.store(true, std::memory_order_relaxed);
+#endif
+}
+
+void a2TransitionLedgerDisable() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_a2_transition_ledger.clear();
+#endif
+}
+
+void a2TransitionLedgerRecord(
+    PyCodeObject* code,
+    const char* transition,
+    const char* reason,
+    int cause_offset,
+    int resume_offset,
+    bool forced,
+    bool instrumentation) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (code == nullptr ||
+      !s_a2_transition_ledger_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  if (filename == nullptr || qualname == nullptr) {
+    PyErr_Clear();
+    s_a2_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  try {
+    s_a2_transition_ledger.push_back(A2TransitionLedgerRow{
+        filename,
+        qualname,
+        transition != nullptr ? transition : "unknown",
+        reason != nullptr ? reason : "unknown",
+        code->co_firstlineno,
+        cause_offset,
+        resume_offset,
+        forced,
+        instrumentation});
+  } catch (const std::bad_alloc&) {
+    s_a2_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
+  (void)code;
+  (void)transition;
+  (void)reason;
+  (void)cause_offset;
+  (void)resume_offset;
+  (void)forced;
+  (void)instrumentation;
+#endif
+}
+
+PyObject* a2TransitionLedgerSnapshot() {
+#if PY_VERSION_HEX < 0x030C0000
+  bool was_enabled =
+      s_a2_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
+  Ref<> rows = Ref<>::steal(PyList_New(0));
+  if (rows == nullptr) {
+    s_a2_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  for (const A2TransitionLedgerRow& row : s_a2_transition_ledger) {
+    Ref<> item = Ref<>::steal(Py_BuildValue(
+        "{s:s,s:s,s:i,s:s,s:s,s:i,s:i,s:O,s:O}",
+        "filename",
+        row.filename.c_str(),
+        "qualname",
+        row.qualname.c_str(),
+        "firstlineno",
+        row.firstlineno,
+        "transition",
+        row.transition.c_str(),
+        "deopt_reason",
+        row.reason.c_str(),
+        "cause_offset",
+        row.cause_offset,
+        "resume_offset",
+        row.resume_offset,
+        "forced",
+        row.forced ? Py_True : Py_False,
+        "instrumentation",
+        row.instrumentation ? Py_True : Py_False));
+    if (item == nullptr || PyList_Append(rows, item) < 0) {
+      s_a2_transition_ledger_enabled.store(
+          was_enabled, std::memory_order_relaxed);
+      return nullptr;
+    }
+  }
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> dropped = Ref<>::steal(PyLong_FromUnsignedLongLong(
+      s_a2_transition_ledger_dropped.load(std::memory_order_relaxed)));
+  if (result == nullptr || dropped == nullptr ||
+      PyDict_SetItemString(result, "rows", rows) < 0 ||
+      PyDict_SetItemString(result, "dropped", dropped) < 0) {
+    s_a2_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  s_a2_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  return result.release();
+#else
+  PyErr_SetString(
+      PyExc_NotImplementedError,
+      "the A2 transition ledger exists only on CPython 3.11");
   return nullptr;
 #endif
 }

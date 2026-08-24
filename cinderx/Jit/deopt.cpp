@@ -335,16 +335,18 @@ static BCIndex getDeoptResumeIndex(
     // On 3.11 the error resume enters the anchored evaluator at
     // resume_with_error, which reads prev_instr for both the traceback
     // entry (PyTraceBack_Here) and the exception-table lookup
-    // (INSTR_OFFSET()-1).  Stock leaves prev_instr at the faulting
-    // instruction's opcode unit: every raising opcode on the execute
-    // surface reaches `goto error` before its inline-cache JUMPBY, and a
-    // callee-raised error stops at the CALL unit too because the inlined
-    // fast path is structurally disabled under an installed PEP 523
-    // evaluator.  The default advance would park prev_instr on the last
-    // cache unit instead -- same handler and line, wrong tb_lasti.
-    return BytecodeInstruction(frame.code, frame.cause_instr_idx)
-               .opcodeIndex() +
-        1;
+    // (INSTR_OFFSET()-1). Ordinary raising opcodes reach `goto error`
+    // before advancing over their inline caches, so their traceback names
+    // the opcode unit. CALL-family propagated errors are different: Stock's
+    // inlined Python-call path advances the caller over the CALL caches before
+    // entering the callee, and a later exception therefore keeps the caller
+    // at the last cache unit. The installed PEP 523 evaluator prevents that
+    // inlining, so the JIT has to reproduce the Stock cursor explicitly.
+    BytecodeInstruction cause{frame.code, frame.cause_instr_idx};
+    if (cause.opcode() == CALL) {
+      return cause.nextInstrOffset();
+    }
+    return cause.opcodeIndex() + 1;
 #endif
   }
   return BytecodeInstruction(frame.code, frame.cause_instr_idx)

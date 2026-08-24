@@ -258,6 +258,31 @@ TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
   jit::a1EntryLedgerDisable();
 }
 
+TEST_F(JITContextTest, A2TransitionLedgerRecordsExactResumeEvidence) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::a2TransitionLedgerReset();
+  jit::a2TransitionLedgerRecord(
+      code, "deopt", "GuardFailure", 4, 6, false, false);
+  Ref<> snapshot = Ref<>::steal(jit::a2TransitionLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> rows = PyDict_GetItemString(snapshot, "rows");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_TRUE(PyList_Check(rows));
+  ASSERT_EQ(PyList_GET_SIZE(rows.get()), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(rows.get(), 0);
+  EXPECT_STREQ(PyUnicode_AsUTF8(PyDict_GetItemString(row, "deopt_reason")),
+               "GuardFailure");
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "cause_offset")), 4);
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "resume_offset")), 6);
+  EXPECT_EQ(PyLong_AsLong(dropped), 0);
+  jit::a2TransitionLedgerDisable();
+}
+
 TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -4162,6 +4187,115 @@ def with_def(a, b=1):
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
       << "a successful bind must still consume a recursion slot";
   PyErr_Clear();
+
+  runCode(R"(
+import _testinternalcapi
+import _cinderx
+import cinderjit
+import sys
+
+def recursive(depth):
+    return 0 if depth == 0 else 1 + recursive(depth - 1)
+
+def capture(function):
+    before = _testinternalcapi.get_recursion_depth()
+    try:
+        function(100_000)
+    except RecursionError as exc:
+        frames = []
+        tb = exc.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code is function.__code__:
+                code = tb.tb_frame.f_code
+                positions = list(code.co_positions())
+                position = positions[tb.tb_lasti // 2]
+                frames.append((
+                    tb.tb_lasti,
+                    tb.tb_frame.f_lasti,
+                    tb.tb_lineno - code.co_firstlineno,
+                    (
+                        position[0] - code.co_firstlineno,
+                        position[1] - code.co_firstlineno,
+                        position[2],
+                        position[3],
+                    ),
+                ))
+            tb = tb.tb_next
+        result = (type(exc).__name__, str(exc), frames)
+    else:
+        raise AssertionError("recursive call did not fail")
+    after = _testinternalcapi.get_recursion_depth()
+    assert after == before, (before, after)
+    return result
+
+old_limit = sys.getrecursionlimit()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    stock = capture(recursive)
+    cinderjit.enable()
+    assert cinderjit.force_compile(recursive) is True
+    machine = capture(recursive)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert machine == stock, (stock, machine)
+assert len(machine[2]) > 0
+assert recursive(4) == 4
+
+def native_recursive(remaining, operand):
+    if remaining:
+        return native_recursive(remaining - 1, operand)
+    return operand + 0
+
+def exercise_native(operand):
+    outer_before = _cinderx._native_recursion_state()
+    native = native_recursive(outer_before["recursion_remaining"], operand)
+    outer_after = _cinderx._native_recursion_state()
+    return outer_before, native, outer_after
+
+def native_semantics(result):
+    native = result[1]
+    return (
+        native["entered"],
+        native["return_code"],
+        native["error_occurred"],
+        native["exception_type"],
+        native["exception_message"],
+        native["before"]["recursion_remaining"],
+        native["after"]["recursion_remaining"],
+        native["before"]["recursion_headroom"],
+        native["after"]["recursion_headroom"],
+    )
+
+operand = _cinderx._native_recursion_probe_operand()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    native_stock = exercise_native(operand)
+    cinderjit.enable()
+    assert cinderjit.force_compile(native_recursive) is True
+    cinderjit._jit311_reset_entry_ledger()
+    native_machine = exercise_native(operand)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert native_semantics(native_machine) == native_semantics(native_stock)
+assert native_stock[1]["entered"] is False
+assert native_stock[1]["exception_type"] == "RecursionError"
+assert native_stock[1]["before"]["recursion_remaining"] == 0
+assert native_machine[1]["before"]["recursion_remaining"] == 0
+for result in (native_stock, native_machine):
+    assert (result[0]["recursion_remaining"]
+            == result[2]["recursion_remaining"])
+assert native_machine[2]["recursion_headroom"] == 0
+assert native_machine[2]["boundary_active"] is False
+assert native_machine[2]["jit_entries"] == 0
+ledger = cinderjit._jit311_entry_ledger()
+assert ledger["dropped"] == 0
+assert any(row["qualname"] == "native_recursive"
+           and row["entries"] > 0 for row in ledger["entries"])
+)");
 }
 
 TEST_F(JITLifecycle311Test, CallDeliversAsyncExcBeforeNextStatement) {

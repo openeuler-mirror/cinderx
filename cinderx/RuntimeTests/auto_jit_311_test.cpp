@@ -230,6 +230,27 @@ TEST_F(AutoJit311Test, FreshInstanceAttachesToThePublishedArtifact) {
   EXPECT_EQ(PyErr_Occurred(), nullptr);
 }
 
+TEST_F(AutoJit311Test, CodeStateDiagnosticReportsInstalledArtifactPolicy) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  runCode(kFactorySource);
+  runCode(R"(
+import cinderjit
+state_function = factory(1)
+assert cinderjit.force_compile(state_function) is True
+state = cinderjit._jit311_code_state(state_function)
+assert state["installed"] is True
+assert state["code_has_artifact"] is True
+assert state["artifact_member"] is True
+assert state["auto_jit_disabled"] is False
+assert state["policy_reason"] == "installed"
+assert state["code_id"] == id(state_function.__code__)
+assert state["function_id"] == id(state_function)
+assert state["fresh_attach_count"] == 0
+assert state["fresh_attach_budget"] >= 0
+)");
+}
+
 TEST_F(AutoJit311Test, AttachmentBudgetIsPerCodeAndFinal) {
   SKIP_311_EXECUTABLE_COMPILE();
 

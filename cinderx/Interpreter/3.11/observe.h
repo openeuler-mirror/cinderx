@@ -56,6 +56,16 @@ Ci_JitMode311 Ci_Observe311_Mode(void);
 // exception and returns -1, and a later call parses again.
 int Ci_Observe311_Configure(void);
 
+// Publish the final CPython 3.11 threshold resolved by the shared JIT flag
+// processor. Execute/shadow mode calls this before installing the evaluator,
+// so the frame scheduler consumes the same final value (including option
+// ordering) rather than reparsing the environment independently.
+void Ci_Observe311_SetResolvedAutoJitConfig(
+    int configured,
+    uint64_t threshold,
+    int auto_classify,
+    int valid);
+
 // Frame-entry hot counting: one scheduling request per code object crossing
 // the threshold, walked into Ci_JitShell311_RequestCompile with the real
 // function object.  In execute mode a later frame of an already-dispatched
@@ -79,9 +89,18 @@ void Ci_Observe311_OnFrame(
 
 // Snapshot dict for tests and diagnostics: enabled, mode, requested_mode,
 // threshold, codes_seen, events_dropped, fresh_attachments,
+// post_publication_interpreted_frames,
 // auto_jit_disabled_codes, and the bounded event list (qualname, filename,
-// count, result).
+// count, result, post_publication_interpreted_frames).
 PyObject* Ci_Observe311_Stats(void);
+
+// Read the scheduler slot for one live code object without creating it.
+// Returns 1 when a slot exists, 0 otherwise. Output pointers are optional.
+int Ci_Observe311_GetCodeState(
+    PyCodeObject* code,
+    uint64_t* count,
+    int* dispatched,
+    int* attachable);
 
 // Release all observer-owned weakrefs, event references, tables and files.
 // This also resets configuration so a later interpreter can configure anew.

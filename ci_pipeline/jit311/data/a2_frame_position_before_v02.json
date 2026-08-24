@@ -1,0 +1,31 @@
+{
+  "format": "cp311-jit-a2-frame-position-before-v02",
+  "source_git_sha": "b69288614a1d4a07657bb3f8a630f1303cbd436f",
+  "wheel_sha256": "84f455aba06496d52b9668f7a2736e9487db34b235f7abee858842081c8fe6e0",
+  "inspect_stack": {
+    "stock": [39, 39, 8, 27],
+    "before": [39, 39, 8, 12]
+  },
+  "running": {
+    "simple_expression": {"stock": [40, 37, [37, 37, 15, 26]], "before": [16, 37, [37, 37, 15, 24]], "machine_entry_proven": true},
+    "CALL": {"stock": [26, 42, [42, 42, 11, 22]], "before": [2, 42, [42, 42, 11, 20]], "machine_entry_proven": true},
+    "LOAD_ATTR": {"stock": [4, 52, [52, 52, 11, 22]], "before": [2, 52, [52, 52, 11, 16]], "machine_entry_proven": true},
+    "BINARY_OP": {"stock": [6, 61, [61, 61, 11, 20]], "before": [2, 61, [61, 61, 11, 16]], "machine_entry_proven": true},
+    "branch": {"stock": [30, 66, [66, 66, 15, 26]], "before": [6, 66, [66, 66, 15, 24]], "machine_entry_proven": true},
+    "loop": {"stock": [54, 74, [74, 74, 19, 30]], "before": [30, 74, [74, 74, 19, 28]], "machine_entry_proven": true},
+    "exception_edge": {"stock": [78, 83, [83, 83, 15, 26]], "before": [70, 83, [83, 83, 15, 26]], "machine_entry_proven": true}
+  },
+  "error": {
+    "CALL": {"stock": [26, 26, [20, 20, 11, 26]], "before": [18, 18, [20, 20, 11, 26]], "machine_entry_proven": true},
+    "CALL_FUNCTION_EX": {"stock": [8, 8, [24, 24, 11, 26]], "before": [8, 8, [24, 24, 11, 26]], "machine_entry_proven": true},
+    "BINARY_OP": {"stock": [6, 6, [33, 33, 11, 20]], "before": [6, 6, [33, 33, 11, 20]], "machine_entry_proven": true},
+    "LOAD_ATTR": {"stock": [4, 4, [43, 43, 11, 22]], "before": [4, 4, [43, 43, 11, 22]], "machine_entry_proven": true},
+    "LOAD_METHOD": {"stock": [38, 38, [52, 52, 11, 25]], "before": [30, 30, [52, 52, 11, 25]], "machine_entry_proven": true},
+    "COMPARE_OP": {"stock": [6, 6, [61, 61, 11, 20]], "before": [6, 6, [61, 61, 11, 20]], "machine_entry_proven": true},
+    "RAISE_VARARGS": {"stock": [30, 30, [65, 65, 4, 37]], "before": [30, 30, [65, 65, 4, 37]], "machine_entry_proven": true}
+  },
+  "transitions": {
+    "T03": {"stock_tb_lasti": 20, "before_tb_lasti": 12},
+    "T10": {"stock_tb_lasti": 52, "before_tb_lasti": 44}
+  }
+}

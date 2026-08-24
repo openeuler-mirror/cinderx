@@ -7,6 +7,7 @@
 #include "cinderx/Interpreter/interpreter.h"
 
 #include "internal/pycore_frame.h"
+#include "internal/pycore_ceval.h"
 
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
@@ -15,11 +16,44 @@
 // is no CinderX table to initialize.
 void Ci_InitOpcodes() {}
 
+static _Thread_local int ci_jit_recursion_boundary_active;
+
+int Ci_JitRecursionBoundary311_IsActive(void) {
+  return ci_jit_recursion_boundary_active;
+}
+
+void Ci_JitRecursionBoundary311_Enter(void) {
+  assert(ci_jit_recursion_boundary_active == 0);
+  ci_jit_recursion_boundary_active = 1;
+}
+
+void Ci_JitRecursionBoundary311_Leave(void) {
+  assert(ci_jit_recursion_boundary_active == 1);
+  ci_jit_recursion_boundary_active = 0;
+}
+
+int Ci_JitRecursionBoundary311_Refuse(PyThreadState* tstate) {
+  assert(ci_jit_recursion_boundary_active == 1);
+  assert(tstate->recursion_headroom == 0);
+  // The logical JIT boundary does not borrow CPython's overflow-recovery
+  // headroom. Let CPython's own check construct the canonical RecursionError.
+  int rc = _Py_EnterRecursiveCallTstate(tstate, "");
+  if (rc == 0) {
+    _Py_LeaveRecursiveCallTstate(tstate);
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+  }
+  return -1;
+}
+
 // PEP 523 entry point.  Once installed, every Python frame in the process
 // enters here and runs on the vendored CPython 3.11.6 evaluator instead of
 // libpython's own copy.
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
+  if (Ci_JitRecursionBoundary311_IsActive()) {
+    Ci_JitRecursionBoundary311_Refuse(tstate);
+    return NULL;
+  }
   // The counting modes' whole disabled-path budget is this predictable flag
   // test; counting, discard-only compilation and execute-mode scheduling
   // never change frame results.

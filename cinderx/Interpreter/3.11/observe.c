@@ -41,6 +41,12 @@ static const char* ci_observe_spelling = "off";
 // an already-dispatched code object are offered for fresh attachment.
 static int ci_observe_execute;
 static uint64_t ci_observe_threshold;
+static const char* ci_observe_threshold_source = "unconfigured";
+static int ci_shared_autojit_set;
+static int ci_shared_autojit_configured;
+static int ci_shared_autojit_valid;
+static int ci_shared_autojit_classify;
+static uint64_t ci_shared_autojit_threshold;
 static FILE* ci_observe_file;
 // Compilation is synchronous under the 3.11 GIL.  Keep all frames entered by
 // the compiler itself out of observation and protect the single JIT context
@@ -52,6 +58,7 @@ static uint64_t ci_observe_events_dropped;
 static uint64_t ci_observe_fresh_attachments;
 static uint64_t ci_observe_auto_jit_disabled_codes;
 static uint64_t ci_observe_late_deferrals;
+static uint64_t ci_observe_post_publication_interpreted_frames;
 
 // One slot per code object ever observed.  The key is the code's address,
 // which is only ever trusted together with `dead`: the code-extra free
@@ -67,6 +74,12 @@ typedef struct {
   // this code object (fresh function objects) are offered for attachment.
   // Cleared once the attach entry point answers "never again".
   int attachable;
+  // Sticky after a successful publication. Any later interpreter frame for
+  // this code object is evidence that publication did have a re-entry
+  // opportunity, even if the artifact was retired in the meantime.
+  int published;
+  uint64_t post_publication_interpreted_frames;
+  Py_ssize_t event_index; // -1 when the bounded event ledger dropped it
   // The keyed code object has been destroyed.  The key stays so probe
   // chains through this slot survive; the state does not.
   int dead;
@@ -102,6 +115,7 @@ typedef struct {
   char* filename; // owned malloc'd UTF-8; NULL when unavailable
   uint64_t count;
   const char* result; // static string from the compile entry point
+  uint64_t post_publication_interpreted_frames;
 } Ci_ObserveEvent;
 
 static Ci_ObserveEvent* ci_observe_events;
@@ -117,6 +131,72 @@ static int env_flag_enabled(const char* name) {
   }
   return strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
       strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0;
+}
+
+void Ci_Observe311_SetResolvedAutoJitConfig(
+    int configured,
+    uint64_t threshold,
+    int auto_classify,
+    int valid) {
+  ci_shared_autojit_set = 1;
+  ci_shared_autojit_configured = configured != 0;
+  ci_shared_autojit_threshold = threshold;
+  ci_shared_autojit_classify = auto_classify != 0;
+  ci_shared_autojit_valid = valid != 0;
+}
+
+static int parse_autojit_threshold(const char* raw, uint64_t* threshold) {
+  if (strcmp(raw, "auto") == 0 || strncmp(raw, "auto:", 5) == 0) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
+        "positive integer threshold (or 0 for immediate scheduling); "
+        "classification is not supported",
+        raw);
+    return -1;
+  }
+  const char* number = raw;
+  int digits_only = *number != '\0';
+  for (const char* cursor = number; *cursor != '\0'; cursor++) {
+    if (*cursor < '0' || *cursor > '9') {
+      digits_only = 0;
+      break;
+    }
+  }
+  errno = 0;
+  char* end = NULL;
+  unsigned long long parsed = strtoull(number, &end, 10);
+  if (!digits_only || end == number || *end != '\0' || errno == ERANGE ||
+      parsed > UINT32_MAX) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
+        "non-negative integer threshold",
+        raw);
+    return -1;
+  }
+  *threshold = (uint64_t)parsed;
+  return 0;
+}
+
+static int resolve_autojit_threshold_from_env(uint64_t* threshold) {
+  *threshold = 50;
+  ci_shared_autojit_classify = 0;
+  const char* raw_all = getenv("PYTHONJITALL");
+  if (raw_all != NULL && *raw_all != '\0') {
+    errno = 0;
+    char* end = NULL;
+    (void)strtol(raw_all, &end, 10);
+    if (end != raw_all && *end == '\0' && errno != ERANGE) {
+      *threshold = 0;
+    }
+  }
+  const char* raw_auto = getenv("PYTHONJITAUTO");
+  if (raw_auto != NULL && *raw_auto != '\0' &&
+      parse_autojit_threshold(raw_auto, threshold) < 0) {
+    return -1;
+  }
+  return 0;
 }
 
 int Ci_Observe311_ResolveMode(Ci_JitMode311* mode, const char** spelling) {
@@ -215,37 +295,21 @@ int Ci_Observe311_Configure(void) {
     return -1;
   }
 
-  // The hot threshold reuses the auto-JIT knob rather than growing a new
-  // one.  Counting is explicit, so only a plain positive count is accepted;
-  // the 3.12+ "auto[:N]" classifier spellings are not part of this port.
   uint64_t threshold = 50;
-  const char* raw_threshold = getenv("PYTHONJITAUTO");
-  if (raw_threshold != NULL && *raw_threshold != '\0') {
-    // Digits only, checked before strtoull rather than after: strtoull
-    // accepts a sign, so "-1" would convert to 18446744073709551615 and
-    // read back as a threshold no program ever reaches -- auto-JIT
-    // apparently on, in practice never compiling anything.  Range errors
-    // are refused for the same reason instead of saturating.
-    int digits_only = 1;
-    for (const char* c = raw_threshold; *c != '\0'; c++) {
-      if (*c < '0' || *c > '9') {
-        digits_only = 0;
-        break;
-      }
-    }
-    errno = 0;
-    char* end = NULL;
-    unsigned long long parsed = strtoull(raw_threshold, &end, 10);
-    if (!digits_only || end == raw_threshold || *end != '\0' ||
-        errno == ERANGE || parsed == 0) {
-      PyErr_Format(
+  if (ci_shared_autojit_set) {
+    if (!ci_shared_autojit_valid) {
+      PyErr_SetString(
           PyExc_RuntimeError,
-          "PYTHONJITAUTO=%s is not a usable observe threshold: expected a "
-          "positive integer",
-          raw_threshold);
+          "shared CPython 3.11 Auto-JIT threshold resolution failed");
       return -1;
     }
-    threshold = (uint64_t)parsed;
+    threshold = ci_shared_autojit_configured ? ci_shared_autojit_threshold : 50;
+    ci_observe_threshold_source = "shared-jit-config";
+  } else {
+    if (resolve_autojit_threshold_from_env(&threshold) < 0) {
+      return -1;
+    }
+    ci_observe_threshold_source = "environment-fallback";
   }
 
   FILE* file = NULL;
@@ -310,6 +374,9 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 1;
       if (ci_observe_watched > 0) {
         ci_observe_watched--;
@@ -321,6 +388,50 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
     }
     probe = (probe + 1) & (ci_observe_capacity - 1);
   }
+}
+
+int Ci_Observe311_GetCodeState(
+    PyCodeObject* code,
+    uint64_t* count,
+    int* dispatched,
+    int* attachable) {
+  if (count != NULL) {
+    *count = 0;
+  }
+  if (dispatched != NULL) {
+    *dispatched = 0;
+  }
+  if (attachable != NULL) {
+    *attachable = 0;
+  }
+  if (code == NULL || ci_observe_capacity == 0) {
+    return 0;
+  }
+  uintptr_t key = (uintptr_t)code;
+  size_t probe = slot_index(key, ci_observe_capacity);
+  for (size_t steps = 0; steps < ci_observe_capacity; steps++) {
+    Ci_ObserveSlot* slot = &ci_observe_table[probe];
+    if (slot->key == key) {
+      if (slot->dead) {
+        return 0;
+      }
+      if (count != NULL) {
+        *count = slot->count;
+      }
+      if (dispatched != NULL) {
+        *dispatched = slot->dispatched;
+      }
+      if (attachable != NULL) {
+        *attachable = slot->attachable;
+      }
+      return 1;
+    }
+    if (slot->key == 0) {
+      return 0;
+    }
+    probe = (probe + 1) & (ci_observe_capacity - 1);
+  }
+  return 0;
 }
 
 // Guarantee that this code object's death will be reported: the co_extra
@@ -406,6 +517,9 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 0;
       ci_observe_watched++;
       ci_observe_codes_seen++;
@@ -419,6 +533,9 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 0;
       ci_observe_live++;
       ci_observe_watched++;
@@ -484,8 +601,12 @@ static void observe_on_frame_locked(
     PyCodeObject* code,
     struct _PyInterpreterFrame* frame);
 
-static const char*
-observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
+static const char* observe_emit(
+    PyFunctionObject* func,
+    PyCodeObject* code,
+    uint64_t count,
+    Py_ssize_t* event_index) {
+  *event_index = -1;
   const char* result = Ci_JitShell311_RequestCompile(func, code);
   // The observer only runs when no exception is active.  Compilation is
   // diagnostic and may fail, but that failure must not leak into evaluation.
@@ -495,11 +616,13 @@ observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
   PyObject* filename = code->co_filename;
   if ((size_t)ci_observe_event_count < ci_observe_event_capacity ||
       observe_events_grow() == 0) {
+    *event_index = ci_observe_event_count;
     Ci_ObserveEvent* event = &ci_observe_events[ci_observe_event_count++];
     event->qualname = observe_copy_utf8(qualname);
     event->filename = observe_copy_utf8(filename);
     event->count = count;
     event->result = result;
+    event->post_publication_interpreted_frames = 0;
   } else {
     ci_observe_events_dropped++;
   }
@@ -577,6 +700,16 @@ static void observe_on_frame_locked(
     // Only the latter has anything to gain, and only while the dispatch
     // installed an artifact; the attach entry point tells the two apart
     // cheaply and says when to stop asking for this code object.
+    if (slot->published) {
+      slot->post_publication_interpreted_frames++;
+      ci_observe_post_publication_interpreted_frames++;
+      if (slot->event_index >= 0 &&
+          slot->event_index < ci_observe_event_count) {
+        ci_observe_events[slot->event_index]
+            .post_publication_interpreted_frames =
+            slot->post_publication_interpreted_frames;
+      }
+    }
     if (slot->attachable) {
       int attached = Ci_JitShell311_AttachFresh(func);
       // Attachment is scheduling, not evaluation: nothing it raised may
@@ -624,7 +757,9 @@ static void observe_on_frame_locked(
     if (ci_observe_execute) {
       Ci_JitShell311_TrackOuterFromFrame(func, frame);
     }
-    const char* result = observe_emit(func, code, slot->count);
+    Py_ssize_t event_index = -1;
+    const char* result = observe_emit(func, code, slot->count, &event_index);
+    slot->event_index = event_index;
     if (ci_observe_execute) {
       if (strcmp(result, CI_JIT_RESULT_311_INSTALLED) == 0 ||
           (strcmp(result, CI_JIT_RESULT_311_PUBLISHED_ELSEWHERE) == 0 &&
@@ -643,6 +778,7 @@ static void observe_on_frame_locked(
         // correctness fix for one refusal, not a scheduling policy
         // change.
         slot->attachable = 1;
+        slot->published = 1;
       } else if (strcmp(result, CI_JIT_RESULT_311_DEFERRED) == 0) {
         // The attempt was withheld rather than made: everything the
         // scheduler did is undone, and the next frame that finds the JIT
@@ -734,6 +870,8 @@ PyObject* Ci_Observe311_Stats(void) {
     const char* filename = event->filename;
     uint64_t count = event->count;
     const char* result = event->result;
+    uint64_t post_publication_interpreted_frames =
+        event->post_publication_interpreted_frames;
 
     PyObject* entry = PyDict_New();
     int rc = entry == NULL ? -1 : 0;
@@ -742,6 +880,10 @@ PyObject* Ci_Observe311_Stats(void) {
          stats_set_str_or_none(entry, "filename", filename) < 0 ||
          stats_set_uint(entry, "count", count) < 0 ||
          stats_set_str(entry, "result", result) < 0 ||
+         stats_set_uint(
+             entry,
+             "post_publication_interpreted_frames",
+             post_publication_interpreted_frames) < 0 ||
          PyList_Append(events, entry) < 0)) {
       rc = -1;
     }
@@ -762,6 +904,12 @@ PyObject* Ci_Observe311_Stats(void) {
       stats_set_str(stats, "mode", mode_names[ci_observe_mode]) < 0 ||
       stats_set_str(stats, "requested_mode", ci_observe_spelling) < 0 ||
       stats_set_uint(stats, "threshold", ci_observe_threshold) < 0 ||
+      stats_set_str(stats, "threshold_source", ci_observe_threshold_source) <
+          0 ||
+      PyDict_SetItemString(
+          stats,
+          "auto_classify",
+          ci_shared_autojit_classify ? Py_True : Py_False) < 0 ||
       stats_set_uint(stats, "codes_seen", ci_observe_codes_seen) < 0 ||
       stats_set_uint(stats, "events_dropped", ci_observe_events_dropped) < 0 ||
       stats_set_uint(stats, "fresh_attachments", ci_observe_fresh_attachments) <
@@ -771,6 +919,10 @@ PyObject* Ci_Observe311_Stats(void) {
           "auto_jit_disabled_codes",
           ci_observe_auto_jit_disabled_codes) < 0 ||
       stats_set_uint(stats, "late_deferrals", ci_observe_late_deferrals) < 0 ||
+      stats_set_uint(
+          stats,
+          "post_publication_interpreted_frames",
+          ci_observe_post_publication_interpreted_frames) < 0 ||
       stats_set_uint(stats, "watched_codes", ci_observe_watched) < 0 ||
       stats_set_uint(stats, "table_capacity", ci_observe_capacity) < 0 ||
       PyDict_SetItemString(stats, "events", events) < 0) {
@@ -821,9 +973,16 @@ void Ci_Observe311_Finalize(void) {
   ci_observe_spelling = "off";
   ci_observe_execute = 0;
   ci_observe_threshold = 0;
+  ci_observe_threshold_source = "unconfigured";
+  ci_shared_autojit_set = 0;
+  ci_shared_autojit_configured = 0;
+  ci_shared_autojit_valid = 0;
+  ci_shared_autojit_classify = 0;
+  ci_shared_autojit_threshold = 0;
   ci_observe_codes_seen = 0;
   ci_observe_events_dropped = 0;
   ci_observe_fresh_attachments = 0;
   ci_observe_auto_jit_disabled_codes = 0;
   ci_observe_late_deferrals = 0;
+  ci_observe_post_publication_interpreted_frames = 0;
 }

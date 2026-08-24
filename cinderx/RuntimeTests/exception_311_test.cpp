@@ -41,6 +41,18 @@ int firstOpcodeLasti(BorrowedRef<PyCodeObject> code, int opcode) {
   return -1;
 }
 
+// Byte offset of the last code unit owned by the first occurrence of opcode.
+// This differs from firstOpcodeLasti() for instructions with inline caches.
+int firstInstructionEndLasti(BorrowedRef<PyCodeObject> code, int opcode) {
+  for (const auto& instr : jit::BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == opcode) {
+      return (instr.nextInstrOffset().asIndex().value() - 1) *
+          static_cast<int>(sizeof(_Py_CODEUNIT));
+    }
+  }
+  return -1;
+}
+
 // The (tb_lasti, tb_lineno) of the innermost traceback entry of the
 // currently-set exception, which is restored afterwards so the caller can
 // keep inspecting it.  Returns false when no traceback is attached.
@@ -69,6 +81,45 @@ bool innermostTracebackPosition(int* lasti, int* lineno) {
     }
     PyErr_Clear();
   }
+  PyErr_Restore(exc, val, tb);
+  return ok;
+}
+
+// The traceback position for a specific code object in the currently-set
+// exception, preserving the exception for the caller.
+bool tracebackPositionForCode(
+    BorrowedRef<PyCodeObject> code,
+    int* lasti,
+    int* lineno) {
+  PyObject* exc = nullptr;
+  PyObject* val = nullptr;
+  PyObject* tb = nullptr;
+  PyErr_Fetch(&exc, &val, &tb);
+  bool ok = false;
+  Ref<> cursor = Ref<>::create(tb);
+  while (cursor != nullptr && cursor != Py_None) {
+    auto frame_obj = Ref<>::steal(PyObject_GetAttrString(cursor, "tb_frame"));
+    if (frame_obj == nullptr) {
+      PyErr_Clear();
+      break;
+    }
+    auto frame_code = Ref<PyCodeObject>::steal(
+        PyFrame_GetCode(reinterpret_cast<PyFrameObject*>(frame_obj.get())));
+    if (frame_code == code) {
+      auto lasti_obj = Ref<>::steal(PyObject_GetAttrString(cursor, "tb_lasti"));
+      auto lineno_obj =
+          Ref<>::steal(PyObject_GetAttrString(cursor, "tb_lineno"));
+      if (lasti_obj != nullptr && lineno_obj != nullptr) {
+        *lasti = static_cast<int>(PyLong_AsLong(lasti_obj));
+        *lineno = static_cast<int>(PyLong_AsLong(lineno_obj));
+        ok = !PyErr_Occurred();
+      }
+      PyErr_Clear();
+      break;
+    }
+    cursor = Ref<>::steal(PyObject_GetAttrString(cursor, "tb_next"));
+  }
+  PyErr_Clear();
   PyErr_Restore(exc, val, tb);
   return ok;
 }
@@ -186,10 +237,47 @@ def div(a, b):
   ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_ZeroDivisionError));
   int lasti = -1;
   int lineno = -1;
-  ASSERT_TRUE(innermostTracebackPosition(&lasti, &lineno));
+  ASSERT_TRUE(tracebackPositionForCode(code, &lasti, &lineno));
   PyErr_Clear();
   EXPECT_EQ(lasti, expected_lasti);
   EXPECT_EQ(lineno, 3);
+}
+
+TEST_F(Exception311Test, PropagatedCallStopsAtTheLastCacheUnit) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Stock advances an inlined Python caller over CALL's four cache units
+  // before entering the callee. With the installed PEP 523 evaluator the JIT
+  // call is not inlined, so error reification must reproduce that cursor.
+  const char* src = R"(
+def raiser():
+    raise ValueError("boom")
+
+def caller(function):
+    return function()
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "caller"));
+  ASSERT_NE(func, nullptr);
+  auto raiser_obj = getGlobal("raiser");
+  ASSERT_NE(raiser_obj, nullptr);
+  auto args = Ref<>::steal(PyTuple_Pack(1, raiser_obj.get()));
+  ASSERT_NE(args, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  int expected_lasti = firstInstructionEndLasti(code, CALL);
+  ASSERT_GE(expected_lasti, 0);
+
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_EQ(result, nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+
+  int lasti = -1;
+  int lineno = -1;
+  ASSERT_TRUE(tracebackPositionForCode(code, &lasti, &lineno));
+  PyErr_Clear();
+  EXPECT_EQ(lasti, expected_lasti);
+  EXPECT_EQ(lineno, 6);
 }
 
 TEST_F(Exception311Test, RaiseStatementReexecutesInTheInterpreter) {

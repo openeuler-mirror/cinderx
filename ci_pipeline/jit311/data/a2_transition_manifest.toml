@@ -1,0 +1,74 @@
+[meta]
+version = 1
+python = "3.11.6"
+auto_threshold = 1
+
+[[transition]]
+id = "T01"
+name = "guard-miss-specialized-numeric-type"
+probe = "guard_miss"
+requires_transition_reason = ["GuardFailure"]
+recovery = "recompile-allowed"
+
+[[transition]]
+id = "T02"
+name = "dynamic-object-model-method-replacement"
+probe = "object_model"
+requires_transition_reason = []
+recovery = "machine-entry-continues"
+
+[[transition]]
+id = "T03"
+name = "exception-deopt-restore"
+probe = "exceptions"
+requires_transition_reason = ["Raise", "UnhandledException"]
+recovery = "next-call-reentry"
+
+[[transition]]
+id = "T04"
+name = "function-code-mutation"
+probe = "code_mutation"
+requires_transition_reason = []
+recovery = "new-code-auto-compile"
+
+[[transition]]
+id = "T05"
+name = "defaults-and-kwdefaults-mutation"
+probe = "defaults_mutation"
+requires_transition_reason = []
+recovery = "machine-entry-continues"
+
+[[transition]]
+id = "T06"
+name = "runtime-tracing-profile-transition"
+probe = "instrumentation"
+requires_transition_reason = ["Instrumentation"]
+recovery = "reattach-existing-artifact"
+
+[[transition]]
+id = "T07"
+name = "foreign-pep523-evaluator-transition"
+probe = "foreign_evaluator"
+requires_transition_reason = ["UnhandledException"]
+recovery = "reclaim-evaluator-and-reattach"
+
+[[transition]]
+id = "T08"
+name = "generator-suspend-deopt-resume"
+probe = "generator"
+requires_transition_reason = []
+recovery = "interpreter-resume"
+
+[[transition]]
+id = "T09"
+name = "pending-async-exception-boundary"
+probe = "pending_event"
+requires_transition_reason = ["PeriodicTaskFailure"]
+recovery = "next-call-reentry"
+
+[[transition]]
+id = "T10"
+name = "recursion-c-stack-boundary"
+probe = "recursion"
+requires_transition_reason = ["UnhandledException"]
+recovery = "interpreter-after-backoff"

@@ -77,4 +77,18 @@ void a1EntryLedgerReset();
 void a1EntryLedgerDisable();
 PyObject* a1EntryLedgerSnapshot();
 
+// A2 test-only transition ledger.  Records are copied at the actual deopt or
+// suspended-generator conversion point and never retain Python objects.
+void a2TransitionLedgerReset();
+void a2TransitionLedgerDisable();
+void a2TransitionLedgerRecord(
+    PyCodeObject* code,
+    const char* transition,
+    const char* reason,
+    int cause_offset,
+    int resume_offset,
+    bool forced,
+    bool instrumentation);
+PyObject* a2TransitionLedgerSnapshot();
+
 } // namespace jit

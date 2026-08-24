@@ -42,6 +42,10 @@ def run() -> dict:
 
     cinderx.init()
     _cinderx.install_frame_evaluator()
+    from cinderx.jit import jit_suppress
+
+    jit_suppress(control_load)
+    jit_suppress(control_loop)
 
     load_diag = cinderjit._jit311_compile_diagnostic(test_dis.load_test)
     loop_diag = cinderjit._jit311_compile_diagnostic(test_dis.loop_test)
