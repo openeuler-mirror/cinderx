@@ -103,7 +103,7 @@ BIN=$(find "$EXEC_DIR" -name runtime_tests -type f | head -1)
 [ -n "$BIN" ] || { echo "asan runtime_tests binary missing"; exit 1; }
 MANIFEST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_green_families.txt"
 "$BIN" --gtest_list_tests 2>/dev/null \
-  | awk '/^[A-Za-z_][A-Za-z0-9_]*\./ { suite = $1 }
+  | awk '/^[A-Za-z_][A-Za-z0-9_\/]*\./ { suite = $1 }
          /^  [A-Za-z_]/ { print suite $1 }' \
   | sort -u > "$EXEC_DIR-registered.txt"
 EXPECTED=$(awk -F. 'NR == FNR { fam[$1] = 1; next } ($1 in fam)' \
