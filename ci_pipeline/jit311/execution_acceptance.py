@@ -221,8 +221,8 @@ class ExecutionAcceptanceRunner:
         )
         return provenance
 
-    def run_s(self) -> dict:
-        directory = self.output / "S"
+    def run_execution_smoke(self) -> dict:
+        directory = self.output / "EXECUTION_SMOKE"
         directory.mkdir()
         module = "ci_pipeline.jit311.execution_smoke"
         negative = directory / "negative.json"
@@ -292,8 +292,8 @@ class ExecutionAcceptanceRunner:
         command += ["--tests", *targets]
         return command
 
-    def run_c(self) -> dict:
-        directory = self.output / "C"
+    def run_semantic_conformance(self) -> dict:
+        directory = self.output / "SEMANTIC_CONFORMANCE"
         directory.mkdir()
         c0, c1, c2 = directory / "c0", directory / "c1", directory / "c2"
         c1_journal, c2_journal = directory / "c1-journal", directory / "c2-journal"
@@ -399,8 +399,8 @@ class ExecutionAcceptanceRunner:
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         return result
 
-    def run_w(self) -> dict:
-        directory = self.output / "W"
+    def run_specialization_conformance(self) -> dict:
+        directory = self.output / "SPECIALIZATION_CONFORMANCE"
         directory.mkdir()
         result_path = directory / "result.json"
         rc = self._run(
@@ -424,9 +424,9 @@ class ExecutionAcceptanceRunner:
         else:
             final = "PASS"
 
-        s = self.results.get("S", {})
-        c = self.results.get("C", {})
-        w = self.results.get("W", {})
+        s = self.results.get("execution_smoke", {})
+        c = self.results.get("semantic_conformance", {})
+        w = self.results.get("specialization_conformance", {})
         classification = c.get("classification") or {}
         function_counts = classification.get("functions", {})
         module_counts = classification.get("module_counts", {})
@@ -453,7 +453,7 @@ class ExecutionAcceptanceRunner:
             "| Lane | Result |",
             "|---|---|",
         ]
-        for lane in ("S", "C", "W"):
+        for lane in ("execution_smoke", "semantic_conformance", "specialization_conformance"):
             lines.append(f"| {lane} | {self.results.get(lane, {}).get('result', 'NOT_RUN')} |")
         lines.extend(
             [
@@ -491,7 +491,7 @@ class ExecutionAcceptanceRunner:
         (self.output / "CP311_JIT_EXECUTION_REPORT.md").write_text("\n".join(lines) + "\n")
         convergence = {
             "final": final,
-            "lanes": self.results,
+            "cases": self.results,
             "commands": self.command_results,
             "provenance": provenance,
         }
@@ -516,12 +516,12 @@ class ExecutionAcceptanceRunner:
 
     def run(self) -> str:
         provenance = self.preflight()
-        if "S" in self.lanes:
-            self.results["S"] = self.run_s()
-        if "C" in self.lanes:
-            self.results["C"] = self.run_c()
-        if "W" in self.lanes:
-            self.results["W"] = self.run_w()
+        if "execution_smoke" in self.lanes:
+            self.results["execution_smoke"] = self.run_execution_smoke()
+        if "semantic_conformance" in self.lanes:
+            self.results["semantic_conformance"] = self.run_semantic_conformance()
+        if "specialization_conformance" in self.lanes:
+            self.results["specialization_conformance"] = self.run_specialization_conformance()
         return self.finalize(provenance)
 
 
@@ -530,7 +530,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--lane", choices=("S", "C", "W"), action="append")
+    parser.add_argument(
+        "--case",
+        type=lambda value: value.replace("-", "_").lower(),
+        choices=("execution_smoke", "semantic_conformance", "specialization_conformance"),
+        action="append",
+    )
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
@@ -540,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         wheel=args.wheel,
         source=args.source,
         output=output,
-        lanes=set(args.lane or ("S", "C", "W")),
+        lanes=set(args.case or ("execution_smoke", "semantic_conformance", "specialization_conformance")),
         jobs=args.jobs,
         timeout=args.timeout,
     )

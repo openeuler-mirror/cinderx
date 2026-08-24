@@ -390,7 +390,7 @@ class RuntimeTransitionReportTest(unittest.TestCase):
             wheel=Path("wheel.whl"),
             source=ROOT,
             output=Path("out"),
-            lanes={"P"},
+            lanes={"autocompile_coverage"},
             jobs=16,
             timeout=1200,
         )

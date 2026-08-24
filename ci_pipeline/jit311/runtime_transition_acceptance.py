@@ -675,8 +675,8 @@ class RuntimeTransitionAcceptanceRunner:
             env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
         )
 
-    def run_penetration(self) -> dict:
-        directory = self.output / "P"
+    def run_autocompile_coverage(self) -> dict:
+        directory = self.output / "AUTOCOMPILE_COVERAGE"
         directory.mkdir()
         stock = directory / "p0-stock"
         control = directory / "p1-threshold50"
@@ -880,8 +880,8 @@ class RuntimeTransitionAcceptanceRunner:
         )
         return result
 
-    def run_transitions(self) -> dict:
-        directory = self.output / "T"
+    def run_state_transitions(self) -> dict:
+        directory = self.output / "STATE_TRANSITION"
         directory.mkdir()
         stock = directory / "stock.json"
         jit = directory / "jit.json"
@@ -1152,8 +1152,8 @@ class RuntimeTransitionAcceptanceRunner:
         )
         return result
 
-    def run_repetition(self) -> dict:
-        directory = self.output / "R"
+    def run_transition_recovery(self) -> dict:
+        directory = self.output / "TRANSITION_RECOVERY"
         directory.mkdir()
         repetition_path = directory / "repetition.json"
         footprint_path = directory / "footprint.json"
@@ -1249,10 +1249,10 @@ class RuntimeTransitionAcceptanceRunner:
 
     def finalize(self, provenance: dict) -> str:
         blockers: list[dict] = []
-        penetration = self.results.get("P", {})
+        penetration = self.results.get("autocompile_coverage", {})
         aggressive = penetration.get("aggressive_coverage", {})
-        transitions = self.results.get("T", {})
-        repetition = self.results.get("R", {})
+        transitions = self.results.get("state_transition", {})
+        repetition = self.results.get("transition_recovery", {})
 
         def add_blocker(
             *,
@@ -1595,8 +1595,8 @@ class RuntimeTransitionAcceptanceRunner:
         payload = {
             "final": final,
             "provenance": provenance,
-            "penetration": self.results.get("P", {}),
-            "transitions": self.results.get("T", {}),
+            "penetration": self.results.get("autocompile_coverage", {}),
+            "transitions": self.results.get("state_transition", {}),
             "repetition": repetition.get("repetition", {}),
             "footprint": repetition.get("footprint", {}),
             "code_swap_policy": repetition.get("code_swap", {}),
@@ -1638,12 +1638,12 @@ class RuntimeTransitionAcceptanceRunner:
 
     def run(self) -> str:
         provenance = self.base.preflight()
-        if "P" in self.lanes:
-            self.results["P"] = self.run_penetration()
-        if "T" in self.lanes:
-            self.results["T"] = self.run_transitions()
-        if "R" in self.lanes:
-            self.results["R"] = self.run_repetition()
+        if "autocompile_coverage" in self.lanes:
+            self.results["autocompile_coverage"] = self.run_autocompile_coverage()
+        if "state_transition" in self.lanes:
+            self.results["state_transition"] = self.run_state_transitions()
+        if "transition_recovery" in self.lanes:
+            self.results["transition_recovery"] = self.run_transition_recovery()
         return self.finalize(provenance)
 
 
@@ -1652,7 +1652,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--lane", choices=("P", "T", "R"), action="append")
+    parser.add_argument(
+        "--case",
+        type=lambda value: value.replace("-", "_").lower(),
+        choices=("autocompile_coverage", "state_transition", "transition_recovery"),
+        action="append",
+    )
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
@@ -1661,7 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
         wheel=args.wheel,
         source=args.source,
         output=output,
-        lanes=set(args.lane or ("P", "T", "R")),
+        lanes=set(args.case or ("autocompile_coverage", "state_transition", "transition_recovery")),
         jobs=args.jobs,
         timeout=args.timeout,
     )
