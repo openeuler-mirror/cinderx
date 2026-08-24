@@ -875,12 +875,14 @@ def test_unexpected_organic_deopt_turns_red():
 
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
+    # The MR-08 exception surface re-pinned the leg at 6; any drift off
+    # the pinned constant must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 6})
+        for error in judge({"organic_deopt_hits": 7})
     ]
-    assert any("organic_deopt_hits == 5" in error for error in errors)
+    assert any("organic_deopt_hits == 6" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):

@@ -231,63 +231,11 @@ TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
-TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
-  SKIP_311_EXECUTABLE_COMPILE();
-
-  // The refcount pass runs after the instrumentation-poll insertion and
-  // generates arbitrary execution of its own: the last DECREF of a value
-  // can enter tp_dealloc and run __del__.  The boundary polls only close
-  // that door if every Decref-family instruction is followed by another
-  // poll before the frame can return.  Assert that ordering on the final
-  // HIR -- the exact pipeline codegen consumes -- for the shape that
-  // exercises it: a discarded operator result released by POP_TOP.
-  Ref<PyFunctionObject> func(compileAndGet(
-      "def func(a, b):\n"
-      "    a + b\n"
-      "    return 42",
-      "func"));
-  ASSERT_NE(func, nullptr);
-
-  std::unique_ptr<jit::hir::Function> irfunc =
-      jit::compileToFinalHIRForTest(func);
-  ASSERT_NE(irfunc, nullptr);
-
-  int polls = 0;
-  for (auto& block : irfunc->cfg.blocks) {
-    bool decref_since_poll = false;
-    const jit::hir::Instr* offender = nullptr;
-    for (const jit::hir::Instr& instr : block) {
-      switch (instr.opcode()) {
-        case jit::hir::Opcode::kDecref:
-        case jit::hir::Opcode::kXDecref:
-        case jit::hir::Opcode::kBatchDecref:
-          decref_since_poll = true;
-          offender = &instr;
-          break;
-        case jit::hir::Opcode::kCheckInstrumentation:
-          polls++;
-          decref_since_poll = false;
-          break;
-        case jit::hir::Opcode::kReturn:
-          EXPECT_FALSE(decref_since_poll)
-              << "a Decref (last: "
-              << (offender != nullptr
-                      ? jit::hir::hirOpcodeName(offender->opcode())
-                      : "?")
-              << " at bytecode offset "
-              << (offender != nullptr ? offender->bytecodeOffset().value() : -1)
-              << ") can run __del__ after the last poll and before the "
-                 "return";
-          break;
-        default:
-          break;
-      }
-    }
-    (void)offender;
-  }
-  EXPECT_GT(polls, 0);
-}
-
+// The bytecode-boundary instrumentation polls were removed per RFC
+// 3.3.4.5: a frame already running when tracing/profiling activates keeps
+// running natively to its natural return, so no poll ordering exists to
+// assert.  Mid-flight transition coverage lives in the RFC-exemption
+// oracles in test_canary_execute_311.py.
 TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
   SKIP_311_EXECUTABLE_COMPILE();
 

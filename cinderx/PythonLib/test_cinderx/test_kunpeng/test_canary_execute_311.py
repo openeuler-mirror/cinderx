@@ -15,6 +15,21 @@ import sys
 import textwrap
 import unittest
 
+def _capability_clean_env():
+    """A child environment with every JIT-capability variable removed.
+
+    Dual-arm oracles must fail closed: an interp/stock arm that inherits
+    CINDERX_JIT_MODE=canary from the parent would silently compare the jit
+    arm against itself.  Mirrors the prefix scrub the jit311 runners apply
+    to their children.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
+    }
+
+
 CHILD = textwrap.dedent(
     """
     import json
@@ -2772,7 +2787,7 @@ class CanaryExecute311Test(unittest.TestCase):
         )
 
         def run_arm(mode):
-            env = dict(os.environ)
+            env = _capability_clean_env()
             if mode == "jit":
                 env["CINDERX_JIT_MODE"] = "canary"
                 env["PYTHONJITAUTO"] = "1000000"
@@ -3143,11 +3158,11 @@ class CanaryExecute311Test(unittest.TestCase):
     def test_instrumentation_support_config_is_refused_by_canary(self):
         # The flag patches sys.setprofile/settrace/monitoring to pause the
         # whole JIT while instrumentation is active.  This mode delivers
-        # tracing correctness through the bytecode-boundary polls and the
-        # guarded entry instead, and the toggle's disable arm has no
-        # audited 3.11 story -- so the canary refuses the configuration by
-        # name rather than running an unaudited pause-the-world path
-        # alongside the audited polling one.
+        # tracing correctness through the guarded entry and the RFC
+        # 3.3.4.5 exemption (running frames finish natively) instead, and
+        # the toggle's disable arm has no audited 3.11 story -- so the
+        # canary refuses the configuration by name rather than running an
+        # unaudited pause-the-world path alongside the audited one.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3242,17 +3257,13 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("traced through the interpreter", proc.stdout)
         self.assertIn("machine entry restored", proc.stdout)
 
-    def test_profile_enabled_inside_binary_op_reaches_the_running_frame(self):
-        # The entry check answers "is instrumentation active NOW"; the body
-        # can change the answer.  BINARY_OP on the execute surface runs
-        # arbitrary protocol code, and stock 3.11 reacts to a mid-frame
-        # sys.setprofile immediately: the frame that is currently executing
-        # delivers its remaining events, above all PyTrace_RETURN on exit.
-        # A compiled frame must therefore leave machine code at the first
-        # safe point after the transition and hand the rest of the frame to
-        # the interpreter -- running natively to the end swallows the
-        # return event and is an observable differential.  No threads and
-        # no timing: the transition happens synchronously inside __add__.
+    def test_profile_enabled_inside_binary_op_follows_the_rfc_exemption(self):
+        # RFC 3.3.4.5: a sys.setprofile from inside the running compiled
+        # frame (here: synchronously inside __add__) does NOT interrupt
+        # that frame -- it keeps running natively to its natural return
+        # and its remaining events, including PyTrace_RETURN, are not
+        # delivered.  Only new calls observe the activation: the guarded
+        # entry falls back and the interpreted run is fully profiled.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3298,18 +3309,29 @@ class CanaryExecute311Test(unittest.TestCase):
             assert cinderjit.force_compile(hot) is True
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
             result = hot(Num(2), Num(10), Num(1))
-            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
-                - before == 1, "the probe call must start in machine code"
-            sys.setprofile(None)
+            entered = _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                - before
+            assert entered == 1, "the probe call must start in machine code"
             assert result.n == 20, result.n
+            assert not [e for e in events if e[0] == "hot"], (
+                "the running compiled frame must not deliver events "
+                "(RFC 3.3.4.5 items 2-3): %r" % (events,)
+            )
 
-            returned = [e for e in events if e == ("hot", "return")]
-            assert returned, (
-                "sys.setprofile() from inside the compiled loop's BINARY_OP"
-                " never produced PyTrace_RETURN for the running frame: %r"
+            # A new call under the active profiler: interpreted, and
+            # fully profiled.
+            events.clear()
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            follow = hot(Num(2), Num(10), Num(1))
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                == before, "a new call under profiling entered machine code"
+            sys.setprofile(None)
+            assert follow.n == 20, follow.n
+            assert ("hot", "call") in events and ("hot", "return") in events, (
+                "the interpreted follow-up call was not profiled: %r"
                 % (events,)
             )
-            print("mid-frame profile reached the running frame")
+            print("mid-frame profile followed the RFC exemption")
             """
         )
         proc = subprocess.run(
@@ -3320,17 +3342,16 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("mid-frame profile reached the running frame", proc.stdout)
+        self.assertIn("mid-frame profile followed the RFC exemption", proc.stdout)
 
-    def test_profile_enabled_by_pending_call_reaches_the_running_frame(self):
+    def test_profile_enabled_by_pending_call_follows_the_rfc_exemption(self):
         # The same transition through the other door: Py_AddPendingCall()
         # runs its callback on this thread at the compiled loop's back
-        # edge -- the eval-breaker service this port wired to the vendored
-        # eval_frame_handle_pending() -- and the callback enables
-        # profiling via the C API surface (sys.setprofile is the same
-        # call).  Stock updates the running frame's tracing state at that
-        # instant and delivers PyTrace_RETURN when the frame exits; the
-        # compiled frame must not run to completion unaware.
+        # edge (the eval-breaker service stays wired per RFC -- signals,
+        # pending calls and GIL periodic tasks are delivered), and the
+        # callback enables profiling.  RFC 3.3.4.5: the running compiled
+        # frame still finishes natively with no events; only new calls
+        # observe the activation.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3387,21 +3408,32 @@ class CanaryExecute311Test(unittest.TestCase):
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
             result = hot(1, 60_000_000, 1)
             worker.join()
-            sys.setprofile(None)
             assert result == 60_000_000, result
             assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
                 - before == 1, (
                 "the pending call landed before the loop entered machine"
                 " code; the mid-frame transition was not exercised"
             )
-
-            returned = [e for e in events if e == ("hot", "return")]
-            assert returned, (
-                "the pending call enabled profiling on the running thread"
-                " and the compiled frame still returned without"
-                " PyTrace_RETURN: %r" % (events[:10],)
+            assert sys.getprofile() is prof, (
+                "the pending call never ran on the loop thread")
+            assert not [e for e in events if e[0] == "hot"], (
+                "RFC 3.3.4.5 items 2-3: the running compiled frame must "
+                "keep running natively and deliver no events: %r"
+                % (events[:10],)
             )
-            print("pending-call profile reached the running frame")
+
+            events.clear()
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            follow = hot(1, 10, 1)
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                == before, "a new call under profiling entered machine code"
+            sys.setprofile(None)
+            assert follow == 10, follow
+            assert ("hot", "call") in events and ("hot", "return") in events, (
+                "the interpreted follow-up call was not profiled: %r"
+                % (events[:10],)
+            )
+            print("pending-call profile followed the RFC exemption")
             """
         )
         proc = subprocess.run(
@@ -3413,7 +3445,7 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn(
-            "pending-call profile reached the running frame", proc.stdout)
+            "pending-call profile followed the RFC exemption", proc.stdout)
 
     def _run_transition_probe(self, body):
         env = dict(os.environ)
@@ -3443,23 +3475,22 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("transition reached the running frame", proc.stdout)
+        self.assertIn("transition followed the RFC exemption", proc.stdout)
 
-    def test_profile_enabled_inside_for_iter_next_reaches_the_frame(self):
-        # The transition consumed by a terminator: FOR_ITER lowers to an
-        # iterator-next whose consumer is the branch that ends the block,
-        # so there is no later point in the SAME block to poll -- the
-        # first resumable boundary after __next__ runs is the successor's
-        # entry.  A poll keyed to "reentrant instruction, then a snapshot
-        # in this block" misses it, and the frame returns natively with
-        # the profiler never hearing from it.
+    def test_profile_enabled_inside_for_iter_next_follows_the_exemption(self):
+        # Activation from inside an iterator's __next__ mid-frame: RFC
+        # 3.3.4.5 -- the running compiled frame finishes natively with no
+        # events; the follow-up call is interpreted and fully profiled.
         self._run_transition_probe(
             """
             class It:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __iter__(self):
                     return self
                 def __next__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
                     raise StopIteration
 
             ns = {}
@@ -3475,25 +3506,33 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(It())
+            result = hot(It(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 42, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(It(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 42, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
-    def test_profile_enabled_inside_bool_reaches_the_frame(self):
-        # The same terminator shape through truthiness: a conditional jump
-        # asks the operand for __bool__, and the answer feeds the branch
-        # directly.  The transition must be observed at the successor's
-        # entry boundary.
+    def test_profile_enabled_inside_bool_follows_the_exemption(self):
+        # Activation from inside __bool__ feeding a conditional jump:
+        # same RFC exemption oracle.
         self._run_transition_probe(
             """
             class Flag:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __bool__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
                     return False
 
             ns = {}
@@ -3509,12 +3548,19 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(Flag())
+            result = hot(Flag(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 2, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(Flag(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 2, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
@@ -3851,23 +3897,23 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("mid-frame takeover stayed out of the deopt", proc.stdout)
 
-    def test_profile_enabled_inside_del_reaches_the_frame(self):
-        # The transition the bytecode never shows: reference counting is
-        # arbitrary execution too.  The poll after BINARY_OP runs with the
-        # profiler still off; POP_TOP's DECREF then frees the operand and
-        # its __del__ makes the switch.  The refcount instructions are
-        # generated by a later pass than any bytecode-keyed scan can see,
-        # which is why the poll has to be a boundary invariant rather than
-        # an enumeration of reentrant instructions.
+    def test_profile_enabled_inside_del_follows_the_exemption(self):
+        # Activation from a DECREF's __del__ -- the transition the
+        # bytecode never shows: same RFC exemption oracle.
         self._run_transition_probe(
             """
             class Temp:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __del__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
 
             class Num:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __add__(self, other):
-                    return Temp()
+                    return Temp(self.arm)
 
             ns = {}
             exec(
@@ -3881,12 +3927,19 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(Num(), Num())
+            result = hot(Num(True), Num(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 42, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(Num(False), Num(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 42, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
@@ -5049,6 +5102,1162 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("survived death-window round trips", proc.stdout)
+
+
+    # ------------------------------------------------------------------
+    # MR-08: the exception surface.  A raise inside machine code exits
+    # through the UnhandledException deopt and the anchored evaluator's
+    # exception_unwind runs the handler; these tests hold the whole
+    # observable contract of that route -- results, tracebacks, frame
+    # state, tracing and eval-breaker interplay.
+    #
+    # Dual-arm oracles compare against the JIT-off arm of the same build
+    # (evaluator installed, canary off).  That arm is this project's
+    # baseline: libtest_jitoff_diff pins it to stock over the full test
+    # corpus, and it shares the vendored evaluator's CALL dispatch, so
+    # positions agree by construction rather than by accident of pure
+    # CPython's inlined-call fast path (structurally disabled under an
+    # installed PEP 523 evaluator).
+
+    def _dual_arm(self, probe, timeout=120):
+        """Run `probe` in the interp (JIT-off) and jit (canary) arms and
+        return the two stdout JOURNAL payloads."""
+
+        def run_arm(mode):
+            env = _capability_clean_env()
+            if mode == "jit":
+                env["CINDERX_JIT_MODE"] = "canary"
+                env["PYTHONJITAUTO"] = "1000000"
+            proc = subprocess.run(
+                [sys.executable, "-c", probe, mode],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout,
+            )
+            self.assertEqual(proc.returncode, 0, (mode, proc.stderr[-2000:]))
+            for line in proc.stdout.splitlines():
+                if line.startswith("JOURNAL "):
+                    return json.loads(line[len("JOURNAL "):])
+            self.fail(f"{mode} arm produced no JOURNAL line: {proc.stdout!r}")
+
+        return run_arm("interp"), run_arm("jit")
+
+    _DUAL_ARM_PREAMBLE = textwrap.dedent(
+        """
+        import json
+        import sys
+        import _cinderx, cinderx
+        cinderx.init()
+        _cinderx.install_frame_evaluator()
+        mode = sys.argv[1]
+        if mode == "jit":
+            import cinderjit
+
+        def compile_all(*fns):
+            if mode == "jit":
+                for fn in fns:
+                    assert cinderjit.force_compile(fn) is True, fn
+                    assert cinderjit.is_jit_compiled(fn), fn
+
+        def still_compiled(*fns):
+            if mode == "jit":
+                for fn in fns:
+                    assert cinderjit.is_jit_compiled(fn), (
+                        "an exception must not uninstall", fn)
+
+        def tb_entries(exc, names):
+            out = []
+            tb = exc.__traceback__
+            while tb is not None:
+                code = tb.tb_frame.f_code
+                if code.co_name in names:
+                    out.append([code.co_name, tb.tb_lasti, tb.tb_lineno])
+                tb = tb.tb_next
+            return out
+        """
+    )
+
+    def test_try_except_executes_and_deopts_organically(self):
+        # The non-raising path stays in machine code; the raising path
+        # exits through an organic UnhandledException deopt, the anchored
+        # evaluator runs the handler, and the artifact survives to serve
+        # the next call.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def guard(a, b):
+                try:
+                    return a // b
+                except ZeroDivisionError:
+                    return -1
+
+            assert guard(6, 2) == 3
+            assert guard(6, 0) == -1
+            assert cinderjit.force_compile(guard) is True
+            assert cinderjit.is_jit_compiled(guard)
+
+            def organic():
+                return _cinderx._get_trigger_stats()["organic_deopt_hits"]
+
+            entries = _cinderx._get_trigger_stats()["machine_code_entries"]
+            base = organic()
+            assert guard(6, 2) == 3
+            assert organic() == base, "the happy path must not deopt"
+
+            assert guard(6, 0) == -1
+            after_first = organic()
+            assert after_first > base, "the raise must deopt organically"
+            assert cinderjit.is_jit_compiled(guard)
+
+            assert guard(6, 0) == -1
+            assert organic() > after_first, (
+                "the deopt is per-activation; the next call re-enters "
+                "machine code and deopts again")
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] > (
+                entries), "the raising calls entered machine code"
+            print("exception surface holds")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("exception surface holds", proc.stdout)
+
+    def test_exception_tracebacks_match_the_interpreter_arm(self):
+        # Full (co_name, tb_lasti, tb_lineno) chains, not just lines: a
+        # raising BINARY_OP carries an inline cache, a raising callee
+        # exits the caller at its CALL, and a raise statement re-executes
+        # in the interpreter.  All three must attribute the exception to
+        # the same bytecode unit as the JIT-off arm.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def div(a, b):
+                return a // b
+
+            def raiser(x):
+                raise ValueError(x)
+
+            def outer(f, x):
+                return f(x) + 1
+
+            def boomcb(x):
+                raise KeyError(x)
+
+            compile_all(div, raiser, outer)
+            names = {"div", "raiser", "outer", "boomcb"}
+            journal = {}
+            for label, thunk in (
+                ("binary_op", lambda: div(1, 0)),
+                ("raise_stmt", lambda: raiser("zz")),
+                ("callee", lambda: outer(boomcb, 3)),
+            ):
+                try:
+                    thunk()
+                except Exception as exc:
+                    journal[label] = [
+                        type(exc).__name__,
+                        tb_entries(exc, names),
+                    ]
+                else:
+                    raise SystemExit(label + " did not raise")
+            still_compiled(div, raiser, outer)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_finally_and_with_blocks_match_the_interpreter_arm(self):
+        # finally runs on both exits, __exit__ sees the exception triple,
+        # suppression resumes after the with block, and a non-manager
+        # raises stock's TypeError out of BEFORE_WITH.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def fin(a, b, log):
+                try:
+                    return a // b
+                finally:
+                    log.append("fin")
+
+            class CM:
+                def __init__(self, log, suppress):
+                    self.log = log
+                    self.suppress = suppress
+
+                def __enter__(self):
+                    self.log.append("enter")
+                    return self
+
+                def __exit__(self, t, v, tb):
+                    self.log.append(
+                        "exit-" + ("none" if t is None else t.__name__))
+                    return self.suppress
+
+            def use(cm, log, z):
+                with cm:
+                    log.append("body")
+                    return 10 // z
+                return -1
+
+            compile_all(fin, use)
+            journal = {}
+
+            log = []
+            journal["fin_return"] = [fin(9, 3, log), log]
+            log = []
+            try:
+                fin(9, 0, log)
+            except ZeroDivisionError:
+                log.append("caught")
+            journal["fin_raise"] = log
+
+            log = []
+            journal["with_return"] = [use(CM(log, False), log, 2), log]
+            log = []
+            journal["with_suppressed"] = [use(CM(log, True), log, 0), log]
+            log = []
+            try:
+                use(CM(log, False), log, 0)
+            except ZeroDivisionError:
+                log.append("caught")
+            journal["with_propagates"] = log
+
+            log = []
+            try:
+                use(42, log, 1)
+            except TypeError as exc:
+                journal["not_a_manager"] = [str(exc), log]
+            still_compiled(fin, use)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_exception_chaining_matches_the_interpreter_arm(self):
+        # raise-from sets __cause__ and __suppress_context__; a raise
+        # inside the handler (which runs interpreted after the deopt)
+        # chains __context__ implicitly.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def chained(mk_cause):
+                try:
+                    raise ValueError("primary") from mk_cause("root")
+                except ValueError:
+                    raise RuntimeError("secondary")
+
+            compile_all(chained)
+            try:
+                chained(KeyError)
+            except RuntimeError as exc:
+                ctx = exc.__context__
+                journal = [
+                    type(exc).__name__,
+                    str(exc),
+                    exc.__cause__ is None,
+                    type(ctx).__name__,
+                    str(ctx),
+                    ctx.__suppress_context__,
+                    type(ctx.__cause__).__name__,
+                ]
+            else:
+                raise SystemExit("chained did not raise")
+            still_compiled(chained)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_assert_and_bare_reraise_match_the_interpreter_arm(self):
+        # assert exercises LOAD_ASSERTION_ERROR + RAISE_VARARGS; a bare
+        # raise in the handler re-raises the original exception with its
+        # traceback extended, not replaced.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def check(x):
+                assert x > 0, "must be positive"
+                return x
+
+            def rethrow(a, b):
+                try:
+                    return a // b
+                except ZeroDivisionError:
+                    raise
+
+            compile_all(check, rethrow)
+            names = {"check", "rethrow"}
+            journal = {"ok": check(3)}
+            try:
+                check(0)
+            except AssertionError as exc:
+                journal["assert"] = [str(exc), tb_entries(exc, names)]
+            try:
+                rethrow(5, 0)
+            except ZeroDivisionError as exc:
+                journal["reraise"] = [str(exc), tb_entries(exc, names)]
+            still_compiled(check, rethrow)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_handler_frame_state_matches_the_interpreter_arm(self):
+        # The deopt reifies locals before the evaluator dispatches to the
+        # handler: a helper called from the handler must see the same
+        # f_locals, f_lasti and f_lineno in the raising frame as the
+        # JIT-off arm.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def snap(n, grab):
+                a = n + 1
+                b = a * 2
+                try:
+                    return a // (n - n)
+                except ZeroDivisionError:
+                    return grab()
+
+            def grab_impl():
+                fr = sys._getframe(1)
+                return {
+                    "locals": {
+                        k: v
+                        for k, v in fr.f_locals.items()
+                        if k in ("a", "b", "n")
+                    },
+                    "lasti": fr.f_lasti,
+                    "lineno": fr.f_lineno,
+                }
+
+            compile_all(snap)
+            journal = snap(4, grab_impl)
+            still_compiled(snap)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_exception_deopt_releases_operand_stack_references(self):
+        # A value sitting on the operand stack when the raise happens (the
+        # pending BUILD_TUPLE element) is owned by the reified frame and
+        # released by the evaluator's unwind -- not leaked, not
+        # double-freed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Probe:
+                pass
+
+            def build(p, z):
+                return (p, 1 // z)
+
+            assert cinderjit.force_compile(build) is True
+            p = Probe()
+            wr = weakref.ref(p)
+            ok = build(p, 1)
+            assert ok[0] is p
+            del ok
+            try:
+                build(p, 0)
+            except ZeroDivisionError:
+                pass
+            else:
+                raise SystemExit("build did not raise")
+            assert cinderjit.is_jit_compiled(build)
+            del p
+            gc.collect()
+            assert wr() is None, "the exception deopt leaked a stack slot"
+            print("operand stack released")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("operand stack released", proc.stdout)
+
+    def test_getframe_from_a_callee_matches_the_interpreter_arm(self):
+        # A callee inspecting the running machine-code frame must see what
+        # stock shows: the exact f_locals content (arguments, rebound
+        # values, locals assigned so far, deletions), the call line, and
+        # the frame chain.  The executing mode writes every local store
+        # through to the materialized frame for exactly this reason.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import traceback
+
+            def peek():
+                fr = sys._getframe(1)
+                return {
+                    "name": fr.f_code.co_name,
+                    "locals": {
+                        k: v
+                        for k, v in fr.f_locals.items()
+                        if k not in ("cb",)
+                    },
+                    "cb_present": "cb" in fr.f_locals,
+                    "back": fr.f_back.f_code.co_name,
+                    "line_delta": fr.f_lineno - fr.f_code.co_firstlineno,
+                    "stack_tail": [
+                        entry.name for entry in traceback.extract_stack(fr)
+                    ][-2:],
+                }
+
+            def caller(n, cb):
+                n = n + 1
+                m = n * 2
+                snap = cb()
+                del m
+                snap2 = cb()
+                return (snap, snap2, n)
+
+            def driver():
+                return caller(7, peek)
+
+            compile_all(caller)
+            journal = driver()
+            still_compiled(caller)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_current_frames_from_another_thread_sees_the_running_loop(self):
+        # sys._current_frames() from a second thread must observe the
+        # machine-code frame mid-flight without tearing: right code
+        # object, sane f_lasti, walkable chain.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import threading
+            import time
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def spin(limit, one, stop):
+                i = limit - limit
+                while i < limit:
+                    i = i + one
+                    if stop():
+                        return i
+                return i
+
+            assert cinderjit.force_compile(spin) is True
+            assert spin(100, 1, bool) == 100
+
+            done = threading.Event()
+            tid_box = {}
+            started = threading.Event()
+
+            def victim():
+                tid_box["tid"] = threading.get_ident()
+                started.set()
+                spin(2_000_000_000, 1, done.is_set)
+
+            t = threading.Thread(target=victim)
+            t.start()
+            started.wait(30)
+            observed = []
+            try:
+                for _ in range(400):
+                    frames = sys._current_frames()
+                    fr = frames.get(tid_box["tid"])
+                    while fr is not None:
+                        if fr.f_code.co_name == "spin":
+                            observed.append(
+                                (fr.f_lasti, dict(fr.f_locals)))
+                            break
+                        fr = fr.f_back
+                    if observed:
+                        break
+                    time.sleep(0.005)
+            finally:
+                done.set()
+            t.join(60)
+            assert not t.is_alive(), "the loop never honored the stop flag"
+            assert observed, "the running compiled loop was never observed"
+            lasti, frame_locals = observed[0]
+            assert isinstance(lasti, int)
+            # Observable frame state, not just survival: the sampled frame
+            # must show the same locals stock would -- the arguments and
+            # the loop counter written through as it advances.
+            assert frame_locals.get("limit") == 2_000_000_000, frame_locals
+            assert frame_locals.get("one") == 1, frame_locals
+            assert callable(frame_locals.get("stop")), frame_locals
+            assert isinstance(frame_locals.get("i"), int), frame_locals
+            print("current_frames observed the loop")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("current_frames observed the loop", proc.stdout)
+
+    def test_settrace_mid_flight_matches_the_interpreter_arm(self):
+        # sys.settrace installed by a callee while the caller runs in
+        # machine code: stock 3.11 delivers no line/return events to the
+        # already-running frame (its f_trace was never populated by a
+        # 'call' event), and frame.f_trace stays None.  Under the RFC
+        # 3.3.4.5 exemption the JIT arm lands in exactly that behavior --
+        # neither missing events stock sends, nor inventing events stock
+        # does not.  (No item-7 restoration applies here: the tracer is
+        # not yet installed at the moment the call site delegates.)
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+            watched = ("workload", "probe_ftrace", "activate")
+
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name in watched:
+                    events.append([event, frame.f_code.co_name])
+                return None
+
+            def activate():
+                sys.settrace(tracer)
+                return 1
+
+            def probe_ftrace():
+                return sys._getframe(1).f_trace is None
+
+            def workload(n, activate, probe):
+                acc = n - n
+                acc = acc + activate()
+                acc = acc + n
+                acc = acc * 2
+                journal.append(["caller_f_trace_none", probe()])
+                return acc
+
+            journal = []
+            compile_all(workload)
+            result = workload(5, activate, probe_ftrace)
+            sys.settrace(None)
+            journal.append(["result", result])
+            journal.append(["events", events])
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_settrace_before_the_call_traces_the_whole_frame(self):
+        # With the tracer active before the call, the guarded entry falls
+        # back and the whole frame runs interpreted: the full stock event
+        # stream -- call, lines, the exception event in the handler, and
+        # return -- must be identical across arms.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name == "traced_target":
+                    what = event
+                    if event == "exception":
+                        what = "exception-" + arg[0].__name__
+                    events.append(
+                        [what, frame.f_lineno - frame.f_code.co_firstlineno])
+                return tracer
+
+            def traced_target(n):
+                try:
+                    return n // (n - n)
+                except ZeroDivisionError:
+                    return -n
+
+            compile_all(traced_target)
+            sys.settrace(tracer)
+            result = traced_target(6)
+            sys.settrace(None)
+            print("JOURNAL " + json.dumps([result, events]))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_delete_fast_unbound_matches_the_interpreter_arm(self):
+        # Stock DELETE_FAST raises UnboundLocalError when the slot is
+        # already empty; the compiled form must not silently clear an
+        # unbound local (the uninitialized-local TNullptr reaching
+        # definition makes that shape compilable).  Covers the always-
+        # unbound form, the conditionally-bound form on both paths, and
+        # an in-frame handler catching the error through this frame's
+        # exception table.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            def f():
+                del x
+                return 1
+
+            def g(flag):
+                if flag:
+                    x = 1
+                del x
+                return "deleted"
+
+            def h():
+                try:
+                    del x
+                except UnboundLocalError:
+                    return "caught"
+                return "not-raised"
+
+            compile_all(f, g, h)
+            journal = [
+                observe(f),
+                observe(g, True),
+                observe(g, False),
+                observe(h),
+            ]
+            still_compiled(f, g, h)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_fused_store_fast_writes_through_matches_interp(self):
+        # The 3.11 superinstructions execute their SETLOCALs in opcode
+        # order, each immediately visible in localsplus.  The oracle must
+        # dodge two masks: a call-shaped observation deopts the frame and
+        # reification rewrites every slot, and a type-guard deopt (mixed
+        # warmup types) does the same -- so the fused stores run in a
+        # CALL-FREE hot loop and another thread samples the running frame
+        # via sys._current_frames() mid-loop.  The loop bound is sized
+        # per arm (the sampled values do not depend on it, and only they
+        # are journaled); the probe asserts the quickened code really
+        # carries a fused store so the oracle cannot pass vacuously.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import dis
+            import threading
+
+            def fused_loop(a, b, n):
+                i = 0
+                x = None
+                y = None
+                while i < n:
+                    x = a
+                    y = b
+                    i = i + 1
+                return i, x, y
+
+            for _ in range(40):
+                fused_loop(1, 2, 5)
+            ops = [i.opname for i in
+                   dis.get_instructions(fused_loop, adaptive=True)]
+            fused_ops = [o for o in ops if o.startswith("STORE_FAST__")]
+            assert fused_ops, (
+                "quickening no longer produces a fused store; the "
+                "oracle would be vacuous", ops)
+            compile_all(fused_loop)
+            for _ in range(3):
+                fused_loop(1, 2, 5)
+
+            main_tid = threading.get_ident()
+            out = {}
+
+            def sampler():
+                for _ in range(200000):
+                    fr = sys._current_frames().get(main_tid)
+                    if fr is not None and fr.f_code.co_name == "fused_loop":
+                        fl = fr.f_locals
+                        if fl.get("i", 0) > 0:
+                            out["x"] = fl.get("x")
+                            out["y"] = fl.get("y")
+                            return
+
+            n = (1 << 29) if mode == "jit" else 5000000
+            # The sampler can miss a short window; retry the whole run a
+            # few times -- the sampled VALUES are timing-independent.
+            for _ in range(5):
+                out.clear()
+                t = threading.Thread(target=sampler)
+                t.start()
+                result = fused_loop(7, 8, n)
+                t.join(60)
+                if "x" in out:
+                    break
+            journal = [out.get("x"), out.get("y"), result[1], result[2]]
+            still_compiled(fused_loop)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_mid_flight_tracer_protocol_matches_the_interpreter_arm(self):
+        # RFC 3.3.4.5 item 7, refined: after an ordinary mid-function
+        # deopt with tracing active, f_trace_lines is made explicit and a
+        # user-installed f_trace is preserved -- but an ABSENT f_trace is
+        # never forged from the GLOBAL tracer (tstate->c_traceobj).  The
+        # local tracer is only ever installed by a 'call' event's return
+        # value, and a mid-flight frame never had that event, so stock
+        # delivers nothing for it.  Four tracer shapes pin the protocol:
+        # the classic self-returning global, a two-level global-only-
+        # accepts-call tracer, a global returning None, and an explicit
+        # frame-level f_trace planted before the deopt.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            journal = []
+
+            def scenario(name, make_tracer, plant_local=None):
+                # Fresh globals per scenario so each guarded load has its
+                # own dk_version story; everything else stays in function
+                # scope (a new module-level name after compile would fire
+                # the first guarded load before the tracer exists).
+                gname = "G_" + name
+                kname = "K_" + name
+                globals()[gname] = 5
+                armed = {"on": False}
+                events = []
+
+                class Flip:
+                    def __add__(self, other):
+                        if armed["on"]:
+                            if plant_local is not None:
+                                sys._getframe(1).f_trace = plant_local(
+                                    events)
+                            sys.settrace(make_tracer(events))
+                            globals()[kname] = 1
+                        return 100
+
+                src = (
+                    "def workload(x):\\n"
+                    "    a = " + gname + "\\n"
+                    "    b = x + 1\\n"
+                    "    c = " + gname + "\\n"
+                    "    return a + b + c\\n"
+                )
+                exec(src, globals())
+                wl = globals().pop("workload")
+                f = Flip()
+                for _ in range(40):
+                    assert wl(f) == 110
+                compile_all(wl)
+                for _ in range(3):
+                    assert wl(f) == 110
+                armed["on"] = True
+                result = wl(f)
+                # A follow-up NEW call observes the activation at entry
+                # and runs interpreted under the full protocol.
+                follow = wl(f)
+                sys.settrace(None)
+                journal.append([name, result, follow, events])
+
+            # 1. Classic self-returning global tracer: the running frame
+            # has no local tracer, so it stays silent (stock parity).
+            def classic(events):
+                def tracer(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return tracer
+                return tracer
+
+            scenario("classic", classic)
+
+            # 2. Two-level protocol: the global tracer ONLY accepts
+            # 'call' and returns a distinct local tracer.  A forged
+            # f_trace would hand it a 'line' event and blow the
+            # assertion.
+            def two_level(events):
+                def local(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["l", event])
+                    return local
+
+                def tracer(frame, event, arg):
+                    assert event == "call", (
+                        "global tracer must only see call events", event)
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return local
+                return tracer
+
+            scenario("twolevel", two_level)
+
+            # 3. Global tracer returning None: no local tracing at all.
+            def none_returning(events):
+                def tracer(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return None
+                return tracer
+
+            scenario("noneret", none_returning)
+
+            # 4. An f_trace the user planted on the frame object BEFORE
+            # the deopt is preserved and receives the interpreted
+            # remainder's events.
+            def planted_local(events):
+                def local(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["planted", event])
+                    return local
+                return local
+
+            scenario("planted", classic, plant_local=planted_local)
+
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        # The jit arm must have taken the organic deopt path in every
+        # scenario -- otherwise the mid-flight half of the protocol was
+        # never exercised.  The interp arm has no machine code, so the
+        # assertion lives here rather than inside the probe.
+
+    def test_ordinary_deopt_with_tracing_is_organic_on_the_jit_arm(self):
+        # Companion to the protocol test: prove the jit arm actually
+        # deopts mid-frame on the guarded load (the dual-arm probe cannot
+        # assert jit-only counters without breaking arm symmetry).
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            G_probe = 5
+            armed = {"on": False}
+
+            def tracer(frame, event, arg):
+                return tracer
+
+            class Flip:
+                def __add__(self, other):
+                    if armed["on"]:
+                        sys.settrace(tracer)
+                        globals()["K_probe"] = 1
+                    return 100
+
+            def workload(x):
+                a = G_probe
+                b = x + 1
+                c = G_probe
+                return a + b + c
+
+            def main():
+                f = Flip()
+                for _ in range(40):
+                    assert workload(f) == 110
+                assert cinderjit.force_compile(workload) is True
+                for _ in range(3):
+                    assert workload(f) == 110
+                before = _cinderx._get_trigger_stats()[
+                    "organic_deopt_hits"]
+                armed["on"] = True
+                assert workload(f) == 110
+                after = _cinderx._get_trigger_stats()[
+                    "organic_deopt_hits"]
+                sys.settrace(None)
+                assert after > before, (
+                    "the guarded load never deopted; the mid-flight "
+                    "protocol was not exercised", before, after)
+                print("mid-flight deopt is organic")
+
+            main()
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("mid-flight deopt is organic", proc.stdout)
+    def test_signal_handler_exception_interrupts_the_compiled_loop(self):
+        # A signal arriving in a tight compiled loop is delivered at the
+        # back-edge poll; the handler's exception unwinds out of the
+        # machine-code frame with a traceback naming the loop.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import signal
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Boom(Exception):
+                pass
+
+            def on_alarm(signum, frame):
+                raise Boom()
+
+            def spin(limit, one):
+                i = limit - limit
+                while i < limit:
+                    i = i + one
+                return i
+
+            assert cinderjit.force_compile(spin) is True
+            assert spin(100, 1) == 100
+
+            signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, 0.2)
+            try:
+                spin(2_000_000_000, 1)
+                raise SystemExit("the signal never interrupted the loop")
+            except Boom as exc:
+                tb = exc.__traceback__
+                names = []
+                while tb is not None:
+                    names.append(tb.tb_frame.f_code.co_name)
+                    tb = tb.tb_next
+                assert "spin" in names, names
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            print("signal interrupted the compiled loop")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("signal interrupted the compiled loop", proc.stdout)
+
+    def test_handler_only_opcodes_do_not_refuse_the_function(self):
+        # The execute whitelist is scoped to normal-flow-reachable
+        # instructions: an opcode that occurs solely inside an
+        # exception-handler region runs in the interpreter after the
+        # deopt regardless of what it is, so STORE_DEREF or a subscript
+        # in a handler must not refuse a function whose normal path this
+        # milestone fully supports.  A normal-flow subscript still
+        # refuses.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def make_counter():
+                count = 0
+
+                def bump(a, b):
+                    nonlocal count
+                    try:
+                        return a // b
+                    except ZeroDivisionError:
+                        count = count + 1
+                        return -count
+
+                return bump
+
+            def pick(d, k, z):
+                try:
+                    return 10 // z
+                except ZeroDivisionError:
+                    return d[k]
+
+            bump = make_counter()
+            compile_all(bump, pick)
+            journal = [
+                bump(6, 2), bump(6, 0), bump(6, 0),
+                pick({"k": "v"}, "k", 2), pick({"k": "v"}, "k", 0),
+            ]
+            if mode == "jit":
+                def normal_flow_subscr(d, k):
+                    return d[k]
+
+                try:
+                    cinderjit.force_compile(normal_flow_subscr)
+                except RuntimeError as exc:
+                    assert "CANNOT_SPECIALIZE" in str(exc), exc
+                else:
+                    raise SystemExit(
+                        "a normal-flow subscript compiled; the reachability "
+                        "scope leaks")
+            still_compiled(bump, pick)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_except_star_shapes_stay_refused(self):
+        # The MR-08 audit keeps except* refused: PREP_RERAISE_STAR has no
+        # reference implementation.  The refusal must be stable across
+        # attempts and the function must keep its interpreted behavior.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def star(fail):
+                out = "ok"
+                try:
+                    if fail:
+                        raise ValueError("x")
+                except* ValueError:
+                    out = "star"
+                return out
+
+            for attempt in range(2):
+                try:
+                    cinderjit.force_compile(star)
+                except RuntimeError as exc:
+                    assert "CANNOT_SPECIALIZE" in str(exc), (attempt, exc)
+                else:
+                    raise SystemExit("except* was compiled")
+            assert not cinderjit.is_jit_compiled(star)
+            assert star(True) == "star"
+            assert star(False) == "ok"
+            print("except* stays refused")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("except* stays refused", proc.stdout)
+
+    def test_exception_injection_sweep_matches_the_interpreter(self):
+        # The injection sweep moves the raising checkpoint across the
+        # whole composed body -- loop iterations inside a with inside a
+        # try/finally -- and every swept answer must equal the answer the
+        # interpreter gave before any machine code existed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Erratic:
+                def __init__(self, fail_at):
+                    self.fail_at = fail_at
+                    self.count = 0
+
+                def tick(self):
+                    self.count = self.count + 1
+                    if self.count == self.fail_at:
+                        raise RuntimeError("inj-%d" % self.fail_at)
+                    return 1
+
+            class Guard:
+                def __init__(self, log):
+                    self.log = log
+
+                def __enter__(self):
+                    self.log.append("enter")
+                    return self
+
+                def __exit__(self, t, v, tb):
+                    self.log.append(
+                        "exit-" + ("none" if t is None else t.__name__))
+                    return False
+
+            def target(e, n, log):
+                acc = n - n
+                try:
+                    with Guard(log):
+                        i = acc
+                        while i < n:
+                            acc = acc + e.tick()
+                            i = i + 1
+                except RuntimeError:
+                    log.append("caught")
+                    return -acc
+                finally:
+                    log.append("fin")
+                return acc
+
+            def run_target(fail_at, n):
+                log = []
+                result = target(Erratic(fail_at), n, log)
+                return (result, log)
+
+            N = 6
+            sweep = list(range(1, N + 2)) + [0]
+            expected = {k: run_target(k, N) for k in sweep}
+            assert cinderjit.force_compile(target) is True
+            base = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            for k in sweep:
+                got = run_target(k, N)
+                assert got == expected[k], (k, got, expected[k])
+                assert cinderjit.is_jit_compiled(target), k
+            assert _cinderx._get_trigger_stats()["organic_deopt_hits"] > (
+                base), "the injected raises never deopted"
+            print("injection sweep matched")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("injection sweep matched", proc.stdout)
 
 
 if __name__ == "__main__":

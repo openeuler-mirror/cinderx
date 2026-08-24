@@ -41,7 +41,7 @@ slots = 256
 
 [refusal_reasons.opcode]
 REFUSE_PATTERN_MATCHING_UNAUDITED = "MATCH_* helper and protocol audit pending"
-REFUSE_EXCEPT_STAR_UNAUDITED = "except* translation audit pending"
+REFUSE_EXCEPT_STAR_UNAUDITED = "except* stays refused after the MR-08 audit: PREP_RERAISE_STAR has no reference implementation, and the exception-group injection surface that would validate a from-scratch pairing is not built"
 REFUSE_HELPER_UNAVAILABLE_PRE314 = "required CPython helper is unavailable before 3.14"
 REFUSE_UNPORTED = "opcode has no audited 3.11 translation"
 INTERP_ONLY_ASYNC_CODE = "opcode occurs only in async code rejected by eligibility"
@@ -102,7 +102,7 @@ CALL_ADAPTIVE = { num = 22, state = "normalize", cache = 4, to = "CALL" }
 CALL_FUNCTION_EX = { num = 142, state = "translate", cache = 0 }
 CALL_PY_EXACT_ARGS = { num = 23, state = "normalize", cache = 4, to = "CALL" }
 CALL_PY_WITH_DEFAULTS = { num = 24, state = "normalize", cache = 4, to = "CALL" }
-CHECK_EG_MATCH = { num = 37, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED", note = "dryrun reference translator supported this" }
+CHECK_EG_MATCH = { num = 37, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED", note = "MR-08 audit: the dryrun reference translator supported this opcode, but its partner PREP_RERAISE_STAR has no reference implementation; the pair is refused together until the exception-group injection surface exists to validate a from-scratch pairing" }
 CHECK_EXC_MATCH = { num = 36, state = "translate", cache = 0 }
 COMPARE_OP = { num = 107, state = "translate", cache = 2 }
 COMPARE_OP_ADAPTIVE = { num = 26, state = "normalize", cache = 2, to = "COMPARE_OP" }
@@ -210,7 +210,7 @@ PRECALL_NO_KW_STR_1 = { num = 121, state = "normalize", cache = 1, to = "PRECALL
 PRECALL_NO_KW_TUPLE_1 = { num = 127, state = "normalize", cache = 1, to = "PRECALL" }
 PRECALL_NO_KW_TYPE_1 = { num = 141, state = "normalize", cache = 1, to = "PRECALL" }
 PRECALL_PYFUNC = { num = 143, state = "normalize", cache = 1, to = "PRECALL" }
-PREP_RERAISE_STAR = { num = 88, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED" }
+PREP_RERAISE_STAR = { num = 88, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED", note = "MR-08 audit: no reference implementation exists; refused together with CHECK_EG_MATCH" }
 PRINT_EXPR = { num = 70, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
 PUSH_EXC_INFO = { num = 35, state = "translate", cache = 0 }
 PUSH_NULL = { num = 2, state = "translate", cache = 0 }

@@ -165,8 +165,13 @@ make -C "$BUILD_DIR" -j"$(nproc)" runtime_tests > "$BUILD_DIR-build.log" 2>&1
 BIN=$(find "$BUILD_DIR" -name runtime_tests -type f | head -1)
 
 # Pin the registered-test identity before anything runs.
+# The suite pattern must accept value-parameterized instantiations
+# ("Prefix/Suite."): a suite line the pattern misses leaves `suite`
+# pointing at whichever suite happened to be listed before it, which
+# both mislabels those tests in the manifest and turns the identity pin
+# order-sensitive (LTO builds reorder registration).
 "$BIN" --gtest_list_tests 2>/dev/null \
-  | awk '/^[A-Za-z_][A-Za-z0-9_]*\./ { suite = $1 }
+  | awk '/^[A-Za-z_][A-Za-z0-9_\/]*\./ { suite = $1 }
          /^  [A-Za-z_]/ { print suite $1 }' \
   | sort -u > "$BUILD_DIR-registered.txt"
 registered_drift "$BUILD_DIR-registered.txt"

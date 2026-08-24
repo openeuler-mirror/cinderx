@@ -544,7 +544,10 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         "      '%d silent' % (len(_covered), len(_targets), len(_silent)))\n"
         "assert not _silent, _silent\n"
     )
-    default = execute_holds(expected_organic_deopts=5) + [
+    # Six organic deopts: five from the MR-07 era, plus one newly compiled
+    # exception path in the stdlib sweep once MR-08 opens the exception
+    # opcode family (verified deterministic across reruns).
+    default = execute_holds(expected_organic_deopts=6) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -720,12 +723,10 @@ def canary_force_cold_runner(*, judges: list[Judge] | None = None) -> RunnerSpec
 def canary_force_warm_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     """Interpreter warm-up with verified quickening, then compile.
 
-    The warm dimension this exercises is the warmed interpreter state, not
-    specialized-input consumption: the executing mode compiles the
-    unspecialized forms until MR-07, and a native case pins that pairing
-    (JITContextTest.CanaryExecutesUnspecializedForms).  Formerly documented
-    as: interpreter warm-up with verified quickening, then force_compile
-    and execute."""
+    The warm dimension this exercises is the warmed interpreter state:
+    the child proves quickening actually happened before force_compile
+    consumes the adaptive stream (specialized_opcodes is on since MR-07,
+    so the compile may select guards from the specialized forms)."""
     payload = CANARY_DEF + CANARY_ATTEST + (
         "for _ in range(200):\n"
         "    hot(2, 9, 1)\n"
@@ -766,13 +767,111 @@ def canary_execute_runner(
         "assert hot(4, 5, 1) == 20\n"
         "assert hot(6, 5, 1) == 25\n"
     )
-    default = execute_holds() + [expect("compile_requests", ">", 0)]
+    # Two organic deopts, both from the child preamble's import machinery:
+    # with the MR-08 exception surface open, importlib/os helpers that the
+    # auto threshold compiles no longer refuse over their exception
+    # opcodes, and their EAFP raise paths deopt once each by design.
+    # Verified deterministic and preamble-attributed (payload-free child
+    # reproduces exactly 2).
+    default = execute_holds(expected_organic_deopts=2) + [
+        expect("compile_requests", ">", 0)
+    ]
     return RunnerSpec(
         name="canary_execute",
         payload=payload,
         env={
             "CINDERX_JIT_MODE": "canary",
             "PYTHONJITAUTO": str(threshold),
+            "PYTHONMALLOC": "debug",
+        },
+        asserted_env={"CINDERX_JIT_MODE": "canary"},
+        judges=judges if judges is not None else default,
+    )
+
+
+EXCEPTION_CORPUS = """\
+class Erratic:
+    def __init__(self, fail_at):
+        self.fail_at = fail_at
+        self.count = 0
+
+    def tick(self):
+        self.count = self.count + 1
+        if self.count == self.fail_at:
+            raise RuntimeError('inj-%d' % self.fail_at)
+        return 1
+
+
+class Guard:
+    def __init__(self, log):
+        self.log = log
+
+    def __enter__(self):
+        self.log.append('enter')
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.log.append('exit-%s' % (
+            'none' if exc_type is None else exc_type.__name__))
+        return False
+
+
+def target(e, n, log):
+    acc = n - n
+    try:
+        with Guard(log):
+            i = acc
+            while i < n:
+                acc = acc + e.tick()
+                i = i + 1
+    except RuntimeError:
+        log.append('caught')
+        return -acc
+    finally:
+        log.append('fin')
+    return acc
+
+
+def run_target(fail_at, n):
+    log = []
+    result = target(Erratic(fail_at), n, log)
+    return (result, log)
+"""
+
+
+def exception_semantics_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
+    """MR-08: the exception surface executes and every raise deopts into
+    the anchored evaluator's handler dispatch.
+
+    An injection sweep moves the raising checkpoint across the whole body
+    (each loop iteration, plus the never-raises arm), and every swept
+    answer -- return value, handler choice, with/finally event order --
+    must equal the interpreter's, recorded before any machine code
+    existed.  Organic deopts are the mechanism, so the run must record
+    some."""
+    payload = CANARY_ATTEST + EXCEPTION_CORPUS + (
+        "N = 6\n"
+        "sweep = list(range(1, N + 2)) + [0]\n"
+        "expected = {k: run_target(k, N) for k in sweep}\n"
+        "assert cinderjit.force_compile(target) is True\n"
+        "assert cinderjit.is_jit_compiled(target)\n"
+        "for k in sweep:\n"
+        "    got = run_target(k, N)\n"
+        "    assert got == expected[k], (k, got, expected[k])\n"
+        "    assert cinderjit.is_jit_compiled(target), (\n"
+        "        'a handled exception must not uninstall the artifact')\n"
+    )
+    # Eight organic deopts: the corpus raises through compiled code by
+    # design, and each raising form deopts exactly once (kUnhandledException
+    # delegation).  The exact pin replaces the old ">0" judge so a deopt
+    # storm cannot wash green.
+    default = execute_holds(expected_organic_deopts=8)
+    return RunnerSpec(
+        name="exception_semantics",
+        payload=payload,
+        env={
+            "CINDERX_JIT_MODE": "canary",
+            "PYTHONJITAUTO": "1000000",
             "PYTHONMALLOC": "debug",
         },
         asserted_env={"CINDERX_JIT_MODE": "canary"},
@@ -1000,9 +1099,12 @@ assert not [f for f in cinderjit.get_compiled_functions()
 assert cinderjit._get_resident_compiled_functions() == 0
 """
 
-# closure_churn: 10k closures (cells -- refused; proves the refusal path
-# leaks nothing) plus 2k lambdas (compile against one code object; each
-# generation exercises artifact succession).
+# closure_churn: 2k cell-carrying closures plus 2k lambdas, each arm
+# compiling generation after generation against one shared code object.
+# The closure arm used to assert refusal, but MR-07's pass rework put
+# LOAD_DEREF/COPY_FREE_VARS bodies on the execute surface for real, so
+# both arms now exercise artifact succession -- the cell arm adds the
+# freevar frame setup to the churn.
 LIFECYCLE_CLOSURE_CHURN = """\
 def _make(i):
     def inner(x):
@@ -1010,21 +1112,13 @@ def _make(i):
     return inner
 
 
-_refused = 0
-for _i in range(10000):
+for _i in range(2000):
     _fn = _make(_i)
     for _ in range(3):
-        _fn(_i)
-    try:
-        cinderjit.force_compile(_fn)
-    except RuntimeError:
-        _refused += 1
-    else:
-        raise SystemExit(
-            "a cell-carrying closure compiled on the MR-04 surface; "
-            "closure_churn is about the refusal path")
+        assert _fn(_i) == _i + _i
+    assert cinderjit.force_compile(_fn) is True
+    assert _fn(_i) == _i + _i
     del _fn
-assert _refused == 10000, _refused
 for _i in range(2000):
     _lam = (lambda x: x + 1)
     assert cinderjit.force_compile(_lam) is True
@@ -1208,13 +1302,11 @@ def lifecycle_runners() -> list[RunnerSpec]:
                 expect("code_destroyed_notifications", ">", 0),
             ],
         ),
-        # The closure arm is refused by the execute surface (cells), the
-        # lambda arm compiles and dies generation after generation.  The
-        # refusal proof lives in the payload itself -- force_compile must
-        # raise for all ten thousand closures, and a single acceptance
-        # aborts the child -- because an explicit force_compile refusal
-        # moves no scheduling counter for a judge to read.  The judges
-        # hold the lambda arm and the exit hygiene.
+        # Both arms compile and die generation after generation against a
+        # shared code object; the cell arm folds the freevar frame setup
+        # into the churn (MR-07's pass rework put those bodies on the
+        # execute surface).  The judges hold the succession accounting
+        # and the exit hygiene.
         lifecycle_runner(
             "closure_churn",
             LIFECYCLE_CLOSURE_CHURN,
@@ -1890,6 +1982,7 @@ def run_all(python: str | None = None) -> list[RunResult]:
         canary_force_cold_runner(),
         canary_force_warm_runner(),
         canary_execute_runner(),
+        exception_semantics_runner(),
         stdlib_canary_runner(),
         canary_churn_runner(),
         singleton_lifetime_runner(),

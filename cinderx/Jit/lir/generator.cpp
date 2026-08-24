@@ -6333,9 +6333,14 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[0]},
         PhyReg{codegen::arch::reg_general_return_loc});
   }
-#if PY_VERSION_HEX >= 0x030C0000
   // Fourth argument: is_instrumentation_deopt returned by
-  // prepareForDeopt.  Save it before being overwritten below.
+  // prepareForDeopt.  Save it before being overwritten below.  This move
+  // is assembled on every version: it used to sit behind a >= 3.12 gate,
+  // which left resumeInInterpreter's fourth argument a register residue
+  // on 3.11 -- a value that happened to agree with the reason-derived
+  // answer for every reason whose error state matched, and silently
+  // depended on the build for the rest.  resumeInInterpreter cross-checks
+  // the forwarded flag against the deopt metadata on 3.11.
   if (codegen::ARGUMENT_REGS[3] !=
       codegen::arch::reg_general_auxilary_return_loc) {
     block->allocateInstr(
@@ -6344,7 +6349,6 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[3]},
         PhyReg{codegen::arch::reg_general_auxilary_return_loc});
   }
-#endif
   // arg1 = code_rt from stack (fp - 3*8)
   block->allocateInstr(
       Instruction::kMove,

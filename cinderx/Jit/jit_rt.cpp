@@ -1081,6 +1081,21 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value) {
+  // MR-08 frame observability: keep the materialized frame's localsplus
+  // current so sys._getframe()/f_locals readers see what stock 3.11
+  // shows.  The frame owns its copy (the existing clear paths --
+  // JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear -- release it);
+  // computation keeps using registers.  The old value's release can run
+  // __del__, which observes the frame already holding the new value,
+  // exactly like stock SETLOCAL.
+  _PyInterpreterFrame* frame = interpFrameFromThreadState(_PyThreadState_GET());
+  PyObject* old = frame->localsplus[idx];
+  frame->localsplus[idx] = Py_XNewRef(value);
+  Py_XDECREF(old);
+  return 0;
+}
+
 int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id) {
   if (code_rt == nullptr) {
     return 0;

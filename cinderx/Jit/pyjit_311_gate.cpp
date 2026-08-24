@@ -167,14 +167,13 @@ const char* unsupportedArgumentShape311(BorrowedRef<PyFunctionObject>) {
   return nullptr;
 }
 
-// One compiled artifact, one owning function -- until MR-05 supplies a
-// function-destroy notification on 3.11.  CPython 3.11 has no function
-// watchers, and the compatibility shim's PyFunction_AddWatcher registers
-// nothing, so nothing removes a dead function from the registries.  With a
-// single owner the artifact dies with its function and its own destructor
-// cleans both registries; with two owners the artifact survives the first
-// death and leaves a borrowed pointer to freed memory behind, which
-// cinderjit.get_compiled_functions() then dereferences.
+// One compiled artifact, one owning function.  MR-05's death
+// notifications (weakref watch for functions, co_extra freefunc for
+// code) retire the original freed-pointer hazard, but the single-owner
+// publication policy stays: the guarded entry resolves its artifact
+// through the code object's ledger, and admitting a second owner would
+// let one function's lifecycle events (uncompile, __code__ replacement,
+// death) invalidate machine code another function is still advertising.
 const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
   auto* ctx =
       static_cast<jit::Context*>(cinderx::getModuleState()->jit_context.get());

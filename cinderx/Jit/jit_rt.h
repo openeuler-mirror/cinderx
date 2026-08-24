@@ -164,6 +164,11 @@ PyObject* JITRT_LoadGlobalModuleValue(
 // armed the site.  The subsequent Guard/AlwaysFail uses the same
 // DeoptMetadata, so forced and organic hits share one restore.
 int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
+
+// Write a local variable through to the current materialized frame's
+// localsplus slot (MR-08 frame observability; value may be nullptr for
+// DELETE_FAST).  Returns 0.
+uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
 #endif
 
 /*

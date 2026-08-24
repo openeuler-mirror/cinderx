@@ -41,6 +41,7 @@ extern "C" {
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -870,18 +871,20 @@ static bool should_snapshot(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  // The executing mode snapshots every non-terminator boundary.  The skip
-  // list below is a metadata-size optimization: replay-safe instructions
-  // do not need a resume point of their own.  The instrumentation polls
-  // change the calculus -- they live on boundaries, and a boundary without
-  // a snapshot is a boundary the poll pass cannot guard.  The gap is not
-  // theoretical: a value released at such a boundary (POP_TOP's operand,
-  // a STORE_FAST's previous value) runs its __del__ AFTER the last polled
-  // boundary, and a profile function registered there would never hear
-  // from the running frame again.  Metadata size is the wrong thing to
-  // save in a milestone whose subject is correctness.
+  // The executing mode writes local mutations through to the observable
+  // frame (JITRT_StoreFrameLocal311).  Releasing the slot's previous value
+  // can run arbitrary __del__ code, so the store is not replayable and its
+  // boundary needs its own resume point -- without one, bindGuards finds
+  // no dominating FrameState for a following guard.
   if (getConfig().state == State::kRunning) {
-    return true;
+    switch (bci.opcode()) {
+      case STORE_FAST:
+      case STORE_FAST_LOAD_FAST:
+      case STORE_FAST_STORE_FAST:
+        return true;
+      default:
+        break;
+    }
   }
 #endif
 
@@ -1289,18 +1292,86 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Instruction indices reachable from entry through normal control flow
+// only -- exactly the set buildHIR will translate.  Exception-handler
+// regions are reachable solely through the exception table, never enter
+// machine code (a raise exits through the UnhandledException deopt and
+// the anchored evaluator runs the handler), and therefore must not be
+// held to the machine-code whitelist.  Returns false if a jump targets
+// something that is not an instruction start (fail closed).
+bool collectNormalFlowReachable311(
+    BorrowedRef<PyCodeObject> code,
+    std::set<int>& reachable) {
+  BytecodeInstructionBlock bc_instrs{code};
+  std::unordered_map<int, BytecodeInstruction> at_index;
+  for (const auto& instr : bc_instrs) {
+    at_index.emplace(instr.baseIndex().value(), instr);
+  }
+  std::vector<int> worklist{0};
+  while (!worklist.empty()) {
+    int index = worklist.back();
+    worklist.pop_back();
+    if (!reachable.insert(index).second) {
+      continue;
+    }
+    auto it = at_index.find(index);
+    if (it == at_index.end()) {
+      return false;
+    }
+    const BytecodeInstruction& instr = it->second;
+    if (instr.isBranch()) {
+      worklist.push_back(instr.getJumpTarget().asIndex().value());
+    }
+    bool falls_through = !instr.isReturn() && instr.opcode() != RAISE_VARARGS &&
+        instr.opcode() != RERAISE && instr.opcode() != JUMP_FORWARD &&
+        instr.opcode() != JUMP_BACKWARD &&
+        instr.opcode() != JUMP_BACKWARD_NO_INTERRUPT &&
+        instr.opcode() != JUMP_ABSOLUTE;
+    if (falls_through) {
+      int next = instr.nextInstrOffset().asIndex().value();
+      if (at_index.contains(next)) {
+        worklist.push_back(next);
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+#endif
+
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
   // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
   // family (including LOAD_GLOBAL without a speculative cache Guard,
   // container builders used by CALL_FUNCTION_EX, MAKE_FUNCTION for
   // genexp call sites, LOAD_DEREF/LOAD_CLOSURE/COPY_FREE_VARS/MAKE_CELL
-  // for nested-function cells).  Still out: attr or subscript ICs,
-  // STORE_DEREF, the exception table, generator *bodies*.  The decoder
-  // yields unspecialized opcodes, so quickened forms cannot slip past.
+  // for nested-function cells) plus the MR-08 exception family.  The
+  // handler-body opcodes (PUSH_EXC_INFO, CHECK_EXC_MATCH, POP_EXCEPT,
+  // RERAISE, WITH_EXCEPT_START) are reachable only through the exception
+  // table, which HIR never translates.  RAISE_VARARGS,
+  // LOAD_ASSERTION_ERROR and BEFORE_WITH do run in normal flow and have
+  // translations.  Only normal-flow-reachable instructions are checked:
+  // an opcode that occurs solely inside a handler region executes in the
+  // interpreter after the deopt regardless of what it is, so holding it
+  // to the machine-code whitelist would refuse functions this milestone
+  // fully supports.  Still out (on the reachable surface): attr or
+  // subscript ICs, STORE_DEREF, generator *bodies*, except* and pattern
+  // matching (the latter two refused earlier by the whole-code translate
+  // scan, keeping their audited refusals).  The decoder yields
+  // unspecialized opcodes, so quickened forms cannot slip past.
+  std::set<int> reachable;
+  if (!collectNormalFlowReachable311(code, reachable)) {
+    return "REFUSE_SHAPE_EXECUTE_SURFACE";
+  }
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    if (!reachable.contains(bc_it->baseIndex().value())) {
+      continue;
+    }
     switch (bc_it->opcode()) {
+      case BEFORE_WITH:
       case BINARY_OP:
       case BUILD_CONST_KEY_MAP:
       case BUILD_LIST:
@@ -1309,6 +1380,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case BUILD_TUPLE:
       case CALL:
       case CALL_FUNCTION_EX:
+      case CHECK_EXC_MATCH:
       case COMPARE_OP:
       case CONTAINS_OP:
       case COPY:
@@ -1327,6 +1399,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case LIST_APPEND:
       case LIST_EXTEND:
       case LIST_TO_TUPLE:
+      case LOAD_ASSERTION_ERROR:
       case LOAD_CLOSURE:
       case LOAD_CONST:
       case LOAD_DEREF:
@@ -1343,11 +1416,15 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case POP_JUMP_BACKWARD_IF_TRUE:
       case POP_JUMP_FORWARD_IF_FALSE:
       case POP_JUMP_FORWARD_IF_NONE:
+      case POP_EXCEPT:
       case POP_JUMP_FORWARD_IF_NOT_NONE:
       case POP_JUMP_FORWARD_IF_TRUE:
       case POP_TOP:
       case PRECALL:
+      case PUSH_EXC_INFO:
       case PUSH_NULL:
+      case RAISE_VARARGS:
+      case RERAISE:
       case RESUME:
       case RETURN_VALUE:
       case SET_ADD:
@@ -1359,6 +1436,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case UNARY_POSITIVE:
       case UNPACK_EX:
       case UNPACK_SEQUENCE:
+      case WITH_EXCEPT_START:
         break;
       default:
         return "REFUSE_SHAPE_EXECUTE_SURFACE";
@@ -1689,6 +1767,14 @@ void HIRBuilder::translate(
         JIT_DCHECK(
             tc.frame.stack.isEmpty(),
             "entry guards inserted with non-empty operand stack");
+        // Entry setup is done: arguments are bound and the cell slots
+        // hold their cells, so this is where the frame's observable
+        // localsplus gets its entry snapshot (executing mode, 3.11).
+        // This must precede the annotation guards: their Snapshot is the
+        // dominating FrameState for the instructions that follow, and the
+        // write-through calls are not replayable, so placing them after
+        // the guards would leave that stretch with no resume point.
+        emitLocalsplusWriteback311(tc);
         if (tc.frame.stack.isEmpty()) {
           emitted_entry_guards = emitTypeAnnotationGuards(tc);
         }
@@ -2368,8 +2454,19 @@ void HIRBuilder::translate(
         case DELETE_FAST: {
           int var_idx = bc_instr.oparg();
           Register* var = tc.frame.localsplus[var_idx];
+#if PY_VERSION_HEX < 0x030C0000
+          // Stock raises UnboundLocalError when the slot is already
+          // empty (the interpreter's DELETE_FAST checks before
+          // clearing); the uninitialized-local TNullptr reaching
+          // definition makes this branch compilable, so without the
+          // check a `del x` on an unbound local would silently succeed.
+          // Gated to 3.11: the 3.12+ translation keeps its existing
+          // shape for reference-line neutrality.
+          tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
+#endif
           moveOverwrittenStackRegisters(tc, var);
           tc.emit<LoadConst>(var, TNullptr);
+          emitStoreFrameLocal311(tc, var_idx, var);
           break;
         }
 #if PY_VERSION_HEX >= 0x030C0000
@@ -5533,6 +5630,61 @@ void HIRBuilder::moveOverwrittenStackRegisters(
     }
   }
 }
+// MR-08 frame observability (3.11, executing mode): the materialized
+// _PyInterpreterFrame is what sys._getframe() / frame.f_locals /
+// sys._current_frames() readers see while machine code runs.  Stock 3.11
+// keeps localsplus current at every store, so mirror that: seed the frame
+// with the entry bindings (arguments and cells) once the entry setup is
+// done, and write every STORE_FAST / DELETE_FAST through.  Values keep
+// living in registers for computation; the frame's copy is for observers,
+// owned by the frame and released by the existing clear paths
+// (JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear).
+void HIRBuilder::emitStoreFrameLocal311(
+    [[maybe_unused]] TranslationContext& tc,
+    [[maybe_unused]] int idx,
+    [[maybe_unused]] Register* value) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  Register* idx_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      idx_reg, Type::fromCUInt(static_cast<uint64_t>(idx), TCUInt64));
+  Register* out = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      2, out, reinterpret_cast<void*>(JITRT_StoreFrameLocal311), TCUInt64);
+  call->SetOperand(0, idx_reg);
+  call->SetOperand(1, value);
+#endif
+}
+
+void HIRBuilder::emitLocalsplusWriteback311(
+    [[maybe_unused]] TranslationContext& tc) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  bool emitted = false;
+  for (std::size_t i = 0; i < tc.frame.localsplus.size(); i++) {
+    Register* value = tc.frame.localsplus[i];
+    if (value == nullptr || value->isA(TNullptr)) {
+      // Unbound slots are already null in the frame.
+      continue;
+    }
+    emitStoreFrameLocal311(tc, static_cast<int>(i), value);
+    emitted = true;
+  }
+  if (emitted) {
+    // The write-through calls are not replayable, so any Snapshot before
+    // them no longer dominates what follows; re-establish the resume
+    // point here.  The boundary logic reuses a trailing Snapshot in
+    // place, which would otherwise leave the stretch up to the next
+    // boundary with no FrameState for bindGuards to bind.
+    tc.emitSnapshot();
+  }
+#endif
+}
+
 void HIRBuilder::emitStoreFast(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
@@ -5541,6 +5693,7 @@ void HIRBuilder::emitStoreFast(
   JIT_DCHECK(dst != nullptr, "no register");
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, bc_instr.oparg(), dst);
 }
 
 void HIRBuilder::emitStoreFastStoreFast(
@@ -5560,11 +5713,16 @@ void HIRBuilder::emitStoreFastStoreFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // Stock executes the fused superinstruction as two SETLOCALs in order:
+  // the first slot's write-through (and its old-value release, which can
+  // run reentrant code) completes before the second store begins.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   src = tc.frame.stack.pop();
   dst = tc.frame.localsplus[var_idx2];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, var_idx2, dst);
 }
 
 void HIRBuilder::emitStoreFastLoadFast(
@@ -5584,6 +5742,10 @@ void HIRBuilder::emitStoreFastLoadFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // The fused store's write-through (and old-value release) completes
+  // before the load half runs, matching stock's SETLOCAL-then-GETLOCAL
+  // order.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   Register* var = tc.frame.localsplus[var_idx2];
   tc.frame.stack.push(var);
