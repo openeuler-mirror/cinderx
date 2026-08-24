@@ -46,7 +46,14 @@ import sys
 import textwrap
 
 from ci_pipeline.jit311.lifecycle_snapshot import CAPACITY_PATHS, value_at
-from ci_pipeline.jit311.lifecycle_discovery import LifecycleDiscoveryRunner
+from ci_pipeline.jit311.execution_acceptance import ExecutionAcceptanceRunner
+import hashlib
+
+# The frozen runtime-transition evidence was recorded under its
+# campaign-era schema; these literals validate that historical material
+# and are exempt from the semantic-naming lint.
+HISTORICAL_TRANSITION_FREEZE_MARKER = "A2 FROZEN"  # naming-lint: allow
+HISTORICAL_TRANSITION_FREEZE_KEY = "a2_freeze"  # naming-lint: allow
 
 
 CASES = ("LIFECYCLE_OWNERSHIP", "SHUTDOWN_STABILITY", "NATIVE_MEMORY_SAFETY")
@@ -326,21 +333,160 @@ def apply_acceptance_policy(result: dict) -> dict:
     return result
 
 
-class LifecycleAcceptanceRunner(LifecycleDiscoveryRunner):
+class LifecycleAcceptanceRunner:
     def __init__(
         self,
         *,
+        wheel: Path,
+        source: Path,
+        output: Path,
+        jobs: int,
+        timeout: int,
+        transition_report: Path | None,
+        transition_result: Path | None,
         asan_build: Path | None,
         stdlib_regression: str,
         regression_base: str | None,
         cases: set[str],
-        **kwargs,
     ) -> None:
-        super().__init__(lanes=set(), **kwargs)
+        self.base = ExecutionAcceptanceRunner(
+            wheel=wheel,
+            source=source,
+            output=output,
+            lanes=set(),
+            jobs=jobs,
+            timeout=timeout,
+        )
+        self.transition_report = transition_report.resolve() if transition_report else None
+        self.transition_result = transition_result.resolve() if transition_result else None
+        self.command_failures: list[str] = []
         self.asan_build = asan_build.resolve() if asan_build else None
         self.stdlib_regression = stdlib_regression
         self.regression_base = regression_base
         self.cases = cases
+
+    @property
+    def output(self) -> Path:
+        return self.base.output
+
+    def _json(self, path: Path) -> dict | None:
+        return self.base._json(path)
+
+    def _frozen_transition(self) -> dict:
+        policy_path = self.base.stage / "ci_pipeline/jit311/data/lifecycle_transition_prerequisite.json"
+        policy = json.loads(policy_path.read_text())
+        frozen = policy["transition_frozen_commit"]
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", frozen, "HEAD"],
+            cwd=self.base.source,
+        ).returncode == 0
+        # The freeze pins historical evidence, not present-day file names:
+        # every frozen source is read back from the frozen commit itself, so
+        # renaming a file later never counts as touching the frozen surface.
+        source_hashes = {}
+        source_errors = []
+        for relative, expected in policy["frozen_source_files"].items():
+            shown = subprocess.run(
+                ["git", "show", f"{frozen}:{relative}"],
+                cwd=self.base.source,
+                capture_output=True,
+            )
+            if shown.returncode != 0:
+                source_hashes[relative] = None
+                source_errors.append(
+                    f"frozen transition source missing from the frozen commit: {relative}"
+                )
+                continue
+            actual = hashlib.sha256(shown.stdout).hexdigest()
+            source_hashes[relative] = actual
+            if actual != expected:
+                source_errors.append(
+                    f"frozen transition source changed at the frozen commit: {relative}"
+                )
+        evidence = {
+            "result": "PASS",
+            "policy": policy,
+            "frozen_commit_is_ancestor": ancestry,
+            "frozen_source_sha256": source_hashes,
+            "external_report": None,
+            "external_result": None,
+            "errors": source_errors,
+        }
+        if not ancestry:
+            evidence["errors"].append(
+                "transition frozen commit is not an ancestor of source HEAD"
+            )
+        for supplied, key, expected_key in (
+            (self.transition_report, "external_report", "canonical_report_sha256"),
+            (self.transition_result, "external_result", "canonical_result_sha256"),
+        ):
+            if supplied is None:
+                continue
+            if not supplied.is_file():
+                evidence["errors"].append(f"transition evidence file is missing: {supplied}")
+                continue
+            digest = hashlib.sha256(supplied.read_bytes()).hexdigest()
+            evidence[key] = {"path": str(supplied), "sha256": digest}
+            if digest != policy[expected_key]:
+                evidence["errors"].append(f"transition evidence digest mismatch: {supplied}")
+        if self.transition_report is not None:
+            text = self.transition_report.read_text(errors="replace")
+            if (
+                HISTORICAL_TRANSITION_FREEZE_MARKER not in text
+                or "PASS_WITH_APPROVED_DEVIATIONS" not in text
+            ):
+                evidence["errors"].append(
+                    "external transition report lacks exact frozen/result markers"
+                )
+        if self.transition_result is not None:
+            result_doc = self._json(self.transition_result)
+            if (
+                not result_doc
+                or result_doc.get(HISTORICAL_TRANSITION_FREEZE_KEY)
+                != HISTORICAL_TRANSITION_FREEZE_MARKER
+            ):
+                evidence["errors"].append(
+                    "external transition result lacks the frozen marker"
+                )
+        if evidence["errors"]:
+            evidence["result"] = "FAIL"
+        (self.output / "transition_frozen_prerequisite.json").write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+        )
+        return evidence
+
+    def _run_prerequisite(self) -> dict | None:
+        directory = self.output / "prerequisite"
+        directory.mkdir()
+        out = directory / "result.json"
+        rc = self.base._run(
+            "10-lifecycle-prerequisite",
+            [
+                str(self.base.python),
+                "-m",
+                "ci_pipeline.jit311.lifecycle_prerequisite",
+                "--out",
+                str(out),
+            ],
+            env=self.base._product_env(threshold="1000000"),
+        )
+        result = self._json(out)
+        if rc != 0 and result is None:
+            self.command_failures.append("lifecycle prerequisite probe produced no result")
+        return result
+
+    def _churn_env(self, scenario: str) -> dict[str, str]:
+        env = self.base._product_env(threshold="1000000")
+        env["PYTHONMALLOC"] = "debug"
+        if scenario == "C2":
+            env.pop("PYTHONJITAUTO", None)
+            env["PYTHONJITALL"] = "1"
+        if scenario == "C8":
+            env.update(
+                PYTHONJITMULTITHREADEDCOMPILETEST="1",
+                PYTHONJITBATCHCOMPILEWORKERS="4",
+            )
+        return env
 
     # -- probes ----------------------------------------------------------
 

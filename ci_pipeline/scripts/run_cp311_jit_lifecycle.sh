@@ -6,4 +6,4 @@ repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 python_bin="${A3_PYTHON:-python3.11}"
 
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
-exec "${python_bin}" -m ci_pipeline.jit311.lifecycle_discovery "$@"
+exec "${python_bin}" -m ci_pipeline.jit311.lifecycle_acceptance "$@"
