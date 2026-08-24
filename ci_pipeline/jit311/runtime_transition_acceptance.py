@@ -16,24 +16,7 @@ from ci_pipeline.jit311.runtime_transition_report import (
     compare_penetration,
     compare_recursion_boundary,
     judge_transitions,
-    render_frame_position_report,
-    render_footprint_deviation_proof_final,
     render_markdown,
-    render_native_recursion_boundary_report,
-    render_policy_footprint_report,
-    render_recursion_boundary_report,
-)
-
-OLD_THRESHOLD1_GAPS = (
-    "test_cprofile",
-    "test_dataclasses",
-    "test_extcall",
-    "test_genexps",
-    "test_import",
-    "test_listcomps",
-    "test_metaclass",
-    "test_unpack",
-    "test_unpack_ex",
 )
 
 ADAPTIVE_DEVIATIONS = {
@@ -188,288 +171,6 @@ def validate_approved_deviations(penetration: dict, repetition: dict) -> dict:
     }
 
 
-def _coverage_count(report: dict, status: str) -> int:
-    return int(report.get("counts", {}).get(status, 0))
-
-
-def _short_gap_reason(row: dict) -> str:
-    events = row.get("own_scheduler_events", [])
-    installed = [event for event in events if event.get("result") == "installed"]
-    if installed and not row.get("machine_entry_proven"):
-        return "artifact published on the last observed call; no later own-code call entered it"
-    if not events:
-        return "no own function reached the scheduler threshold"
-    results = ", ".join(
-        f"{name}={count}"
-        for name, count in sorted(row.get("compile_results", {}).items())
-    )
-    return f"own scheduler attempts were refused ({results})"
-
-
-def render_penetration_v02(result: dict, path: Path) -> None:
-    control = result["control_coverage"]
-    aggressive = result["aggressive_coverage"]
-    diagnostic = result["threshold1_diagnostic_coverage"]
-    differential = result["differential"]
-    gaps = {
-        name: row
-        for name, row in aggressive.get("modules", {}).items()
-        if row.get("status") == "A2_COVERAGE_GAP"
-    }
-    thresholds = sorted(
-        {
-            row.get("scheduler_threshold")
-            for row in aggressive.get("modules", {}).values()
-            if row.get("scheduler_threshold") is not None
-        }
-    )
-    bad_module_states = {
-        name: state
-        for name, state in aggressive.get("test_modules", {}).items()
-        if state in {"crash", "no_result"}
-    }
-    lines = [
-        "# CPython 3.11 JIT Autocompile Penetration v0.2",
-        "",
-        f"- Gate result: `{result['result']}`",
-        f"- Target modules: `{aggressive.get('target_modules', 0)}`",
-        f"- P1 threshold=50 own-code JIT: `{_coverage_count(control, 'OWN_CODE_JIT')}/72`",
-        f"- P2 `PYTHONJITALL=1` own-code JIT: `{_coverage_count(aggressive, 'OWN_CODE_JIT')}/72`",
-        f"- P2-DIAG threshold=1 own-code JIT: `{_coverage_count(diagnostic, 'OWN_CODE_JIT')}/72`",
-        f"- P2 worker JIT active: `{aggressive.get('totals', {}).get('worker_jit_active', 0)}/72`",
-        f"- P2 coverage gaps: `{len(gaps)}`",
-        f"- Unknown refusals: `{len(aggressive.get('unknown_refusals', []))}`",
-        f"- Entry-ledger dropped: `{aggressive.get('totals', {}).get('ledger_dropped', 0)}`",
-        f"- Scheduler threshold observed under JIT-ALL: `{thresholds}`",
-        "",
-        "## Gate conclusion",
-        "",
-    ]
-    if thresholds == [50]:
-        lines.extend(
-            [
-                "The formal P2 process received `PYTHONJITALL=1`, but the CPython 3.11 "
-                "frame-entry scheduler reported threshold 50 in every worker. The JIT "
-                "configuration and the 3.11 scheduler configuration are therefore not "
-                "aligned: this lane does not currently implement the requested first-call "
-                "JIT-ALL experiment.",
-                "",
-                "Per the runtime-transition v0.2 Phase-1 boundary, this report records the mismatch as a "
-                "product scheduler/configuration blocker and does not change product JIT "
-                "semantics.",
-            ]
-        )
-    else:
-        lines.append(
-            "The recorded scheduler thresholds must be reviewed together with the coverage gaps."
-        )
-    lines.extend(
-        [
-            "",
-            "## Nine previous threshold=1 gaps",
-            "",
-            "| Module | threshold=1 now | JIT-ALL now | Attribution effect | Root cause |",
-            "|---|---:|---:|---|---|",
-        ]
-    )
-    for name in OLD_THRESHOLD1_GAPS:
-        diag_row = diagnostic.get("modules", {}).get(name, {})
-        jit_all_row = aggressive.get("modules", {}).get(name, {})
-        diag_ok = diag_row.get("status") == "OWN_CODE_JIT"
-        jit_all_ok = jit_all_row.get("status") == "OWN_CODE_JIT"
-        package_root = bool(diag_row.get("ownership", {}).get("package_roots"))
-        attribution = (
-            "fixed old suffix false-negative"
-            if package_root and diag_ok
-            else "not an attribution gap"
-        )
-        reason = (
-            "package ownership correction" if diag_ok else _short_gap_reason(diag_row)
-        )
-        lines.append(
-            f"| `{name}` | {'yes' if diag_ok else 'no'} | "
-            f"{'yes' if jit_all_ok else 'no'} | {attribution} | {reason} |"
-        )
-    lines.extend(
-        [
-            "",
-            "Package attribution alone fixes `test_dataclasses` and `test_import` in "
-            "the threshold=1 diagnostic. The remaining seven threshold=1 gaps publish "
-            "on their final own-code call (or are refused) and have no subsequent "
-            "machine-code entry. Moving from threshold=1 to the current JIT-ALL lane "
-            "fixes none of the nine because the 3.11 scheduler actually uses 50.",
-            "",
-            "## P2 gap evidence",
-            "",
-            "| Module | Ownership | Own functions | Scheduler events | Calls | Verdicts | Artifact | Machine entry |",
-            "|---|---|---|---:|---:|---|---:|---:|",
-        ]
-    )
-    for name, row in sorted(gaps.items()):
-        ownership = row.get("ownership", {})
-        roots = [ownership.get("module_file")] + list(
-            ownership.get("package_roots", [])
-        )
-        roots_text = "<br>".join(f"`{root}`" for root in roots if root) or "missing"
-        functions = row.get("observed_own_functions", [])
-        functions_text = "<br>".join(f"`{item}`" for item in functions) or "none"
-        verdicts = (
-            ", ".join(
-                f"{key}={value}"
-                for key, value in sorted(row.get("compile_results", {}).items())
-            )
-            or "none"
-        )
-        lines.append(
-            f"| `{name}` | {roots_text} | {functions_text} | "
-            f"{len(row.get('own_scheduler_events', []))} | "
-            f"{row.get('observed_call_count', 0)} | {verdicts} | "
-            f"{'yes' if row.get('artifact_installed') else 'no'} | "
-            f"{'yes' if row.get('machine_entry_proven') else 'no'} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## Differential and runtime integrity",
-            "",
-            f"- Stock vs JIT-ALL testcase differences: `{len(differential.get('differences', {}))}`",
-            f"- Unexpected differences: `{len(differential.get('unexpected', {}))}`",
-            f"- Stale approved candidates: `{len(differential.get('stale_baseline', {}))}`",
-            f"- New crash/hang/no-result modules: `{json.dumps(bad_module_states, sort_keys=True)}`",
-            f"- Differential result: `{differential.get('result')}`",
-            "",
-            "The former threshold=1 superinstruction candidates do not reproduce "
-            "under JIT-ALL and were removed from the formal runtime-transition v0.2 deviation input. "
-            "No new baseline entry is created.",
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines))
-
-
-def render_jitall_scheduler_report(result: dict, path: Path) -> None:
-    aggressive = result["aggressive_coverage"]
-    diagnostic = result["threshold1_diagnostic_coverage"]
-    differential = result["differential"]
-    config = result["jitall_config_matrix"]
-    gaps = {
-        name: row
-        for name, row in aggressive.get("modules", {}).items()
-        if row.get("status") == "COVERAGE_GAP"
-    }
-    counts = aggressive.get("counts", {})
-    thresholds = sorted(
-        {
-            row.get("scheduler_threshold")
-            for row in aggressive.get("modules", {}).values()
-            if row.get("scheduler_threshold") is not None
-        }
-    )
-    bad_modules = {
-        name: state
-        for name, state in aggressive.get("test_modules", {}).items()
-        if state in {"crash", "no_result"}
-    }
-    lines = [
-        "# CPython 3.11 Autocompile Scheduler Report",
-        "",
-        f"- Gate result: `{result['result']}`",
-        f"- Config matrix: `{config.get('result')}`",
-        f"- Target modules: `{aggressive.get('target_modules')}`",
-        f"- Classified modules: `{aggressive.get('classified_modules')}/72`",
-        f"- OWN_CODE_JIT: `{counts.get('OWN_CODE_JIT', 0)}`",
-        f"- PUBLISHED_NO_REENTRY: `{counts.get('PUBLISHED_NO_REENTRY', 0)}`",
-        f"- EXPECTED_SAFE_REFUSAL: `{counts.get('EXPECTED_SAFE_REFUSAL', 0)}`",
-        f"- COVERAGE_GAP: `{counts.get('COVERAGE_GAP', 0)}`",
-        f"- Actual own-code machine entry: `{aggressive.get('totals', {}).get('actual_own_code_machine_entry_modules', 0)}/72`",
-        f"- Unknown refusals: `{len(aggressive.get('unknown_refusals', []))}`",
-        f"- Entry-ledger dropped: `{aggressive.get('totals', {}).get('ledger_dropped', 0)}`",
-        f"- Scheduler events dropped: `{aggressive.get('totals', {}).get('events_dropped', 0)}`",
-        f"- Observed JIT-ALL scheduler thresholds: `{thresholds}`",
-        "",
-        "## Threshold resolution contract",
-        "",
-        "| Case | Environment | Shared threshold | Scheduler threshold | Mode | Result |",
-        "|---|---|---:|---:|---|---|",
-    ]
-    for name, row in config.get("cases", {}).items():
-        payload = row.get("payload") or {}
-        expected_failure = name in {
-            "invalid_jitauto",
-            "unsupported_auto_classifier",
-        }
-        passed = (
-            row.get("returncode") != 0
-            if expected_failure
-            else row.get("returncode") == 0
-        )
-        lines.append(
-            f"| `{name}` | `{json.dumps(row.get('environment', {}), sort_keys=True)}` | "
-            f"`{payload.get('shared_threshold')}` | "
-            f"`{payload.get('observe_threshold')}` | "
-            f"`{payload.get('observe_mode')}` | {'PASS' if passed else 'FAIL'} |"
-        )
-    lines.extend(
-        [
-            "",
-            "The shared FlagProcessor remains the execute/shadow oracle. It processes "
-            "JIT-ALL first and JITAUTO second, so JITAUTO=7 overrides JIT-ALL=1. "
-            "The final resolved value is published to the 3.11 frame scheduler; "
-            "PYTHONJITDISABLE still resolves execute mode to off.",
-            "",
-            "With neither JITALL nor JITAUTO set, the scheduler's effective default "
-            "is 50 while `compile_after_n_calls` remains unset. This is deliberate: "
-            "the implicit observation default must not masquerade as an explicit "
-            "Auto-JIT policy and arm ROI backoff for force-compiled functions.",
-            "",
-            "Threshold zero means the first observed frame schedules and publishes. "
-            "It does not replace the already-running interpreted frame; a one-call "
-            "function may therefore be PUBLISHED_NO_REENTRY.",
-            "",
-            "## Historical threshold=1 gaps",
-            "",
-            "| Module | threshold=1 machine entry | Final JIT-ALL class | Events | Verdicts |",
-            "|---|---:|---|---:|---|",
-        ]
-    )
-    for name in OLD_THRESHOLD1_GAPS:
-        diag = diagnostic.get("modules", {}).get(name, {})
-        final = aggressive.get("modules", {}).get(name, {})
-        lines.append(
-            f"| `{name}` | {'yes' if diag.get('status') == 'OWN_CODE_JIT' else 'no'} | "
-            f"`{final.get('status')}` | {len(final.get('own_scheduler_events', []))} | "
-            f"`{json.dumps(final.get('compile_results', {}), sort_keys=True)}` |"
-        )
-    lines.extend(
-        [
-            "",
-            "## Remaining coverage gaps",
-            "",
-        ]
-    )
-    if not gaps:
-        lines.append("No COVERAGE_GAP remains.")
-    for name, row in sorted(gaps.items()):
-        lines.append(
-            f"- `{name}` ownership={json.dumps(row.get('ownership', {}), sort_keys=True)} "
-            f"events={json.dumps(row.get('own_scheduler_events', []), sort_keys=True)}"
-        )
-    lines.extend(
-        [
-            "",
-            "## Semantic and runtime integrity",
-            "",
-            f"- Stock vs JIT-ALL testcase differences: `{len(differential.get('differences', {}))}`",
-            f"- Unexpected differences: `{len(differential.get('unexpected', {}))}`",
-            f"- Approved exact deviations used: `{len(differential.get('approved_deviations', []))}`",
-            f"- Differential result: `{differential.get('result')}`",
-            f"- Crash/hang/no-result modules: `{json.dumps(bad_modules, sort_keys=True)}`",
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines))
-
-
 def published_no_reentry_proof(aggressive: dict) -> dict:
     rows = []
     errors = []
@@ -514,44 +215,6 @@ def published_no_reentry_proof(aggressive: dict) -> dict:
         "count": len(rows),
         "errors": errors,
     }
-
-
-def render_published_no_reentry_proof(proof: dict, path: Path) -> None:
-    lines = [
-        "# CPython 3.11 PUBLISHED_NO_REENTRY Proof",
-        "",
-        f"- Result: `{proof.get('result')}`",
-        f"- Modules: `{proof.get('count')}`",
-        "",
-        "| Module | Own function | Scheduler event / publication call | Machine entries | Post-publication interpreted frames | Result |",
-        "|---|---|---|---:|---:|---|",
-    ]
-    for row in proof.get("modules", []):
-        functions = "<br>".join(
-            f"`{name}`" for name in row.get("functions", []) if name
-        )
-        events = "<br>".join(
-            f"`{event.get('result')}@{event.get('count')}`"
-            for event in row.get("publication_events", [])
-        )
-        lines.append(
-            f"| `{row['module']}` | {functions or 'none'} | {events or 'none'} | "
-            f"{row.get('machine_entries')} | "
-            f"{row.get('post_publication_interpreted_frames')} | "
-            f"`{row.get('result')}` |"
-        )
-    lines.extend(
-        [
-            "",
-            "Every listed code object published successfully at threshold 0, "
-            "had no own-code machine entry opportunity, and recorded zero later "
-            "interpreter frames after publication.",
-            "",
-            f"- Errors: `{json.dumps(proof.get('errors', []), sort_keys=True)}`",
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines))
 
 
 class RuntimeTransitionAcceptanceRunner:
@@ -676,57 +339,30 @@ class RuntimeTransitionAcceptanceRunner:
         )
 
     def run_autocompile_coverage(self) -> dict:
+        """The autocompile case proper: the whole-program arm.
+
+        The execution smoke, the threshold-50 stdlib arm and the adaptive
+        specialization proof all have their own formal cases (EXECUTION_SMOKE,
+        STDLIB_AUTOJIT_REGRESSION, SPECIALIZATION_CONFORMANCE); this case
+        proves only what nothing else owns -- the scheduler configuration
+        contract, the whole-program JITALL arm with its three-state
+        classification and publication-reentry proof, and the stock semantic
+        oracle it is compared against.
+        """
         directory = self.output / "AUTOCOMPILE_COVERAGE"
         directory.mkdir()
         stock = directory / "p0-stock"
-        control = directory / "p1-threshold50"
         aggressive = directory / "p2-jit-all"
-        diagnostic = directory / "p2-diag-threshold1"
-        control_journal = directory / "p1-journal"
         aggressive_journal = directory / "p2-journal"
-        diagnostic_journal = directory / "p2-diag-journal"
-        control_journal.mkdir()
         aggressive_journal.mkdir()
-        diagnostic_journal.mkdir()
-        control_startup = directory / "p1-startup"
         aggressive_startup = directory / "p2-startup"
-        diagnostic_startup = directory / "p2-diag-startup"
-        control_startup.mkdir()
         aggressive_startup.mkdir()
-        diagnostic_startup.mkdir()
-        sitecustomize = "from ci_pipeline.jit311 import autocompile_penetration\n"
-        (control_startup / "sitecustomize.py").write_text(sitecustomize)
-        (aggressive_startup / "sitecustomize.py").write_text(sitecustomize)
-        (diagnostic_startup / "sitecustomize.py").write_text(sitecustomize)
+        (aggressive_startup / "sitecustomize.py").write_text(
+            "from ci_pipeline.jit311 import autocompile_penetration\n"
+        )
 
-        execution_summary = directory / "execution-threshold50-smoke.json"
-        rc_a1 = self.base._run(
-            "10-execution-prerequisite",
-            [
-                str(self.base.python),
-                "-m",
-                "ci_pipeline.jit311.execution_smoke",
-                "--expect-mode",
-                "execute",
-                "--out",
-                str(execution_summary),
-            ],
-            env=self.base._product_env(threshold="50"),
-        )
-        config_probe_path = directory / "jitall-config-matrix.json"
-        rc_config_probe = self.base._run(
-            "11-autocompile-config-probe",
-            [
-                str(self.base.python),
-                "-m",
-                "ci_pipeline.jit311.autocompile_config_probe",
-                "--out",
-                str(config_probe_path),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
-        )
         rc_config_ut = self.base._run(
-            "12-autocompile-config-ut",
+            "11-autocompile-config-ut",
             [
                 str(self.base.python),
                 "-m",
@@ -740,15 +376,6 @@ class RuntimeTransitionAcceptanceRunner:
             env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
         )
         rc0 = self.base._run("20-autocompile-stock", self._arm_command(out=stock))
-        rc1 = self.base._run(
-            "21-autocompile-threshold50",
-            self._arm_command(
-                out=control,
-                threshold=50,
-                startup=control_startup,
-                journal=control_journal,
-            ),
-        )
         rc2 = self.base._run(
             "22-autocompile-jit-all",
             self._arm_command(
@@ -758,24 +385,7 @@ class RuntimeTransitionAcceptanceRunner:
                 journal=aggressive_journal,
             ),
         )
-        rc2_diag = self.base._run(
-            "22D-autocompile-threshold1-diagnostic",
-            self._arm_command(
-                out=diagnostic,
-                threshold=1,
-                startup=diagnostic_startup,
-                journal=diagnostic_journal,
-            ),
-        )
-        control_coverage = directory / "p1-coverage.json"
         aggressive_coverage = directory / "p2-coverage.json"
-        diagnostic_coverage = directory / "p2-diag-coverage.json"
-        rc_control_coverage = self._classify_penetration(
-            "23-autocompile-coverage",
-            control_journal,
-            control / "result.json",
-            control_coverage,
-        )
         rc_aggressive_coverage = self._classify_penetration(
             "24-autocompile-coverage",
             aggressive_journal,
@@ -783,12 +393,6 @@ class RuntimeTransitionAcceptanceRunner:
             aggressive_coverage,
             stock_result=stock / "result.json",
             jit_all_contract=True,
-        )
-        rc_diagnostic_coverage = self._classify_penetration(
-            "24D-autocompile-threshold1-coverage",
-            diagnostic_journal,
-            diagnostic / "result.json",
-            diagnostic_coverage,
         )
         differential = compare_penetration(
             stock / "result.json",
@@ -799,6 +403,12 @@ class RuntimeTransitionAcceptanceRunner:
         (directory / "p0-vs-p2.json").write_text(
             json.dumps(differential, indent=2, sort_keys=True) + "\n"
         )
+        # The adaptive disassembly pair in the frozen deviation register is
+        # approved only against this probe's semantic-equivalence checks
+        # under the whole-program environment; the execution domain runs
+        # the same module for a different question (dis classification
+        # under the threshold scheduler), so this is evidence, not a
+        # duplicate.
         semantic_probe_path = directory / "adaptive-semantic-probe.json"
         rc_semantic_probe = self.base._run(
             "25-autocompile-adaptive-probe",
@@ -811,29 +421,19 @@ class RuntimeTransitionAcceptanceRunner:
             ],
             env=self._jit_all_env(),
         )
-        control_report = json.loads(control_coverage.read_text())
-        aggressive_report = json.loads(aggressive_coverage.read_text())
-        diagnostic_report = json.loads(diagnostic_coverage.read_text())
         semantic_probe = json.loads(semantic_probe_path.read_text())
+        aggressive_report = json.loads(aggressive_coverage.read_text())
         stock_result = json.loads((stock / "result.json").read_text())
-        control_result = json.loads((control / "result.json").read_text())
-        control_modules_ok = all(
-            value == "pass" for value in control_result.get("modules", {}).values()
-        )
         stock_modules_ok = all(
             value == "pass" for value in stock_result.get("modules", {}).values()
         )
         good = (
-            rc_a1 == 0
-            and rc_config_probe == 0
-            and rc_config_ut == 0
+            rc_config_ut == 0
             and rc0 == 0
-            and rc1 == 0
             and rc2 == 0
             and rc_aggressive_coverage == 0
             and rc_semantic_probe == 0
             and stock_modules_ok
-            and control_modules_ok
             and aggressive_report["result"] == "PASS"
             and differential["result"] in PASS_STATES
             and semantic_probe["result"] == "PASS"
@@ -844,25 +444,15 @@ class RuntimeTransitionAcceptanceRunner:
                 if good and differential["differences"]
                 else "PASS" if good else "FAIL"
             ),
-            "execution_prerequisite": json.loads(execution_summary.read_text()),
-            "jitall_config_matrix": json.loads(config_probe_path.read_text()),
             "stock_result": stock_result,
-            "control_result": control_result,
-            "control_coverage": control_report,
             "aggressive_coverage": aggressive_report,
-            "threshold1_diagnostic_coverage": diagnostic_report,
             "differential": differential,
             "adaptive_semantic_probe": semantic_probe,
             "commands": {
-                "p0": rc0,
-                "config_probe": rc_config_probe,
                 "config_ut": rc_config_ut,
-                "p1": rc1,
+                "p0": rc0,
                 "p2": rc2,
-                "p2_diag": rc2_diag,
-                "p1_coverage": rc_control_coverage,
                 "p2_coverage": rc_aggressive_coverage,
-                "p2_diag_coverage": rc_diagnostic_coverage,
             },
         }
         result["published_no_reentry_proof"] = published_no_reentry_proof(
@@ -871,45 +461,44 @@ class RuntimeTransitionAcceptanceRunner:
         (directory / "result.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n"
         )
-        render_jitall_scheduler_report(
-            result, self.output / "CP311_JIT_AUTOCOMPILE_SCHEDULER_REPORT.md"
-        )
-        render_published_no_reentry_proof(
-            result["published_no_reentry_proof"],
-            self.output / "A2_PUBLISHED_NO_REENTRY_PROOF.md",
-        )
         return result
 
     def run_state_transitions(self) -> dict:
         directory = self.output / "STATE_TRANSITION"
         directory.mkdir()
+        def dual_probe(number, tag, module, stock_out, jit_out):
+            rc_probe_stock = self.base._run(
+                f"{number}-{tag}-stock",
+                [
+                    str(self.base.python),
+                    "-m",
+                    module,
+                    "--mode",
+                    "stock",
+                    "--out",
+                    str(stock_out),
+                ],
+                env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+            )
+            rc_probe_jit = self.base._run(
+                f"{number}-{tag}-jit",
+                [
+                    str(self.base.python),
+                    "-m",
+                    module,
+                    "--mode",
+                    "jit",
+                    "--out",
+                    str(jit_out),
+                ],
+                env=self.base._product_env(threshold="1"),
+            )
+            return rc_probe_stock, rc_probe_jit
+
         stock = directory / "stock.json"
         jit = directory / "jit.json"
-        rc_stock = self.base._run(
-            "30-transition-stock",
-            [
-                str(self.base.python),
-                "-m",
-                "ci_pipeline.jit311.state_transition_probe",
-                "--mode",
-                "stock",
-                "--out",
-                str(stock),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
-        )
-        rc_jit = self.base._run(
-            "31-transition-threshold1",
-            [
-                str(self.base.python),
-                "-m",
-                "ci_pipeline.jit311.state_transition_probe",
-                "--mode",
-                "jit",
-                "--out",
-                str(jit),
-            ],
-            env=self.base._product_env(threshold="1"),
+        rc_stock, rc_jit = dual_probe(
+            "30", "transition", "ci_pipeline.jit311.state_transition_probe", stock, jit
         )
         tracing_regression_path = directory / "tracing-regression.json"
         rc_tracing_regression = self.base._run(
@@ -927,59 +516,19 @@ class RuntimeTransitionAcceptanceRunner:
         running_jit = directory / "frame-position-jit.json"
         error_stock = directory / "error-position-stock.json"
         error_jit = directory / "error-position-jit.json"
-        probe_module = "ci_pipeline.jit311.frame_position_probe"
-        error_module = "ci_pipeline.jit311.error_position_probe"
-        rc_running_stock = self.base._run(
-            "33-frame-running-stock",
-            [
-                str(self.base.python),
-                "-m",
-                probe_module,
-                "--mode",
-                "stock",
-                "--out",
-                str(running_stock),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        rc_running_stock, rc_running_jit = dual_probe(
+            "33",
+            "frame-running",
+            "ci_pipeline.jit311.frame_position_probe",
+            running_stock,
+            running_jit,
         )
-        rc_running_jit = self.base._run(
-            "34-frame-running-jit",
-            [
-                str(self.base.python),
-                "-m",
-                probe_module,
-                "--mode",
-                "jit",
-                "--out",
-                str(running_jit),
-            ],
-            env=self.base._product_env(threshold="1"),
-        )
-        rc_error_stock = self.base._run(
-            "35-frame-error-stock",
-            [
-                str(self.base.python),
-                "-m",
-                error_module,
-                "--mode",
-                "stock",
-                "--out",
-                str(error_stock),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
-        )
-        rc_error_jit = self.base._run(
-            "36-frame-error-jit",
-            [
-                str(self.base.python),
-                "-m",
-                error_module,
-                "--mode",
-                "jit",
-                "--out",
-                str(error_jit),
-            ],
-            env=self.base._product_env(threshold="1"),
+        rc_error_stock, rc_error_jit = dual_probe(
+            "35",
+            "frame-error",
+            "ci_pipeline.jit311.error_position_probe",
+            error_stock,
+            error_jit,
         )
         rc_inspect = self.base._run(
             "37-frame-test-inspect",
@@ -988,63 +537,21 @@ class RuntimeTransitionAcceptanceRunner:
         )
         recursion_stock = directory / "recursion-boundary-stock.json"
         recursion_jit = directory / "recursion-boundary-jit.json"
-        recursion_module = "ci_pipeline.jit311.recursion_boundary_probe"
-        rc_recursion_stock = self.base._run(
-            "38-recursion-stock",
-            [
-                str(self.base.python),
-                "-m",
-                recursion_module,
-                "--mode",
-                "stock",
-                "--out",
-                str(recursion_stock),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
-        )
-        rc_recursion_jit = self.base._run(
-            "39-recursion-jit",
-            [
-                str(self.base.python),
-                "-m",
-                recursion_module,
-                "--mode",
-                "jit",
-                "--out",
-                str(recursion_jit),
-            ],
-            env=self.base._product_env(threshold="1"),
+        rc_recursion_stock, rc_recursion_jit = dual_probe(
+            "38",
+            "recursion",
+            "ci_pipeline.jit311.recursion_boundary_probe",
+            recursion_stock,
+            recursion_jit,
         )
         native_recursion_stock = directory / "native-recursion-boundary-stock.json"
         native_recursion_jit = directory / "native-recursion-boundary-jit.json"
-        native_recursion_module = (
-            "ci_pipeline.jit311.native_recursion_boundary_probe"
-        )
-        rc_native_recursion_stock = self.base._run(
-            "39S-native-recursion-stock",
-            [
-                str(self.base.python),
-                "-m",
-                native_recursion_module,
-                "--mode",
-                "stock",
-                "--out",
-                str(native_recursion_stock),
-            ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
-        )
-        rc_native_recursion_jit = self.base._run(
-            "39J-native-recursion-jit",
-            [
-                str(self.base.python),
-                "-m",
-                native_recursion_module,
-                "--mode",
-                "jit",
-                "--out",
-                str(native_recursion_jit),
-            ],
-            env=self.base._product_env(threshold="1"),
+        rc_native_recursion_stock, rc_native_recursion_jit = dual_probe(
+            "39",
+            "native-recursion",
+            "ci_pipeline.jit311.native_recursion_boundary_probe",
+            native_recursion_stock,
+            native_recursion_jit,
         )
         if stock.is_file() and jit.is_file():
             result = judge_transitions(
@@ -1110,23 +617,6 @@ class RuntimeTransitionAcceptanceRunner:
                 "native_recursion_stock": rc_native_recursion_stock,
                 "native_recursion_jit": rc_native_recursion_jit,
             }
-        )
-        render_frame_position_report(
-            positions,
-            self.base.stage
-            / "ci_pipeline/jit311/data/frame_position_baseline_v02.json",
-            result,
-            rc_inspect,
-            self.output / "CP311_JIT_FRAME_POSITION_REPORT.md",
-        )
-        render_recursion_boundary_report(
-            recursion,
-            result,
-            self.output / "CP311_JIT_RECURSION_BOUNDARY_REPORT.md",
-        )
-        render_native_recursion_boundary_report(
-            native_recursion,
-            self.output / "CP311_JIT_NATIVE_RECURSION_BOUNDARY_REPORT.md",
         )
         if (
             rc_stock != 0
@@ -1242,9 +732,6 @@ class RuntimeTransitionAcceptanceRunner:
                 "code_swap": code_swap_returncodes,
             },
         }
-        render_policy_footprint_report(
-            result, self.output / "CP311_JIT_TRANSITION_POLICY_AND_FOOTPRINT_REPORT.md"
-        )
         return result
 
     def finalize(self, provenance: dict) -> str:
@@ -1333,8 +820,8 @@ class RuntimeTransitionAcceptanceRunner:
             coverage_errors.append(
                 f"JIT-ALL scheduler threshold is not exactly [0]: {observed_thresholds}"
             )
-        if penetration.get("jitall_config_matrix", {}).get("result") != "PASS":
-            coverage_errors.append("JIT-ALL configuration matrix is not PASS")
+        if penetration.get("commands", {}).get("config_ut") != 0:
+            coverage_errors.append("scheduler configuration unit tests failed")
         no_reentry_proof = penetration.get("published_no_reentry_proof", {})
         if no_reentry_proof.get("result") != "PASS":
             coverage_errors.append(
@@ -1388,11 +875,6 @@ class RuntimeTransitionAcceptanceRunner:
                 testcases=other_unexpected,
             )
         deviation_proof = validate_approved_deviations(penetration, repetition)
-        render_footprint_deviation_proof_final(
-            deviation_proof,
-            repetition.get("footprint", {}),
-            self.output / "A2_FOOTPRINT_DEVIATION_PROOF_FINAL.md",
-        )
         if deviation_proof["result"] != "PASS":
             add_blocker(
                 ident="APPROVED_DEVIATION_PROOF",

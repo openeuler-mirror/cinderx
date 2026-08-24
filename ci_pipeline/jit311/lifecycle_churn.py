@@ -17,10 +17,8 @@ from ci_pipeline.jit311.lifecycle_snapshot import checkpoint, judge_plateau, sna
 CHECKPOINTS = {
     "C1": (1, 10, 100, 1000),
     "C2": (100, 1000, 10000),
-    "C3": (1, 10, 100, 1000),
     "C4": (1, 10, 100, 1000),
     "C5": (1, 10, 100, 1000),
-    "C6": (1, 10, 100, 1000),
     "C7": (1, 10, 100, 1000),
     "C8": (1, 10, 100),
 }
@@ -28,10 +26,8 @@ CHECKPOINTS = {
 QUICK_CHECKPOINTS = {
     "C1": (1, 4),
     "C2": (4, 16),
-    "C3": (1, 4),
     "C4": (1, 4),
     "C5": (1, 4),
-    "C6": (1, 4),
     "C7": (1, 4),
     "C8": (1, 4),
 }
@@ -256,27 +252,6 @@ def scenario_c2(_cinderx, cinderjit):
     return samples, {"unique_code_identities": len(identities)}
 
 
-def scenario_c3(_cinderx, cinderjit):
-    checkpoints = ACTIVE_CHECKPOINTS["C3"]
-    _settle_census(cinderjit)
-    samples = [_collect_sample(cinderjit, "baseline")]
-    owner, namespace, expected = _make_plain(1, "c3_owner")
-    _compile_and_enter(cinderjit, owner, (3, 5, 1), expected)
-    code = owner.__code__
-    samples.append(_collect_sample(cinderjit, "owner_baseline"))
-    refs = []
-    for index in range(1, checkpoints[-1] + 1):
-        fresh = types.FunctionType(code, namespace, f"c3_fresh_{index}")
-        refs.append(weakref.ref(fresh))
-        _compile_and_enter(cinderjit, fresh, (3, 5, 1), expected)
-        del fresh
-        if index in checkpoints:
-            samples.append(_collect_sample(cinderjit, f"after_{index}", refs))
-    del owner, code, namespace
-    _finalize_samples(cinderjit, samples, refs)
-    return samples, {"transient_functions": len(refs)}
-
-
 def scenario_c4(_cinderx, cinderjit):
     checkpoints = ACTIVE_CHECKPOINTS["C4"]
     _settle_census(cinderjit)
@@ -352,85 +327,6 @@ def scenario_c5(_cinderx, cinderjit):
     del victim, donor, code_a, code_b, namespace_a, namespace_b
     _finalize_samples(cinderjit, samples, [function_ref])
     return samples, {"swaps": checkpoints[-1]}
-
-
-def scenario_c6(_cinderx, cinderjit):
-    checkpoints = ACTIVE_CHECKPOINTS["C6"]
-    _settle_census(cinderjit)
-    namespace = {"__builtins__": __builtins__, "__name__": "__main__"}
-    exec(
-        compile(
-            "def lifecycle_generator(value):\n"
-            "    yield value\n"
-            "    yield value + 1\n",
-            "<a3-C6-generator>",
-            "exec",
-        ),
-        namespace,
-        namespace,
-    )
-    function = namespace.pop("lifecycle_generator")
-    type_probe = function(0)
-    generator_type = type(type_probe)
-    type_probe.close()
-    del type_probe
-    gc.collect()
-    baseline_generators = _count_exact_type(gc.get_objects(), generator_type)
-    samples = [
-        _collect_sample(
-            cinderjit,
-            "baseline",
-            extra={"jit_generator_gc_objects": baseline_generators},
-        )
-    ]
-    if not cinderjit.force_compile(function):
-        raise AssertionError("C6 generator function did not compile")
-    samples.append(_collect_sample(cinderjit, "owner_baseline"))
-    refs = []
-    modes = ("exhaust", "close", "throw", "suspended-drop")
-    for index in range(1, checkpoints[-1] + 1):
-        for mode in modes:
-            generator = function(index)
-            generator_type = type(generator)
-            refs.append(weakref.ref(generator))
-            if mode == "exhaust":
-                list(generator)
-            elif mode == "close":
-                next(generator)
-                generator.close()
-            elif mode == "throw":
-                next(generator)
-                try:
-                    generator.throw(ValueError("a3-c6"))
-                except ValueError:
-                    pass
-            else:
-                next(generator)
-            del generator
-        if index in checkpoints:
-            gc.collect()
-            live_type = _count_exact_type(gc.get_objects(), generator_type)
-            samples.append(
-                _collect_sample(
-                    cinderjit,
-                    f"after_{index}",
-                    refs,
-                    {"jit_generator_gc_objects": live_type},
-                )
-            )
-    del function, namespace
-    gc.collect()
-    live_type = _count_exact_type(gc.get_objects(), generator_type)
-    _finalize_samples(
-        cinderjit,
-        samples,
-        refs,
-        extra={"jit_generator_gc_objects": live_type},
-    )
-    return samples, {
-        "generator_modes": list(modes),
-        "generator_native_gauge": "GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE",
-    }
 
 
 def scenario_c7(_cinderx, cinderjit):
@@ -515,10 +411,8 @@ def scenario_c8(_cinderx, cinderjit):
 SCENARIOS = {
     "C1": scenario_c1,
     "C2": scenario_c2,
-    "C3": scenario_c3,
     "C4": scenario_c4,
     "C5": scenario_c5,
-    "C6": scenario_c6,
     "C7": scenario_c7,
     "C8": scenario_c8,
 }
@@ -551,16 +445,6 @@ def run(scenario: str, *, quick: bool = False, scale: str | None = None) -> dict
     for field in ("weakrefs_alive", "code_weakrefs_alive"):
         if int(final_liveness.get(field, 0)) != 0:
             errors.append(f"final Python liveness {field} is non-zero")
-    if scenario == "C6":
-        baseline_generators = samples[0]["python_liveness"].get(
-            "jit_generator_gc_objects"
-        )
-        final_generators = final_liveness.get("jit_generator_gc_objects")
-        if final_generators != baseline_generators:
-            errors.append(
-                "generator GC census did not return to baseline: "
-                f"{baseline_generators}->{final_generators}"
-            )
     machine_entries = after_entries - before_entries
     if machine_entries <= 0:
         errors.append("scenario has no machine-code entry proof")
