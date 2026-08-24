@@ -935,6 +935,15 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->yieldPoint = nullptr;
   footer->gen = static_cast<PyGenObject*>(gen);
   footer->code_rt = code_rt;
+#if PY_VERSION_HEX < 0x030C0000
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InvocationArtifact());
+  JIT_CHECK(
+      compiled != nullptr,
+      "3.11 JIT generator created without an invocation artifact");
+  footer->compiled =
+      reinterpret_cast<jit::CompiledFunction*>(Py_NewRef(compiled));
+#endif
   footer->tree_iter_state = nullptr;
   footer->originalFramePointer = original_frame_pointer;
   footer->linkAddress =

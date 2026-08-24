@@ -60,6 +60,12 @@ void raise_tree_iter_deopt_blocked() {
       "cannot deopt a suspended TreeIter state-machine generator");
 }
 
+void clearGeneratorCompiledFunction(GenDataFooter* gen_footer) {
+#if PY_VERSION_HEX < 0x030C0000
+  Py_CLEAR(gen_footer->compiled);
+#endif
+}
+
 // Reimplementation of CPython's gen_dealloc that uses our custom free-list
 // (Ci_free_jit_list_gen) instead of PyObject_GC_Del for memory recycling.
 void gen_dealloc_with_custom_free(PyObject* self) {
@@ -202,6 +208,7 @@ void jitgen_dealloc(PyObject* self) {
   } else if (
       gen_footer->yieldPoint == nullptr &&
       FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
+    clearGeneratorCompiledFunction(gen_footer);
     deopt_jit_gen_object_only(jit_gen);
   } else {
     deopted = deopt_jit_gen_with_footer(
@@ -218,6 +225,9 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
   JitGenObject* jit_gen = JitGenObject::cast(obj);
   if (jit_gen != nullptr) {
     const GenDataFooter* gen_footer = jit_gen->genDataFooter();
+#if PY_VERSION_HEX < 0x030C0000
+    Py_VISIT(reinterpret_cast<PyObject*>(gen_footer->compiled));
+#endif
     // Only visit JIT-specific live values if we have a valid yield point.
     // If yieldPoint is null, the generator hasn't yielded yet or has completed,
     // but we still need to call PyGen_Type.tp_traverse below to visit standard
@@ -316,6 +326,7 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
     if (FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
       jit_gen->gi_frame_state = FRAME_CLEARED;
       jitFrameClearExceptCode(frame);
+      clearGeneratorCompiledFunction(gen_footer);
     } else {
 #if PY_VERSION_HEX >= 0x030E0000
       jit_gen->gi_frame_state = gen_footer->yieldPoint->isYieldFrom()
@@ -478,6 +489,17 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
       "Should not have an exception by now");
 #endif
   JIT_DCHECK(gen->gi_frame_state == FRAME_CLEARED, "Frame not cleared");
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (JitGen_CheckAny(obj)) {
+    // All JIT state has now been consumed.  Convert before closing the code
+    // owner so later stock deallocation never has to locate the footer through
+    // FRAME_EXECUTABLE.  jitFrameClearExceptCode() already cleared the rest of
+    // the frame, so only the preserved executable remains to be released.
+    deopt_jit_gen_object_only(gen);
+    Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+  }
+#endif
 
   *presult = result;
   return result ? PYGEN_RETURN : PYGEN_ERROR;
@@ -1074,6 +1096,7 @@ bool deopt_jit_gen_with_footer(
   if (!tree_iter_cleared) {
     clearTreeIterState(gen_footer);
   }
+  clearGeneratorCompiledFunction(gen_footer);
   deopt_jit_gen_object_only(jit_gen);
 
   return true;
