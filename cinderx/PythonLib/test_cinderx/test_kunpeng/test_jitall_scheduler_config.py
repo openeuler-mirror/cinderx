@@ -4,6 +4,17 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
+# The 3.11 execute/observe surface -- the mode resolver, the scheduler
+# thresholds and _get_observe_stats -- exists only on the CPython 3.11.6
+# build; on any other runtime these children would die on the missing
+# private API instead of exercising the configuration contract.
+pytestmark = pytest.mark.skipif(
+    sys.version_info[:3] != (3, 11, 6),
+    reason="the autocompile scheduler configuration surface is CPython 3.11.6 only",
+)
+
 
 CHILD = r"""
 import json
