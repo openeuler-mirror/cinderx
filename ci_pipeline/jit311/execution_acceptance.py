@@ -461,8 +461,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
     if args.wheel is None:
-        print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
-        return 2
+        candidates = sorted(Path("/wheels").glob("cinderx-*cp311*.whl"))
+        if not candidates:
+            print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
+            return 2
+        args.wheel = candidates[-1]
+    if args.source is None:
+        args.source = Path(__file__).resolve().parents[2]
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output = args.out or Path.cwd() / f"cp311-execution-{timestamp}"
     runner = ExecutionAcceptanceRunner(

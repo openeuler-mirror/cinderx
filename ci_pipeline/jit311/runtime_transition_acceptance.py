@@ -1143,6 +1143,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    # The last line is the whole verdict: approved deviations are a pass.
+    print("PASS" if final in PASS_STATES else final)
+    print(
+        f"evidence: {runner.output / 'runtime_transition_result.json'}",
+        file=sys.stderr,
+    )
     if final in PASS_STATES:
         return 0
     return 2 if final == "REVIEW_REQUIRED" else 1
