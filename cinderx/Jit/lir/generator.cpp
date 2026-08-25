@@ -1982,7 +1982,9 @@ void LIRGenerator::makeDecrefGILEnabled(
 
   if (destructor.has_value()) {
 #ifdef Py_TRACE_REFS
-    bbb.appendInvokeInstruction(_Py_ForgetReference, obj);
+    // A custom destructor bypasses _Py_Dealloc, where the refchain
+    // unlink normally happens, so unlink here.
+    bbb.appendInvokeInstruction(_Py_ForgetReference, instr);
 #endif
 
     bbb.appendInvokeInstruction(destructor.value(), instr);

@@ -1,0 +1,45 @@
+# Target modules that must compile a function of their own under
+# CINDERX_JIT_MODE=execute.
+#
+# The 72-module differential proves stock-vs-execute equivalence for every
+# module.  This is the other half: proof that the execute arm actually ran
+# the JIT on the surface, not merely alongside it.  A worker's
+# machine-code counters are process-wide -- sitecustomize, the import
+# machinery and regrtest's own harness all move them -- so "this worker
+# entered machine code" is satisfied by 72/72 workers while only these
+# modules have a function of their own compiled.  Most Lib/test cases run
+# once or twice and never approach a threshold; what is hot in a test
+# worker is usually the harness.
+#
+# Every module listed here must compile at least one of its own functions,
+# individually.  Requiring all 72 would be requiring the corpus to be
+# something it is not; requiring "at least one anywhere" proved almost
+# nothing.  The list only shrinks with a reason.
+test_binop
+test_builtin
+test_bytes
+test_class
+test_code
+test_complex
+test_descr
+test_dis
+test_enum
+test_exception_group
+test_float
+test_format
+test_functools
+test_generators
+test_index
+test_inspect
+test_iter
+test_itertools
+test_long
+test_pickle
+test_range
+test_richcmp
+test_set
+test_slice
+test_sys_setprofile
+test_sys_settrace
+test_traceback
+test_weakref

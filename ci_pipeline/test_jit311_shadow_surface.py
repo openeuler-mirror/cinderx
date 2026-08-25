@@ -866,7 +866,7 @@ def test_apply_suite_env_does_not_copy_official_runner_env():
         {
             "name": "x",
             "env": {
-                "CINDERX_JIT_MODE": "execute",
+                "CINDERX_JIT_MODE": "turbo",
                 "PYTHONJITLIGHTWEIGHTFRAME": "1",
             },
         },

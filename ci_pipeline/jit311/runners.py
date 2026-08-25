@@ -274,6 +274,33 @@ def canary_requests_accounted() -> Judge:
     return judge
 
 
+def organic_deopts_bounded_by_entries() -> Judge:
+    """A driver whose work scales with its input (the pyperformance driver
+    runs one subprocess per benchmark and parses every report) compiles a
+    workload-dependent slice of the standard library, and the exception
+    (MR-08) and attribute-cache (MR-09) surfaces deopt organically inside
+    it.  An exact pin would track the benchmark list rather than the JIT;
+    what must hold is that deopts never outrun entries -- the deopt-storm
+    guard the worker side applies."""
+
+    def judge(snap: dict) -> list[str]:
+        deopts = snap.get("organic_deopt_hits")
+        entries = snap.get("machine_code_entries")
+        if not isinstance(deopts, int) or not isinstance(entries, int):
+            return [
+                "organic_deopt_hits / machine_code_entries missing: "
+                f"{deopts!r} / {entries!r}"
+            ]
+        if deopts >= entries:
+            return [
+                "organic deopts reached machine-code entries (deopt storm): "
+                f"{deopts} >= {entries}"
+            ]
+        return []
+
+    return judge
+
+
 def evaluator_is_installed(snap: dict) -> list[str]:
     if snap.get("evaluator_installed") is not True:
         return [
@@ -344,7 +371,8 @@ assert _target_events[0]["result"] == "compiled", _target_events[0]
 
 def target_event_assertion(mode: str = "shadow") -> str:
     """The scheduling event for the target function, per mode: shadow
-    discards its compilation, canary installs it."""
+    discards its compilation, execute (and its test spelling, canary)
+    installs it."""
     if mode == "shadow":
         return TARGET_EVENT_ASSERTION
     return TARGET_EVENT_ASSERTION.replace(
@@ -549,12 +577,25 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         "      '%d silent' % (len(_covered), len(_targets), len(_silent)))\n"
         "assert not _silent, _silent\n"
     )
-    # The stdlib sweep's organic count steps with each milestone: five in
-    # the MR-07 era, one more when MR-08 opened the exception family, and
-    # 333 once MR-09's pull-validated attribute caches guard attribute
-    # sites across 72 importing modules (import-time class mutation
-    # retires receiver-version guards by design).  Verified deterministic
-    # across reruns; the exact pin keeps the fail-closed drift guard.
+    # This sweep measures import-time breadth on purpose: it imports 72
+    # stdlib test modules and requires each to have reached the JIT.  That
+    # is precisely what MR-11's import suppression prevents, so the sweep
+    # runs with the providers off -- it is a coverage stress surface for
+    # the compiler across 72 modules' worth of code shapes, not a model of
+    # the product's startup, and the product's startup behaviour is what
+    # the execute drivers and the 72-module differential measure.
+    #
+    # The organic count steps with each milestone: five in the MR-07 era,
+    # one more when MR-08 opened the exception family, 333 once MR-09's
+    # pull-validated attribute caches guard attribute sites across 72
+    # importing modules (import-time class mutation retires
+    # receiver-version guards by design), and 336 at the MR-11 base after
+    # MR-10's generator round.  MR-11 itself leaves the count unchanged:
+    # the base build and this branch measure alike in the gate's
+    # invocation context.  The count is sensitive to sys.path (an extra
+    # repository root on PYTHONPATH changes the compiled slice); the gate
+    # runs with the venv only.  Verified deterministic across reruns; the
+    # exact pin keeps the fail-closed drift guard.
     default = execute_holds(expected_organic_deopts=336) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
@@ -566,6 +607,9 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
             "CINDERX_JIT_MODE": "canary",
             "PYTHONJITAUTO": "1",
             "PYTHONMALLOC": "debug",
+            # See above: this sweep is about import-time breadth.
+            "CINDERX_AUTOJIT_IMPORT_PROVIDER": "off",
+            "CINDERX_AUTOJIT_SETUP_PROVIDER": "off",
         },
         asserted_env={"CINDERX_JIT_MODE": "canary"},
         judges=judges if judges is not None else default,
@@ -775,14 +819,9 @@ def canary_execute_runner(
         "assert hot(4, 5, 1) == 20\n"
         "assert hot(6, 5, 1) == 25\n"
     )
-    # Thirty-seven organic deopts, all from the child preamble's import
-    # machinery under the auto threshold: MR-08 opened the exception
-    # opcode family (EAFP raise paths deopt by design), and MR-09's
-    # pull-validated attribute caches add guarded attribute sites whose
-    # receiver-version guards organically retire as import-time types
-    # mutate.  Verified deterministic across reruns; the exact pin keeps
-    # the fail-closed drift guard.
-    default = execute_holds(expected_organic_deopts=37) + [
+    # Zero organic deopts: import/setup suppression keeps the child
+    # preamble's import machinery interpreted (see EXECUTE_AUTO_DEOPT_PIN).
+    default = execute_holds(expected_organic_deopts=0) + [
         expect("compile_requests", ">", 0)
     ]
     return RunnerSpec(
@@ -796,6 +835,75 @@ def canary_execute_runner(
         asserted_env={"CINDERX_JIT_MODE": "canary"},
         judges=judges if judges is not None else default,
     )
+
+
+# A nested function re-created per call: the shape 3.11 fresh attachment
+# exists for.  Same execute-surface discipline as CANARY_DEF.
+EXECUTE_FRESH_DEF = CANARY_DEF + """\
+def factory(k):
+    def adder(a, b, one):
+        total = a - a
+        i = total
+        while i < b:
+            total = total + a + k
+            i = i + one
+        return total
+    return adder
+"""
+
+
+def execute_auto_runner(
+    *, threshold: int = 8, judges: list[Judge] | None = None
+) -> RunnerSpec:
+    """The product mode (MR-11), spelled as the product spells it.
+
+    An acceptance smoke: organic scheduling installs machine code under
+    the product spelling, and a fresh instance attaches without a second
+    compilation.  The fresh-attach CONTRACT (budget, flags, event ledger)
+    is owned by test_execute_311.py; re-proving it here would track that
+    suite, not the product."""
+    payload = EXECUTE_FRESH_DEF + CANARY_ATTEST + (
+        "_stats = _cinderx._get_observe_stats()\n"
+        "assert _stats['mode'] == 'execute', _stats\n"
+        "assert _stats['requested_mode'] == 'execute', _stats\n"
+        "for i in range(40):\n"
+        "    hot(i, 5, 1)\n"
+        "assert cinderjit.is_jit_compiled(hot), 'threshold must install'\n"
+        "assert hot(4, 5, 1) == 20\n"
+        "_made = _cinderx._get_trigger_stats()['compiled_function_creations']\n"
+        "_first = factory(1)\n"
+        "for _ in range(12):\n"
+        "    assert _first(2, 3, 1) == 3 * (2 + 1)\n"
+        "assert cinderjit.is_jit_compiled(_first), 'threshold must install'\n"
+        "_fresh = factory(2)\n"
+        "assert _fresh(2, 3, 1) == 3 * (2 + 2)\n"
+        "assert _fresh(2, 3, 1) == 3 * (2 + 2)\n"
+        "assert cinderjit.is_jit_compiled(_fresh), 'fresh must attach'\n"
+        "_after = _cinderx._get_trigger_stats()['compiled_function_creations']\n"
+        "assert _after - _made == 1, (_made, _after)  # attach, not recompile\n"
+    )
+    default = execute_holds(expected_organic_deopts=EXECUTE_AUTO_DEOPT_PIN) + [
+        expect("compile_requests", ">", 0)
+    ]
+    return RunnerSpec(
+        name="execute_auto",
+        payload=payload,
+        env={
+            "CINDERX_JIT_MODE": "execute",
+            "PYTHONJITAUTO": str(threshold),
+            "PYTHONMALLOC": "debug",
+        },
+        asserted_env={"CINDERX_JIT_MODE": "execute"},
+        judges=judges if judges is not None else default,
+    )
+
+
+# Organic deopt pins for the execute-mode drivers.  All zero, and the
+# attribution is import/setup suppression: every count these pins used to
+# hold came from the child preamble's import machinery, which MR-11 no
+# longer compiles.  Zero fails closed if import-time compilation returns.
+EXECUTE_AUTO_DEOPT_PIN = 0
+EXECUTE_MATRIX_DEOPT_PINS = {"1": 0, "2": 0, "4": 0, "default": 0}
 
 
 EXCEPTION_CORPUS = """\
@@ -1621,11 +1729,21 @@ def config_matrix_runner(
             {"CINDERX_JIT_MODE": "shadow", "PYTHONJITAUTO": "30"},
             {"CINDERX_JIT_MODE": "observe", "PYTHONJITAUTO": "1"},
             {"CINDERX_JIT_MODE": "observe", "PYTHONJITAUTO": "1000000"},
+            # The execute threshold matrix (MR-11): 1 / 2 / 4 / default /
+            # very high.  The very high row is the armed-but-interpreting
+            # control: the evaluator is installed and nothing compiles.
+            {"CINDERX_JIT_MODE": "execute", "PYTHONJITAUTO": "1"},
+            {"CINDERX_JIT_MODE": "execute", "PYTHONJITAUTO": "2"},
+            {"CINDERX_JIT_MODE": "execute", "PYTHONJITAUTO": "4"},
+            {"CINDERX_JIT_MODE": "execute"},
+            {"CINDERX_JIT_MODE": "execute", "PYTHONJITAUTO": "1000000000"},
         ]
     specs = []
     for i, combo in enumerate(combos):
         default = gate_holds()
-        threshold = int(combo.get("PYTHONJITAUTO", "0") or 0)
+        payload = "ITERS = 400\n" + HOT_LOOP
+        raw_threshold = combo.get("PYTHONJITAUTO")
+        threshold = int(raw_threshold or 0)
         mode = combo.get("CINDERX_JIT_MODE")
         if mode == "shadow" and 0 < threshold <= 400:
             default = shadow_holds()
@@ -1635,10 +1753,40 @@ def config_matrix_runner(
                 expect("capability_rejects", ">", 0),
                 requests_accounted(),
             ]
+        elif mode in ("execute", "canary"):
+            # The execute rows drive the surface-clean workload and pin the
+            # threshold crossing: the event fires at exactly the configured
+            # count (the default is 50 when PYTHONJITAUTO is unset).
+            effective = threshold if raw_threshold is not None else 50
+            payload = CANARY_DEF + CANARY_ATTEST + (
+                "for _ in range(ITERS):\n"
+                "    hot(4, 5, 1)\n"
+                "assert hot(4, 5, 1) == 20\n"
+                "_stats = _cinderx._get_observe_stats()\n"
+                "assert _stats['mode'] == 'execute', _stats\n"
+                f"assert _stats['threshold'] == {effective}, _stats\n"
+                "_hot = [e for e in _stats['events'] if e['qualname'] == 'hot']\n"
+            ).replace("ITERS", "400")
+            if 0 < effective <= 400:
+                payload += (
+                    f"assert _hot == [dict(_hot[0], count={effective}, "
+                    "result='installed')], _hot\n"
+                    "assert cinderjit.is_jit_compiled(hot), 'threshold must install'\n"
+                )
+                pin_key = raw_threshold if raw_threshold is not None else "default"
+                default = execute_holds(
+                    expected_organic_deopts=EXECUTE_MATRIX_DEOPT_PINS[pin_key]
+                ) + [expect("compile_requests", ">", 0)]
+            else:
+                payload += (
+                    "assert _hot == [], _hot\n"
+                    "assert not cinderjit.is_jit_compiled(hot)\n"
+                )
+                default = gate_holds() + [expect("compile_requests", "==", 0)]
         specs.append(
             RunnerSpec(
                 name=f"config_matrix_{i}",
-                payload="ITERS = 400\n" + HOT_LOOP,
+                payload=payload,
                 env=dict(combo),
                 asserted_env=dict(combo),
                 judges=judges if judges is not None else default,
@@ -1978,11 +2126,13 @@ def pyperformance_completeness_runner(
     if mode == "shadow":
         mode_judges = shadow_holds()
     else:
-        # canary driver-process contract: the driver's own target is
-        # crosses the threshold, so machine code must genuinely be entered
-        # here.  MR-09's guarded attribute sites organically retire during
-        # the 33-benchmark driver workload; pin the deterministic total so
-        # drift or a deopt storm still turns the leg red.
+        # execute/canary driver-process contract: the driver's own target
+        # is surface-clean and crosses the threshold, so machine code must
+        # genuinely be entered here; the ledger closes and no shadow
+        # counter moves.  The driver's organic deopts are bounded, not
+        # pinned: the driver compiles whatever standard-library machinery
+        # its benchmark list makes hot (subprocess, json, pathlib), and the
+        # exception and attribute-cache surfaces deopt organically there.
         mode_judges = [
             expect("evaluator_installed", "==", True),
             expect("machine_code_entries", ">", 0),
@@ -1991,7 +2141,7 @@ def pyperformance_completeness_runner(
             expect("unknown_rejects", "==", 0),
             expect("events_dropped", "==", 0),
             expect("forced_deopt_hits", "==", 0),
-            expect("organic_deopt_hits", "==", 131),
+            organic_deopts_bounded_by_entries(),
             expect("compile_success", "==", 0),
             expect("shadow_codegen_bytes", "==", 0),
         ]
@@ -2085,6 +2235,7 @@ def run_all(python: str | None = None) -> list[RunResult]:
         canary_force_cold_runner(),
         canary_force_warm_runner(),
         canary_execute_runner(),
+        execute_auto_runner(),
         exception_semantics_runner(),
         stdlib_canary_runner(),
         canary_churn_runner(),
@@ -2126,6 +2277,56 @@ def main(argv: list[str] | None = None) -> int:
         result = run(spec)
         print(result.summary())
         return 0 if result.ok else 1
+    if "--pyperf-execute-all" in argv:
+        # MR-11: the execute leg covers the full applicable set, in the
+        # product spelling, for several consecutive rounds -- the
+        # acceptance is zero worker crashes in every round, not in one.
+        rounds = 3
+        if "--rounds" in argv:
+            try:
+                rounds = int(argv[argv.index("--rounds") + 1])
+            except (ValueError, IndexError):
+                print("usage: runners --pyperf-execute-all [--rounds N]")
+                return 2
+        if rounds < 1:
+            print("jit311-runners: --rounds must be a positive integer")
+            return 2
+        names = discover_all_pyperf_benchmarks()
+        spec = pyperformance_completeness_runner(mode="execute", benchmarks=names)
+        if spec is None:
+            print(
+                "jit311-runners: pyperformance is required for the execute "
+                "completion leg",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"jit311-runners: execute completion leg covers all "
+            f"{len(names)} applicable benchmark(s), {rounds} round(s)"
+        )
+        failed = 0
+        for round_index in range(1, rounds + 1):
+            round_spec = RunnerSpec(
+                name=f"{spec.name}_round_{round_index}_of_{rounds}",
+                payload=spec.payload,
+                env=dict(spec.env),
+                judges=list(spec.judges),
+                expect_report=spec.expect_report,
+                asserted_env=dict(spec.asserted_env),
+                expect_returncode=spec.expect_returncode,
+                expect_stderr_contains=spec.expect_stderr_contains,
+                timeout=spec.timeout,
+                target_modules_attempted=spec.target_modules_attempted,
+            )
+            result = run(round_spec)
+            print(result.summary())
+            if not result.ok:
+                failed += 1
+        print(
+            f"jit311-runners: execute completion rounds "
+            f"{rounds - failed}/{rounds} passed"
+        )
+        return 1 if failed else 0
     if "--stdlib-canary" in argv:
         result = run(stdlib_canary_runner())
         print(result.summary())

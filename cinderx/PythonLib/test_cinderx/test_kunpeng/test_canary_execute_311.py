@@ -1083,13 +1083,14 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("tracing fell back", proc.stdout)
 
-    def test_compiled_artifact_is_never_shared_between_functions(self):
-        # CPython 3.11 has no function-destroy notification, so a second
-        # owner of one compiled artifact would keep it alive past the first
-        # owner's death and leave that dead function as a borrowed pointer
-        # in the registry -- reading it then segfaults.  Until the MR-05
-        # lifecycle lands, a function whose (code, globals, builtins) is
-        # already compiled for someone else is refused.
+    def test_same_namespace_twin_shares_the_compiled_artifact(self):
+        # One artifact per code object, shared by every function over the
+        # same (code, globals, builtins): the second function attaches to
+        # the published artifact instead of compiling again (MR-11 fresh
+        # attachment).  The single-owner refusal that held from MR-04 to
+        # MR-10 stood in for the death notifications MR-05 delivered; with
+        # membership kept honest by the death watch, a member's death
+        # removes only that member and the survivor keeps its machine code.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1102,6 +1103,13 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
+            def creations():
+                return _cinderx._get_trigger_stats()[
+                    "compiled_function_creations"]
+
+            def entries():
+                return _cinderx._get_trigger_stats()["machine_code_entries"]
+
             def twin(a, b, one):
                 total = a - a
                 i = total
@@ -1113,14 +1121,16 @@ class CanaryExecute311Test(unittest.TestCase):
             other = types.FunctionType(
                 twin.__code__, twin.__globals__, "other")
             assert cinderjit.force_compile(twin) is True
-            try:
-                cinderjit.force_compile(other)
-            except RuntimeError as exc:
-                assert "CANNOT_SPECIALIZE" in str(exc), exc
-            else:
-                raise SystemExit("a second owner was allowed to share")
-            assert not cinderjit.is_jit_compiled(other)
-            assert other(3, 5, 1) == twin(3, 5, 1)
+            made = creations()
+            assert cinderjit.force_compile(other) is True
+            assert creations() == made, "the twin was compiled again"
+            assert cinderjit.is_jit_compiled(other)
+            assert cinderjit.is_jit_compiled(twin)
+            assert (other.__dict__["__cinderx_compiled_func__"]
+                    is twin.__dict__["__cinderx_compiled_func__"])
+            before = entries()
+            assert other(3, 5, 1) == twin(3, 5, 1) == 15
+            assert entries() - before == 2, "a member ran interpreted"
 
             # The twin dies; the registry must stay readable and the
             # surviving function must keep running its machine code.
@@ -1128,8 +1138,11 @@ class CanaryExecute311Test(unittest.TestCase):
             gc.collect()
             for func in cinderjit.get_compiled_functions():
                 assert func.__qualname__, func
+            assert cinderjit.get_compiled_functions() == [twin]
+            before = entries()
             assert twin(3, 5, 1) == 15
-            print("artifact ownership stayed exclusive")
+            assert entries() - before == 1
+            print("artifact shared by the same-namespace twin")
             """
         )
         proc = subprocess.run(
@@ -1140,7 +1153,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("artifact ownership stayed exclusive", proc.stdout)
+        self.assertIn("artifact shared by the same-namespace twin", proc.stdout)
 
     def test_specialized_bytecode_deopts_organically_on_type_change(self):
         # Warm compilation plus Simplify install compact-long / float
@@ -1526,6 +1539,18 @@ class CanaryExecute311Test(unittest.TestCase):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
+        # This probe fires its finalizer by lowering the GC threshold and
+        # letting the next tracked allocation inside deopt_sites() collect
+        # -- which depends on how many allocations happened before it.  The
+        # import and setup providers change that history (they add import
+        # machinery of their own), and with them on the counter sits high
+        # enough that deopt_sites() makes no tracked allocation at all and
+        # nothing collects.  What is under test here is the artifact pin
+        # across a reentrant uncompile, not the providers, so the probe
+        # pins the environment it needs instead of depending on the
+        # ambient one.
+        env["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "off"
+        env["CINDERX_AUTOJIT_SETUP_PROVIDER"] = "off"
         probe = textwrap.dedent(
             """
             import gc
@@ -4028,15 +4053,13 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("stale teardown left the successor installed", proc.stdout)
 
-    def test_reassociation_is_a_one_way_transfer(self):
-        # Severing the old claim at re-association time has a visible
-        # consequence: while the old artifact is still published for the
-        # old code object, the function cannot walk back onto it -- the
-        # one-artifact-per-code refusal now finds a published artifact
-        # that no longer names the function.  That is the fail-closed
-        # reading of "association ends with an explicit re-association":
-        # the transfer is not reversible while the abandoned publisher
-        # lives, and becomes an ordinary fresh compile once it dies.
+    def test_reassociation_is_reversible_onto_live_compiled_code(self):
+        # Re-association transfers the claim to the new code's artifact;
+        # swapping back while the old artifact is still published simply
+        # re-attaches the function to it -- the same-key attachment MR-11
+        # opened -- without compiling again.  The abandoned publisher's
+        # later death does not disturb the re-attached function, which
+        # anchors the artifact itself.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -4050,6 +4073,10 @@ class CanaryExecute311Test(unittest.TestCase):
 
             def entries():
                 return _cinderx._get_trigger_stats()["machine_code_entries"]
+
+            def creations():
+                return _cinderx._get_trigger_stats()[
+                    "compiled_function_creations"]
 
             body = (
                 "def {name}(a, b, one):\\n"
@@ -4075,32 +4102,35 @@ class CanaryExecute311Test(unittest.TestCase):
             victim.__code__ = rep_code
             cinderjit.enable()
             assert cinderjit.force_compile(victim) is True
+            assert victim.__dict__["__cinderx_compiled_func__"] is not old
+            made = creations()
 
             # Swap back while the abandoned publisher is still alive: the
-            # old code object still has a published artifact, and the
-            # function is no longer among its owners.
+            # old code object still has a published artifact under the
+            # same namespace, and enable() re-attaches the parked function
+            # to it -- the registry is keyed by the function's current
+            # code -- without compiling anything.
             cinderjit.disable(True)
             victim.__code__ = old_code
-            cinderjit.enable()
-            refused = False
-            try:
-                cinderjit.force_compile(victim)
-            except RuntimeError as exc:
-                refused = "CANNOT_SPECIALIZE" in str(exc)
-            assert refused, "walking back onto an abandoned artifact"
             assert not cinderjit.is_jit_compiled(victim)
+            cinderjit.enable()
+            assert cinderjit.is_jit_compiled(victim)
+            assert cinderjit.force_compile(victim) is False
+            assert creations() == made, "the old code was compiled again"
+            assert victim.__dict__["__cinderx_compiled_func__"] is old
             before = entries()
             assert victim(3, 5, 1) == 15
-            assert entries() - before == 0, "refused shape ran machine code"
+            assert entries() - before == 1, "re-attached function interpreted"
 
-            # Once the abandoned publisher dies the refusal dies with it.
+            # The external pin on the old artifact is not what keeps the
+            # function compiled: the function anchors it itself.
             del old
             gc.collect()
-            assert cinderjit.force_compile(victim) is True
+            assert cinderjit.is_jit_compiled(victim)
             before = entries()
             assert victim(3, 5, 1) == 15
             assert entries() - before == 1
-            print("re-association transferred one way")
+            print("re-association is reversible onto live compiled code")
             """
         )
         proc = subprocess.run(
@@ -4111,7 +4141,9 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("re-association transferred one way", proc.stdout)
+        self.assertIn(
+            "re-association is reversible onto live compiled code", proc.stdout
+        )
 
     def test_stale_generation_outliving_its_function_stays_inert(self):
         # The death-order mirror of the clobber case: the function dies

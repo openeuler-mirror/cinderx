@@ -30,14 +30,27 @@ void decref_total([[maybe_unused]] PyThreadState* tstate) {
 #endif
 }
 
+// CPython moved the reference-count total into the interpreter state in
+// 3.12; before that it is a single process-wide global.  Only a
+// Py_REF_DEBUG interpreter has either, and that is exactly the build a
+// regrtest -R leg needs, so the older spelling has to be here for 3.11 to
+// be measurable at all.
 void incref_total([[maybe_unused]] PyInterpreterState* interp) {
 #if defined(Py_REF_DEBUG) && !defined(Py_GIL_DISABLED)
+#if PY_VERSION_HEX >= 0x030C0000
   interp->object_state.reftotal++;
+#else
+  _Py_RefTotal++;
+#endif
 #endif
 }
 
 void decref_total([[maybe_unused]] PyInterpreterState* interp) {
 #if defined(Py_REF_DEBUG) && !defined(Py_GIL_DISABLED)
+#if PY_VERSION_HEX >= 0x030C0000
   interp->object_state.reftotal--;
+#else
+  _Py_RefTotal--;
+#endif
 #endif
 }

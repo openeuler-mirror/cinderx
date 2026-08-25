@@ -1,0 +1,4 @@
+{
+ "comment": "Frozen stock-vs-execute asymmetries for the confirmed 72-module surface. The execute differential is symmetric: the two arms must report the same testcase identities in the same states (pass / failure / error / skipped), because under Auto-JIT a case that starts passing, a case that changes how it fails, and a case only one arm ran are each a semantic difference the execute mode is supposed not to produce. This file names the ones that are genuinely about the environment rather than about the JIT; every entry needs such a reason. It is empty because the surface currently has none, and a gate run that no longer reproduces an entry reports it so the entry can be deleted.",
+ "asymmetries": {}
+}

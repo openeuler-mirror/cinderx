@@ -81,7 +81,7 @@ command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m un
 # never count as a skip, and configuration must be asserted in the child.
 [[jobs]]
 name = "jit311_runner_selftests"
-command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_jit311_runners.py ci_pipeline/test_jit311_corpus.py ci_pipeline/test_jit311_shadow_surface.py'"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_jit311_runners.py ci_pipeline/test_jit311_corpus.py ci_pipeline/test_jit311_shadow_surface.py ci_pipeline/test_jit311_lifecycle_census.py'"
 
 # RuntimeTests on 3.11: the green baseline (LIR, register allocation,
 # dataflow, utilities, shadow compile, and HIRBuildTest) must stay green.
@@ -127,6 +127,51 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners
 name = "observe_gate"
 command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_observe_311'"
 
+# MR-11: the product auto-JIT.  CINDERX_JIT_MODE=execute compiles, installs
+# and enters machine code from the same scheduling request observe refuses
+# and shadow discards; one code object gets one attempt (a failed attempt
+# disables it, force_compile stays available); fresh function objects over
+# compiled code attach within the per-code budget and outlive the instance
+# that was compiled; the interpreter's CALL keeps its legal specializations
+# and enters compiled callees; a third-party evaluator degrades the JIT
+# safely; thresholds 1 / 2 / 4 / default / very high and ten shutdown
+# repetitions run clean.
+# MR-11 acceptance 14a: the reference-count contract under Auto-JIT.
+# The generator leg above reaches machine code through force_compile(),
+# which skips everything MR-11 adds -- the frame-entry dispatch, the
+# one-attempt verdict, outer anchoring and fresh attachment never run.
+# This leg reaches it the way production does, by calling the function,
+# and pins how many cases the scheduler must still be taking on its own:
+# "no drift" and "nothing was compiled" produce the same table otherwise.
+# The two cases below the floor are the ones whose every call raises, which
+# the exception-rate freeze returns to the interpreter by design.
+[[jobs]]
+name = "jit311_rcm_execute"
+command = "bash -lc 'mkdir -p \"{run_dir}/rcm-execute\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_execute_min interp \"{run_dir}/rcm-execute/interp.json\" && CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 PYTHONMALLOC=debug \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_execute_min auto \"{run_dir}/rcm-execute/auto.json\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py diff \"{run_dir}/rcm-execute/interp.json\" \"{run_dir}/rcm-execute/auto.json\" 11'"
+
+# MR-11 acceptance 14b: nothing MR-11 allocates may accumulate.  The
+# matrix above watches the reference counts of objects the corpus names;
+# it cannot see an artifact buffer that outlives its last anchor, a
+# code-extra block for a dead code object, or an observer slot that is
+# never recycled, because none of those is reachable from a named target
+# -- and the first and last are not Python objects at all, so a
+# gc.get_objects() census is blind to them too.  This leg runs the whole
+# lifecycle -- schedule, attach, park, resume, retire, die -- repeatedly
+# and censuses BOTH the Python objects and the runtime's own residency
+# gauges, reporting only what grows in every round.  It fails closed if a
+# round did not compile, attach and retire.
+#
+# Not regrtest's -R: that needs sys.gettotalrefcount and therefore a
+# Py_DEBUG interpreter, which this platform's 3.11.6 is not.  The name
+# says what the leg actually does.
+[[jobs]]
+name = "jit311_lifecycle_census"
+command = "bash -lc 'CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/lifecycle_census.py --rounds 6 --out \"{run_dir}/lifecycle-census.json\"'"
+
+[[jobs]]
+name = "execute_gate"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_execute_311'"
+
 # MR-03 blocking proof: real cold, warm and threshold-driven requests traverse
 # the complete shadow compiler, while code allocation, installation and entry
 # counters remain zero. The same driver covers lifecycle churn, five shutdown
@@ -137,8 +182,12 @@ command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m un
 # From MR-04 the same driver also runs the canary children, where those
 # counters are required to move instead: cold and warm force-compile against
 # an interpreted oracle, organic-threshold execution, the 72-module import
-# under execution, and five shutdown repetitions. Each child asserts its own
+# under execution, and ten shutdown repetitions. Each child asserts its own
 # mode, so a shadow judge can never accept a canary run or the reverse.
+# From MR-11 the driver also runs the product spelling: the execute_auto
+# child (organic install plus budgeted fresh attachment) and the execute
+# rows of the configuration matrix (thresholds 1 / 2 / 4 / default / very
+# high, the last one armed but never compiling).
 [[jobs]]
 name = "shadow_compile_gate"
 command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners'"

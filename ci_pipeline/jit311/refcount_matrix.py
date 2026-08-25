@@ -45,6 +45,11 @@ sys.modules["diffgate_rt"] = _rt
 
 def diff_main() -> int:
     interp_path, jit_path = sys.argv[2:4]
+    # The scheduled arm's floor: how many cases the JIT must still be
+    # choosing on its own.  Pinned by the caller, because "the scheduler
+    # took nothing" and "the scheduler took everything it should" produce
+    # the same drift table.
+    min_compiled = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     interp = json.load(open(interp_path))
     jit_doc = json.load(open(jit_path))
     mismatched = {}
@@ -78,11 +83,14 @@ def diff_main() -> int:
             return 1
     # Entry evidence is only meaningful for a run that was allowed to
     # execute; a shadow-mode jit arm records no entries by design.
-    if jit_doc.get("mode") == "jit" and jit_doc.get("executing"):
+    if jit_doc.get("mode") in ("jit", "auto") and jit_doc.get("executing"):
+        chosen = jit_doc.get("scheduler_compiled")
         silent = [
             case
             for case, entries in jit_doc.get("machine_code_entries", {}).items()
-            if not entries
+            # In the scheduled arm the JIT decides what it takes; a case it
+            # declined is interpreted on purpose and owes no entries.
+            if not entries and (chosen is None or chosen.get(case))
         ]
         if silent or not jit_doc.get("machine_code_entries"):
             print(
@@ -90,6 +98,22 @@ def diff_main() -> int:
                 f"machine code: {silent or '(no entry table at all)'}"
             )
             return 1
+        if chosen is not None:
+            # The scheduled arm proves nothing if the scheduler stopped
+            # taking anything.  The floor is pinned by the caller so an
+            # eroding surface is a red leg rather than a quiet one.
+            taken = sorted(case for case, fns in chosen.items() if fns)
+            if len(taken) < min_compiled:
+                print(
+                    f"refcount-matrix: the scheduler compiled {len(taken)} "
+                    f"case(s), below the pinned floor of {min_compiled}: "
+                    f"{taken}"
+                )
+                return 1
+            print(
+                f"refcount-matrix: scheduler took {len(taken)}/"
+                f"{len(chosen)} case(s)"
+            )
     print(
         f"refcount-matrix: {len(cases)} case(s), drift and outcome equal "
         f"across modes"
@@ -127,6 +151,12 @@ def outcome_of(fn) -> str:
         return f"raise:{type(exc).__qualname__}:{stable_digest(str(exc))}"
 
 
+# Calls made before the scheduled arm expects machine code.  The threshold
+# the leg runs at is well below this; the margin covers a case whose
+# helpers are only reached on some of its paths.
+SCHEDULER_WARMUP = 200
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "diff":
         return diff_main()
@@ -138,8 +168,17 @@ def main() -> int:
     # Only the executing mode can move the machine-code entry counter;
     # under shadow the artifact is compiled and deliberately discarded, so
     # requiring entries there would demand something the mode forbids.
-    executing = os.environ.get("CINDERX_JIT_MODE") == "canary"
-    if mode == "jit":
+    # `canary` is execute's test-only alias, so both spellings name the
+    # same tier; reading only one of them silently downgraded the execute
+    # arm to "entries are optional".
+    executing = os.environ.get("CINDERX_JIT_MODE") in ("execute", "canary")
+    # Two ways to reach machine code.  `jit` asks for it directly, which
+    # keeps the arm deterministic; `auto` lets the Auto-JIT scheduler
+    # decide, which is the path production takes and the only one that
+    # exercises dispatch, outer anchoring and fresh attachment under the
+    # reference-count contract.
+    scheduled = mode == "auto"
+    if mode in ("jit", "auto"):
         # 守卫自适应去特化会在案例中途卸载重编（共享 helper 跑热后被
         # force_compile 会烘焙特化形，守卫风暴触发 despec）：产物切换
         # 使烘焙引用集合变化，双快照协议无法与真实漂移区分（实测恰为
@@ -149,7 +188,7 @@ def main() -> int:
         os.environ.setdefault("CINDERX_ADAPTIVE_DESPEC", "0")
         # The executing tier runs under the debug allocator from MR-04 on;
         # assert it rather than assume the caller set it.
-        if os.environ.get("CINDERX_JIT_MODE") == "canary":
+        if executing:
             # Ask the runtime which allocator is in force rather than which
             # one the environment asked for: the variable says what was
             # requested, the interpreter says what happened.
@@ -162,14 +201,14 @@ def main() -> int:
             if in_force is not None:
                 if "debug" not in in_force:
                     print(
-                        f"refcount-matrix: canary mode requires the debug "
+                        f"refcount-matrix: the executing mode requires the debug "
                         f"allocator; the interpreter reports {in_force!r}",
                         file=sys.stderr,
                     )
                     return 2
             elif os.environ.get("PYTHONMALLOC") != "debug":
                 print(
-                    "refcount-matrix: canary mode requires PYTHONMALLOC=debug "
+                    "refcount-matrix: the executing mode requires PYTHONMALLOC=debug "
                     "(this build exposes no way to confirm it physically)",
                     file=sys.stderr,
                 )
@@ -253,6 +292,7 @@ def main() -> int:
     results = {}
     outcomes = {}
     entry_counts = {}
+    chosen = {}
     for name, fn in cases:
         print(f"refcount-matrix: running {name}", flush=True)
         fns = [fn] + list(getattr(fn, "helpers", ()))
@@ -260,14 +300,46 @@ def main() -> int:
             to_compile = [
                 f for f in fns if isinstance(f, types.FunctionType)
             ]
-            # corpus_calls builds 285 nested dispatchers from one `def case`
-            # code object.  The 3.11 exclusive-artifact rule will compile
-            # the first owner and refuse every later one, so compile the
-            # per-shape helpers (distinct code objects) instead of the
-            # shared wrapper.  Shared callees are the same function object
-            # and is_jit_compiled() stays true on later sightings.
+            # A case that names helpers is a driver for them: the helpers
+            # are the per-shape code objects under test, and the driver's
+            # own body may legitimately sit outside the execute surface
+            # (corpus_ic_mutation's cases build classes and delete
+            # attributes; corpus_calls builds 285 nested dispatchers from
+            # one shared `def case` code object).  Compile the helpers and
+            # leave the driver interpreted.
+            #
+            # Until MR-11 this was also the only way the corpus_calls
+            # dispatchers could be compiled at all, because one artifact
+            # admitted one owning function.  That restriction is gone --
+            # same-namespace functions now share a code object's artifact
+            # -- but the driver-vs-helper split stands on its own.
             if fn in to_compile and any(f is not fn for f in to_compile):
                 to_compile = [f for f in to_compile if f is not fn]
+            if scheduled:
+                # No force_compile(): the scheduler has to pick these up on
+                # its own, which is what puts dispatch, outer anchoring and
+                # fresh attachment inside the reference-count contract.
+                # The warm-up calls are the same ones the case makes; only
+                # their number is chosen here.
+                for _ in range(SCHEDULER_WARMUP):
+                    try:
+                        fn()
+                    except BaseException:
+                        pass
+                # Which functions the scheduler took is its decision, not
+                # this leg's: an automatic surface narrower than
+                # force_compile()'s, and the exception-rate freeze that
+                # returns a function whose every call raises to the
+                # interpreter, are both designed behaviour.  Record the
+                # partition instead of demanding all of it -- what must
+                # not happen is the set quietly emptying, which the pinned
+                # floor in the diff catches.
+                chosen[name] = sorted(
+                    getattr(f, "__name__", repr(f))
+                    for f in to_compile
+                    if jit.is_jit_compiled(f)
+                )
+                to_compile = []
             for f in to_compile:
                 try:
                     jit.force_compile(f)
@@ -307,7 +379,10 @@ def main() -> int:
         gc.collect()
         after = snapshot()
         entry_counts[name] = entries() - entries_before
-        if executing and entry_counts[name] <= 0:
+        # A case the scheduler declined runs interpreted on purpose, so
+        # only the ones it took owe machine-code entries.
+        owes_entries = executing and (not scheduled or chosen.get(name))
+        if owes_entries and entry_counts[name] <= 0:
             print(
                 f"refcount-matrix: {name} was compiled but never entered "
                 f"machine code across {N} iterations",
@@ -328,6 +403,10 @@ def main() -> int:
             "outcome": outcomes,
             "executing": executing,
             "machine_code_entries": entry_counts,
+            # Only the scheduled arm has a partition; recording an empty
+            # one for the force_compile arm would report "the scheduler
+            # took 0 of 0 cases" about a leg that never asked it to.
+            "scheduler_compiled": chosen if scheduled else None,
         },
         open(out_path, "w"),
         indent=1,

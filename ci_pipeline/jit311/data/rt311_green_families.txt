@@ -1,5 +1,6 @@
 AliasClassTest
 AttrCache311Test
+AutoJit311ConfigTest
 BasicBlockTest
 BehaviorClassifierTest
 BitVectorTest

@@ -73,6 +73,33 @@ command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-ch
 name = "jit311_pyperf_canary"
 command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-canary'"
 
+# MR-11 acceptance: the execute completion leg covers the full applicable
+# set in the product spelling, three consecutive rounds, zero worker
+# crashes in every round.  Each worker attests its mode; a round that
+# crashes or leaves the ledger open is red on its own.
+[[jobs]]
+name = "jit311_pyperf_execute"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-execute-all --rounds 3'"
+
+# MR-11 acceptance 11: the 72-module surface under execute must match
+# stock per testcase (importing a module is not running it), and the leg
+# fails closed unless the execute arm actually entered machine code.
+[[jobs]]
+name = "libtest_execute_diff_72"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py execute-gate --out \"{run_dir}/libtest-execute\"'"
+
+# MR-11 acceptance 14: regrtest -R over the execute mode, on a Py_DEBUG
+# CPython 3.11.6 the leg builds and caches itself.  Fails closed on its
+# own premises (debug interpreter, CinderX loaded, evaluator installed,
+# machine code entered) before reading any verdict, and "memory blocks"
+# figures are verified by quickened_artifact.py rather than believed --
+# the vendored evaluator's _Py_QuickenedCount double-copy makes
+# regrtest's derived figure unsound (mechanism: quickened_artifact.py's
+# module docstring).
+[[jobs]]
+name = "jit311_refleak_execute"
+command = "bash -lc 'ci_pipeline/scripts/run_refleak_311.sh \"{run_dir}/refleak\"'"
+
 [[jobs]]
 name = "jit311_shadow_surface"
 command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --shadow-surface --out \"{run_dir}/shadow-surface\"'"

@@ -188,10 +188,23 @@ struct Config {
   // the interpreter
   bool support_instrumentation{false};
 
-  // Permit CPython 3.11 synchronous generators on the canary execute
-  // surface.  Explicit force/canary compilation is enabled for MR-10;
-  // automatic compilation remains separately gated until MR-11.
+  // Permit CPython 3.11 synchronous generators on the execute surface.
+  // Explicit force/canary compilation is enabled (MR-10); automatic
+  // compilation of generators stays off by policy (MR-11): the measured
+  // verdict is that compiling generators only on request beats both
+  // compiling them all and interpreting them all.
   bool sync_generator_jit{true};
+
+  // CPython 3.11 auto-JIT (MR-11): how many fresh function objects over an
+  // already-compiled code object may attach to its artifact automatically.
+  // 3.11 has no function-creation watcher, so a fresh function (a closure,
+  // lambda or comprehension re-created per call) is noticed at its first
+  // interpreted frame and attached for its later calls.  Each attachment
+  // costs a full publication; the budget keeps churn-heavy shapes (a new
+  // closure per call, called once) from paying it forever, while stable
+  // instance sets attach in full.  0 disables automatic attachment;
+  // force_compile() of a fresh function is never budgeted.
+  uint32_t fresh_attach_budget{8};
 
   // Add RefineType instructions for Static Python values before they get
   // typechecked.  Enabled by default as HIR doesn't pass through Static Python

@@ -8,6 +8,9 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 #include "cinderx/module_state.h"
 
@@ -38,6 +41,13 @@ struct CodeObjectExtra311 {
 
 CodeDestroyedHook g_code_destroyed_hook = nullptr;
 
+// Live owned code-extra blocks: incremented where one is allocated,
+// decremented where it is freed.  A GAUGE.  It is the only way to see
+// this allocation from a test: the block comes from the raw allocator, so
+// it is invisible to gc.get_objects(), and a leak of one per code object
+// would look exactly like a clean census.
+size_t g_live_code_extra_blocks = 0;
+
 #if PY_VERSION_HEX < 0x030C0000
 // 3.11: the free call is a dead code object's only signal, so the block
 // names its owner in a version-local header (shared struct untouched).
@@ -62,6 +72,13 @@ void codeExtraFree(void* extra) {
 #if PY_VERSION_HEX < 0x030C0000
   OwnedCodeExtra311* block = ownedBlockOf(extra);
   PyCodeObject* owner = block->owner;
+  if (owner != nullptr) {
+    // The observer's table watches code objects the JIT may know nothing
+    // about -- observe mode runs with no JIT at all -- so its notice is
+    // not routed through the hook below, which the JIT owns.  Key only,
+    // and it neither allocates nor raises.
+    Ci_Observe311_OnCodeDeath(owner);
+  }
   if (owner != nullptr && g_code_destroyed_hook != nullptr) {
     // Key only.  code_dealloc is already tearing the object down, so no
     // C++ exception may cross this boundary and the block must be freed
@@ -71,6 +88,9 @@ void codeExtraFree(void* extra) {
       g_code_destroyed_hook(owner);
     } catch (...) {
     }
+  }
+  if (g_live_code_extra_blocks > 0) {
+    g_live_code_extra_blocks--;
   }
   PyMem_Free(block);
 #else
@@ -309,6 +329,15 @@ void initCodeExtraIndex() {
       PyUnstable_Eval_RequestCodeExtraIndex(codeExtraFree);
 }
 
+Py_ssize_t codeExtraSlotIndex() {
+  auto state = cinderx::getModuleState();
+  return state != nullptr ? state->code_extra_index : -1;
+}
+
+size_t liveCodeExtraBlocks() {
+  return g_live_code_extra_blocks;
+}
+
 void setCodeDestroyedHook(CodeDestroyedHook hook) {
   g_code_destroyed_hook = hook;
 }
@@ -397,6 +426,7 @@ CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
     return nullptr;
   }
   block->owner = code;
+  g_live_code_extra_blocks++;
   CodeExtra* extra = &block->extra;
   void* owned = block;
 #else
@@ -426,6 +456,14 @@ CodeExtra* codeExtraImpl(PyCodeObject* code, bool preserve_error) {
       jit::printPythonException();
       PyErr_Clear();
     }
+#if PY_VERSION_HEX < 0x030C0000
+    // The gauge was taken when the block was made; this path gives the
+    // block back, so it has to give the count back too.  A gauge that
+    // only ever rises reports a leak on the one path that did not leak.
+    if (g_live_code_extra_blocks > 0) {
+      g_live_code_extra_blocks--;
+    }
+#endif
     PyMem_Free(owned);
     return nullptr;
   }
@@ -473,6 +511,20 @@ CodeExtra* codeExtraIfExists(PyCodeObject* code) {
   }
   return reinterpret_cast<CodeExtra*>(data_ptr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+bool codeAutoJitDisabled311(PyCodeObject* code) {
+  CodeExtra* extra = codeExtraIfExists(code);
+  return extra != nullptr && Ci_code_extra_jit311_auto_disabled(extra);
+}
+
+void disableCodeAutoJit311(PyCodeObject* code) {
+  CodeExtra* extra = codeExtra(code);
+  if (extra != nullptr) {
+    Ci_code_extra_jit311_disable_auto(extra);
+  }
+}
+#endif
 
 int numLocals(PyCodeObject* code) {
   return code->co_nlocals;

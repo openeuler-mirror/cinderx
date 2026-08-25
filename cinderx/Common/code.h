@@ -54,6 +54,19 @@ int loadGlobalIndex(int oparg);
 void initCodeExtraIndex();
 void finiCodeExtraIndex();
 
+// Where CinderX's code-extra slot sits, or -1 before it is claimed.
+//
+// The index is a load-order fact, and on CPython 3.11 it is a safety fact
+// too: code_dealloc walks slots 0..ce_size calling every registered
+// freefunc, whether or not this code object populated the slot, so
+// anything CinderX stores forces the walk past every FOREIGN slot below
+// its own -- including a mortal one (a ctypes callback) that may already
+// be dead at shutdown.  Slots above ours are protected by capping what we
+// allocate; slots below ours cannot be protected at all, so callers that
+// are about to make CinderX store into code objects must check this
+// first.
+Py_ssize_t codeExtraSlotIndex();
+
 /*
  * Report that a code object is being destroyed.
  *
@@ -69,6 +82,12 @@ void finiCodeExtraIndex();
 #ifdef __cplusplus
 using CodeDestroyedHook = void (*)(PyCodeObject*);
 void setCodeDestroyedHook(CodeDestroyedHook hook);
+
+// Owned code-extra blocks currently allocated.  A gauge for lifecycle
+// tests: these blocks come from the raw allocator and are therefore
+// invisible to gc.get_objects(), so leaking one per code object would
+// leave a Python object census perfectly flat.
+size_t liveCodeExtraBlocks();
 #endif
 
 // Get the extra data object associated with a code object. Lazily allocates
@@ -105,6 +124,21 @@ size_t codeCallCount(PyCodeObject* code);
 // Get the extra data object associated with a code object if it already exists.
 // Unlike codeExtra(), this never allocates a CodeExtra.
 CodeExtra* codeExtraIfExists(PyCodeObject* code);
+
+#if PY_VERSION_HEX < 0x030C0000
+// CPython 3.11 auto-JIT verdict for a code object (CI_CODE_EXTRA_JIT311_*).
+//
+// The scheduler gives every code object exactly one automatic compilation
+// attempt.  A failed or refused attempt disables automatic compilation for
+// the code object for the rest of its life; explicit force_compile() is not
+// affected.  Without an extra block the code was never scheduled, so it is
+// not disabled.
+bool codeAutoJitDisabled311(PyCodeObject* code);
+// Record the verdict.  Allocates the extra block if needed; an allocation
+// failure leaves the code object un-disabled (the scheduler's own one-shot
+// dispatch table still prevents a second attempt).
+void disableCodeAutoJit311(PyCodeObject* code);
+#endif
 
 // Count the various frame variables that a code object will use.
 int numLocals(PyCodeObject* code);

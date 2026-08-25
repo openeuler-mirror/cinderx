@@ -219,6 +219,15 @@ class CompiledFunction {
     owner_ = owner;
   }
 
+  // The context this artifact belongs to, or null once it has been
+  // retired.  A publication that ran Python mid-transaction re-checks this
+  // before completing: a retirement in that window empties the member set
+  // and detaches the artifact, and finishing the publication onto it would
+  // leave registry entries the retirement can no longer reach.
+  CompiledFunctionOwner* owner() const {
+    return owner_;
+  }
+
 #if PY_VERSION_HEX < 0x030C0000
   /*
    * Forget the functions this artifact serves, without touching them.
