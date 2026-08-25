@@ -347,7 +347,7 @@ class ExecutionAcceptanceRunner:
         classification = directory / "classification.json"
         rc_classify = self._run(
             "25-C-classification",
-            [str(self.python), "-m", report_module, "classify", "--journal", str(c2_journal), "--targets", str(self.stage / "ci_pipeline/jit311/data/frozen_stdlib_modules.txt"), "--capabilities", str(self.stage / "ci_pipeline/jit311/data/semantic_conformance_capabilities.toml"), "--out", str(classification), "--markdown", str(directory / "CP311_JIT_EXECUTION_INFRA_REPORT.md")],
+            [str(self.python), "-m", report_module, "classify", "--journal", str(c2_journal), "--targets", str(self.stage / "ci_pipeline/jit311/data/frozen_stdlib_modules.txt"), "--capabilities", str(self.stage / "ci_pipeline/jit311/data/semantic_conformance_capabilities.toml"), "--out", str(classification)],
             env=common_env,
         )
         tracing = directory / "tracing.json"
@@ -405,7 +405,7 @@ class ExecutionAcceptanceRunner:
         result_path = directory / "result.json"
         rc = self._run(
             "30-W-specialization",
-            [str(self.python), "-m", "ci_pipeline.jit311.specialization_conformance", "--manifest", str(self.stage / "ci_pipeline/jit311/data/specialization_conformance_manifest.toml"), "--out", str(result_path), "--markdown", str(directory / "CP311_JIT_SPECIALIZATION_CONFORMANCE_REPORT.md")],
+            [str(self.python), "-m", "ci_pipeline.jit311.specialization_conformance", "--manifest", str(self.stage / "ci_pipeline/jit311/data/specialization_conformance_manifest.toml"), "--out", str(result_path)],
             env=self._product_env(),
         )
         result = self._json(result_path) or {"result": "FAIL"}
@@ -424,71 +424,6 @@ class ExecutionAcceptanceRunner:
         else:
             final = "PASS"
 
-        s = self.results.get("execution_smoke", {})
-        c = self.results.get("semantic_conformance", {})
-        w = self.results.get("specialization_conformance", {})
-        classification = c.get("classification") or {}
-        function_counts = classification.get("functions", {})
-        module_counts = classification.get("module_counts", {})
-        w_counts = w.get("counts", {})
-        deviations = (c.get("c1_vs_c2") or {}).get("approved_deviations", [])
-        unexpected = (c.get("c1_vs_c2") or {}).get("unexpected", {})
-        lines = [
-            "# CPython 3.11 CinderX JIT Execution Report",
-            "",
-            "## Provenance",
-            "",
-            f"- Python: `{provenance['python'].splitlines()[0]}`",
-            f"- Architecture: `{provenance['architecture']}`",
-            f"- Wheel: `{provenance['wheel']}`",
-            f"- Wheel SHA256: `{provenance['wheel_sha256']}`",
-            f"- Embedded git SHA: `{provenance['wheel_embedded'].get('git_sha')}`",
-            f"- Source git SHA: `{provenance['source_git_sha']}`",
-            f"- Wheel/source SHA match: `{provenance['wheel_source_sha_match']}`",
-            f"- `cinderx`: `{provenance['cinderx_file']}`",
-            f"- `_cinderx`: `{provenance['_cinderx_file']}`",
-            "",
-            "## Lane summary",
-            "",
-            "| Lane | Result |",
-            "|---|---|",
-        ]
-        for lane in ("execution_smoke", "semantic_conformance", "specialization_conformance"):
-            lines.append(f"| {lane} | {self.results.get(lane, {}).get('result', 'NOT_RUN')} |")
-        lines.extend(
-            [
-                "",
-                "## Compile-All evidence",
-                "",
-                f"- Target modules: {sum(module_counts.values())}/72",
-                f"- JIT_EXECUTED: {module_counts.get('JIT_EXECUTED', 0)}",
-                f"- EXPECTED_SAFE_REFUSAL: {module_counts.get('EXPECTED_SAFE_REFUSAL', 0)}",
-                f"- RUNTIME_FALLBACK: {module_counts.get('RUNTIME_FALLBACK', 0)}",
-                f"- UNCOVERED: {module_counts.get('UNCOVERED', 0)}",
-                f"- Exact own-code entry ledger dropped: {classification.get('entry_ledger_dropped', 0)}",
-                f"- Execute-surface drift errors: {len(classification.get('execute_surface_errors', []))}",
-                f"- Functions discovered/attempted: {function_counts.get('discovered', 0)}/{function_counts.get('attempted', 0)}",
-                f"- Functions compiled/entered: {function_counts.get('compiled', 0)}/{function_counts.get('entered', 0)}",
-                f"- Expected refusal: {function_counts.get('expected_refusal', 0)}",
-                f"- Runtime fallback: {function_counts.get('runtime_fallback', 0)}",
-                f"- Unknown refusal: {function_counts.get('unknown_refusal', 0)}",
-                f"- Unexpected refusal: {function_counts.get('unexpected_refusal', 0)}",
-                f"- Approved deviations: {len(deviations)}",
-                f"- Unexpected differences: {len(unexpected)}",
-                "",
-                "## Warm specialization",
-                "",
-                f"- Families: {w_counts.get('families', 0)}/17",
-                f"- W-JIT: {w_counts.get('w_jit', 0)}",
-                f"- W-SAFE-REFUSE: {w_counts.get('w_safe_refuse', 0)}",
-                f"- Unknown: {w_counts.get('unknown', 0)}",
-                "",
-                "## Final",
-                "",
-                f"**{final}**",
-            ]
-        )
-        (self.output / "CP311_JIT_EXECUTION_REPORT.md").write_text("\n".join(lines) + "\n")
         convergence = {
             "final": final,
             "cases": self.results,
@@ -513,8 +448,8 @@ class ExecutionAcceptanceRunner:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wheel", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--wheel", type=Path, default=None)
+    parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--case",
@@ -540,7 +475,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"execution acceptance failed before final judgment: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(f"execution acceptance {final}: {runner.output / 'CP311_JIT_EXECUTION_REPORT.md'}")
+    # The last line is the whole verdict: approved deviations are a pass.
+    print("PASS" if final in PASS_STATES else final)
+    print(f"evidence: {runner.output / 'execution_result.json'}", file=sys.stderr)
     if final in PASS_STATES:
         return 0
     return 2 if final == "REVIEW_REQUIRED" else 1

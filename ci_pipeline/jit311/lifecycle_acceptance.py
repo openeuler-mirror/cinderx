@@ -962,103 +962,27 @@ class LifecycleAcceptanceRunner:
         (self.output / "lifecycle_result.json").write_text(
             json.dumps(document, indent=2, sort_keys=True) + "\n"
         )
-        self._write_reports(document)
         return status
 
-    def _write_reports(self, document: dict) -> None:
-        def case_report(name: str, title: str) -> None:
-            case = document["cases"].get(name)
-            lines = [f"# {title}", "", f"Result: **{case['result'] if case else 'NOT_RUN'}**", ""]
-            if case:
-                lines.append("| Section | Result | Notes |")
-                lines.append("|---|---|---|")
-                for section, value in (case.get("sections") or {}).items():
-                    note = "; ".join(value.get("errors", [])) or "-"
-                    lines.append(f"| {section} | {value.get('result')} | {note} |")
-                diagnostics = {
-                    section: value.get("resource_stability_diagnostic")
-                    for section, value in (case.get("sections") or {}).items()
-                    if value.get("resource_stability_diagnostic", {}).get("errors_demoted")
-                    or value.get("resource_stability_diagnostic", {}).get("capacity_readings")
-                }
-                if diagnostics:
-                    lines += [
-                        "",
-                        "## RESOURCE_STABILITY_DIAGNOSTIC (recorded, not judged)",
-                        "",
-                        "```json",
-                        json.dumps(diagnostics, indent=1, sort_keys=True),
-                        "```",
-                    ]
-            (self.output / f"CP311_JIT_{name}_REPORT.md").write_text(
-                "\n".join(lines) + "\n"
-            )
+def _default_wheel() -> Path | None:
+    """The colleague convention: one wheel, mounted read-only at /wheels."""
+    candidates = sorted(Path("/wheels").glob("cinderx-*cp311*.whl"))
+    return candidates[-1] if candidates else None
 
-        case_report("LIFECYCLE_OWNERSHIP", "CPython 3.11 CinderX JIT 函数、代码对象与编译产物生命周期所有权一致性验证")
-        case_report("SHUTDOWN_STABILITY", "CPython 3.11 CinderX JIT 暂停恢复、多线程编译清理与进程退出稳定性验证")
-        case_report("NATIVE_MEMORY_SAFETY", "CPython 3.11 CinderX JIT 生命周期与销毁路径 Native 内存安全验证")
 
-        regression = document["stdlib_regression"]
-        if regression.get("run") is not None:
-            run = regression["run"]
-            (self.output / "CP311_JIT_STDLIB_AUTOJIT_REGRESSION_REPORT.md").write_text(
-                "\n".join(
-                    [
-                        "# CPython 3.11 CinderX JIT 真实程序面渗透回归",
-                        "",
-                        f"Result: **{run['result']}**",
-                        "",
-                        f"- 模块: {run.get('modules')}/72（threshold=50 Auto-JIT，MALLOC_PERTURB_ 在开）",
-                        f"- 非 pass: `{json.dumps(run.get('non_pass'))}`",
-                        f"- JIT 路径证明: `{json.dumps(run.get('path_proof'), ensure_ascii=False)}`",
-                        f"- 触发方式: `{json.dumps({k: v for k, v in regression.items() if k != 'run'}, ensure_ascii=False)}`",
-                        "",
-                    ]
-                )
-                + "\n"
-            )
+def _default_source() -> Path:
+    return Path(__file__).resolve().parents[2]
 
-        status_note = (
-            " (subset execution — a single-case result, not "
-            "the full lifecycle acceptance)"
-            if document["status"] == "NOT_FULLY_RUN"
-            else ""
-        )
-        summary = [
-            "# CP311 JIT Lifecycle Acceptance Report",
-            "",
-            f"Final: **{document['status']}**{status_note}",
-            "",
-            f"- Source SHA: `{document['provenance'].get('source_git_sha')}`",
-            f"- Wheel SHA256: `{document['provenance'].get('wheel_sha256')}`",
-            f"- transition frozen evidence: `{document['transition_frozen'].get('result')}`",
-            "",
-            "| Case | Result |",
-            "|---|---|",
-        ]
-        for name in CASES:
-            case = document["cases"].get(name)
-            summary.append(f"| {name} | {case['result'] if case else 'NOT_RUN'} |")
-        regression_result = (
-            (document["stdlib_regression"].get("run") or {}).get("result", "NOT_TRIGGERED")
-            if document["stdlib_regression"]["required"]
-            else "NOT_TRIGGERED"
-        )
-        summary.append(f"| STDLIB_AUTOJIT_REGRESSION | {regression_result} |")
-        summary += [
-            "",
-            "Resource Stability Follow-ups (recorded, not judged): "
-            "executable allocator retention, CodeRuntime slab high-water — "
-            "see the per-case RESOURCE_STABILITY_DIAGNOSTIC sections.",
-            "",
-        ]
-        (self.output / "CP311_JIT_LIFECYCLE_REPORT.md").write_text("\n".join(summary) + "\n")
+
+def _default_evidence(name: str) -> Path | None:
+    candidate = Path("/a2evidence") / name
+    return candidate if candidate.is_file() else None
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wheel", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--wheel", type=Path, default=_default_wheel())
+    parser.add_argument("--source", type=Path, default=_default_source())
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--case",
@@ -1071,15 +995,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stdlib-regression",
         choices=("auto", "required", "skip"),
-        default="auto",
+        # The bare invocation is the formal acceptance: all ten cases run.
+        default="required",
     )
     parser.add_argument("--regression-base")
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--transition-report", type=Path)
-    parser.add_argument("--transition-result", type=Path)
+    parser.add_argument(
+        "--transition-report",
+        type=Path,
+        default=_default_evidence("A2_EXECUTION_REPORT_FINAL.md"),
+    )
+    parser.add_argument(
+        "--transition-result",
+        type=Path,
+        # The frozen evidence file keeps its campaign-era name.
+        default=_default_evidence("a2_result.json"),  # naming-lint: allow
+    )
     args = parser.parse_args(argv)
+    if args.wheel is None:
+        print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
+        return 2
     output = args.out or Path.cwd() / f"cp311-lifecycle-acceptance-{datetime.now():%Y%m%d-%H%M%S}"
+    asan_build = args.asan_build
+    if asan_build is None:
+        # The colleague convention: build the sanitizer arms on first use,
+        # with the same script the record documents.
+        asan_build = output.parent / "acceptance-asan-build-exec"
+        if not asan_build.is_dir():
+            print("building the ASAN arms (first run only; ~30-45 minutes) ...")
+            rc = subprocess.run(
+                ["bash", str(args.source / "ci_pipeline/scripts/run_asan_build_311.sh"),
+                 str(output.parent / "acceptance-asan-build")],
+                cwd=args.source,
+            ).returncode
+            if rc != 0:
+                print("INFRA_FAIL")
+                return 1
     runner = LifecycleAcceptanceRunner(
         wheel=args.wheel,
         source=args.source,
@@ -1088,7 +1040,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.timeout,
         transition_report=args.transition_report,
         transition_result=args.transition_result,
-        asan_build=args.asan_build,
+        asan_build=asan_build,
         stdlib_regression=args.stdlib_regression,
         regression_base=args.regression_base,
         cases=set(args.case or CASES),
@@ -1101,7 +1053,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"lifecycle acceptance {status}: {runner.output / 'CP311_JIT_LIFECYCLE_REPORT.md'}")
+    # The last line is the whole verdict: approved deviations are a pass.
+    print("PASS" if status == "PASS" else status)
+    print(f"evidence: {runner.output / 'lifecycle_result.json'}", file=sys.stderr)
     if status in ("PASS", "NOT_FULLY_RUN"):
         # A green subset exits zero but its report says NOT_FULLY_RUN --
         # it never claims a full lifecycle acceptance (review P0-2).

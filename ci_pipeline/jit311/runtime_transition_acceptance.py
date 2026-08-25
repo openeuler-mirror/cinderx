@@ -16,7 +16,6 @@ from ci_pipeline.jit311.runtime_transition_report import (
     compare_penetration,
     compare_recursion_boundary,
     judge_transitions,
-    render_markdown,
 )
 
 ADAPTIVE_DEVIATIONS = {
@@ -849,7 +848,7 @@ class RuntimeTransitionAcceptanceRunner:
                     "ci_pipeline.test_runtime_transition_report.RuntimeTransitionReportTest.test_autocompile_jit_all_and_diagnostic_uses_threshold_one",
                     "ci_pipeline.test_runtime_transition_report.A2ReportTest.test_penetration_classifier_uses_package_ownership",
                 ],
-                evidence="P/p2-coverage.json, CP311_JIT_AUTOCOMPILE_SCHEDULER_REPORT.md",
+                evidence="AUTOCOMPILE_COVERAGE/p2-coverage.json",
                 modules=gaps,
                 errors=coverage_errors,
             )
@@ -923,7 +922,7 @@ class RuntimeTransitionAcceptanceRunner:
                     "InsertUpdatePrevInstrTest.PythonVisibleBoundariesPublishPrecisePositions",
                     "Exception311Test.PropagatedCallStopsAtTheLastCacheUnit",
                 ],
-                evidence="T/frame-position-*.json, T/error-position-*.json, CP311_JIT_FRAME_POSITION_REPORT.md",
+                evidence="STATE_TRANSITION/frame-position-*.json, STATE_TRANSITION/error-position-*.json",
             )
         recursion_result = transitions.get("recursion_boundary", {})
         if recursion_result and recursion_result.get("result") != "PASS":
@@ -949,7 +948,7 @@ class RuntimeTransitionAcceptanceRunner:
                     "recursion_boundary_probe:R1-R6",
                     "T10",
                 ],
-                evidence="T/recursion-boundary-*.json, T/result.json, CP311_JIT_RECURSION_BOUNDARY_REPORT.md",
+                evidence="STATE_TRANSITION/recursion-boundary-*.json, STATE_TRANSITION/result.json",
                 errors=recursion_result.get("errors", []),
             )
         native_recursion_result = transitions.get("native_recursion_boundary", {})
@@ -975,7 +974,7 @@ class RuntimeTransitionAcceptanceRunner:
                     "native_recursion_boundary_probe",
                     "JITLifecycle311Test.BindFailureAtRecursionLimitMatchesStock",
                 ],
-                evidence="T/native-recursion-boundary-*.json, CP311_JIT_NATIVE_RECURSION_BOUNDARY_REPORT.md",
+                evidence="STATE_TRANSITION/native-recursion-boundary-*.json",
                 errors=native_recursion_result.get("errors", []),
             )
         transition_failures = [
@@ -1029,7 +1028,7 @@ class RuntimeTransitionAcceptanceRunner:
                 ],
                 fix_summary="No forced automatic re-JIT was introduced.",
                 regression_tests=["code_swap_transition_probe:default/zero/large/force"],
-                evidence="R/code-swap-*.json, CP311_JIT_TRANSITION_POLICY_AND_FOOTPRINT_REPORT.md",
+                evidence="TRANSITION_RECOVERY/code-swap-*.json",
                 arms=sorted(failed_code_swap),
             )
         states = [result.get("result") for result in self.results.values()]
@@ -1092,30 +1091,6 @@ class RuntimeTransitionAcceptanceRunner:
         (self.output / "runtime_transition_result.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
-        render_markdown(payload, self.output / "CP311_JIT_RUNTIME_TRANSITION_REPORT.md")
-        blocker_lines = ["# CPython 3.11 CinderX JIT Runtime-Transition Final Blockers", ""]
-        if not blockers:
-            blocker_lines.extend(["No remaining runtime-transition correctness blocker.", ""])
-        for item in blockers:
-            blocker_lines.extend(
-                [
-                    f"## {item['id']}",
-                    "",
-                    f"- Severity: `{item['severity']}`",
-                    f"- Classification: `{item['classification']}`",
-                    f"- Cluster: `{item['cluster']}`",
-                    f"- Summary: {item['summary']}",
-                    f"- Evidence: `{item['evidence']}`",
-                    "",
-                    "```json",
-                    json.dumps(item, indent=2, sort_keys=True),
-                    "```",
-                    "",
-                ]
-            )
-        (self.output / "A2_BLOCKERS_FINAL.md").write_text(
-            "\n".join(blocker_lines) + "\n"
-        )
         return final
 
     def run(self) -> str:
@@ -1131,8 +1106,8 @@ class RuntimeTransitionAcceptanceRunner:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wheel", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--wheel", type=Path, default=None)
+    parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--case",
@@ -1143,6 +1118,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
+    if args.wheel is None:
+        candidates = sorted(Path("/wheels").glob("cinderx-*cp311*.whl"))
+        if not candidates:
+            print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
+            return 2
+        args.wheel = candidates[-1]
+    if args.source is None:
+        args.source = Path(__file__).resolve().parents[2]
     output = args.out or Path.cwd() / f"cp311-a2-{datetime.now():%Y%m%d-%H%M%S}"
     runner = RuntimeTransitionAcceptanceRunner(
         wheel=args.wheel,
@@ -1160,7 +1143,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"runtime-transition {final}: {runner.output / 'CP311_JIT_RUNTIME_TRANSITION_REPORT.md'}")
     if final in PASS_STATES:
         return 0
     return 2 if final == "REVIEW_REQUIRED" else 1
