@@ -460,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
+    if args.wheel is None:
+        print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
+        return 2
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output = args.out or Path.cwd() / f"cp311-execution-{timestamp}"
     runner = ExecutionAcceptanceRunner(
