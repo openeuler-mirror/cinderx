@@ -584,6 +584,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   // Allocate all CodeRuntimes together so they can be mlocked() without
   // including any other data that happened to be on the same page.
+  std::shared_ptr<CodeRuntimeLifetime> code_runtime_lifetime_{
+      std::make_shared<CodeRuntimeLifetime>()};
   SlabArena<CodeRuntime> code_runtimes_;
 
   // These SlabAreas hold data that is allocated at compile-time and likely to

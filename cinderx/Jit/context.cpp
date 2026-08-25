@@ -247,6 +247,13 @@ Context::~Context() {
     code.second->clear(true /* context_finalizing */);
   }
 #endif
+
+  // Retired 3.11 artifacts can be absent from every registry while a
+  // suspended generator still owns them. Stop their destructors from
+  // dereferencing this arena, then release every CodeRuntime's Python
+  // references while the arena storage is still valid.
+  code_runtime_lifetime_->alive.store(false, std::memory_order_release);
+  releaseReferences();
 }
 
 void Context::mlockProfilerDependencies() {
@@ -1661,6 +1668,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
   bool immortal = getConfig().immortalize_compiled_functions ||
       (func != nullptr && _Py_IsImmortal(func)) ||
       (outer != nullptr && _Py_IsImmortal(outer));
+  compiled_func.runtime_lifetime = code_runtime_lifetime_;
   auto compiled = CompiledFunction::create(std::move(compiled_func), immortal);
   if (compiled == nullptr) {
     return nullptr;

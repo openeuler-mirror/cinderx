@@ -449,7 +449,13 @@ void CompiledFunction::clear(
   // registries are gone. Keep these references until that generator converts
   // to stock state and releases the artifact's final owner.
   if (release_runtime_references && data_.runtime != nullptr) {
-    data_.runtime->releaseReferences();
+    // A retired artifact can outlive the Context arena through a suspended
+    // 3.11 generator. Context releases every CodeRuntime before marking the
+    // arena dead; a later artifact destructor must not dereference that arena.
+    if (data_.runtime_lifetime == nullptr ||
+        data_.runtime_lifetime->alive.load(std::memory_order_acquire)) {
+      data_.runtime->releaseReferences();
+    }
     data_.runtime = nullptr;
   }
 }

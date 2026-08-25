@@ -74,13 +74,19 @@ bool isJitCompiled(const PyFunctionObject* func);
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/hir.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <unordered_set>
 #include <utility>
 
 namespace jit {
+
+struct CodeRuntimeLifetime {
+  std::atomic<bool> alive{true};
+};
 
 // Data members extracted from CompiledFunction to enable separate storage.
 // CompiledFunction is a GC tracked object and cannot be constructed during
@@ -99,6 +105,7 @@ struct CompiledFunctionData {
   std::vector<std::unique_ptr<CodePatcher>> code_patchers;
   std::unique_ptr<hir::Function> irfunc;
   CodeRuntime* runtime{nullptr};
+  std::shared_ptr<CodeRuntimeLifetime> runtime_lifetime;
   // Whether the compilation produced OSR entry stubs.
   bool osr_aware{false};
   bool has_osr_entries{false};

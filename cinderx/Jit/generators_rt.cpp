@@ -336,6 +336,17 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
 #endif
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  else {
+    // An in-stack deopt converted this generator to stock PyGen/PyCoro while
+    // its machine code was running. The deopt trampoline still consumes this
+    // artifact's metadata and epilogue after prepareForDeopt(), so the handler
+    // cannot release the MakeGen pin. The resume call has now fully left
+    // machine code, and stock traversal/deallocation will never visit the
+    // footer, making this the final safe point to balance that pin.
+    clearGeneratorCompiledFunction(gen_footer);
+  }
+#endif
 
   return result;
 }
