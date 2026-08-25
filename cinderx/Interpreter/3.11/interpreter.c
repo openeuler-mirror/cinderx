@@ -6,8 +6,8 @@
 
 #include "cinderx/Interpreter/interpreter.h"
 
-#include "internal/pycore_frame.h"
 #include "internal/pycore_ceval.h"
+#include "internal/pycore_frame.h"
 
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"

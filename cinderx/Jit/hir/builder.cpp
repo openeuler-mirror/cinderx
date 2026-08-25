@@ -1418,8 +1418,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
 #endif
 }
 
-ExecuteRefusal311 unsupportedExecuteDetail311(
-    BorrowedRef<PyCodeObject> code) {
+ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
   // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
   // family (including LOAD_GLOBAL without a speculative cache Guard,

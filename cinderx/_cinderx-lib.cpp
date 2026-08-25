@@ -944,8 +944,7 @@ static void get_recursion_state_for_test(
     int* headroom,
     int* boundary_active,
     int* jit_entries) {
-  JITRT_GetRecursionState311(
-      remaining, headroom, boundary_active, jit_entries);
+  JITRT_GetRecursionState311(remaining, headroom, boundary_active, jit_entries);
 }
 
 static PyObject* native_recursion_state_for_test(PyObject*, PyObject*) {
@@ -968,8 +967,9 @@ static PyObject* native_recursion_state_for_test(PyObject*, PyObject*) {
 }
 
 // Test-only native recursion probe.  It deliberately calls the public C API
-// directly, without going through Ci_EvalFrame, so the runtime-transition freeze validation can
-// compare Stock and JIT behavior at the last admitted Python frame.
+// directly, without going through Ci_EvalFrame, so the runtime-transition
+// freeze validation can compare Stock and JIT behavior at the last admitted
+// Python frame.
 static PyObject* native_enter_recursive_call_for_test(PyObject*, PyObject*) {
   int before_remaining;
   int before_headroom;
@@ -1011,10 +1011,7 @@ static PyObject* native_enter_recursive_call_for_test(PyObject*, PyObject*) {
   int after_boundary;
   int after_jit_entries;
   get_recursion_state_for_test(
-      &after_remaining,
-      &after_headroom,
-      &after_boundary,
-      &after_jit_entries);
+      &after_remaining, &after_headroom, &after_boundary, &after_jit_entries);
   return Py_BuildValue(
       "{s:O,s:i,s:O,s:z,s:O,s:{s:i,s:i,s:O,s:i},s:{s:i,s:i,s:O,s:i}}",
       "entered",

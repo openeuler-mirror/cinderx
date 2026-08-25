@@ -275,8 +275,9 @@ TEST_F(JITContextTest, RuntimeTransitionLedgerRecordsExactResumeEvidence) {
   ASSERT_TRUE(PyList_Check(rows));
   ASSERT_EQ(PyList_GET_SIZE(rows.get()), 1);
   BorrowedRef<> row = PyList_GET_ITEM(rows.get(), 0);
-  EXPECT_STREQ(PyUnicode_AsUTF8(PyDict_GetItemString(row, "deopt_reason")),
-               "GuardFailure");
+  EXPECT_STREQ(
+      PyUnicode_AsUTF8(PyDict_GetItemString(row, "deopt_reason")),
+      "GuardFailure");
   EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "cause_offset")), 4);
   EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "resume_offset")), 6);
   EXPECT_EQ(PyLong_AsLong(dropped), 0);
@@ -2730,8 +2731,6 @@ def gen(n: int):
   EXPECT_EQ(val.get(), nullptr);
 }
 
-
-
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -2792,7 +2791,6 @@ def gen():
   EXPECT_EQ(val.get(), nullptr);
 }
 
-
 TEST_F(JITGeneratorTest, CompileCoroutine) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -2843,7 +2841,6 @@ def gen():
   EXPECT_NE(close_result, nullptr);
   Py_XDECREF(close_result);
 }
-
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
   SKIP_311_EXECUTABLE_COMPILE();
@@ -6052,7 +6049,8 @@ TEST_F(JITLifecycle311Test, RetiredCodeRuntimeStorageIsRecycled) {
     func.reset();
   };
 
-  auto first = compile_one("def recycle_a(x):\n    return x + 1\n", "recycle_a");
+  auto first =
+      compile_one("def recycle_a(x):\n    return x + 1\n", "recycle_a");
   ASSERT_NE(first, nullptr);
   auto baseline = ctx->lifecycleSnapshot311();
   kill(first, "recycle_a");
@@ -6112,8 +6110,7 @@ TEST_F(JITLifecycle311Test, RecycleSurvivesFreeListAllocationFailure) {
       << "the artifact still died and cleared its runtime";
   EXPECT_EQ(refused.code_runtimes_allocated, baseline.code_runtimes_allocated);
 
-  auto second =
-      compile_one("def refuse_b(x):\n    return x + 2\n", "refuse_b");
+  auto second = compile_one("def refuse_b(x):\n    return x + 2\n", "refuse_b");
   ASSERT_NE(second, nullptr);
   EXPECT_EQ(
       ctx->lifecycleSnapshot311().code_runtimes_allocated,

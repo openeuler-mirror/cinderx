@@ -2574,8 +2574,7 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
   } else if ((reason = Ci_JitShell311_ExecuteRefusal(func)) != nullptr) {
     eligible = false;
     phase = "preflight";
-    Ci_JitShell311_GetExecuteRefusalDetail(
-        &refusal_opcode, &refusal_offset);
+    Ci_JitShell311_GetExecuteRefusalDetail(&refusal_opcode, &refusal_offset);
   } else if (!isJitCompiled(func)) {
     if (Ci_InitFrameEvalFunc() < 0) {
       return nullptr;
@@ -2647,8 +2646,8 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
       : Ref<>::steal(PyLong_FromLong(refusal_offset));
   if (result == nullptr || phase_obj == nullptr || reason_obj == nullptr ||
       opcode_obj == nullptr || offset_obj == nullptr ||
-      PyDict_SetItemString(
-          result, "eligible", eligible ? Py_True : Py_False) < 0 ||
+      PyDict_SetItemString(result, "eligible", eligible ? Py_True : Py_False) <
+          0 ||
       PyDict_SetItemString(
           result, "compiled", isJitCompiled(func) ? Py_True : Py_False) < 0 ||
       PyDict_SetItemString(result, "phase", phase_obj) < 0 ||
@@ -2683,10 +2682,7 @@ PyObject* jit311_code_state(PyObject* /* self */, PyObject* arg) {
   int scheduler_dispatched = 0;
   int scheduler_attachable = 0;
   bool scheduler_observed = Ci_Observe311_GetCodeState(
-      code,
-      &scheduler_count,
-      &scheduler_dispatched,
-      &scheduler_attachable);
+      code, &scheduler_count, &scheduler_dispatched, &scheduler_attachable);
   bool installed = Ci_JitShell311_InstalledArtifact(func) != nullptr;
   const char* policy_reason = "automatic-attempt-available";
   if (installed) {
@@ -2748,7 +2744,8 @@ PyObject* jit311_config_state(PyObject* /* self */, PyObject* /* arg */) {
       ? Ref<>::steal(PyLong_FromUnsignedLong(*threshold))
       : Ref<>::create(Py_None);
   if (result == nullptr || threshold_obj == nullptr ||
-      PyDict_SetItemString(result, "compile_after_n_calls", threshold_obj) < 0 ||
+      PyDict_SetItemString(result, "compile_after_n_calls", threshold_obj) <
+          0 ||
       PyDict_SetItemString(
           result,
           "auto_classify",
@@ -2795,7 +2792,8 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
   cinderx::ModuleState* module_state = cinderx::getModuleState();
   if (module_state == nullptr) {
     PyErr_SetString(
-        PyExc_RuntimeError, "CPython 3.11 lifecycle module state is unavailable");
+        PyExc_RuntimeError,
+        "CPython 3.11 lifecycle module state is unavailable");
     return nullptr;
   }
   CompilerContext<Compiler>* ctx = jitCtx();
@@ -2822,9 +2820,10 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> runtime = Ref<>::steal(PyDict_New());
   Ref<> observer = Ref<>::steal(PyDict_New());
   Ref<> generator = Ref<>::steal(PyDict_New());
-  Ref<> schema = Ref<>::steal(PyUnicode_FromString("cp311-jit-a3-lifecycle-v1"));
-  Ref<> unavailable =
-      Ref<>::steal(PyUnicode_FromString("GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"));
+  Ref<> schema =
+      Ref<>::steal(PyUnicode_FromString("cp311-jit-a3-lifecycle-v1"));
+  Ref<> unavailable = Ref<>::steal(
+      PyUnicode_FromString("GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"));
   if (result == nullptr || jit_state == nullptr || module == nullptr ||
       runtime == nullptr || observer == nullptr || generator == nullptr ||
       schema == nullptr || unavailable == nullptr) {
@@ -2838,22 +2837,21 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
       jit_state, "installed_functions", census.installed_functions);
   rc |= lifecycleSetSize(
       jit_state, "associated_functions", census.associated_functions);
-  rc |= lifecycleSetSize(jit_state, "parked_functions", census.parked_functions);
-  rc |= lifecycleSetSize(jit_state, "watched_functions", census.watched_functions);
-  rc |= lifecycleSetSize(jit_state, "artifact_members", census.artifact_members);
+  rc |=
+      lifecycleSetSize(jit_state, "parked_functions", census.parked_functions);
   rc |= lifecycleSetSize(
-      jit_state,
-      "deferred_anchor_releases",
-      census.deferred_anchor_releases);
+      jit_state, "watched_functions", census.watched_functions);
+  rc |=
+      lifecycleSetSize(jit_state, "artifact_members", census.artifact_members);
+  rc |= lifecycleSetSize(
+      jit_state, "deferred_anchor_releases", census.deferred_anchor_releases);
   rc |= lifecycleSetSize(jit_state, "active_compiles", census.active_compiles);
   rc |= lifecycleSetSize(
       jit_state, "completed_compiles", census.completed_compiles);
   rc |= lifecycleSetSize(
       jit_state, "deferred_finalizations", census.deferred_finalizations);
   rc |= lifecycleSetSize(
-      jit_state,
-      "orphaned_compiled_codes",
-      census.orphaned_compiled_codes);
+      jit_state, "orphaned_compiled_codes", census.orphaned_compiled_codes);
   rc |= lifecycleSetSize(
       jit_state, "code_dedup_entries", census.code_dedup_entries);
   rc |= lifecycleSetSize(
@@ -2877,7 +2875,9 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
       "unit_deletion_tracking_failed",
       module_state->unit_deletion_tracking_failed);
   rc |= lifecycleSetBool(
-      module, "code_allocator_present", module_state->code_allocator != nullptr);
+      module,
+      "code_allocator_present",
+      module_state->code_allocator != nullptr);
   rc |= lifecycleSetSize(
       module,
       "code_allocator_used_bytes",
@@ -2925,11 +2925,13 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
 }
 
 PyObject* jit311_lifecycle_invariants(
-    PyObject* /* self */, PyObject* /* arg */) {
+    PyObject* /* self */,
+    PyObject* /* arg */) {
   cinderx::ModuleState* module_state = cinderx::getModuleState();
   if (module_state == nullptr) {
     PyErr_SetString(
-        PyExc_RuntimeError, "CPython 3.11 lifecycle module state is unavailable");
+        PyExc_RuntimeError,
+        "CPython 3.11 lifecycle module state is unavailable");
     return nullptr;
   }
   std::vector<std::string> errors;
@@ -2950,8 +2952,8 @@ PyObject* jit311_lifecycle_invariants(
       return nullptr;
     }
   }
-  if (PyDict_SetItemString(
-          result, "ok", errors.empty() ? Py_True : Py_False) < 0 ||
+  if (PyDict_SetItemString(result, "ok", errors.empty() ? Py_True : Py_False) <
+          0 ||
       PyDict_SetItemString(result, "errors", error_list) < 0) {
     return nullptr;
   }
@@ -2959,18 +2961,16 @@ PyObject* jit311_lifecycle_invariants(
 }
 
 PyObject* jit311_compile_with_publish_failure(
-    PyObject* /* self */, PyObject* args) {
+    PyObject* /* self */,
+    PyObject* args) {
   PyObject* func_obj;
   int step;
   if (!PyArg_ParseTuple(
-          args,
-          "Oi:_jit311_compile_with_publish_failure",
-          &func_obj,
-          &step)) {
+          args, "Oi:_jit311_compile_with_publish_failure", &func_obj, &step)) {
     return nullptr;
   }
-  BorrowedRef<PyFunctionObject> func = get_func_arg(
-      "_jit311_compile_with_publish_failure", func_obj);
+  BorrowedRef<PyFunctionObject> func =
+      get_func_arg("_jit311_compile_with_publish_failure", func_obj);
   if (func == nullptr) {
     return nullptr;
   }
@@ -3005,8 +3005,8 @@ PyObject* jit311_compile_with_publish_failure(
   }
   failJitPublishStepForTest(0);
 
-  bool memory_error = result == Result::PYTHON_EXCEPTION &&
-      PyErr_Occurred() && PyErr_ExceptionMatches(PyExc_MemoryError);
+  bool memory_error = result == Result::PYTHON_EXCEPTION && PyErr_Occurred() &&
+      PyErr_ExceptionMatches(PyExc_MemoryError);
   PyErr_Clear();
   if (!memory_error) {
     PyErr_Format(
@@ -3033,7 +3033,8 @@ PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
   if (result == nullptr) {
     return nullptr;
   }
-  for (int opcode = 0; opcode <= std::numeric_limits<uint8_t>::max(); opcode++) {
+  for (int opcode = 0; opcode <= std::numeric_limits<uint8_t>::max();
+       opcode++) {
     if (!jit::hir::isExecuteOpcodeSupported311(opcode)) {
       continue;
     }
@@ -3055,7 +3056,8 @@ PyObject* jit311_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
 }
 
 PyObject* jit311_reset_transition_ledger(
-    PyObject* /* self */, PyObject* /* arg */) {
+    PyObject* /* self */,
+    PyObject* /* arg */) {
   jit::runtimeTransitionLedgerReset();
   Py_RETURN_NONE;
 }
@@ -5819,10 +5821,7 @@ int initialize() {
   }
   auto resolved_threshold = getConfig().compile_after_n_calls;
   Ci_Observe311_SetResolvedAutoJitConfig(
-      1,
-      resolved_threshold.value_or(50),
-      getConfig().auto_classify,
-      1);
+      1, resolved_threshold.value_or(50), getConfig().auto_classify, 1);
 #endif
   if (validateFrameModeConfig() < 0) {
     return -1;

@@ -1471,8 +1471,8 @@ std::vector<std::string> Context::lifecycleInvariantErrors311() const {
   for (const auto& [key, compiled] : compiled_codes_) {
     detached_artifact_error |= compiled->owner() != this;
     artifacts.insert(compiled.get());
-    CodeExtra* extra = codeExtraIfExists(
-        reinterpret_cast<PyCodeObject*>(key.code));
+    CodeExtra* extra =
+        codeExtraIfExists(reinterpret_cast<PyCodeObject*>(key.code));
     if (extra == nullptr) {
       continue;
     }
@@ -1493,8 +1493,8 @@ std::vector<std::string> Context::lifecycleInvariantErrors311() const {
   for (CompiledFunction* compiled : artifacts) {
     for (BorrowedRef<PyFunctionObject> func : compiled->functions()) {
       auto assoc = associated_funcs_.find(func);
-      member_association_error |= assoc == associated_funcs_.end() ||
-          assoc->second.get() != compiled;
+      member_association_error |=
+          assoc == associated_funcs_.end() || assoc->second.get() != compiled;
     }
   }
   if (installed_association_error) {
@@ -1507,7 +1507,8 @@ std::vector<std::string> Context::lifecycleInvariantErrors311() const {
     errors.emplace_back("I2 artifact member lacks its exact association");
   }
   if (borrowed_watch_error) {
-    errors.emplace_back("I3 borrowed function registry lacks a live death watch");
+    errors.emplace_back(
+        "I3 borrowed function registry lacks a live death watch");
   }
   if (detached_artifact_error) {
     errors.emplace_back("I6 compiled registry contains a detached artifact");
@@ -1518,7 +1519,8 @@ std::vector<std::string> Context::lifecycleInvariantErrors311() const {
 #endif
   if (!active_compiles_.empty() || !completed_compiles_.empty() ||
       !deferred_finalizations_.empty()) {
-    errors.emplace_back("I4 stable checkpoint retains compile transaction state");
+    errors.emplace_back(
+        "I4 stable checkpoint retains compile transaction state");
   }
 #if PY_VERSION_HEX < 0x030C0000
   if (!deferred_anchor_releases_.empty()) {
