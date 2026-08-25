@@ -18,7 +18,7 @@ The freeze criteria (all of them, none waived):
 | LIFECYCLE_OWNERSHIP PASS | L1 function death ×100 · L2 code swap ×100 · L3 observer smoke ×1000 · L4 generator anchor · invariants at every checkpoint, non-vacuity proven |
 | SHUTDOWN_STABILITY PASS | S1 park/die/re-enable ×100 (phase evidence judged) · S2 multithread batch · S3 six-state exit matrix 200/200 poisoned+entropy, multithread-completed passing on its own |
 | NATIVE_MEMORY_SAFETY PASS | seven targeted ASAN legs against a verified-instrumented extension, zero sanitizer reports; the ASAN executed arm also runs the full green-family population |
-| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 464 257 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
+| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 456 489 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
 | execution regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged) |
 | runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the lifecycle prerequisite validates the frozen evidence from the frozen commit itself (`git show <frozen>:<historical path>`), so the freeze pins history rather than present-day file names |
 | lifecycle blockers | none |
@@ -27,14 +27,14 @@ The freeze criteria (all of them, none waived):
 ## Frozen identity
 
 ```text
-frozen_commit            2ff2d160adf5bcbb788ca3de7699c1d02b6c7235
-wheel                    cinderx-2026.8.24.0-cp311-cp311-linux_aarch64.whl
-wheel_sha256             78bb60ae29f55c2553905b697858560703d38dc787d7b360864a8e75bacede56
-wheel_embedded_git_sha   2ff2d160adf5bcbb788ca3de7699c1d02b6c7235
+frozen_commit            1a3ada1ba5717ce34f9dd5a99cbcc90518d6b62d
+wheel                    cinderx-2026.8.25.0-cp311-cp311-linux_aarch64.whl
+wheel_sha256             564309a2db759c69ecfa1192243a56d8925145f1d4834b70ffbc8410467c8259
+wheel_embedded_git_sha   1a3ada1ba5717ce34f9dd5a99cbcc90518d6b62d
 canonical_report         CP311_JIT_LIFECYCLE_REPORT.md
-canonical_report_sha256  e7c2a3e18ce32369f2dae1b2ce87a392c5fe2da88f74e4cf344a6aeebbfadc41
+canonical_report_sha256  ef0ccba8d523faaac6709f5dc9aa952c6b516099e4984a803a158f3520761eaf
 canonical_result         lifecycle_result.json
-canonical_result_sha256  2ecb9ded2e6fc2910b816c769411b2746f9598777ad535ad07ff2cf6cfa2b495
+canonical_result_sha256  5afeeb4296a910c9da71821b79ff410464fd041257b6f04870245c1b535a6b50
 ```
 
 The MR closes the development phase.  The chain sits on the execute-mode
