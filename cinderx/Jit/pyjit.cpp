@@ -2820,8 +2820,7 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> runtime = Ref<>::steal(PyDict_New());
   Ref<> observer = Ref<>::steal(PyDict_New());
   Ref<> generator = Ref<>::steal(PyDict_New());
-  Ref<> schema =
-      Ref<>::steal(PyUnicode_FromString("cp311-jit-lifecycle-v1"));
+  Ref<> schema = Ref<>::steal(PyUnicode_FromString("cp311-jit-lifecycle-v1"));
   Ref<> unavailable = Ref<>::steal(
       PyUnicode_FromString("GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"));
   if (result == nullptr || jit_state == nullptr || module == nullptr ||

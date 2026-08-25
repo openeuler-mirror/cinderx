@@ -312,8 +312,7 @@ PyObject* runtimeTransitionLedgerSnapshot() {
       s_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
   Ref<> rows = Ref<>::steal(PyList_New(0));
   if (rows == nullptr) {
-    s_transition_ledger_enabled.store(
-        was_enabled, std::memory_order_relaxed);
+    s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
   for (const TransitionLedgerRow& row : s_transition_ledger) {
@@ -338,8 +337,7 @@ PyObject* runtimeTransitionLedgerSnapshot() {
         "instrumentation",
         row.instrumentation ? Py_True : Py_False));
     if (item == nullptr || PyList_Append(rows, item) < 0) {
-      s_transition_ledger_enabled.store(
-          was_enabled, std::memory_order_relaxed);
+      s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
       return nullptr;
     }
   }
@@ -349,8 +347,7 @@ PyObject* runtimeTransitionLedgerSnapshot() {
   if (result == nullptr || dropped == nullptr ||
       PyDict_SetItemString(result, "rows", rows) < 0 ||
       PyDict_SetItemString(result, "dropped", dropped) < 0) {
-    s_transition_ledger_enabled.store(
-        was_enabled, std::memory_order_relaxed);
+    s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
   s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);

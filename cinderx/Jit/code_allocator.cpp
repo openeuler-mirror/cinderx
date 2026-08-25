@@ -113,12 +113,14 @@ AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
   // allocPages(), so this allocator watches the underlying block pool
   // grow rather than counting per-artifact spans -- the metric must not
   // change meaning with the allocator choice.
-  const size_t reserved_before = runtime_.allocator()->statistics().reservedSize();
+  const size_t reserved_before =
+      runtime_.allocator()->statistics().reservedSize();
   void* addr = nullptr;
   asmjit::Error error = runtime_.add(&addr, code);
 
   if (addr != nullptr && error == asmjit::kErrorOk) {
-    const size_t reserved_after = runtime_.allocator()->statistics().reservedSize();
+    const size_t reserved_after =
+        runtime_.allocator()->statistics().reservedSize();
     if (reserved_after > reserved_before) {
       triggerStatsOnExecutableAlloc(reserved_after - reserved_before);
     }
