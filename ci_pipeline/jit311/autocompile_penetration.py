@@ -254,7 +254,7 @@ def classify(
         ):
             status = "EXPECTED_SAFE_REFUSAL"
         else:
-            status = "COVERAGE_GAP" if jit_all_contract else "A2_COVERAGE_GAP"
+            status = "COVERAGE_GAP" if jit_all_contract else "THRESHOLD_COVERAGE_GAP"
         machine_entries = int(trigger.get("machine_code_entries", 0))
         rows[short] = {
             "status": status,
@@ -328,7 +328,7 @@ def classify(
     for target in target_modules:
         if target not in rows:
             rows[target] = {
-                "status": "COVERAGE_GAP" if jit_all_contract else "A2_COVERAGE_GAP",
+                "status": "COVERAGE_GAP" if jit_all_contract else "THRESHOLD_COVERAGE_GAP",
                 "missing": True,
             }
     counts = Counter(row["status"] for row in rows.values())

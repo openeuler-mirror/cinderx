@@ -51,8 +51,9 @@ import hashlib
 # The frozen runtime-transition evidence was recorded under its
 # campaign-era schema; these literals validate that historical material
 # and are exempt from the semantic-naming lint.
+# The frozen transition report is a byte-exact historical document; its freeze
+# marker is quoted verbatim from that era and must never be modernized.
 HISTORICAL_TRANSITION_FREEZE_MARKER = "A2 FROZEN"  # naming-lint: allow
-HISTORICAL_TRANSITION_FREEZE_KEY = "a2_freeze"  # naming-lint: allow
 
 
 CASES = ("LIFECYCLE_OWNERSHIP", "SHUTDOWN_STABILITY", "NATIVE_MEMORY_SAFETY")
@@ -302,8 +303,6 @@ class LifecycleAcceptanceRunner:
         output: Path,
         jobs: int,
         timeout: int,
-        transition_report: Path | None,
-        transition_result: Path | None,
         asan_build: Path | None,
         stdlib_regression: str,
         regression_base: str | None,
@@ -317,8 +316,6 @@ class LifecycleAcceptanceRunner:
             jobs=jobs,
             timeout=timeout,
         )
-        self.transition_report = transition_report.resolve() if transition_report else None
-        self.transition_result = transition_result.resolve() if transition_result else None
         self.command_failures: list[str] = []
         self.asan_build = asan_build.resolve() if asan_build else None
         self.stdlib_regression = stdlib_regression
@@ -368,45 +365,52 @@ class LifecycleAcceptanceRunner:
             "policy": policy,
             "frozen_commit_is_ancestor": ancestry,
             "frozen_source_sha256": source_hashes,
-            "external_report": None,
-            "external_result": None,
+            "frozen_report": None,
+            "frozen_summary": None,
             "errors": source_errors,
         }
         if not ancestry:
             evidence["errors"].append(
                 "transition frozen commit is not an ancestor of source HEAD"
             )
+        # The frozen evidence itself lives in the repository: the report is the
+        # byte-exact historical document, and the summary is a distilled record
+        # that carries the digest of the full archived result (56 MB, kept out
+        # of the tree) as its provenance link.
+        frozen_dir = self.base.stage / "ci_pipeline/jit311/data/frozen"
+        report_path = frozen_dir / "runtime_transition_frozen_report.md"
+        summary_path = frozen_dir / "runtime_transition_frozen_summary.json"
         for supplied, key, expected_key in (
-            (self.transition_report, "external_report", "canonical_report_sha256"),
-            (self.transition_result, "external_result", "canonical_result_sha256"),
+            (report_path, "frozen_report", "canonical_report_sha256"),
+            (summary_path, "frozen_summary", "frozen_summary_sha256"),
         ):
-            if supplied is None:
-                continue
             if not supplied.is_file():
-                evidence["errors"].append(f"transition evidence file is missing: {supplied}")
+                evidence["errors"].append(f"frozen transition evidence is missing: {supplied}")
                 continue
             digest = hashlib.sha256(supplied.read_bytes()).hexdigest()
             evidence[key] = {"path": str(supplied), "sha256": digest}
             if digest != policy[expected_key]:
-                evidence["errors"].append(f"transition evidence digest mismatch: {supplied}")
-        if self.transition_report is not None:
-            text = self.transition_report.read_text(errors="replace")
+                evidence["errors"].append(f"frozen transition evidence digest mismatch: {supplied}")
+        if report_path.is_file():
+            text = report_path.read_text(errors="replace")
             if (
                 HISTORICAL_TRANSITION_FREEZE_MARKER not in text
                 or "PASS_WITH_APPROVED_DEVIATIONS" not in text
             ):
                 evidence["errors"].append(
-                    "external transition report lacks exact frozen/result markers"
+                    "frozen transition report lacks exact frozen/result markers"
                 )
-        if self.transition_result is not None:
-            result_doc = self._json(self.transition_result)
+        if summary_path.is_file():
+            summary_doc = self._json(summary_path)
             if (
-                not result_doc
-                or result_doc.get(HISTORICAL_TRANSITION_FREEZE_KEY)
-                != HISTORICAL_TRANSITION_FREEZE_MARKER
+                not summary_doc
+                or summary_doc.get("freeze_state") != "FROZEN"
+                or summary_doc.get("final") != policy["transition_result"]
+                or summary_doc.get("full_result_sha256")
+                != policy["archived_result_sha256"]
             ):
                 evidence["errors"].append(
-                    "external transition result lacks the frozen marker"
+                    "frozen transition summary does not match the pinned freeze facts"
                 )
         if evidence["errors"]:
             evidence["result"] = "FAIL"
@@ -974,11 +978,6 @@ def _default_source() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _default_evidence(name: str) -> Path | None:
-    candidate = Path("/a2evidence") / name
-    return candidate if candidate.is_file() else None
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, default=_default_wheel())
@@ -1001,17 +1000,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--regression-base")
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument(
-        "--transition-report",
-        type=Path,
-        default=_default_evidence("A2_EXECUTION_REPORT_FINAL.md"),
-    )
-    parser.add_argument(
-        "--transition-result",
-        type=Path,
-        # The frozen evidence file keeps its campaign-era name.
-        default=_default_evidence("a2_result.json"),  # naming-lint: allow
-    )
     args = parser.parse_args(argv)
     if args.wheel is None:
         print("no wheel: pass --wheel or mount it at /wheels", file=sys.stderr)
@@ -1038,8 +1026,6 @@ def main(argv: list[str] | None = None) -> int:
         output=output,
         jobs=args.jobs,
         timeout=args.timeout,
-        transition_report=args.transition_report,
-        transition_result=args.transition_result,
         asan_build=asan_build,
         stdlib_regression=args.stdlib_regression,
         regression_base=args.regression_base,

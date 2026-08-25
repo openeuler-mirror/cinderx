@@ -148,7 +148,7 @@ class CanaryExecute311Test(unittest.TestCase):
             assert hot(4) == 5
             gc.collect(); gc.collect()
             before = cinderjit._jit311_lifecycle_snapshot()
-            assert before["schema"] == "cp311-jit-a3-lifecycle-v1"
+            assert before["schema"] == "cp311-jit-lifecycle-v1"
             assert cinderjit._jit311_lifecycle_invariants() == {
                 "ok": True,
                 "errors": [],

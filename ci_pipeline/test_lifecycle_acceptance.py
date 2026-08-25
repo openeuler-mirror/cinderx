@@ -10,7 +10,7 @@ from ci_pipeline.jit311.lifecycle_acceptance import (
 
 def _snapshot(**overrides):
     document = {
-        "schema": "cp311-jit-a3-lifecycle-v1",
+        "schema": "cp311-jit-lifecycle-v1",
         "generator": {"status": "GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"},
     }
     for path in REQUIRED_PATHS:

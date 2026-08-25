@@ -280,9 +280,9 @@ class ExecutionAcceptanceRunner:
         if startup is not None:
             command += ["--pythonpath-prepend", str(startup), "--pythonpath-prepend", str(self.stage)]
         if mode is not None:
-            command += ["--env", f"A1_COMPILE_ALL_MODE={mode}"]
+            command += ["--env", f"EXECUTION_COMPILE_ALL_MODE={mode}"]
         if journal is not None:
-            command += ["--env", f"A1_COMPILE_ALL_LOG_DIR={journal}"]
+            command += ["--env", f"EXECUTION_COMPILE_ALL_LOG_DIR={journal}"]
         if mode == "jit":
             command += [
                 "--env", "CINDERX_JIT_MODE=canary",
@@ -304,14 +304,14 @@ class ExecutionAcceptanceRunner:
         c2_startup.mkdir()
         (c1_startup / "sitecustomize.py").write_text(
             "import os,sys\n"
-            "assert os.environ.get('A1_COMPILE_ALL_MODE') == 'instrumented'\n"
+            "assert os.environ.get('EXECUTION_COMPILE_ALL_MODE') == 'instrumented'\n"
             "assert 'cinderx' not in sys.modules and '_cinderx' not in sys.modules\n"
             "from ci_pipeline.jit311 import semantic_conformance_hook\n",
             encoding="utf-8",
         )
         (c2_startup / "sitecustomize.py").write_text(
             "import os\n"
-            "assert os.environ.get('A1_COMPILE_ALL_MODE') == 'jit'\n"
+            "assert os.environ.get('EXECUTION_COMPILE_ALL_MODE') == 'jit'\n"
             "import _cinderx,cinderx\n"
             "cinderx.init()\n"
             "_cinderx.install_frame_evaluator()\n"
@@ -329,7 +329,7 @@ class ExecutionAcceptanceRunner:
         )
 
         empty_deviations = directory / "empty-deviations.json"
-        empty_deviations.write_text('{"format":"cp311-jit-a1-deviations-v1","deviations":[]}\n')
+        empty_deviations.write_text('{"format":"cp311-jit-execution-deviations-v1","deviations":[]}\n')
         c0c1 = directory / "c0-vs-c1.json"
         c1c2 = directory / "c1-vs-c2.json"
         report_module = "ci_pipeline.jit311.execution_report"
@@ -461,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args(argv)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output = args.out or Path.cwd() / f"cp311-a1-{timestamp}"
+    output = args.out or Path.cwd() / f"cp311-execution-{timestamp}"
     runner = ExecutionAcceptanceRunner(
         wheel=args.wheel,
         source=args.source,

@@ -11,7 +11,7 @@ import threading
 import time
 
 
-class A2GuardBase:
+class TransitionGuardBase:
     def __init__(self, value):
         self.value = value
 
@@ -19,7 +19,7 @@ class A2GuardBase:
         return self.value + 1
 
 
-class A2GuardOther:
+class TransitionGuardOther:
     def __init__(self, value):
         self.value = value
 
@@ -28,7 +28,7 @@ def t01_numeric(value):
     return value + 1
 
 
-class A2Dynamic:
+class TransitionDynamic:
     def method(self):
         return 1
 
@@ -68,21 +68,21 @@ def t05_defaults(value=1, *, scale=2):
     return value * scale
 
 
-A2_TRACE_CALLBACK = None
+TRANSITION_TRACE_CALLBACK = None
 
 
-class A2TraceNumber:
+class TransitionTraceNumber:
     def __init__(self, value, arm=False):
         self.value = value
         self.arm = arm
 
     def __add__(self, other):
-        global A2_TRACE_CALLBACK
-        if self.arm and A2_TRACE_CALLBACK is not None:
-            sys.settrace(A2_TRACE_CALLBACK)
-            sys._getframe().f_back.f_trace = A2_TRACE_CALLBACK
+        global TRANSITION_TRACE_CALLBACK
+        if self.arm and TRANSITION_TRACE_CALLBACK is not None:
+            sys.settrace(TRANSITION_TRACE_CALLBACK)
+            sys._getframe().f_back.f_trace = TRANSITION_TRACE_CALLBACK
             self.arm = False
-        return A2TraceNumber(self.value + other.value)
+        return TransitionTraceNumber(self.value + other.value)
 
 
 def t06_workload(left, right):
@@ -274,18 +274,18 @@ class Probe:
         )
 
     def t02(self):
-        original = A2Dynamic.method
-        obj = A2Dynamic()
+        original = TransitionDynamic.method
+        obj = TransitionDynamic()
         pre = self.prepare(t02_method, lambda: t02_method(obj), 1)
         cache_before = self.cinderjit.get_attr_cache_stats() if self.jit else {}
         start = self.start_transition()
-        A2Dynamic.method = lambda self: 2
+        TransitionDynamic.method = lambda self: 2
         changed = t02_method(obj)
         transition = self.finish_transition(*start)
         cache_after = self.cinderjit.get_attr_cache_stats() if self.jit else {}
         recovery_before = self.entries()
         recovered = t02_method(obj)
-        A2Dynamic.method = original
+        TransitionDynamic.method = original
         if self.jit:
             transition["cache_stats_changed"] = cache_after != cache_before
         self.add(
@@ -368,7 +368,7 @@ class Probe:
         )
 
     def t06(self):
-        global A2_TRACE_CALLBACK
+        global TRANSITION_TRACE_CALLBACK
         events = []
 
         def tracer(frame, event, arg):
@@ -378,10 +378,10 @@ class Probe:
 
         pre = self.prepare(t06_workload, lambda: t06_workload(1, 1), 3)
         start = self.start_transition()
-        A2_TRACE_CALLBACK = tracer
-        changed_obj = t06_workload(A2TraceNumber(1, True), A2TraceNumber(1))
+        TRANSITION_TRACE_CALLBACK = tracer
+        changed_obj = t06_workload(TransitionTraceNumber(1, True), TransitionTraceNumber(1))
         sys.settrace(None)
-        A2_TRACE_CALLBACK = None
+        TRANSITION_TRACE_CALLBACK = None
         transition = self.finish_transition(*start)
         recovery_before = self.entries()
         recovered = t06_workload(1, 1)

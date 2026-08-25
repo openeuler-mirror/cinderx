@@ -1,6 +1,6 @@
-# CPython 3.11 JIT A3 Lifecycle Inventory
+# CPython 3.11 JIT Lifecycle Inventory
 
-This is the source inventory for A3 discovery. It describes the state before any A3 product-lifecycle fix. A2 is frozen at `0ebc04c2` and its runner is not reused as the A3 implementation surface.
+This is the source inventory for the lifecycle discovery. It describes the state before any product-lifecycle fix. The runtime-transition domain is frozen at `0ebc04c2` and its runner is not reused as the lifecycle implementation surface.
 
 ## Ownership structures
 
@@ -60,7 +60,7 @@ This is the source inventory for A3 discovery. It describes the state before any
     - `GenDataFooter` is stored with the generator's heap suspend data and points to the generator and `CodeRuntime` by borrow.
     - The generator object/frame owns Python live values; JIT traversal visits owned spill values while suspended.
     - Deallocation clears/deopts footer state and returns memory through `jit_gen_free_list` or `PyObject_GC_Del`.
-    - CPython 3.11 deliberately bypasses the fixed freelist and currently has no allocation-free live native gauge. A3 v0.1 reports `GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE` and uses weakref/GC census plus registry/residency evidence.
+    - CPython 3.11 deliberately bypasses the fixed freelist and currently has no allocation-free live native gauge. The lifecycle gate reports `GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE` and uses weakref/GC census plus registry/residency evidence.
 
 11. Parked/deopted cleanup:
     - `disable()` removes installed entries and records surviving associations in `deopted_funcs_`.
@@ -94,7 +94,7 @@ This is the source inventory for A3 discovery. It describes the state before any
 
 ## Snapshot schema and field classes
 
-Schema: `cp311-jit-a3-lifecycle-v1`.
+Schema: `cp311-jit-lifecycle-v1`.
 
 | Section.field | Class | Meaning |
 |---|---|---|

@@ -6,7 +6,7 @@ import gc
 from typing import Any
 
 
-SCHEMA = "cp311-jit-a3-lifecycle-v1"
+SCHEMA = "cp311-jit-lifecycle-v1"
 
 GAUGE_PATHS = (
     "jit.compiled_codes",

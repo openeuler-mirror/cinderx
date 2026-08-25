@@ -35,7 +35,7 @@ destructors inserted by the refcount pass.  The native RuntimeTest
 
 ## Acceptance mapping
 
-`a1_tracing_probe.py` owns T1-T8: entry-time trace fallback, compile stop,
+`tracing_conformance_probe.py` owns T1-T8: entry-time trace fallback, compile stop,
 mid-flight return, mid-flight raise, C trace-error delivery, profile fallback,
 recovery after removal, and interpreter-wide final-callback ownership. T8
 covers trace+trace and trace+profile on two threads: clearing the first thread

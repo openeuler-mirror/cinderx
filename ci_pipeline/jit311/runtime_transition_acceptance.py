@@ -846,7 +846,7 @@ class RuntimeTransitionAcceptanceRunner:
                 fix_summary="The final autocompile classification fails closed on any unclassified module, unknown refusal, or dropped evidence.",
                 regression_tests=[
                     "ci_pipeline.test_runtime_transition_report.RuntimeTransitionReportTest.test_autocompile_jit_all_and_diagnostic_uses_threshold_one",
-                    "ci_pipeline.test_runtime_transition_report.A2ReportTest.test_penetration_classifier_uses_package_ownership",
+                    "ci_pipeline.test_runtime_transition_report.RuntimeTransitionReportTest.test_penetration_classifier_uses_package_ownership",
                 ],
                 evidence="AUTOCOMPILE_COVERAGE/p2-coverage.json",
                 modules=gaps,
@@ -893,7 +893,7 @@ class RuntimeTransitionAcceptanceRunner:
                 ],
                 fix_summary="The final judge rejects a baseline-only approval.",
                 regression_tests=[
-                    "A2ReportTest.test_final_deviation_proof_requires_semantics_and_exact_footprint"
+                    "RuntimeTransitionReportTest.test_final_deviation_proof_requires_semantics_and_exact_footprint"
                 ],
                 evidence="P/p0-vs-p2.json, P/adaptive-semantic-probe.json, R/footprint.json",
                 errors=deviation_proof["errors"],
@@ -1126,7 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
         args.wheel = candidates[-1]
     if args.source is None:
         args.source = Path(__file__).resolve().parents[2]
-    output = args.out or Path.cwd() / f"cp311-a2-{datetime.now():%Y%m%d-%H%M%S}"
+    output = args.out or Path.cwd() / f"cp311-runtime-transition-{datetime.now():%Y%m%d-%H%M%S}"
     runner = RuntimeTransitionAcceptanceRunner(
         wheel=args.wheel,
         source=args.source,

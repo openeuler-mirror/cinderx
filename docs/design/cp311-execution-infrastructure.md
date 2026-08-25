@@ -1,4 +1,4 @@
-# CPython 3.11 A1 refusal and coverage infrastructure
+# CPython 3.11 JIT refusal and coverage infrastructure
 
 ## Refusal pipeline
 
@@ -31,14 +31,14 @@ decision parses log text.
 
 ## Compile-All classification
 
-`a1_compile_all_hook.py` is staged through `sitecustomize`; it never edits
+`semantic_conformance_hook.py` is staged through `sitecustomize`; it never edits
 CPython tests.  It attributes work from regrtest's `--worker-args`, scans the
 real target module (including TestCase methods), and records TestCase and
 doctest execution windows.  The private per-code entry ledger observes the
 exact `PyCodeObject` at entry and records its stable source identity plus
 count, archiving the row at code destruction without extending its lifetime.
 Module attribution is based on a ledger row whose `co_filename` belongs to
-that module, never a process-wide window delta. `a1_report.py` deduplicates
+that module, never a process-wide window delta. `execution_report.py` deduplicates
 functions by source identity, checks every
 refusal against the capability manifest, and assigns each frozen module
 exactly one of:
@@ -65,8 +65,8 @@ tracked source `HEAD` and requires exact equality with the wheel's embedded
 
 ## Warm specialization
 
-`a1_warm_specialization.toml` is the closed 17-family contract.
-`a1_warm.py` proves the expected adaptive opcode, typed compile/refusal result,
+`specialization_conformance_manifest.toml` is the closed 17-family contract.
+`specialization_conformance.py` proves the expected adaptive opcode, typed compile/refusal result,
 machine entry for W-JIT, and semantic result.  `BINARY_SUBSCR` and
 `STORE_SUBSCR` are explicitly W-SAFE-REFUSE with
 `REFUSE_SHAPE_EXECUTE_SURFACE`; no function-name allowlist is involved.

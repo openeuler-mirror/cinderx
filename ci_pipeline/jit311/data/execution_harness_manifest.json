@@ -1,5 +1,5 @@
 {
-  "format": "cp311-jit-a1-harness-v1",
+  "format": "cp311-jit-execution-harness-v1",
   "entries": [
     {
       "source": "cinderx/PythonLib/test_cinderx",

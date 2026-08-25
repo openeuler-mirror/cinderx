@@ -1,5 +1,5 @@
 {
-  "format": "cp311-jit-a2-deviations-v1",
+  "format": "cp311-jit-runtime-transition-deviations-v1",
   "comment": "The runtime-transition final judge permits only these exact stress-mode differences. The final judge separately requires the adaptive semantic probe or exact publication-footprint proof; this file alone can never approve a difference.",
   "deviations": [
     {

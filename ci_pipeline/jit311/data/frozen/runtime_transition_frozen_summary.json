@@ -1,0 +1,8 @@
+{
+  "format": "cp311-jit-runtime-transition-frozen-summary-v1",
+  "domain": "runtime_transition",
+  "freeze_state": "FROZEN",
+  "final": "PASS_WITH_APPROVED_DEVIATIONS",
+  "full_result_sha256": "103f19f0c79265b2b2fd5f96ae7aab38e96f1ce91ad50fb667282e256491ada2",
+  "note": "Distilled from the archived frozen result (56 MB); the full document's digest above is the provenance link."
+}

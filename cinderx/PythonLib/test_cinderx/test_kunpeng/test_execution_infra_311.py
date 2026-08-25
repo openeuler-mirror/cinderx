@@ -9,7 +9,7 @@ import unittest
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 execution acceptance infrastructure"
 )
-class A1Infra311Test(unittest.TestCase):
+class ExecutionInfra311Test(unittest.TestCase):
     def run_child(self, body: str):
         env = {
             key: value

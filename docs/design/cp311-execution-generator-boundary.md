@@ -1,4 +1,4 @@
-# CPython 3.11 A1 synchronous-generator boundary
+# CPython 3.11 JIT synchronous-generator boundary
 
 Synchronous generator functions remain a supported JIT capability.  Their
 instances use CinderX's extended `JitGenObject` layout so suspended machine
@@ -14,8 +14,8 @@ API that requires `PyGen_Type`.  This converts the object and reifies its
 interpreter continuation before the C API sends into it.
 
 The standard CinderX CPython lib-test runner already applies this narrow
-adapter for `_testcapi.raise_SIGINT_then_send_None`.  A1-C stages the same
-adapter, and `a1_generator_probe.py` separately proves:
+adapter for `_testcapi.raise_SIGINT_then_send_None`.  The execution acceptance's C lane stages the same
+adapter, and `generator_execution_probe.py` separately proves:
 
 - normal yield-from;
 - send and throw through yield-from;

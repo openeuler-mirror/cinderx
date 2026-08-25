@@ -89,7 +89,7 @@ def _plain(index: int):
         "        i += one\n"
         f"    return total + {index}\n"
     )
-    exec(compile(source, f"<a3-shutdown-{index}>", "exec"), namespace, namespace)
+    exec(compile(source, f"<shutdown-stability-{index}>", "exec"), namespace, namespace)
     return namespace[f"shutdown_{index}"], namespace, 15 + index
 
 
@@ -167,7 +167,7 @@ def child(state: str) -> dict:
 
         def __del__(self):
             state = self.jit._jit311_lifecycle_snapshot()
-            assert state["schema"] == "cp311-jit-a3-lifecycle-v1"
+            assert state["schema"] == "cp311-jit-lifecycle-v1"
             self.jit.is_enabled()
 
     roots.append(ExitFinalizer(cinderjit))
@@ -256,7 +256,7 @@ def _run_one(
         env["MALLOC_PERTURB_"] = str(malloc_perturb)
     pad = entropy_pad(global_index, entropy_span)
     if pad:
-        env["A3_SHUTDOWN_LAYOUT_PAD"] = "x" * pad
+        env["SHUTDOWN_STABILITY_LAYOUT_PAD"] = "x" * pad
     # A crash during the measured workload should say where it was; the
     # teardown crashes this lane hunts happen after the handler is torn
     # down and are covered by cores instead.

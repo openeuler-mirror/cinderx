@@ -1,7 +1,7 @@
-# CPython 3.11 A3 Multithread Shutdown Root Cause
+# CPython 3.11 Multithread Shutdown Root Cause
 
-Status: evidence dossier for MR-A3-04 (`cp311: finalize orphaned JIT artifacts
-before context teardown`). The product fix is not part of this change; this
+Status: evidence dossier for the orphan-finalize MR (`cp311: finalize
+orphaned JIT artifacts before context teardown`). The product fix is not part of this change; this
 records the reproduction, the native stacks and the mechanism confirmation
 that the fix must satisfy.
 
@@ -10,7 +10,8 @@ Blockers covered: `B8` (multithread compile lifetime) and `B9`
 
 ## Observed
 
-- The `a3_shutdown` child that builds the `multithread-completed` state
+- The shutdown-stability child that builds the `multithread-completed`
+  state
   (register 8 functions, run `_jit311_multithreaded_compile_test()`, verify
   the batch, root everything to module teardown) prints its full readiness
   evidence — `READY_FOR_NORMAL_EXIT`, machine-code entries, a clean
@@ -80,7 +81,7 @@ layout-sensitivity plus the two stacks above.
 Whether the read faults is decided by what the allocator did with the
 slab pages afterwards — hence deterministic-per-layout, flaky-across-layout.
 
-## Fix contract (for MR-A3-04, not this change)
+## Fix contract (for the orphan-finalize MR, not this change)
 
 Any release that can run Python `DECREF`/finalizers, and any pointer the
 GC can walk, must be severed while the context's teardown support is
@@ -99,14 +100,14 @@ export PYTHONPATH=<staged harness>
 export CINDERX_JIT_MODE=canary PYTHONJITAUTO=1000000 PYTHONJITGENERATOR=1
 export PYTHONJITMULTITHREADEDCOMPILETEST=1 PYTHONJITBATCHCOMPILEWORKERS=4
 export MALLOC_PERTURB_=165
-<venv python> -m ci_pipeline.jit311.a3_shutdown --child --state multithread-completed
+<venv python> -m ci_pipeline.jit311.shutdown_stability --child --state multithread-completed
 # → SIGSEGV after READY_FOR_NORMAL_EXIT
 
 # Gate form (per-state ledger, poisoning and layout entropy are defaults):
-<venv python> -m ci_pipeline.jit311.a3_shutdown \
+<venv python> -m ci_pipeline.jit311.shutdown_stability \
     --only-state multithread-completed --repetitions 1000 --out result.json
 ```
 
-The A3-F lane records the per-state ledger, keeps the first cores and
-extracts the gdb backtrace automatically; see `a3_shutdown.py` for the
-detector defaults.
+The SHUTDOWN_STABILITY gate records the per-state ledger, keeps the
+first cores and extracts the gdb backtrace automatically; see
+`shutdown_stability.py` for the detector defaults.

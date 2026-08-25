@@ -173,7 +173,7 @@ def run(cycles: int, force_compile: bool) -> dict:
         "classification": (
             "COMPILER_RUNTIME_CAPABILITY_OK"
             if force_compile and passed
-            else "A2_POLICY_DECISION" if passed else "PRODUCT_BUG"
+            else "APPROVED_POLICY_DECISION" if passed else "PRODUCT_BUG"
         ),
         "mode": "force-compile-diagnostic" if force_compile else "automatic",
         "cycles": cycles,

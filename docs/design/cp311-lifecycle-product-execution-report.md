@@ -1,11 +1,12 @@
-# CPython 3.11 A3 Product Execution Report
+# CPython 3.11 Lifecycle Product Execution Report
 
-The v0.2 fix round (`A3_PRODUCT_EXECUTION_REPORT`): product repairs for
+The lifecycle fix round: product repairs for
 the discovery blockers B7-EXEC, B7-RUNTIME and B8/B9, verified by the full
-Product A3 rerun, the A1/A2 regressions and the strengthened shutdown
+product-lifecycle rerun, the execution and runtime-transition
+regressions and the strengthened shutdown
 gate.  Covers the per-MR reports the task book names
-(`A3_MULTITHREAD_SHUTDOWN_FIX_REPORT`, `A3_EXECUTABLE_RECLAMATION_REPORT`,
-`A3_CODERUNTIME_RECYCLING_REPORT`, `A3_SHUTDOWN_ACCEPTANCE_REPORT`).
+(the multithread-shutdown fix, executable reclamation, CodeRuntime
+recycling and shutdown-acceptance reports).
 
 Fix head: `b16afbb7` (wheel `73f23e77…`, embedded SHA matches).
 Environment: openEuler dev container, CPython 3.11.6, aarch64.
@@ -13,42 +14,42 @@ Environment: openEuler dev container, CPython 3.11.6, aarch64.
 ## Verdict
 
 ```text
-Product A3:  DISCOVERY_PASS  (C1-C8 PASS, A3-O PASS, A3-F PASS, 0 blockers)
-A1 regression:  PASS_WITH_APPROVED_DEVIATIONS  (deviation register unchanged)
-A2 regression:  PASS_WITH_APPROVED_DEVIATIONS  (deviation register unchanged)
-A3_BLOCKERS_FINAL: No remaining Product A3 lifecycle blocker.
+Lifecycle round:  DISCOVERY_PASS  (C1-C8, ownership and shutdown lanes PASS, 0 blockers)
+Execution regression:  PASS_WITH_APPROVED_DEVIATIONS  (register unchanged)
+Runtime-transition regression:  PASS_WITH_APPROVED_DEVIATIONS  (register unchanged)
+Final blocker list: no remaining product lifecycle blocker.
 ```
 
 ## The four product changes
 
-1. **MR-A3-04 · `cp311: finalize orphaned JIT artifacts before context
+1. **`cp311: finalize orphaned JIT artifacts before context
    teardown`** — B8/B9.  Orphans from `clearForMultithreadedCompileTest()`
    left every registry, so `~Context`'s severing walks never reached them;
    a function-dictionary anchor kept them alive past the context and the
    exit GC walked `tp_traverse`/`tp_clear` into freed slab storage.  The
    destructor now severs orphans in the same window as every other
    artifact.  Root cause dossier:
-   `cp311-a3-multithread-shutdown-root-cause.md` (core+gdb stacks on both
+   `cp311-lifecycle-multithread-shutdown-root-cause.md` (core+gdb stacks on both
    the `CodeRuntime::releaseReferences` and `CodeRuntime::traverse` arms;
    `MALLOC_PERTURB_` poisoning turned the surviving layout into a 3/3
    deterministic fault).
-2. **MR-A3-05 · `cp311: reclaim retired JIT executable code`** — B7-EXEC.
+2. **`cp311: reclaim retired JIT executable code`** — B7-EXEC.
    CPython 3.11 now routes to the asmjit-backed reclaiming allocator at
    configuration time (the configuration always reads the effective
    policy; an explicit `PYTHONJITHUGEPAGES` request is answered with a log
    line and a `false` reading).  Accounting is span-symmetric on both
    sides and `~CompiledFunction` fails closed on a refused release.
-3. **MR-A3-06 · `cp311: recycle retired CodeRuntime storage`** —
+3. **`cp311: recycle retired CodeRuntime storage`** —
    B7-RUNTIME.  `SlabArena` reuses cleared husks through a free list;
    `Context::recycleCodeRuntime()` purges the one address-keyed side table
    (`deopt_stats_`) first.  The identity audit
-   (`cp311-a3-coderuntime-identity-audit.md`) surfaced that the leak had
+   (`cp311-lifecycle-coderuntime-identity-audit.md`) surfaced that the leak had
    been load-bearing, so two ownership repairs land with it: the
    generator footer pins its artifact for the generator's lifetime, and
    registry retirement (`retire()`) leaves the runtime whole for pins —
    gutting and hand-back happen only at destruction/GC/finalization.
 4. **`cp311: sever a survivor artifact's runtime after its context dies`**
-   — caught by the A2 threshold-50 regression arm, not by the churn
+   — caught by the runtime-transition threshold-50 regression arm, not by the churn
    matrix: a *retired* artifact anchored in a module cycle outlives the
    context and the exit GC walked its runtime pointer into freed slabs
    (2/72 stdlib modules crashed in one memory layout; 51/72 with
@@ -58,7 +59,7 @@ A3_BLOCKERS_FINAL: No remaining Product A3 lifecycle blocker.
    slots it owns).  After the fix the same 72-module arm passes 72/72
    *with poisoning still armed*.
 
-## Product A3 rerun (wheel-first, `/root/a3/out4`)
+## Product lifecycle rerun (wheel-first)
 
 C lane — every scenario PASS at full scale, machine-entry proven, all
 live-ownership gauges at baseline (empty `gauge_drift` everywhere):
@@ -74,21 +75,22 @@ live-ownership gauges at baseline (empty `gauge_drift` everywhere):
 | C7 ×1000 (fault inj.) | 1 001 | 1 → 1 (was 201 → 2 001) | plateau |
 | C8 ×100 (batch 8) | 801 | 8 → 8 (was 81 → 801) | plateau |
 
-A3-O: PASS (three refcount-matrix corpora, interp vs jit differential).
+Ownership lane: PASS (three refcount-matrix corpora, interp vs jit
+differential).
 
-A3-F (strengthened gate: per-state quotas, `MALLOC_PERTURB_`, layout
+Shutdown gate (strengthened: per-state quotas, `MALLOC_PERTURB_`, layout
 entropy, core capture): **3000/3000 clean exits** —
 `installed/parked/function-death/code-death/failure-unwind` 200/200 each,
 `multithread-completed` **2000/2000** (0 SIGSEGV / 0 SIGABRT / 0 timeout /
-0 forbidden stderr).  Before MR-A3-04 the same gate recorded 2000/2000
+0 forbidden stderr).  Before the orphan-finalize fix the same gate recorded 2000/2000
 SIGSEGV on that state.
 
 ## Regressions on the fix head
 
-- A1 (S/C/W): PASS_WITH_APPROVED_DEVIATIONS — compile-all over the
+- Execution (S/C/W): PASS_WITH_APPROVED_DEVIATIONS — compile-all over the
   72-module surface (5 296 functions discovered, 0 unexpected refusals,
   0 unexpected differences, deviation register unchanged).
-- A2 (P/T/R): PASS_WITH_APPROVED_DEVIATIONS — the penetration coverage
+- Runtime transition (P/T/R): PASS_WITH_APPROVED_DEVIATIONS — the penetration coverage
   counts are byte-identical to the frozen baseline (35/37 control gap,
   7/65 threshold-1 gap, `test_descr`/`test_dis` fails unchanged), and the
   control arm's crash column is empty again.
@@ -96,10 +98,10 @@ SIGSEGV on that state.
   family** runs to completion on the final tree; every failure sits in the
   historically red capability families, none in the lifecycle/allocator
   surface or the new tests.  The DeoptStress exclusion is an inherited
-  A2-chain condition, not this round's: on the pre-round frozen tree
+  runtime-transition-chain condition, not this round's: on the pre-round frozen tree
   (`0ebc04c2`) the same tests already grind past 300 s at >1.4 GB RSS
   (this round's control build), where the last daily census recorded them
-  as 3 ms fast-fails — the A2 chain's compile-surface widening made them
+  as 3 ms fast-fails — that chain's compile-surface widening made them
   runnable and pathological, and the full census now exceeds this
   machine's 15.65 GiB VM.  Flagged for the daily-gate owners.
 - Green families / canary RuntimeTests (dev build): 225/225 and full
@@ -110,7 +112,7 @@ SIGSEGV on that state.
   tests) and the Python-level
   `test_suspended_generator_pins_its_artifact`.
 
-## A3-S
+## Sanitizer battery
 
 - S1 ASAN: PASS — green families (225) and the mode-gated canary population (117, including every new lifecycle/allocator test) run clean under the instrumented RuntimeTests; the instrumented `_cinderx.so` (42 `__asan` symbols, libasan NEEDED verified) passes the canary execution smoke (1 023 machine-code entries) and the quick churn subset C1/C2/C5/C7/C8. 0 UAF / heap-buffer-overflow / double-free / invalid-free / sanitizer crashes.
 - S2 LSan: off by the evidence contract of the ASAN leg

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "ci_pipeline/jit311/data"
 
 
-class A1ReportTest(unittest.TestCase):
+class ExecutionReportTest(unittest.TestCase):
     def test_release_provenance_requires_exact_source_sha(self):
         require_matching_source_sha("a" * 40, "a" * 40)
         with self.assertRaisesRegex(RuntimeError, "provenance mismatch"):

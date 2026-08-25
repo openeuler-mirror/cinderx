@@ -29,20 +29,20 @@ std::atomic<uint64_t> s_forced_deopt_hits{0};
 std::atomic<uint64_t> s_organic_deopt_hits{0};
 
 #if PY_VERSION_HEX < 0x030C0000
-struct A1EntryLedgerRow {
+struct EntryLedgerRow {
   std::string filename;
   std::string qualname;
   int firstlineno;
   uint64_t entries;
 };
 
-std::atomic<bool> s_a1_entry_ledger_enabled{false};
-std::atomic<uint64_t> s_a1_entry_ledger_dropped{0};
-std::unordered_map<PyCodeObject*, A1EntryLedgerRow> s_a1_entry_ledger;
+std::atomic<bool> s_entry_ledger_enabled{false};
+std::atomic<uint64_t> s_entry_ledger_dropped{0};
+std::unordered_map<PyCodeObject*, EntryLedgerRow> s_entry_ledger;
 std::map<std::tuple<std::string, int, std::string>, uint64_t>
-    s_a1_entry_ledger_archived;
+    s_entry_ledger_archived;
 
-struct A2TransitionLedgerRow {
+struct TransitionLedgerRow {
   std::string filename;
   std::string qualname;
   std::string transition;
@@ -54,9 +54,9 @@ struct A2TransitionLedgerRow {
   bool instrumentation;
 };
 
-std::atomic<bool> s_a2_transition_ledger_enabled{false};
-std::atomic<uint64_t> s_a2_transition_ledger_dropped{0};
-std::vector<A2TransitionLedgerRow> s_a2_transition_ledger;
+std::atomic<bool> s_transition_ledger_enabled{false};
+std::atomic<uint64_t> s_transition_ledger_dropped{0};
+std::vector<TransitionLedgerRow> s_transition_ledger;
 #endif
 
 } // namespace
@@ -74,11 +74,11 @@ void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   s_machine_code_entries.fetch_add(1, std::memory_order_relaxed);
 #if PY_VERSION_HEX < 0x030C0000
   if (code == nullptr ||
-      !s_a1_entry_ledger_enabled.load(std::memory_order_relaxed)) {
+      !s_entry_ledger_enabled.load(std::memory_order_relaxed)) {
     return;
   }
-  auto it = s_a1_entry_ledger.find(code);
-  if (it != s_a1_entry_ledger.end()) {
+  auto it = s_entry_ledger.find(code);
+  if (it != s_entry_ledger.end()) {
     it->second.entries++;
     return;
   }
@@ -87,13 +87,13 @@ void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
     const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
     if (filename == nullptr || qualname == nullptr) {
       PyErr_Clear();
-      s_a1_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+      s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    s_a1_entry_ledger.emplace(
-        code, A1EntryLedgerRow{filename, qualname, code->co_firstlineno, 1});
+    s_entry_ledger.emplace(
+        code, EntryLedgerRow{filename, qualname, code->co_firstlineno, 1});
   } catch (const std::bad_alloc&) {
-    s_a1_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
   }
 #else
   (void)code;
@@ -115,18 +115,18 @@ void triggerStatsOnCodeDestroyed(PyCodeObject* code) {
   if (code == nullptr) {
     return;
   }
-  auto it = s_a1_entry_ledger.find(code);
-  if (it == s_a1_entry_ledger.end()) {
+  auto it = s_entry_ledger.find(code);
+  if (it == s_entry_ledger.end()) {
     return;
   }
   try {
     auto key = std::make_tuple(
         it->second.filename, it->second.firstlineno, it->second.qualname);
-    s_a1_entry_ledger_archived[key] += it->second.entries;
+    s_entry_ledger_archived[key] += it->second.entries;
   } catch (const std::bad_alloc&) {
-    s_a1_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
   }
-  s_a1_entry_ledger.erase(it);
+  s_entry_ledger.erase(it);
 #else
   (void)code;
 #endif
@@ -171,42 +171,42 @@ TriggerStats triggerStatsSnapshot() {
 
 void executionEntryLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
-  s_a1_entry_ledger_enabled.store(false, std::memory_order_relaxed);
-  s_a1_entry_ledger.clear();
-  s_a1_entry_ledger_archived.clear();
-  s_a1_entry_ledger_dropped.store(0, std::memory_order_relaxed);
-  s_a1_entry_ledger_enabled.store(true, std::memory_order_relaxed);
+  s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_entry_ledger.clear();
+  s_entry_ledger_archived.clear();
+  s_entry_ledger_dropped.store(0, std::memory_order_relaxed);
+  s_entry_ledger_enabled.store(true, std::memory_order_relaxed);
 #endif
 }
 
 void executionEntryLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
-  s_a1_entry_ledger_enabled.store(false, std::memory_order_relaxed);
-  s_a1_entry_ledger.clear();
-  s_a1_entry_ledger_archived.clear();
+  s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_entry_ledger.clear();
+  s_entry_ledger_archived.clear();
 #endif
 }
 
 PyObject* executionEntryLedgerSnapshot() {
 #if PY_VERSION_HEX < 0x030C0000
   bool was_enabled =
-      s_a1_entry_ledger_enabled.exchange(false, std::memory_order_relaxed);
+      s_entry_ledger_enabled.exchange(false, std::memory_order_relaxed);
   std::map<std::tuple<std::string, int, std::string>, uint64_t> rows;
   try {
-    rows = s_a1_entry_ledger_archived;
-    for (const auto& [code, row] : s_a1_entry_ledger) {
+    rows = s_entry_ledger_archived;
+    for (const auto& [code, row] : s_entry_ledger) {
       (void)code;
       rows[std::make_tuple(row.filename, row.firstlineno, row.qualname)] +=
           row.entries;
     }
   } catch (const std::bad_alloc&) {
-    s_a1_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
     PyErr_NoMemory();
     return nullptr;
   }
   Ref<> entries = Ref<>::steal(PyList_New(0));
   if (entries == nullptr) {
-    s_a1_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
   for (const auto& [key, count] : rows) {
@@ -222,20 +222,20 @@ PyObject* executionEntryLedgerSnapshot() {
         "entries",
         static_cast<unsigned long long>(count)));
     if (item == nullptr || PyList_Append(entries, item) < 0) {
-      s_a1_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+      s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
       return nullptr;
     }
   }
   Ref<> result = Ref<>::steal(PyDict_New());
   Ref<> dropped = Ref<>::steal(PyLong_FromUnsignedLongLong(
-      s_a1_entry_ledger_dropped.load(std::memory_order_relaxed)));
+      s_entry_ledger_dropped.load(std::memory_order_relaxed)));
   if (result == nullptr || dropped == nullptr ||
       PyDict_SetItemString(result, "entries", entries) < 0 ||
       PyDict_SetItemString(result, "dropped", dropped) < 0) {
-    s_a1_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
-  s_a1_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
   return result.release();
 #else
   PyErr_SetString(
@@ -247,17 +247,17 @@ PyObject* executionEntryLedgerSnapshot() {
 
 void runtimeTransitionLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
-  s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
-  s_a2_transition_ledger.clear();
-  s_a2_transition_ledger_dropped.store(0, std::memory_order_relaxed);
-  s_a2_transition_ledger_enabled.store(true, std::memory_order_relaxed);
+  s_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_transition_ledger.clear();
+  s_transition_ledger_dropped.store(0, std::memory_order_relaxed);
+  s_transition_ledger_enabled.store(true, std::memory_order_relaxed);
 #endif
 }
 
 void runtimeTransitionLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
-  s_a2_transition_ledger_enabled.store(false, std::memory_order_relaxed);
-  s_a2_transition_ledger.clear();
+  s_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_transition_ledger.clear();
 #endif
 }
 
@@ -271,18 +271,18 @@ void runtimeTransitionLedgerRecord(
     bool instrumentation) {
 #if PY_VERSION_HEX < 0x030C0000
   if (code == nullptr ||
-      !s_a2_transition_ledger_enabled.load(std::memory_order_relaxed)) {
+      !s_transition_ledger_enabled.load(std::memory_order_relaxed)) {
     return;
   }
   const char* filename = PyUnicode_AsUTF8(code->co_filename);
   const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
   if (filename == nullptr || qualname == nullptr) {
     PyErr_Clear();
-    s_a2_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    s_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   try {
-    s_a2_transition_ledger.push_back(A2TransitionLedgerRow{
+    s_transition_ledger.push_back(TransitionLedgerRow{
         filename,
         qualname,
         transition != nullptr ? transition : "unknown",
@@ -293,7 +293,7 @@ void runtimeTransitionLedgerRecord(
         forced,
         instrumentation});
   } catch (const std::bad_alloc&) {
-    s_a2_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    s_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
   }
 #else
   (void)code;
@@ -309,14 +309,14 @@ void runtimeTransitionLedgerRecord(
 PyObject* runtimeTransitionLedgerSnapshot() {
 #if PY_VERSION_HEX < 0x030C0000
   bool was_enabled =
-      s_a2_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
+      s_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
   Ref<> rows = Ref<>::steal(PyList_New(0));
   if (rows == nullptr) {
-    s_a2_transition_ledger_enabled.store(
+    s_transition_ledger_enabled.store(
         was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
-  for (const A2TransitionLedgerRow& row : s_a2_transition_ledger) {
+  for (const TransitionLedgerRow& row : s_transition_ledger) {
     Ref<> item = Ref<>::steal(Py_BuildValue(
         "{s:s,s:s,s:i,s:s,s:s,s:i,s:i,s:O,s:O}",
         "filename",
@@ -338,22 +338,22 @@ PyObject* runtimeTransitionLedgerSnapshot() {
         "instrumentation",
         row.instrumentation ? Py_True : Py_False));
     if (item == nullptr || PyList_Append(rows, item) < 0) {
-      s_a2_transition_ledger_enabled.store(
+      s_transition_ledger_enabled.store(
           was_enabled, std::memory_order_relaxed);
       return nullptr;
     }
   }
   Ref<> result = Ref<>::steal(PyDict_New());
   Ref<> dropped = Ref<>::steal(PyLong_FromUnsignedLongLong(
-      s_a2_transition_ledger_dropped.load(std::memory_order_relaxed)));
+      s_transition_ledger_dropped.load(std::memory_order_relaxed)));
   if (result == nullptr || dropped == nullptr ||
       PyDict_SetItemString(result, "rows", rows) < 0 ||
       PyDict_SetItemString(result, "dropped", dropped) < 0) {
-    s_a2_transition_ledger_enabled.store(
+    s_transition_ledger_enabled.store(
         was_enabled, std::memory_order_relaxed);
     return nullptr;
   }
-  s_a2_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
   return result.release();
 #else
   PyErr_SetString(

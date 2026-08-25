@@ -19,8 +19,8 @@ import types
 import unittest
 
 
-_MODE = os.environ["A1_COMPILE_ALL_MODE"]
-_LOG_DIR = Path(os.environ["A1_COMPILE_ALL_LOG_DIR"])
+_MODE = os.environ["EXECUTION_COMPILE_ALL_MODE"]
+_LOG_DIR = Path(os.environ["EXECUTION_COMPILE_ALL_LOG_DIR"])
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _SCANNED: set[str] = set()
 _COMPILE_RESULTS: dict[int, dict] = {}

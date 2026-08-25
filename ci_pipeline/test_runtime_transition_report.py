@@ -793,7 +793,7 @@ class RuntimeTransitionReportTest(unittest.TestCase):
                 DATA / "frozen_stdlib_modules.txt",
                 result_path,
             )
-        self.assertEqual(report["counts"]["A2_COVERAGE_GAP"], 72)
+        self.assertEqual(report["counts"]["THRESHOLD_COVERAGE_GAP"], 72)
         self.assertEqual(report["counts"].get("OWN_CODE_JIT", 0), 0)
 
 

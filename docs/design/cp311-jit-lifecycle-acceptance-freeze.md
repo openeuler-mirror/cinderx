@@ -20,7 +20,7 @@ The freeze criteria (all of them, none waived):
 | NATIVE_MEMORY_SAFETY PASS | seven targeted ASAN legs against a verified-instrumented extension, zero sanitizer reports; the ASAN executed arm also runs the full green-family population |
 | STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 471 844 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
 | execution regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged) |
-| runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the lifecycle prerequisite validates the frozen evidence from the frozen commit itself (`git show <frozen>:<historical path>`), so the freeze pins history rather than present-day file names |
+| runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the lifecycle prerequisite validates the frozen evidence from the frozen commit itself (`git show <frozen>:<historical path>`), so the freeze pins history rather than present-day file names. The frozen evidence is carried in-repo under `ci_pipeline/jit311/data/frozen/`: the byte-exact frozen report, plus a distilled summary whose pinned digest embeds the sha256 of the full archived result (56 MB, kept out of the tree) as the provenance link -- the acceptance takes no external evidence input |
 | lifecycle blockers | none |
 | release wheel smoke | 165/165 on the stock openEuler 24.03-sp3 runtime; the executable-allocation trigger metric counts pool-level growth uniformly across both allocators, so the huge-page clamp no longer silences it and per-artifact spans no longer inflate it |
 | 3.14 reference differential | paused by operator decision for the closing cleanup rounds; the cleanup commits are CI-only and the product tree is unchanged since the semantic-naming commit, and the differential stays runnable at any time via `ci_pipeline/scripts/rt314_differential.sh <base> <work-dir>` |
@@ -77,6 +77,21 @@ regression (JITLifecycle311Test.InStackGeneratorDeoptDropsTheArtifactPin,
 held in the required manifest), and the arena lifetime token the base
 introduced is now the single storage-liveness source for
 runtimeStorageAlive().
+
+The acceptance invocation is the bare-module contract: a container with
+the wheel mounted at `/wheels` and the repository checked out at the
+frozen commit runs the ten cases as three bare commands --
+`python3.11 -m ci_pipeline.jit311.lifecycle_acceptance`,
+`... execution_acceptance` and `... runtime_transition_acceptance` --
+with no flags: the wheel, source, in-repo frozen evidence and ASAN arms
+(built on first use) all resolve by convention, and each entry's final
+stdout line is the verdict, `PASS` on success.  The campaign's stage
+vocabulary is retired from every active surface (code identifiers, env
+variables, data-format strings, document names) and the naming lint
+enforces the semantic vocabulary across the acceptance trees; the only
+stage-numbered content left is quoted history -- the frozen commit's
+`git show` paths, the byte-locked frozen evidence and the historical
+freeze marker it validates.
 
 The lifecycle campaign is closed.  Regressions in this surface route to
 the lifecycle acceptance entry (every lifecycle-sensitive change also

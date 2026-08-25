@@ -1,7 +1,8 @@
-# CPython 3.11 A3 CodeRuntime Identity Audit
+# CPython 3.11 CodeRuntime Identity Audit
 
 Mechanical audit of every long-term store of `CodeRuntime*` /
-`const CodeRuntime*`, performed before slot recycling (MR-A3-06) so the
+`const CodeRuntime*`, performed before the storage-recycling MR (`cp311: recycle retired
+CodeRuntime storage`) so the
 slot's next tenant cannot inherit the previous tenant's state (ABA) and
 no borrower can outlive the storage.
 
@@ -44,7 +45,8 @@ Reclaiming B7 therefore required making the ownership explicit first:
   is gutted and its storage handed back exclusively at artifact
   destruction, GC collection of an unreachable artifact, or context
   finalization, all of which prove no pin remains;
-- `~Context` severs orphans before the slabs die (MR-A3-04).
+- `~Context` severs orphans before the slabs die (the orphan-finalize
+  MR: `cp311: finalize orphaned JIT artifacts before context teardown`).
 
 ## Recycling boundaries (R1–R5)
 
