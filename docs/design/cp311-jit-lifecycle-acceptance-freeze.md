@@ -18,7 +18,7 @@ The freeze criteria (all of them, none waived):
 | LIFECYCLE_OWNERSHIP PASS | L1 function death ×100 · L2 code swap ×100 · L3 observer smoke ×1000 · L4 generator anchor · invariants at every checkpoint, non-vacuity proven |
 | SHUTDOWN_STABILITY PASS | S1 park/die/re-enable ×100 (phase evidence judged) · S2 multithread batch · S3 six-state exit matrix 200/200 poisoned+entropy, multithread-completed passing on its own |
 | NATIVE_MEMORY_SAFETY PASS | seven targeted ASAN legs against a verified-instrumented extension, zero sanitizer reports; the ASAN executed arm also runs the full green-family population |
-| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 449 025 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
+| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 454 313 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
 | execution regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged) |
 | runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the transition freeze fact rests on three proofs and takes no external evidence input: the frozen commit's ancestry, the harness sources read back from the frozen commit itself (`git show <frozen>:<historical path>` -- the freeze pins history rather than present-day file names), and the byte-exact frozen report carried in-repo under `ci_pipeline/jit311/data/frozen/`. The raw result archive of the frozen run stays out of the tree and out of the gate; the policy records its digest for archival authentication only, and current correctness never rests on it -- every acceptance re-runs the transition cases live |
 | lifecycle blockers | none |
@@ -28,12 +28,12 @@ The freeze criteria (all of them, none waived):
 ## Frozen identity
 
 ```text
-frozen_commit            f2867e87b4d6075685d8b36a4862db086011b1ef
+frozen_commit            11481c0bee320979e51b40125579e3d72631636f
 wheel                    cinderx-2026.8.25.0-cp311-cp311-linux_aarch64.whl
-wheel_sha256             f192bb794134793e0042f32fde48022a5781053e8bf6748d506ad766697c2a38
-wheel_embedded_git_sha   f2867e87b4d6075685d8b36a4862db086011b1ef
+wheel_sha256             a9ab5602b9377782a9b5db66631e59c2430ff097633b5f3c832eccefb686c6e9
+wheel_embedded_git_sha   11481c0bee320979e51b40125579e3d72631636f
 canonical_result         lifecycle_result.json
-canonical_result_sha256  4b24377051193c28e582e032a2c7d4e7b6908029ea89ab193f82c41b692fa056
+canonical_result_sha256  39aae7fbd1a5e841c3e7284b970291ba874c16b1c4ef7bfa2aec60c170e1773d
 ```
 
 The acceptance emits machine-readable evidence only; the canonical
