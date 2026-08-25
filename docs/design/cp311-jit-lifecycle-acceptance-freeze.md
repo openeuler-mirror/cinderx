@@ -18,7 +18,7 @@ The freeze criteria (all of them, none waived):
 | LIFECYCLE_OWNERSHIP PASS | L1 function death ×100 · L2 code swap ×100 · L3 observer smoke ×1000 · L4 generator anchor · invariants at every checkpoint, non-vacuity proven |
 | SHUTDOWN_STABILITY PASS | S1 park/die/re-enable ×100 (phase evidence judged) · S2 multithread batch · S3 six-state exit matrix 200/200 poisoned+entropy, multithread-completed passing on its own |
 | NATIVE_MEMORY_SAFETY PASS | seven targeted ASAN legs against a verified-instrumented extension, zero sanitizer reports; the ASAN executed arm also runs the full green-family population |
-| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 471 844 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
+| STDLIB_AUTOJIT_REGRESSION PASS with JIT path proof | 72/72 module results present and passing, JIT active in 72/72 workers, scheduler uniformly threshold=50, 18 449 025 machine-code entries, 37 own-code modules, 0 dropped ledger/scheduler events, 0 unknown refusals, `MALLOC_PERTURB_` armed |
 | execution regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged) |
 | runtime-transition regression | PASS_WITH_APPROVED_DEVIATIONS (frozen deviation register unchanged); the lifecycle prerequisite validates the frozen evidence from the frozen commit itself (`git show <frozen>:<historical path>`), so the freeze pins history rather than present-day file names. The frozen evidence is carried in-repo under `ci_pipeline/jit311/data/frozen/`: the byte-exact frozen report, plus a distilled summary whose pinned digest embeds the sha256 of the full archived result (56 MB, kept out of the tree) as the provenance link -- the acceptance takes no external evidence input |
 | lifecycle blockers | none |
@@ -28,15 +28,19 @@ The freeze criteria (all of them, none waived):
 ## Frozen identity
 
 ```text
-frozen_commit            1d356c556451ab7b88b3ca4739e9683ad27d3d34
+frozen_commit            f2867e87b4d6075685d8b36a4862db086011b1ef
 wheel                    cinderx-2026.8.25.0-cp311-cp311-linux_aarch64.whl
-wheel_sha256             55c302115111a2f1aa854655c79eb544975af97a14993b2a46aaedcbf5f64550
-wheel_embedded_git_sha   1d356c556451ab7b88b3ca4739e9683ad27d3d34
-canonical_report         CP311_JIT_LIFECYCLE_REPORT.md
-canonical_report_sha256  9b76c26d61c93920d0a68af2676f99f9b309acd902161d44301ca7ef4b85b21e
+wheel_sha256             f192bb794134793e0042f32fde48022a5781053e8bf6748d506ad766697c2a38
+wheel_embedded_git_sha   f2867e87b4d6075685d8b36a4862db086011b1ef
 canonical_result         lifecycle_result.json
-canonical_result_sha256  627a1ddcea6bd7e3424344de6298e370c7ccea613a3c90aeb56a79b23ec547f1
+canonical_result_sha256  4b24377051193c28e582e032a2c7d4e7b6908029ea89ab193f82c41b692fa056
 ```
+
+The acceptance emits machine-readable evidence only; the canonical
+document is the lifecycle result JSON (the entries name their evidence
+paths on stderr), and re-runs compare verdicts, not digests -- entry
+counts move a little run to run, so the canonical digest identifies our
+archived evidence run rather than constraining yours.
 
 The MR closes the development phase.  The chain sits on the execute-mode
 base as three delivery commits -- the execution acceptance, the
