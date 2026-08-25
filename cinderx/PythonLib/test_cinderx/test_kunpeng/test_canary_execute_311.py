@@ -1230,7 +1230,7 @@ class CanaryExecute311Test(unittest.TestCase):
                 "get_compiled_functions", "get_and_clear_runtime_stats",
                 "is_enabled", "jit_suppress", "jit_unsuppress",
                 "disable", "enable", "force_uncompile",
-                "deopt_sites", "force_deopt",
+                "deopt_sites", "force_deopt", "_deopt_gen",
                 "_get_resident_compiled_functions",
             ]
             missing = [name for name in needed if not hasattr(cinderjit, name)]
@@ -7404,6 +7404,521 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("stats cover every class", proc.stdout)
+
+    def test_sync_generator_iterates_on_both_arms(self):
+        # RFC 3.3.7: a plain CO_GENERATOR compiles, yields, and exhausts
+        # with the same values as the interpreter.  The jit arm asserts
+        # compilation so a silent refuse cannot go green.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def gen():
+                yield 1
+                yield 2
+                yield 3
+
+            compile_all(gen)
+            journal = list(gen())
+            still_compiled(gen)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        self.assertEqual(interp, [1, 2, 3])
+
+    def test_sync_generator_send_throw_close_match_the_interpreter_arm(self):
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def proto():
+                received = yield 10
+                yield received + 1
+
+            compile_all(proto)
+            g = proto()
+            first = next(g)
+            second = g.send(4)
+            g3 = proto()
+            next(g3)
+            threw = None
+            try:
+                g3.throw(ValueError("x"))
+            except ValueError as exc:
+                threw = str(exc)
+            g2 = proto()
+            next(g2)
+            closed = g2.close()
+            still_compiled(proto)
+            print("JOURNAL " + json.dumps(
+                [first, second, threw, closed is None]))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_yield_from_and_pep479_match_the_interpreter_arm(self):
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def inner():
+                yield 1
+                yield 2
+
+            def outer():
+                yield from inner()
+                yield 3
+
+            def leaks_stop():
+                raise StopIteration("leaked")
+                yield
+
+            compile_all(inner, outer, leaks_stop)
+            values = list(outer())
+            leaked = None
+            try:
+                next(leaks_stop())
+            except RuntimeError as exc:
+                leaked = type(exc).__name__ + ":" + str(exc)
+            still_compiled(inner, outer, leaks_stop)
+            print("JOURNAL " + json.dumps([values, leaked]))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        self.assertEqual(interp[0], [1, 2, 3])
+        self.assertTrue(str(interp[1]).startswith("RuntimeError:"))
+
+    def test_generator_exception_completion_repeats_safely(self):
+        # An exception deopts each generator instance into the vendored
+        # evaluator.  Its exception-stack link must be restored before the
+        # instance dies, or the next instance follows a pointer into freed
+        # generator memory when it raises.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def gen_boom():
+                yield 1
+                raise ValueError("boom")
+
+            compile_all(gen_boom)
+            journal = []
+            entries_before = (
+                _cinderx._get_trigger_stats()["machine_code_entries"]
+                if mode == "jit" else 0
+            )
+            for _ in range(8):
+                g = gen_boom()
+                journal.append(next(g))
+                try:
+                    next(g)
+                except ValueError as exc:
+                    journal.append(str(exc))
+                try:
+                    next(g)
+                except StopIteration:
+                    journal.append(g.gi_frame is None)
+            if mode == "jit":
+                assert _cinderx._get_trigger_stats()[
+                    "machine_code_entries"] > entries_before
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        self.assertEqual(len(jit), 24)
+        self.assertTrue(all(jit[index] for index in range(2, 24, 3)))
+
+    def test_gi_code_and_startup_errors_match_the_interpreter_arm(self):
+        # 3.11 holds gi_code independently of the frame executable.
+        # send(non-None) before the first yield keeps the stock TypeError.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def gen():
+                yield 1
+                yield 2
+
+            compile_all(gen)
+            g = gen()
+            code_ok = g.gi_code is gen.__code__
+            startup = None
+            try:
+                g.send(1)
+            except TypeError as exc:
+                startup = str(exc)
+            still_compiled(gen)
+            print("JOURNAL " + json.dumps([code_ok, startup]))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        self.assertTrue(interp[0])
+        self.assertIsNotNone(interp[1])
+
+    def test_generator_capability_switch_and_auto_default(self):
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def gen():
+                yield 1
+
+            for _ in range(8):
+                assert list(gen()) == [1]
+            assert cinderjit.is_jit_compiled(gen) is False, (
+                "sync generators must remain auto-JIT disabled in MR-10")
+
+            if __import__("os").environ["PYTHONJITGENERATOR"] == "0":
+                try:
+                    cinderjit.force_compile(gen)
+                except RuntimeError as exc:
+                    assert "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED" in str(exc), exc
+                else:
+                    raise SystemExit("generator capability-off force-compiled")
+            else:
+                assert cinderjit.force_compile(gen) is True
+                assert cinderjit.is_jit_compiled(gen) is True
+                before = _cinderx._get_trigger_stats()["machine_code_entries"]
+                assert list(gen()) == [1]
+                after = _cinderx._get_trigger_stats()["machine_code_entries"]
+                assert after > before, (before, after)
+            print("generator capability held")
+            """
+        )
+        for enabled in ("0", "1"):
+            with self.subTest(enabled=enabled):
+                env = dict(os.environ)
+                env["CINDERX_JIT_MODE"] = "canary"
+                env["PYTHONJITAUTO"] = "1"
+                env["PYTHONJITGENERATOR"] = enabled
+                proc = subprocess.run(
+                    [sys.executable, "-c", probe],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=120,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+                self.assertIn("generator capability held", proc.stdout)
+
+    def test_suspended_generator_deopt_introspection_and_churn(self):
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import gc
+            import weakref
+            from cinderx import jit
+
+            def gen(seed):
+                local = seed + 1
+                received = yield local
+                yield received + local
+
+            compile_all(gen)
+            g = gen(4)
+            first = next(g)
+            frame_before = g.gi_frame
+            locals_before = dict(frame_before.f_locals)
+            yield_from_before = g.gi_yieldfrom
+            deopted = bool(jit._deopt_gen(g)) if mode == "jit" else False
+            frame_same = g.gi_frame is frame_before
+            second = g.send(6)
+
+            # Function-level retirement must not invalidate a separately
+            # suspended generator that still owns the compiled artifact.
+            held = gen(10)
+            held_first = next(held)
+            retired = cinderjit.force_uncompile(gen) if mode == "jit" else False
+            held_second = held.send(3)
+
+            compile_all(gen)
+            gens = [gen(i) for i in range(4)]
+            interleaved = [next(item) for item in gens]
+            interleaved += [item.send(10) for item in reversed(gens)]
+            for item in gens:
+                item.close()
+
+            collected = []
+            subject = gen(20)
+            ref = weakref.ref(subject, lambda _ref: collected.append(True))
+            next(subject)
+            del subject
+            gc.collect()
+            weakref_dead = ref() is None and collected == [True]
+
+            print("JOURNAL " + json.dumps({
+                "first": first,
+                "locals": locals_before,
+                "yield_from": yield_from_before,
+                "deopted": deopted,
+                "frame_same": frame_same,
+                "second": second,
+                "held_first": held_first,
+                "retired": retired,
+                "held_second": held_second,
+                "interleaved": interleaved,
+                "weakref_dead": weakref_dead,
+            }, sort_keys=True))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        for key in ("deopted", "retired"):
+            interp.pop(key)
+            self.assertTrue(jit.pop(key), key)
+        self.assertEqual(interp, jit)
+        self.assertTrue(jit["frame_same"])
+        self.assertTrue(jit["weakref_dead"])
+
+    def test_generator_releases_code_and_pins_suspended_artifact(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONJITGENERATOR"] = "1"
+        env["PYTHONJITHUGEPAGES"] = "0"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import sys
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+            from cinderx import jit
+
+            def completed(seed):
+                received = yield seed + 1
+                return received + seed
+
+            assert cinderjit.force_compile(completed) is True
+            code_refs = sys.getrefcount(completed.__code__)
+            for i in range(25):
+                gen = completed(i)
+                assert next(gen) == i + 1
+                try:
+                    gen.send(2)
+                except StopIteration as exc:
+                    assert exc.value == i + 2
+                else:
+                    raise AssertionError("generator did not complete")
+                del gen
+            gc.collect()
+            assert sys.getrefcount(completed.__code__) == code_refs
+
+            def abandoned(seed):
+                received = yield seed + 1
+                return received + seed
+
+            assert cinderjit.force_compile(abandoned) is True
+            code_refs = sys.getrefcount(abandoned.__code__)
+            for i in range(25):
+                gen = abandoned(i)
+                del gen
+            gc.collect()
+            assert sys.getrefcount(abandoned.__code__) == code_refs
+
+            def closed(seed):
+                received = yield seed + 1
+                return received + seed
+
+            assert cinderjit.force_compile(closed) is True
+            code_refs = sys.getrefcount(closed.__code__)
+            for i in range(25):
+                gen = closed(i)
+                assert next(gen) == i + 1
+                gen.close()
+                del gen
+            gc.collect()
+            assert sys.getrefcount(closed.__code__) == code_refs
+
+            def deopted(seed):
+                received = yield seed + 1
+                return received + seed
+
+            assert cinderjit.force_compile(deopted) is True
+            code_refs = sys.getrefcount(deopted.__code__)
+            for i in range(25):
+                gen = deopted(i)
+                assert next(gen) == i + 1
+                assert jit._deopt_gen(gen)
+                try:
+                    gen.send(2)
+                except StopIteration as exc:
+                    assert exc.value == i + 2
+                else:
+                    raise AssertionError("deopted generator did not complete")
+                del gen
+            gc.collect()
+            assert sys.getrefcount(deopted.__code__) == code_refs
+
+            def suspended(seed):
+                received = yield seed + 1
+                return received + seed
+
+            baseline = cinderjit._get_resident_compiled_functions()
+            assert cinderjit.force_compile(suspended) is True
+            compiled = cinderjit._get_resident_compiled_functions()
+            assert compiled == baseline + 1, (baseline, compiled)
+            gen = suspended(10)
+            assert next(gen) == 11
+            assert cinderjit.force_uncompile(suspended) is True
+            pinned = cinderjit._get_resident_compiled_functions()
+            assert pinned == compiled, (baseline, compiled, pinned)
+            try:
+                gen.send(3)
+            except StopIteration as exc:
+                assert exc.value == 13
+            else:
+                raise AssertionError("generator did not complete")
+            del gen
+            gc.collect()
+            released = cinderjit._get_resident_compiled_functions()
+            assert released == baseline, (baseline, released)
+
+            def destroyed(seed):
+                received = yield seed + 1
+                return received + seed
+
+            baseline = cinderjit._get_resident_compiled_functions()
+            assert cinderjit.force_compile(destroyed) is True
+            gen = destroyed(20)
+            assert next(gen) == 21
+            assert cinderjit.force_uncompile(destroyed) is True
+            assert cinderjit._get_resident_compiled_functions() == baseline + 1
+            gen_ref = weakref.ref(gen)
+            del gen
+            gc.collect()
+            assert gen_ref() is None
+            assert cinderjit._get_resident_compiled_functions() == baseline
+
+            def deopted_artifact(seed):
+                received = yield seed + 1
+                return received + seed
+
+            baseline = cinderjit._get_resident_compiled_functions()
+            assert cinderjit.force_compile(deopted_artifact) is True
+            gen = deopted_artifact(30)
+            assert next(gen) == 31
+            assert cinderjit.force_uncompile(deopted_artifact) is True
+            assert cinderjit._get_resident_compiled_functions() == baseline + 1
+            assert jit._deopt_gen(gen)
+            assert cinderjit._get_resident_compiled_functions() == baseline
+            try:
+                gen.send(4)
+            except StopIteration as exc:
+                assert exc.value == 34
+            else:
+                raise AssertionError("deopted generator did not complete")
+
+            namespace = {}
+            exec(
+                "def cycle(seed):\\n"
+                "    received = yield seed + 1\\n"
+                "    return received + seed\\n",
+                namespace,
+            )
+            cycle = namespace["cycle"]
+            baseline = cinderjit._get_resident_compiled_functions()
+            assert cinderjit.force_compile(cycle) is True
+            gen = cycle(40)
+            assert next(gen) == 41
+            namespace["held"] = gen
+            gen_ref = weakref.ref(gen)
+            del gen, cycle, namespace
+            gc.collect()
+            assert gen_ref() is None
+            assert cinderjit._get_resident_compiled_functions() == baseline
+            print("generator artifact lifetime held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("generator artifact lifetime held", proc.stdout)
+
+    def test_async_code_stays_refused_on_the_execute_surface(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import types
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            async def coro():
+                return 42
+
+            async def agen():
+                yield 1
+
+            @types.coroutine
+            def iterable_coro():
+                yield 1
+
+            for fn, label in (
+                (coro, "coroutine"),
+                (iterable_coro, "iterable coroutine"),
+                (agen, "async generator"),
+            ):
+                try:
+                    cinderjit.force_compile(fn)
+                except RuntimeError as exc:
+                    assert "REFUSE_SHAPE_ASYNC_CODE" in str(exc), (label, exc)
+                else:
+                    raise SystemExit(f"execute surface compiled {label}")
+                assert cinderjit.is_jit_compiled(fn) is False, label
+            print("async refused")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("async refused", proc.stdout)
+
+    def test_generator_body_outside_the_execute_surface_is_refused(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def uses_subscr(a):
+                yield a[0]
+
+            try:
+                cinderjit.force_compile(uses_subscr)
+            except RuntimeError as exc:
+                assert "CANNOT_SPECIALIZE" in str(exc), exc
+            else:
+                raise SystemExit(
+                    "execute surface compiled a generator with BINARY_SUBSCR")
+            print("generator subscr refused")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("generator subscr refused", proc.stdout)
 
 
 if __name__ == "__main__":

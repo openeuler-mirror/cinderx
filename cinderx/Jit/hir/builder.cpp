@@ -1354,16 +1354,19 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   // LOAD_ASSERTION_ERROR and BEFORE_WITH do run in normal flow and have
   // translations.  MR-09 adds LOAD_ATTR and STORE_ATTR: attribute access
   // executes through the pull-validated helper caches (or their
-  // guarded/generic fallbacks).  Only normal-flow-reachable instructions
+  // guarded/generic fallbacks).  MR-10 adds the generator-body opcodes
+  // (RETURN_GENERATOR, YIELD_VALUE, SEND, GET_YIELD_FROM_ITER) so a
+  // sync CO_GENERATOR that stays on the rest of this whitelist can
+  // install and resume.  Only normal-flow-reachable instructions
   // are checked: an opcode that occurs solely inside a handler region
   // executes in the interpreter after the deopt regardless of what it
   // is, so holding it to the machine-code whitelist would refuse
   // functions this milestone fully supports.  Still out (on the
-  // reachable surface): subscripts, DELETE_ATTR, STORE_DEREF, generator
-  // *bodies*, except* and pattern matching (the latter two refused
-  // earlier by the whole-code translate scan, keeping their audited
-  // refusals).  The decoder yields unspecialized opcodes, so quickened
-  // forms cannot slip past.
+  // reachable surface): subscripts, DELETE_ATTR, STORE_DEREF, except*
+  // and pattern matching (the latter two refused earlier by the
+  // whole-code translate scan, keeping their audited refusals).  The
+  // decoder yields unspecialized opcodes, so quickened forms cannot
+  // slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
     return "REFUSE_SHAPE_EXECUTE_SURFACE";
@@ -1394,6 +1397,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case EXTENDED_ARG:
       case FOR_ITER:
       case GET_ITER:
+      case GET_YIELD_FROM_ITER:
       case IS_OP:
       case JUMP_BACKWARD:
       case JUMP_BACKWARD_NO_INTERRUPT:
@@ -1430,7 +1434,9 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case RAISE_VARARGS:
       case RERAISE:
       case RESUME:
+      case RETURN_GENERATOR:
       case RETURN_VALUE:
+      case SEND:
       case SET_ADD:
       case STORE_ATTR:
       case STORE_FAST:
@@ -1442,6 +1448,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case UNPACK_EX:
       case UNPACK_SEQUENCE:
       case WITH_EXCEPT_START:
+      case YIELD_VALUE:
         break;
       default:
         return "REFUSE_SHAPE_EXECUTE_SURFACE";
@@ -1475,9 +1482,9 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
   code_is_simple_numeric_leaf_ = isSimpleNumericLeafFunction(code_);
 
 #if PY_VERSION_HEX < 0x030C0000
-  if (code_->co_flags & kCoFlagsAnyGenerator) {
+  if (code_->co_flags & kCoFlagsAsyncCode) {
     JIT_THROW(
-        "generators are unsupported on CPython 3.11 in {}",
+        "async code is unsupported on CPython 3.11 in {}",
         preloader_.fullname());
   }
 #if PY_VERSION_HEX >= 0x030B0000

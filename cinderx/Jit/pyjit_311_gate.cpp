@@ -119,12 +119,8 @@ const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
   if ((code->co_flags & kRequiredCodeFlags) != kRequiredCodeFlags) {
     return "REFUSE_SHAPE_NON_FUNCTION_SCOPE";
   }
-  if (code->co_flags &
-      (CO_COROUTINE | CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR)) {
+  if (code->co_flags & jit::kCoFlagsAsyncCode) {
     return "REFUSE_SHAPE_ASYNC_CODE";
-  }
-  if (code->co_flags & CO_GENERATOR) {
-    return "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED";
   }
   if (code->co_flags & CI_CO_SUPPRESS_JIT) {
     return "REFUSE_SHAPE_JIT_SUPPRESSED";
@@ -341,13 +337,17 @@ extern "C" const char* Ci_JitShell311_ExecuteRefusal(
   if (reason != nullptr) {
     return reason;
   }
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if ((code->co_flags & CO_GENERATOR) != 0 &&
+      !jit::getConfig().sync_generator_jit) {
+    return "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED";
+  }
   if (const char* arg_reason = unsupportedArgumentShape311(func)) {
     return arg_reason;
   }
   if (const char* share_reason = unsupportedSharedArtifact311(func)) {
     return share_reason;
   }
-  BorrowedRef<PyCodeObject> code{func->func_code};
   return jit::hir::unsupportedExecuteReason311(code);
 }
 
@@ -487,6 +487,10 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     }
 
     if (canaryMode()) {
+      BorrowedRef<PyCodeObject> code{func->func_code};
+      if ((code->co_flags & CO_GENERATOR) != 0) {
+        return "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED";
+      }
       // canary: compile, install and let the next call execute machine code.
       // The execute surface is narrower than the shadow surface; refusals
       // report their registered reason so observe accounting stays closed.

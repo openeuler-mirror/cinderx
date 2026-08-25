@@ -7,6 +7,7 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
+#include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
@@ -49,13 +50,13 @@
 
 #if PY_VERSION_HEX < 0x030C0000
 // A milestone gate, not a mode gate.  These cases assert a surface the 3.11
-// port has not opened in either mode -- generators and coroutines, the
-// opcodes outside the MR-04 execute whitelist, the Static Python runtime
-// cache, or control-plane entry points the canary does not publish -- so
-// the executing mode refuses to compile them by design.  Running them there
-// would only assert that a deliberate refusal is a failure.  The reason
-// names the surface the case waits on, so that widening the surface makes
-// the skip visible instead of leaving it inert.
+// port has not opened in either mode -- opcodes outside the execute
+// whitelist, the Static Python runtime cache, or control-plane entry
+// points the canary does not publish -- so the executing mode refuses to
+// compile them by design.  Running them there would only assert that a
+// deliberate refusal is a failure.  The reason names the surface the case
+// waits on, so that widening the surface makes the skip visible instead of
+// leaving it inert.
 #define SKIP_311_UNTIL_SURFACE(reason)                                    \
   do {                                                                    \
     GTEST_SKIP() << "3.11 has not opened this surface yet: " << (reason); \
@@ -1493,7 +1494,7 @@ def add(a, b):
 }
 
 TEST_F(JITFrameTest, CompileAndRunGeneratorFunc) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -1628,7 +1629,7 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2086,7 +2087,7 @@ TEST_F(JITGenDataFooterTest, GenDataFooterDefaults) {
 }
 
 TEST_F(JITGenDataFooterTest, CompileGeneratorAndCheckRuntime) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2520,7 +2521,7 @@ class JITGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(JITGeneratorTest, CompileGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2547,7 +2548,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorAndCheck) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2570,7 +2571,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndRunGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2600,7 +2601,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorWithArg) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen(n: int):
@@ -2639,7 +2640,7 @@ def gen(n: int):
 
 
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2662,7 +2663,7 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndIterateGenerator) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -2700,7 +2701,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, CompileCoroutine) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 async def coro():
@@ -2715,7 +2716,11 @@ async def coro():
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_EQ(comp_result, jit::Result::CANNOT_SPECIALIZE);
+#else
   ASSERT_EQ(comp_result, jit::Result::OK);
+#endif
 }
 
 TEST_F(JITGeneratorTest, GeneratorClose) {
@@ -2748,7 +2753,7 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def gen():
@@ -3328,7 +3333,7 @@ def run():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGeneratorSendAndYieldFrom) {
-  SKIP_311_UNTIL_SURFACE("JIT generators and coroutines");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def inner():
@@ -4163,6 +4168,27 @@ def drive(callee, helper, box):
       << "CALL_FUNCTION_EX-after mutation ran; eval breaker was deferred";
 }
 
+TEST_F(JITLifecycle311Test, GeneratorCapabilityHasStableRefusal) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def gen():
+    yield 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "gen"));
+  ASSERT_NE(func, nullptr);
+
+  bool saved = jit::getConfig().sync_generator_jit;
+  SCOPE_EXIT(jit::getMutableConfig().sync_generator_jit = saved);
+  jit::getMutableConfig().sync_generator_jit = true;
+  EXPECT_EQ(Ci_JitShell311_ExecuteRefusal(func), nullptr);
+
+  jit::getMutableConfig().sync_generator_jit = false;
+  EXPECT_STREQ(
+      Ci_JitShell311_ExecuteRefusal(func),
+      "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED");
+}
+
 #if defined(__linux__)
 TEST_F(JITLifecycle311Test, CStackLargeGuardRaisesRecursionError) {
   SKIP_311_EXECUTABLE_COMPILE();
@@ -4297,6 +4323,192 @@ def undo_me(x):
   auto recompiled = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(recompiled, nullptr);
   EXPECT_EQ(PyLong_AsLong(recompiled), 42);
+}
+
+TEST_F(JITLifecycle311Test, GeneratorPublishesStockBeforeArtifactRelease) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+import types
+from cinderx import jit
+
+events = []
+
+class Reenter:
+    def __init__(self, mode, gen):
+        self.mode = mode
+        self.gen = gen
+
+    def __del__(self):
+        events.append((self.mode, type(self.gen) is types.GeneratorType))
+        if self.mode == "send":
+            try:
+                self.gen.send(5)
+            except StopIteration as exc:
+                events.append((self.mode, exc.value))
+        elif self.mode == "close":
+            self.gen.close()
+        else:
+            events.append((self.mode, jit._deopt_gen(self.gen)))
+
+def lifecycle_gen():
+    received = yield 1
+    return received + 10
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lifecycle_gen"));
+  Ref<> reenter_type(getGlobal("Reenter"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(reenter_type, nullptr);
+  auto jit_mod = importCinderJitModule();
+
+  for (const char* mode : {"send", "close", "deopt"}) {
+    ASSERT_EQ(jit::compileFunction(func), jit::Result::OK) << mode;
+    auto args = Ref<>::steal(PyTuple_New(0));
+    Ref<> gen = Ref<>::steal(PyObject_Call(func, args, nullptr));
+    ASSERT_NE(gen, nullptr) << mode;
+
+    auto first = Ref<>::steal(PyIter_Next(gen));
+    ASSERT_NE(first, nullptr) << mode;
+    EXPECT_EQ(PyLong_AsLong(first), 1) << mode;
+    auto* jit_gen = jit::JitGenObject::cast(gen.get());
+    ASSERT_NE(jit_gen, nullptr) << mode;
+    jit::GenDataFooter* footer = jit_gen->genDataFooter();
+    ASSERT_NE(footer, nullptr) << mode;
+    ASSERT_NE(footer->compiled, nullptr) << mode;
+    jit::CompiledFunction* artifact = footer->compiled;
+    ASSERT_NE(artifact->runtime(), nullptr) << mode;
+
+    auto mode_obj = Ref<>::steal(PyUnicode_FromString(mode));
+    auto trigger = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reenter_type.get(), mode_obj.get(), gen.get(), nullptr));
+    ASSERT_NE(trigger, nullptr) << mode;
+    artifact->runtime()->addReference(trigger);
+    trigger.reset();
+
+    auto uncompiled = Ref<>::steal(
+        PyObject_CallMethod(jit_mod, "force_uncompile", "O", func.get()));
+    ASSERT_NE(uncompiled, nullptr) << mode;
+    EXPECT_EQ(uncompiled.get(), Py_True) << mode;
+    EXPECT_EQ(footer->compiled, artifact) << mode;
+    EXPECT_EQ(Py_REFCNT(reinterpret_cast<PyObject*>(artifact)), 1)
+        << "the suspended generator is not the artifact's final owner: "
+        << mode;
+    EXPECT_EQ(jit::getContext()->lookupFunc(func), nullptr) << mode;
+
+    ASSERT_TRUE(jit::deopt_jit_gen(gen.get())) << mode;
+    EXPECT_TRUE(Py_IS_TYPE(gen.get(), &PyGen_Type)) << mode;
+  }
+
+  runCode(R"(
+assert events == [
+    ("send", True),
+    ("send", 15),
+    ("close", True),
+    ("deopt", True),
+    ("deopt", False),
+], events
+)");
+}
+
+TEST_F(JITLifecycle311Test, InStackGeneratorDeoptDropsTheArtifactPin) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def instack_gen(a, b, one):
+    total = a - a
+    i = total
+    yield total
+    while i < b:
+        total = total + a
+        i = i + one
+    yield total
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "instack_gen"));
+  ASSERT_NE(func, nullptr);
+
+  auto three = Ref<>::steal(PyLong_FromLong(3));
+  auto five = Ref<>::steal(PyLong_FromLong(5));
+  auto one = Ref<>::steal(PyLong_FromLong(1));
+  auto args = Ref<>::steal(PyTuple_Pack(3, three.get(), five.get(), one.get()));
+  for (int i = 0; i < 8; ++i) {
+    auto warm_gen = Ref<>::steal(PyObject_Call(func, args, nullptr));
+    ASSERT_NE(warm_gen, nullptr);
+    for (;;) {
+      auto item = Ref<>::steal(PyIter_Next(warm_gen));
+      if (item == nullptr) {
+        break;
+      }
+    }
+    ASSERT_FALSE(PyErr_Occurred());
+  }
+
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  Ref<> gen = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(gen, nullptr);
+  auto* jit_gen = jit::JitGenObject::cast(gen.get());
+  ASSERT_NE(jit_gen, nullptr);
+  jit::GenDataFooter* footer = jit_gen->genDataFooter();
+  ASSERT_NE(footer, nullptr);
+  jit::CompiledFunction* artifact = footer->compiled;
+  ASSERT_NE(artifact, nullptr);
+  jit::CodeRuntime* rt = artifact->runtime();
+  ASSERT_NE(rt, nullptr);
+  auto* artifact_obj = reinterpret_cast<PyObject*>(artifact);
+  Py_ssize_t pinned = Py_REFCNT(artifact_obj);
+
+  runCode(R"(
+import weakref
+class _InStackCanary: pass
+instack_canary = _InStackCanary()
+instack_canary_ref = weakref.ref(instack_canary)
+)");
+  {
+    Ref<> canary(getGlobal("instack_canary"));
+    ASSERT_NE(canary, nullptr);
+    rt->addReference(canary);
+  }
+  runCode("del instack_canary");
+
+  auto first = Ref<>::steal(PyIter_Next(gen));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 0);
+
+  int armed = 0;
+  for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
+    if (meta.reason == jit::DeoptReason::kGuardFailure && meta.forceable &&
+        !meta.frame_meta.empty() &&
+        rt->armForcedDeopt(meta.site_id, 1, false)) {
+      ++armed;
+    }
+  }
+  ASSERT_GT(armed, 0) << "warm generator compiled with no forceable site";
+
+  jit::TriggerStats before = jit::triggerStatsSnapshot();
+  auto second = Ref<>::steal(PyIter_Next(gen));
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyLong_AsLong(second), 15);
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  ASSERT_EQ(after.forced_deopt_hits, before.forced_deopt_hits + 1);
+  ASSERT_EQ(jit::JitGenObject::cast(gen.get()), nullptr);
+  ASSERT_TRUE(Py_IS_TYPE(gen.get(), &PyGen_Type));
+
+  EXPECT_EQ(Py_REFCNT(artifact_obj), pinned - 1)
+      << "in-stack deopt leaked the generator's artifact pin";
+  gen.reset();
+  EXPECT_EQ(Py_REFCNT(artifact_obj), pinned - 1)
+      << "stock dealloc changed the artifact count";
+
+  auto jit_mod = importCinderJitModule();
+  auto uncompiled = Ref<>::steal(
+      PyObject_CallMethod(jit_mod, "force_uncompile", "O", func.get()));
+  ASSERT_NE(uncompiled, nullptr);
+  EXPECT_EQ(uncompiled.get(), Py_True);
+  runCode(R"(
+assert instack_canary_ref() is None, (
+    "artifact closure survived retirement: the in-stack deopt pin leaked")
+)");
 }
 
 namespace {
@@ -5454,6 +5666,43 @@ def orphaned(x):
   preloader.reset();
   func.reset();
   ctx.reset();
+}
+
+TEST_F(JITLifecycle311Test, RetiredArtifactCanOutliveCodeRuntimeArena) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def retired_artifact(x):
+    return x + 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "retired_artifact"));
+  ASSERT_NE(func, nullptr);
+
+  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(ctx.get(), *preloader, func), jit::Result::OK);
+
+  BorrowedRef<jit::CompiledFunction> borrowed =
+      ctx->lookupCode(func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(borrowed, nullptr);
+  Ref<jit::CompiledFunction> compiled =
+      Ref<jit::CompiledFunction>::create(borrowed);
+  ASSERT_NE(compiled->runtime(), nullptr);
+
+  // Match force_uncompile's retirement shape: the registries and function
+  // anchor are gone, while an external owner keeps the artifact alive.
+  ctx->forgetCodeForArtifact(func, compiled);
+  ASSERT_EQ(PyDict_DelItem(func->func_dict, jit::kCompiledFunctionKey), 0);
+  EXPECT_EQ(
+      ctx->lookupCode(func->func_code, func->func_builtins, func->func_globals),
+      nullptr);
+
+  // Context frees the CodeRuntime arena first. The artifact then dies later;
+  // without the lifetime token its destructor dereferences the freed arena.
+  ctx.reset();
+  compiled.reset();
 }
 
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheInstalledRegistry) {

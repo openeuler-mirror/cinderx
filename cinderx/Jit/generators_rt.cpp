@@ -15,6 +15,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_mm.h"
 #include "cinderx/Jit/tree_iter_state.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/module_state.h"
 
@@ -59,6 +60,12 @@ void raise_tree_iter_deopt_blocked() {
       "cannot deopt a suspended TreeIter state-machine generator");
 }
 
+void clearGeneratorCompiledFunction(GenDataFooter* gen_footer) {
+#if PY_VERSION_HEX < 0x030C0000
+  Py_CLEAR(gen_footer->compiled);
+#endif
+}
+
 // Reimplementation of CPython's gen_dealloc that uses our custom free-list
 // (Ci_free_jit_list_gen) instead of PyObject_GC_Del for memory recycling.
 void gen_dealloc_with_custom_free(PyObject* self) {
@@ -92,14 +99,27 @@ void gen_dealloc_with_custom_free(PyObject* self) {
   }
 
   _PyInterpreterFrame* frame = generatorFrame(gen);
+  bool cleared_frame_here = false;
   if (gen->gi_frame_state < FRAME_CLEARED) {
     gen->gi_frame_state = FRAME_CLEARED;
     frame->previous = nullptr;
     _PyFrame_ClearExceptCode(frame);
     _PyErr_ClearExcState(&gen->gi_exc_state);
+    cleared_frame_here = true;
   }
 
+  // 3.11 stock gen_dealloc only Py_CLEAR(gi_code) once the frame is
+  // already FRAME_CLEARED (finalize/close cleared f_code).  The extra
+  // Ci_STACK_CLEAR must run only when *this* path still holds the
+  // frame's f_code ref that ClearExceptCode preserved.
+#if PY_VERSION_HEX < 0x030C0000
+  if (cleared_frame_here) {
+    Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+  }
+  Py_CLEAR(gen->gi_code);
+#else
   Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+#endif
 
   Py_CLEAR(gen->gi_name);
   Py_CLEAR(gen->gi_qualname);
@@ -189,6 +209,7 @@ void jitgen_dealloc(PyObject* self) {
       gen_footer->yieldPoint == nullptr &&
       FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
     deopt_jit_gen_object_only(jit_gen);
+    clearGeneratorCompiledFunction(gen_footer);
   } else {
     deopted = deopt_jit_gen_with_footer(
         jit_gen, gen_footer, true /* tree_iter_cleared */);
@@ -204,6 +225,9 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
   JitGenObject* jit_gen = JitGenObject::cast(obj);
   if (jit_gen != nullptr) {
     const GenDataFooter* gen_footer = jit_gen->genDataFooter();
+#if PY_VERSION_HEX < 0x030C0000
+    Py_VISIT(reinterpret_cast<PyObject*>(gen_footer->compiled));
+#endif
     // Only visit JIT-specific live values if we have a valid yield point.
     // If yieldPoint is null, the generator hasn't yielded yet or has completed,
     // but we still need to call PyGen_Type.tp_traverse below to visit standard
@@ -279,6 +303,13 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
   JIT_DCHECK(
       gen_footer->yieldPoint != nullptr,
       "Attempting to resume a generator with no yield point");
+#if PY_VERSION_HEX < 0x030C0000
+  // Generator resume enters machine code without passing through
+  // JITRT_AllocateAndLinkInterpreterFrame(), the ordinary 3.11 counting
+  // point.  Count at this unique resume dispatch so canary evidence covers
+  // both the initial next() and later send()/throw()/close() resumes.
+  jit::triggerStatsOnMachineCodeEntry();
+#endif
   Ref<> result = Ref<>::steal(gen_footer->resumeEntry(
       gen_obj, arg, 0 /* finish_yield_from (not used in 3.12+) */, tstate));
 
@@ -305,6 +336,17 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
 #endif
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  else {
+    // An in-stack deopt converted this generator to stock PyGen/PyCoro while
+    // its machine code was running. The deopt trampoline still consumes this
+    // artifact's metadata and epilogue after prepareForDeopt(), so the handler
+    // cannot release the MakeGen pin. The resume call has now fully left
+    // machine code, and stock traversal/deallocation will never visit the
+    // footer, making this the final safe point to balance that pin.
+    clearGeneratorCompiledFunction(gen_footer);
+  }
+#endif
 
   return result;
 }
@@ -357,6 +399,28 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
   // Execution happens here
   PyObject* result = send_core(gen, arg, tstate).release();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // The vendored 3.11 evaluator returns from an entry generator frame
+  // without restoring the exception-stack link that gen_send_ex2 owns.
+  // send_core restores it while the object remains a JitGen, but an
+  // exception deopt changes the object to stock PyGen_Type first.  Restore
+  // unconditionally at this owner boundary or the next generator chains its
+  // exception state through the freed predecessor object.
+  tstate->exc_info = prev_exc_info;
+  gen->gi_exc_state.previous_item = nullptr;
+
+  if (gen->gi_frame_state == FRAME_EXECUTING) {
+    // Exception exits skip the Return epilogue that stores COMPLETED.
+    // send_core only updates state while the object is still a JitGen;
+    // a deopt mid-raise would otherwise leave FRAME_EXECUTING.
+#if PY_VERSION_HEX >= 0x030F0000
+    gen->gi_frame_state = FRAME_CLEARED;
+#else
+    gen->gi_frame_state = FRAME_COMPLETED;
+#endif
+  }
+#endif
+
   JIT_DCHECK(tstate->exc_info == prev_exc_info, "Invalid exc_info");
   JIT_DCHECK(gen->gi_exc_state.previous_item == nullptr, "Invalid exc_state");
   JIT_DCHECK(gen->gi_frame_state != FRAME_EXECUTING, "Invalid frame state");
@@ -381,6 +445,27 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     }
 
   } else {
+#if PY_VERSION_HEX < 0x030C0000
+    // PEP 479: a StopIteration that bubbles out of the generator body is
+    // converted at this boundary.  CPython does the same in gen_send_ex2;
+    // JIT-compiled RAISE never goes through the eval loop that used to
+    // be the other conversion site.
+    if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
+      const char* msg = "generator raised StopIteration";
+      if (PyCoro_CheckExact(obj) ||
+          Py_TYPE(obj) == cinderx::getModuleState()->coro_type) {
+        msg = "coroutine raised StopIteration";
+      } else if (PyAsyncGen_CheckExact(obj)) {
+        msg = "async generator raised StopIteration";
+      }
+      _PyErr_FormatFromCause(PyExc_RuntimeError, "%s", msg);
+    } else if (
+        PyAsyncGen_CheckExact(obj) &&
+        PyErr_ExceptionMatches(PyExc_StopAsyncIteration)) {
+      _PyErr_FormatFromCause(
+          PyExc_RuntimeError, "async generator raised StopAsyncIteration");
+    }
+#else
     JIT_DCHECK(
         !PyErr_ExceptionMatches(PyExc_StopIteration),
         "Generator should not raise StopIteration");
@@ -388,13 +473,25 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
         !PyAsyncGen_CheckExact(gen) ||
             !PyErr_ExceptionMatches(PyExc_StopAsyncIteration),
         "Async gen should not raise StopAsyncIteration");
+#endif
   }
 
 #ifdef ENABLE_GENERATOR_AWAITER
   Py_CLEAR(gen->gi_ci_awaiter);
 #endif
 
-#if PY_VERSION_HEX < 0x030E0000
+#if PY_VERSION_HEX < 0x030C0000
+  _PyErr_ClearExcState(&gen->gi_exc_state);
+  if (!JitGen_CheckAny(obj)) {
+    // Match CPython 3.11 gen_send_ex2's completed-generator ownership
+    // boundary after a deopt changed the object to stock PyGen_Type.  A
+    // still-JIT generator has a separate generated live-value cleanup and
+    // must not be cleared a second time here.
+    gen->gi_frame_state = FRAME_CLEARED;
+    frame->previous = nullptr;
+    _PyFrame_Clear(frame);
+  }
+#elif PY_VERSION_HEX < 0x030E0000
   _PyErr_ClearExcState(&gen->gi_exc_state);
 #else
   JIT_DCHECK(
@@ -402,6 +499,19 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
       "Should not have an exception by now");
 #endif
   JIT_DCHECK(gen->gi_frame_state == FRAME_CLEARED, "Frame not cleared");
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (JitGen_CheckAny(obj)) {
+    // All JIT state has now been consumed.  Convert before closing the code
+    // owner so later stock deallocation never has to locate the footer through
+    // FRAME_EXECUTABLE.  jitFrameClearExceptCode() already cleared the rest of
+    // the frame, so only the preserved executable remains to be released.
+    GenDataFooter* gen_footer = gen->genDataFooter();
+    deopt_jit_gen_object_only(gen);
+    clearGeneratorCompiledFunction(gen_footer);
+    Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+  }
+#endif
 
   *presult = result;
   return result ? PYGEN_RETURN : PYGEN_ERROR;
@@ -784,6 +894,16 @@ static PyGetSetDef jitcoro_getsetlist[] = {
     {} /* Sentinel */
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+// Stock 3.11 exposes gi_code as a member, not a getset.  The 3.12+
+// getset over the frame executable is gated out of jitgen_getsetlist
+// on this version, so the member has to live here or g.gi_code raises.
+static PyMemberDef jitgen_memberlist[] = {
+    {"gi_code", T_OBJECT, offsetof(PyGenObject, gi_code), READONLY},
+    {} /* Sentinel */
+};
+#endif
+
 static PyMemberDef jitcoro_memberlist[] = {
     {"cr_origin",
      T_OBJECT,
@@ -863,6 +983,9 @@ PyType_Slot gen_slots[] = {
     {Py_tp_iternext, reinterpret_cast<void*>(jitgen_iternext)},
     {Py_tp_methods, jitgen_methods},
     {Py_tp_getset, jitgen_getsetlist},
+#if PY_VERSION_HEX < 0x030C0000
+    {Py_tp_members, jitgen_memberlist},
+#endif
     {Py_am_send, reinterpret_cast<void*>(jitgen_am_send)},
     // gi_weakreflist
     {0, nullptr},
@@ -880,9 +1003,15 @@ constexpr size_t kGenObjectSize =
 
 PyType_Spec JitGen_Spec = {
     .name = "builtins.generator",
-    // We store our pointer to JIT data in an additional
-    // variable slot at the end of the object.
+// Footer pointer is the extra variable slot after locals+stack
+// (computeSlots +1).  On 3.11, putting it in basicsize overlays
+// localsplus[0]: InitializeSpecials sets stacktop=co_nlocalsplus, so
+// gen_traverse / _PyFrame_Clear visit that slot as a PyObject.
+#if PY_VERSION_HEX < 0x030C0000
+    .basicsize = kGenObjectSize,
+#else
     .basicsize = kGenObjectSize + sizeof(GenDataFooter*),
+#endif
     .itemsize = sizeof(PyObject*),
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE,
     .slots = gen_slots,
@@ -906,9 +1035,11 @@ PyType_Slot coro_slots[] = {
 
 PyType_Spec JitCoro_Spec = {
     .name = "builtins.coroutine",
-    // We store our pointer to JIT data in an additional variable slot at the
-    // end of the object.
+#if PY_VERSION_HEX < 0x030C0000
+    .basicsize = kGenObjectSize,
+#else
     .basicsize = kGenObjectSize + sizeof(GenDataFooter*),
+#endif
     .itemsize = sizeof(PyObject*),
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
         Ci_TPFLAGS_HAVE_AM_EXTRA | Py_TPFLAGS_IMMUTABLETYPE,
@@ -978,6 +1109,7 @@ bool deopt_jit_gen_with_footer(
     clearTreeIterState(gen_footer);
   }
   deopt_jit_gen_object_only(jit_gen);
+  clearGeneratorCompiledFunction(gen_footer);
 
   return true;
 }
@@ -1095,6 +1227,7 @@ void init_jit_genobject_type() {
     cinderx::getModuleState()->jit_gen_free_list.reset(new JitGenFreeList());
   }
 
+#if PY_VERSION_HEX >= 0x030C0000
   // Override dealloc so we can use a "free-list" for our objects.
   JIT_CHECK(
       PyGen_Type.tp_dealloc == original_gen_dealloc &&
@@ -1102,6 +1235,7 @@ void init_jit_genobject_type() {
       "PyGen/Coro_Type already overridden");
   PyGen_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
   PyCoro_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
+#endif
 
 #ifdef ENABLE_GENERATOR_AWAITER
   JIT_CHECK(

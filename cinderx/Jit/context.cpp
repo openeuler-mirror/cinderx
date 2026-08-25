@@ -247,6 +247,13 @@ Context::~Context() {
     code.second->clear(true /* context_finalizing */);
   }
 #endif
+
+  // Retired 3.11 artifacts can be absent from every registry while a
+  // suspended generator still owns them. Stop their destructors from
+  // dereferencing this arena, then release every CodeRuntime's Python
+  // references while the arena storage is still valid.
+  code_runtime_lifetime_->alive.store(false, std::memory_order_release);
+  releaseReferences();
 }
 
 void Context::mlockProfilerDependencies() {
@@ -1160,7 +1167,16 @@ void Context::forgetCodeEntry(
 
   clearCachedCompiledIfMatches(code, cf.get());
   dropDedupArtifact(code, cf);
+#if PY_VERSION_HEX < 0x030C0000
+  // A suspended generator may now be the retiring artifact's final owner.
+  // Detach the function-level state, but keep CodeRuntime references alive:
+  // dropping them can run Python finalizers, and the generator must publish
+  // stock state before that becomes observable. Its final artifact DECREF
+  // performs the full clear after deopt/completion.
+  cf->clear(false /* context_finalizing */, false /* release references */);
+#else
   cf->clear();
+#endif
   auto current = compiled_codes_.find(key);
   if (current != compiled_codes_.end() &&
       current->second.get() == retiring.get()) {
@@ -1652,6 +1668,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
   bool immortal = getConfig().immortalize_compiled_functions ||
       (func != nullptr && _Py_IsImmortal(func)) ||
       (outer != nullptr && _Py_IsImmortal(outer));
+  compiled_func.runtime_lifetime = code_runtime_lifetime_;
   auto compiled = CompiledFunction::create(std::move(compiled_func), immortal);
   if (compiled == nullptr) {
     return nullptr;

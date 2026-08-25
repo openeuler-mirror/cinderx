@@ -1164,10 +1164,11 @@ int _cinderx_exec_impl(PyObject* m) {
   state->async_lazy_value.reset(async_lazy_value);
 #endif
 
-#if PY_VERSION_HEX >= 0x030C0000
-  // These types belong to JIT-compiled generators, coroutines and awaitables.
-  // The 3.11 delivery ships no machine-code execution, so no instance of them
-  // can ever exist and the module does not create them.
+  // JitGen / JitCoro host the machine-code generator object model, including
+  // the trailing GenDataFooter* that giJITDataOffset() reads at codegen.
+  // 3.11 canary executes synchronous generators, so the types must exist
+  // there too. Coroutine compile stays refused; the coro type is still
+  // required for layout identity and init_jit_genobject_type().
   PyTypeObject* gen_type = (PyTypeObject*)PyType_FromSpec(&jit::JitGen_Spec);
   if (gen_type == nullptr) {
     return -1;
@@ -1180,7 +1181,8 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->coro_type = Ref<PyTypeObject>::steal(coro_type);
 
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX < 0x030E0000
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000 && \
+    PY_VERSION_HEX < 0x030E0000
   Ref<PyTypeObject> frame_reifier_type = Ref<PyTypeObject>::steal(
       (PyTypeObject*)PyType_FromSpec(&jit::JitFrameReifier_Spec));
   if (frame_reifier_type == nullptr) {
@@ -1210,6 +1212,7 @@ int _cinderx_exec_impl(PyObject* m) {
     return -1;
   }
 
+#if PY_VERSION_HEX >= 0x030C0000
   PyTypeObject* anext_awaitable_type =
       (PyTypeObject*)PyType_FromSpec(&jit::JitAnextAwaitable_Spec);
   if (anext_awaitable_type == nullptr) {

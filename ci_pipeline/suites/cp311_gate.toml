@@ -36,6 +36,13 @@ command = "bash -lc 'python3.11 -m pip wheel . -w \"{run_dir}/wheels\" --no-deps
 name = "release_canary_execute"
 command = "bash -lc 'CMAKE_BUILD_TYPE=Release python3.11 -m pip wheel . -w \"{run_dir}/release-wheels\" --no-deps --no-build-isolation && if ! grep -qx \"CMAKE_BUILD_TYPE:STRING=Release\" scratch/*/CMakeCache.txt; then echo \"the wheel was not built at Release; setup.py reuses a cached build tree, so the build type has to be proven, not assumed\"; grep -h \"^CMAKE_BUILD_TYPE\" scratch/*/CMakeCache.txt; exit 1; fi && python3.11 -m venv \"{run_dir}/release-venv\" && \"{run_dir}/release-venv/bin/pip\" install \"{run_dir}\"/release-wheels/cinderx-*.whl && cd cinderx/PythonLib && \"{run_dir}/release-venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_canary_execute_311'"
 
+# MR-10 generator acceptance: every state-machine case has an interpreted
+# oracle, executes generated code in canary mode under the debug allocator,
+# and must preserve both its semantic outcome and its reference-count drift.
+[[jobs]]
+name = "generator_corpus_canary"
+command = "bash -lc 'mkdir -p \"{run_dir}/generator-corpus\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_generators interp \"{run_dir}/generator-corpus/interp.json\" && CINDERX_JIT_MODE=canary PYTHONJITGENERATOR=1 PYTHONMALLOC=debug \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_generators jit \"{run_dir}/generator-corpus/jit.json\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py diff \"{run_dir}/generator-corpus/interp.json\" \"{run_dir}/generator-corpus/jit.json\"'"
+
 # The differential engine is this suite's judge; its own unit tests run
 # before the engine judges anything, on the venv the wheel job provisioned.
 [[jobs]]

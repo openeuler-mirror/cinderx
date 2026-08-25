@@ -171,6 +171,12 @@ constexpr std::common_type_t<T1, T1> ceilDiv(T1 a, T2 b) {
 constexpr int kCoFlagsAnyGenerator =
     CO_ASYNC_GENERATOR | CO_COROUTINE | CO_GENERATOR | CO_ITERABLE_COROUTINE;
 
+// Coroutine / iterable-coroutine / async-generator flags.  Sync
+// CO_GENERATOR is deliberately not in this set: 3.11 executes those
+// through the JitGen runtime (MR-10) while the async shapes stay refused.
+constexpr int kCoFlagsAsyncCode =
+    CO_ASYNC_GENERATOR | CO_COROUTINE | CO_ITERABLE_COROUTINE;
+
 // If stable pointers are enabled (with a call to setUseStablePointers(true))
 // return 0xdeadbeef. Otherwise, return the original pointer.
 const void* getStablePointer(const void* ptr);

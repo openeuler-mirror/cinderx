@@ -74,13 +74,19 @@ bool isJitCompiled(const PyFunctionObject* func);
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/hir.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <unordered_set>
 #include <utility>
 
 namespace jit {
+
+struct CodeRuntimeLifetime {
+  std::atomic<bool> alive{true};
+};
 
 // Data members extracted from CompiledFunction to enable separate storage.
 // CompiledFunction is a GC tracked object and cannot be constructed during
@@ -99,6 +105,7 @@ struct CompiledFunctionData {
   std::vector<std::unique_ptr<CodePatcher>> code_patchers;
   std::unique_ptr<hir::Function> irfunc;
   CodeRuntime* runtime{nullptr};
+  std::shared_ptr<CodeRuntimeLifetime> runtime_lifetime;
   // Whether the compilation produced OSR entry stubs.
   bool osr_aware{false};
   bool has_osr_entries{false};
@@ -228,9 +235,13 @@ class CompiledFunction {
   // Traverse all GC-reachable objects for the GC.
   int traverse(visitproc visit, void* arg);
 
-  // Clear all references held by this CompiledFunction and deopt all
-  // associated functions.
-  void clear(bool context_finalizing = false);
+  // Deopt all associated functions and optionally clear the references held
+  // by the CodeRuntime. 3.11 retirement can leave a suspended generator as
+  // the artifact's final owner; that path keeps the runtime references until
+  // the generator publishes stock state and drops its owner.
+  void clear(
+      bool context_finalizing = false,
+      bool release_runtime_references = true);
 
  private:
   explicit CompiledFunction(CompiledFunctionData&& data)

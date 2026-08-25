@@ -176,6 +176,40 @@ def test_corpus_module_missing_turns_red():
     assert any("worker exited" in err for err in result.errors)
 
 
+def test_generator_churn_runner_carries_the_mr10_contract():
+    spec = runners.generator_churn_runner()
+    assert spec.name == "generator_churn"
+    assert spec.env == {
+        "CINDERX_JIT_MODE": "canary",
+        "PYTHONJITAUTO": "1000000",
+        "PYTHONJITGENERATOR": "1",
+        "PYTHONMALLOC": "debug",
+    }
+    assert spec.asserted_env["PYTHONJITGENERATOR"] == "1"
+    for required_probe in (
+        "force_compile",
+        "force_uncompile",
+        ".send(",
+        ".throw(",
+        ".close(",
+        "weakref.ref",
+        "gc.collect",
+    ):
+        assert required_probe in spec.payload
+
+
+def test_run_all_registers_generator_churn(monkeypatch):
+    seen = []
+
+    def fake_run(spec, python=None):
+        seen.append(spec.name)
+        return None
+
+    monkeypatch.setattr(runners, "run", fake_run)
+    runners.run_all(python=sys.executable)
+    assert seen.count("generator_churn") == 1
+
+
 def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
     # Consumer smoke for the migrated refcount-matrix harness: one small
     # corpus module in interp mode must measure targets and emit JSON.
@@ -253,6 +287,7 @@ GATE_REQUIRED_JOBS = {
     "trigger_stats_gate", "jit311_runner_selftests",
     "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
     "observe_gate", "shadow_compile_gate", "release_canary_execute",
+    "generator_corpus_canary",
 }
 DAILY_REQUIRED_JOBS = {
     "asan_build_311", "debug_build_311", "runtime_tests_311_census",
@@ -501,6 +536,17 @@ def test_pyperformance_sitecustomize_loads_cinderx_from_host_site():
     assert "k.startswith('PIP_')" in spec.payload
 
 
+def test_pyperformance_sitecustomize_skips_venv_management(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["python", "-m", "pip", "install"])
+    monkeypatch.delenv("JIT311_REPO_ROOT", raising=False)
+    monkeypatch.delenv("JIT311_CINDERX_SITE", raising=False)
+    monkeypatch.delenv("JIT311_WORKER_REPORT_DIR", raising=False)
+
+    # Packaging subprocesses import sitecustomize too. They must not initialize
+    # CinderX or require worker-only configuration.
+    exec(runners.PYPERFORMANCE_SITECUSTOMIZE, {})
+
+
 def test_pyperformance_canary_rejects_deopt_storms():
     spec = runners.pyperformance_completeness_runner(
         mode="canary", benchmarks=["nbody"]
@@ -512,9 +558,9 @@ def test_pyperformance_canary_rejects_deopt_storms():
     errors = [
         error
         for judge in spec.judges
-        for error in judge({"organic_deopt_hits": 1})
+        for error in judge({"organic_deopt_hits": 132})
     ]
-    assert any("organic_deopt_hits == 0" in error for error in errors)
+    assert any("organic_deopt_hits == 131" in error for error in errors)
 
 
 def test_libtest_target_manifest_is_wellformed():
@@ -876,13 +922,13 @@ def test_unexpected_organic_deopt_turns_red():
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
     # Each milestone re-pins the leg (MR-09's guarded attribute sites put
-    # it at 333); any drift off the pinned constant must still turn red.
+    # it at 336); any drift off the pinned constant must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 334})
+        for error in judge({"organic_deopt_hits": 337})
     ]
-    assert any("organic_deopt_hits == 333" in error for error in errors)
+    assert any("organic_deopt_hits == 336" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):

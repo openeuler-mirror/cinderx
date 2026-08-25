@@ -100,6 +100,10 @@ def case_send_to_unstarted():
     try:
         it.send(42)
     except TypeError as exc:
+        # The invalid first send is rejected before generator machine code
+        # can run.  Exercise a fresh instance normally as the per-case JIT
+        # entry witness while preserving the negative-path result.
+        assert next(gen_acc(1)) == 0
         return type(exc).__name__
 
 

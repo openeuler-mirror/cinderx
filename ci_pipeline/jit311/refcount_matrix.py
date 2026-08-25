@@ -254,6 +254,7 @@ def main() -> int:
     outcomes = {}
     entry_counts = {}
     for name, fn in cases:
+        print(f"refcount-matrix: running {name}", flush=True)
         fns = [fn] + list(getattr(fn, "helpers", ()))
         if jit is not None:
             to_compile = [
