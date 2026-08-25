@@ -88,6 +88,26 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     size_t nargsf,
     PyObject* kwnames);
 
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 canary: consume a recursion slot after a successful positional
+// bind, then re-enter the compiled body. Used by the generated
+// equal-argcount prologue so GuardedEntry does not Enter before binding.
+PyObject* JITRT_ReenterAfterBind(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames);
+
+// Transfer the current 3.11 JIT frame's recursion slot to the interpreter
+// before deopt resume. The interpreter will Enter/Leave the same real frame.
+void JITRT_TransferRecursionToInterpreter311();
+void JITRT_GetRecursionState311(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries);
+#endif
+
 // On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a
 // hidden first parameter for the return pointer, shifting all visible
 // arguments. Return PyObject* instead to keep register assignments correct.
@@ -142,6 +162,24 @@ JITRT_StaticCallFPReturn JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn(
 PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name);
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* JITRT_LoadGlobalModuleValue(
+    PyObject* globals,
+    PyObject* name,
+    uint32_t keys_version,
+    Py_ssize_t index);
+
+// Returns 1 when this visit should take the deopt stub because a test
+// armed the site.  The subsequent Guard/AlwaysFail uses the same
+// DeoptMetadata, so forced and organic hits share one restore.
+int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
+
+// Write a local variable through to the current materialized frame's
+// localsplus slot (MR-08 frame observability; value may be nullptr for
+// DELETE_FAST).  Returns 0.
+uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
+#endif
+
 /*
  * Load a global value given a Python thread state.
  */
@@ -179,6 +217,12 @@ int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
 PyObject*
 JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
 
+PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
+    PyObject* obj,
+    PyObject* name,
+    uint32_t type_version,
+    Py_ssize_t index);
+
 /*
  * Perform a function or method call.
  *
@@ -206,6 +250,17 @@ PyObject* JITRT_Call(
  * eval breaker events after the call.
  */
 PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
+/*
+ * Performs a vectorcall to an exact Python function. This has the same calling
+ * convention as JITRT_VectorcallTstate but skips the generic callable dispatch.
+ */
+PyObject* JITRT_VectorcallPythonFunction(
     PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
@@ -503,6 +558,8 @@ int JITRT_NotContainsBool(PyObject* w, PyObject* v);
    PyObject_RichCompare(), returning -1 for error, 0 for false, 1 for true.
    Unlike PyObject_RichCompareBool this doesn't perform an object equality
    check, which is incompatible w/ float comparisons. */
+
+PyObject* JITRT_RichCompare(PyObject* v, PyObject* w, int op);
 
 #if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
 int JITRT_FastPyObjectRichCompareBoolLessThan(PyObject* v, PyObject* w);

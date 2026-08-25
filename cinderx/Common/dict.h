@@ -55,6 +55,14 @@ static inline Py_ssize_t getDictKeysIndex(
   return -1;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// The single in-process 3.11 keys-version allocator; defined in
+// Interpreter/3.11/specialize_wrapper.c and declared in
+// interpreter_contract.h (repeated here to keep Common/ free of an
+// Interpreter include).
+uint32_t Ci_GetDictKeysVersion_311(PyDictKeysObject* keys);
+#endif
+
 // We can't borrow this from CPython because it exists but is not
 // exported, and therefore borrowing it duplicates the symbol.
 static inline uint32_t dictGetKeysVersion(
@@ -65,11 +73,12 @@ static inline uint32_t dictGetKeysVersion(
   }
 #if PY_VERSION_HEX < 0x030C0000
   // 3.11 keeps its keys-version allocator private to libpython and does not
-  // export it.  Handing out numbers from a private counter would collide with
-  // the stock stream, so an unversioned keys object simply stays unversioned:
-  // callers treat 0 as "no evidence" and take the generic path.
+  // export it.  The vendored specializer supplies the one in-process
+  // allocator (Ci_GetDictKeysVersion_311), issuing from the top half of the
+  // 32-bit range so it cannot collide with the stock stream; 0 still means
+  // "cannot be versioned" and callers decline to cache.
   (void)interp;
-  return 0;
+  return Ci_GetDictKeysVersion_311(dictkeys);
 #else
   if (interp->dict_state.next_keys_version == 0) {
     return 0;

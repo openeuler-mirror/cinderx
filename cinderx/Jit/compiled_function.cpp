@@ -4,12 +4,20 @@
 
 #include "internal/pycore_object.h"
 
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/code_extra.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/disassembler.h"
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
+#include "cinderx/Jit/context_iface.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 
@@ -24,6 +32,24 @@ bool isJitCompiled(const PyFunctionObject* func) {
   if (mod_state == nullptr) {
     return false;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // On 3.11 the installed entry is the guarded one, which is ordinary
+  // extension code rather than generated code, so the allocator test below
+  // cannot see it.  The question this answers is whether a call will
+  // execute machine code, and for the guarded entry that is exactly
+  // whether the function's current code object still has a published
+  // artifact -- which is also what makes the answer go false again after a
+  // __code__ swap.
+  if (reinterpret_cast<void*>(func->vectorcall) ==
+      reinterpret_cast<void*>(Ci_JitShell311_GuardedEntry)) {
+    // Exactly the predicate the entry uses for function state, so this
+    // cannot report a function as compiled after a __code__ swap that
+    // already sent every call to the interpreter.  Live defaults are
+    // rebound by the generated prologue and do not clear the artifact.
+    return Ci_JitShell311_InstalledArtifact(
+               const_cast<PyFunctionObject*>(func)) != nullptr;
+  }
+#endif
   jit::ICodeAllocator* code_allocator = mod_state->code_allocator.get();
   return code_allocator != nullptr &&
       code_allocator->contains(reinterpret_cast<const void*>(func->vectorcall));
@@ -159,6 +185,16 @@ Ref<CompiledFunction> CompiledFunction::create(
 #endif
   }
 
+  // Trigger-proof accounting: every compiled-function object ever created
+  // is counted, regardless of how it is later installed or released.
+  jit::triggerStatsOnCompiledFunctionCreate();
+  // Physical residency: the object now owns executable memory, and holds
+  // it until its destructor -- clear() and registry removal do not release
+  // the buffer, and an externally pinned artifact keeps its machine code.
+  if (cf->codeBuffer().data() != nullptr) {
+    jit::triggerStatsOnCodeBufferAcquired();
+  }
+
   // Return a stolen reference - the caller owns it.
   return Ref<CompiledFunction>::steal(cf);
 }
@@ -166,11 +202,24 @@ Ref<CompiledFunction> CompiledFunction::create(
 CompiledFunction::~CompiledFunction() {
   clear();
 
-  auto mod_state = cinderx::getModuleState();
-  if (mod_state != nullptr && data_.code.data() != nullptr) {
-    auto code_allocator = mod_state->code_allocator.get();
-    if (code_allocator != nullptr) {
-      code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+  if (data_.code.data() != nullptr) {
+    // The buffer's lifetime ends with this object (or ended with the
+    // allocator at teardown); either way it stops being resident here.
+    jit::triggerStatsOnCodeBufferReleased();
+    auto mod_state = cinderx::getModuleState();
+    if (mod_state != nullptr) {
+      auto code_allocator = mod_state->code_allocator.get();
+      if (code_allocator != nullptr) {
+        // A refused release means the allocator no longer recognizes this
+        // span: either the buffer was released twice or the accounting has
+        // already diverged from the allocator's, and every later usedBytes()
+        // reading would be fiction.
+        asmjit::Error error = code_allocator->releaseCode(
+            const_cast<std::byte*>(data_.code.data()));
+        JIT_CHECK(
+            error == asmjit::kErrorOk,
+            "Code allocator refused to release an owned code buffer");
+      }
     }
   }
 }
@@ -178,7 +227,8 @@ CompiledFunction::~CompiledFunction() {
 bool associateFunctionWithCompiled(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled,
-    bool is_nested) {
+    bool is_nested,
+    Ref<>* displaced_anchor) {
   if (_Py_IsImmortal(func)) {
     // The function can never be freed, so we can keep the CompiledFunction
     // alive
@@ -186,6 +236,14 @@ bool associateFunctionWithCompiled(
     _Py_SetImmortalUntracked(compiled);
 #else
     _Py_SetImmortal(compiled);
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+    // The 3.11 execute ledger still requires the association: the guarded
+    // entry runs machine code only for a function its artifact names, so
+    // skipping addFunction() here would leave a function the registry
+    // calls compiled but the entry forever refuses.  The reference this
+    // takes on a pseudo-immortal function is moot by definition.
+    compiled->addFunction(func);
 #endif
     return true;
   } else if (_Py_IsImmortal(compiled)) {
@@ -225,6 +283,23 @@ bool associateFunctionWithCompiled(
     }
     return PyList_Append(nested_list, compiled) == 0;
   }
+  if (displaced_anchor != nullptr) {
+    // Detain the value this write displaces.  PyDict_SetItem releases the
+    // old value in place, and on 3.11 that value is the prior artifact's
+    // owning reference: destroying it here would run arbitrary Python in
+    // the middle of a publication (a __del__ can reenter force_compile()).
+    // The caller holds the reference until its transaction settles, and
+    // uses it as the restore token if the takeover is rolled back.
+    BorrowedRef<> displaced =
+        PyDict_GetItemWithError(func_dict, kCompiledFunctionKey);
+    if (displaced == nullptr && PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    if (displaced != nullptr) {
+      *displaced_anchor = Ref<>::create(displaced);
+    }
+  }
+
   // Store the reference (this increfs the CompiledFunction).
   if (PyDict_SetItem(
           func_dict,
@@ -234,7 +309,24 @@ bool associateFunctionWithCompiled(
   }
 
   // Add the function to the CompiledFunction's set.
+#if PY_VERSION_HEX < 0x030C0000
+  // The set insert can throw std::bad_alloc, and the dictionary anchor
+  // is already written: letting the exception escape here would leave
+  // an owned, registered-nowhere artifact behind.  Take the anchor back
+  // and report through the same channel as the dictionary failure.
+  try {
+    throwIfJitPublishStepArmedForTest(1);
+    compiled->addFunction(func);
+  } catch (const std::bad_alloc&) {
+    if (PyDict_DelItem(func_dict, kCompiledFunctionKey) < 0) {
+      PyErr_Clear();
+    }
+    PyErr_NoMemory();
+    return false;
+  }
+#else
   compiled->addFunction(func);
+#endif
 
   return true;
 }
@@ -285,6 +377,10 @@ void CompiledFunction::addFunction(BorrowedRef<PyFunctionObject> func) {
   // for removing itself via funcDestroyed() when it is deallocated.
   // We don't incref to avoid preventing garbage collection of functions
   // when multiple functions share the same CompiledFunction.
+  //
+  // On 3.11 that responsibility is carried by the weak-reference death watch
+  // the context arms (see Context::watchFunctionDeath), which stands in for
+  // the function watcher this branch does not have.
   functions_.insert(func.get());
 }
 
@@ -293,11 +389,50 @@ void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
   functions_.erase(func.get());
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Whether the runtime this artifact points at is still backed by live
+// storage.  A retired or orphaned artifact has no owner link, sits in no
+// registry, and can outlive its context inside a module cycle collected at
+// interpreter exit; the context's destructor already released the
+// runtime's owned references (its release walk covers every arena slot)
+// and freed the slab storage, so the first GC hook to run afterwards must
+// sever the pointer without touching it.  With a live owner the storage
+// lives at least as long as the artifact; without one, the module context
+// answers -- and only for slots it actually owns.
+bool CompiledFunction::runtimeStorageAlive() const {
+  if (data_.runtime == nullptr) {
+    return false;
+  }
+  // The owning context stamps every published artifact with its arena
+  // lifetime token and flips it before the storage dies; wherever the
+  // token exists it is the single source of truth.
+  if (data_.runtime_lifetime != nullptr) {
+    return data_.runtime_lifetime->alive.load(std::memory_order_acquire);
+  }
+  if (owner_ != nullptr) {
+    return true;
+  }
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    return false;
+  }
+  jit::IJitContext* ctx = mod_state->jit_context.get();
+  return ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime);
+}
+#endif
+
 int CompiledFunction::traverse(visitproc visit, void* arg) {
   // Don't traverse functions_ - these are borrowed references that we don't
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+    return 0;
+  }
+#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -307,7 +442,19 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
   return 0;
 }
 
-void CompiledFunction::clear(bool context_finalizing) {
+#if PY_VERSION_HEX < 0x030C0000
+void CompiledFunction::forgetFunctions() {
+  functions_.clear();
+}
+
+#endif
+
+void CompiledFunction::clear(
+    bool context_finalizing,
+    bool release_runtime_references) {
+  // The owner is nulled below, but the runtime hand-back at the bottom
+  // still needs it: only the owner knows which slab the storage came from.
+  [[maybe_unused]] CompiledFunctionOwner* entry_owner = owner_;
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {
@@ -329,15 +476,64 @@ void CompiledFunction::clear(bool context_finalizing) {
     // Deopt all associated functions. No decref needed since these are borrowed
     // refs.
     for (PyFunctionObject* func : funcs_to_deopt) {
+#if PY_VERSION_HEX < 0x030C0000
+      // On 3.11 membership means "claimed", not "installed by me", and
+      // forgetCompiledFunction() above has already detached exactly the
+      // entry points this artifact still had installed.  Writing every
+      // member's entry point here would hand a stale generation the power
+      // to deopt its successor's fresh installation.  The one caller that
+      // skips the owner's bookkeeping is context finalization, where the
+      // registries are already gone and every artifact dies: the
+      // interpreter entry is restored unconditionally there.
+      if (context_finalizing) {
+        func->vectorcall = getInterpretedVectorcall(func);
+      }
+#else
       func->vectorcall = getInterpretedVectorcall(func);
+#endif
     }
 
     owner_ = nullptr;
   }
 
-  // Clear all references held by the CodeRuntime.
-  if (data_.runtime != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // See runtimeStorageAlive(): after the owning context died, the runtime's
+  // references were already released by the context's own walk and the
+  // storage is gone -- sever without touching.
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+  }
+#endif
+
+  // Clear all references held by the CodeRuntime. A retired 3.11 artifact can
+  // remain executable through a suspended generator after its function-level
+  // registries are gone. Keep these references until that generator converts
+  // to stock state and releases the artifact's final owner.
+  if (release_runtime_references && data_.runtime != nullptr) {
     data_.runtime->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+    // The release runs at artifact death, at GC collection of an
+    // unreachable artifact, or at context finalization -- registry
+    // retirement clears without releasing runtime references and never
+    // reaches here -- so no invocation and no suspended generator can
+    // still need this runtime: both hold the artifact alive.  Hand the
+    // storage back for reuse.  Finalization
+    // skips the hand-back (the slab dies wholesale with the context), and
+    // an artifact whose owner link is already severed -- retired, or
+    // orphaned by the multithread teardown -- answers to the module's
+    // context only after proving that context actually owns the slot, so
+    // a test-private context's storage is never adopted.
+    if (!context_finalizing) {
+      if (entry_owner != nullptr) {
+        entry_owner->recycleCodeRuntime(data_.runtime);
+      } else if (auto* mod_state = cinderx::getModuleState()) {
+        jit::IJitContext* ctx = mod_state->jit_context.get();
+        if (ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime)) {
+          ctx->recycleCodeRuntime(data_.runtime);
+        }
+      }
+    }
+#endif
     data_.runtime = nullptr;
   }
 }

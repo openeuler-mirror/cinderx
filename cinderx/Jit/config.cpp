@@ -14,6 +14,10 @@ bool isJitUsable() {
   return getConfig().state == State::kRunning;
 }
 
+bool isJitShadow() {
+  return getConfig().state == State::kShadow;
+}
+
 bool isJitPaused() {
   return getConfig().state == State::kPaused;
 }

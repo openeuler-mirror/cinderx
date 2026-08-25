@@ -1,0 +1,17 @@
+# Modules the reference-leak hunt runs under CINDERX_JIT_MODE=execute.
+#
+# regrtest -R runs each module repeatedly and reports a module whose
+# reference total climbs in every repetition.  The set is drawn from the
+# confirmed 72-module surface and kept small on purpose: -R multiplies
+# runtime by the repetition count, and what is being hunted is a leak in
+# the scheduler, which any module that reaches the threshold exercises.
+test_grammar
+test_listcomps
+test_dictcomps
+test_unpack
+test_bool
+test_binop
+test_int
+test_float
+test_richcmp
+test_iter

@@ -43,6 +43,9 @@ def should_enable_lightweight_frames(
 ) -> bool:
     if meta_python and py_version == "3.12":
         return True
+    # CPython 3.11 uses the materialized _PyInterpreterFrame as its only frame
+    # mode; lightweight frames stay off and CMakeLists.txt rejects turning
+    # them on.
     if py_version not in {"3.14", "3.15"}:
         return False
     if machine is None:

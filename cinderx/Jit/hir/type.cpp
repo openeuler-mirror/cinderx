@@ -422,8 +422,22 @@ Type Type::fromTypeExact(PyTypeObject* type) {
 Type Type::fromObject(PyObject* obj) {
   if (obj == Py_None) {
     // There's only one value of type NoneType, so we don't need the result to
-    // be specialized and it's always immortal.
-    return TImmortalNoneType;
+    // be specialized.  Stock CPython 3.11 does not make None immortal, so keep
+    // its lifetime accurate for refcount insertion.
+    return _Py_IsImmortal(obj) ? TImmortalNoneType : TMortalNoneType;
+  }
+  if (obj == Py_True || obj == Py_False) {
+    // Stock 3.11 bools are NOT immortal.  Modeling them as immortal elides
+    // the incref on borrowed-constant returns while every caller still
+    // decrefs the result, draining the singleton one call at a time until
+    // finalization dies with bool_dealloc.  Keep the concrete-value
+    // specialization but derive the lifetime honestly, exactly like None
+    // above; on 3.12+ the real immortal bit makes this immortal again.
+    bits_t bool_lifetime = [&]() {
+      ThreadedCompileSerialize guard;
+      return _Py_IsImmortal(obj) ? kLifetimeImmortal : kLifetimeMortal;
+    }();
+    return Type{fromTypeExact(Py_TYPE(obj)).bits_, bool_lifetime, obj};
   }
 
   bits_t lifetime = [&]() {

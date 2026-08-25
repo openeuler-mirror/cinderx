@@ -1,7 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/codegen/gen_asm.h"
-
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
 
@@ -11,6 +13,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/autogen.h"
 #include "cinderx/Jit/codegen/code_section.h"
@@ -37,6 +40,7 @@
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
 #include <fmt/format.h>
@@ -46,6 +50,7 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -65,6 +70,73 @@ struct DeoptResult {
   CiPyFrameObjType* frame;
   bool is_instrumentation_deopt;
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+// Ci_EvalFrameDefault_311's throwflag entry normally emits PyTrace_CALL.
+// A frame resumed after a mid-flight instrumentation poll is not a new call:
+// its explicit local tracer is already installed, and Stock proceeds directly
+// to exception delivery.  Drop exactly that synthetic entry event, then put
+// the original callbacks back before the evaluator dispatches the exception.
+thread_local Py_tracefunc t_resume_tracefunc = nullptr;
+thread_local Py_tracefunc t_resume_profilefunc = nullptr;
+
+int suppressResumeCallTrace(
+    PyObject* object,
+    PyFrameObject* frame,
+    int event,
+    PyObject* argument) {
+  PyThreadState* tstate = PyThreadState_Get();
+  Py_tracefunc original = t_resume_tracefunc;
+  JIT_CHECK(original != nullptr, "missing trace callback for JIT resume");
+  t_resume_tracefunc = nullptr;
+  tstate->c_tracefunc = original;
+  if (event == PyTrace_CALL) {
+    return 0;
+  }
+  return original(object, frame, event, argument);
+}
+
+int suppressResumeCallProfile(
+    PyObject* object,
+    PyFrameObject* frame,
+    int event,
+    PyObject* argument) {
+  PyThreadState* tstate = PyThreadState_Get();
+  Py_tracefunc original = t_resume_profilefunc;
+  JIT_CHECK(original != nullptr, "missing profile callback for JIT resume");
+  t_resume_profilefunc = nullptr;
+  tstate->c_profilefunc = original;
+  if (event == PyTrace_CALL) {
+    return 0;
+  }
+  return original(object, frame, event, argument);
+}
+
+void suppressSyntheticResumeCallEvents(PyThreadState* tstate) {
+  JIT_CHECK(
+      t_resume_tracefunc == nullptr && t_resume_profilefunc == nullptr,
+      "nested JIT instrumentation resume callback suppression");
+  if (tstate->c_tracefunc != nullptr) {
+    t_resume_tracefunc = tstate->c_tracefunc;
+    tstate->c_tracefunc = suppressResumeCallTrace;
+  }
+  if (tstate->c_profilefunc != nullptr) {
+    t_resume_profilefunc = tstate->c_profilefunc;
+    tstate->c_profilefunc = suppressResumeCallProfile;
+  }
+}
+
+void restoreSyntheticResumeCallEvents(PyThreadState* tstate) {
+  if (t_resume_tracefunc != nullptr) {
+    tstate->c_tracefunc = t_resume_tracefunc;
+    t_resume_tracefunc = nullptr;
+  }
+  if (t_resume_profilefunc != nullptr) {
+    tstate->c_profilefunc = t_resume_profilefunc;
+    t_resume_profilefunc = nullptr;
+  }
+}
+#endif
 
 #define ASM_CHECK_THROW(exp)                         \
   {                                                  \
@@ -153,9 +225,19 @@ DeoptResult prepareForDeopt(
     CodeRuntime* code_runtime,
     std::size_t deopt_idx) {
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
-  const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  bool is_forced_deopt = false;
+#if PY_VERSION_HEX < 0x030C0000
+  is_forced_deopt = deopt_meta.consumed_forced;
+  deopt_meta.consumed_forced = false;
+  if (is_forced_deopt) {
+    triggerStatsOnForcedDeopt();
+  } else {
+    triggerStatsOnOrganicDeopt();
+  }
+#endif
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
-  bool is_instrumentation_deopt = false;
+  bool is_patched_instrumentation = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
   // Check JIT_FRAME_DEOPT_PATCHED on the outermost frame's header before
@@ -167,11 +249,31 @@ DeoptResult prepareForDeopt(
       for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
         outer = outer->previous;
       }
-      is_instrumentation_deopt = (jitFrameGetHeader(outer)->frame_status &
-                                  JIT_FRAME_DEOPT_PATCHED) != 0;
+      is_patched_instrumentation = (jitFrameGetHeader(outer)->frame_status &
+                                    JIT_FRAME_DEOPT_PATCHED) != 0;
     }
   }
 #endif
+
+  // The patched flavor above stops a frame at its next deopt exit with the
+  // PRE-instruction state, leaving the completed call's return value in a
+  // register to be recovered below.  The polled flavor -- a
+  // CheckInstrumentation exit -- carries the complete post-instruction
+  // frame state instead: the result is already in the reified stack, and
+  // there is nothing to recover from registers.  The two flavors resume
+  // differently -- patched advances past the completed instruction, polled
+  // resumes at its own frame state -- so only the patched flag travels into
+  // frame reification; the polled and periodic-task cases are recognized
+  // there by their deopt reasons.  A single "is instrumentation" bit was
+  // tried as the resume selector and is exactly wrong: it made the polled
+  // flavor advance, skipping the instruction the frame state names.  The
+  // combined bit survives below only for what it is right about --
+  // statistics, backoff accounting and the resume-target routing, which
+  // treat both flavors alike.
+  const bool is_polled_instrumentation =
+      deopt_meta.reason == DeoptReason::kInstrumentation;
+  const bool is_instrumentation_deopt =
+      is_patched_instrumentation || is_polled_instrumentation;
 
   if (getConfig().frame_mode == FrameMode::kLightweight) {
     frame = reifyLightweightFrames(
@@ -194,14 +296,29 @@ DeoptResult prepareForDeopt(
         deopt_meta,
         deopt_meta.frame_meta.at(i),
         regs,
-        is_instrumentation_deopt);
+        is_patched_instrumentation);
     frame_iter = frame_iter->previous;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  BorrowedRef<PyCodeObject> ledger_code = deopt_meta.innermostFrame().code;
+  int resume_offset = static_cast<int>(
+      (frame->prev_instr + 1 - _PyCode_CODE(ledger_code)) *
+      sizeof(_Py_CODEUNIT));
+  runtimeTransitionLedgerRecord(
+      ledger_code,
+      "deopt",
+      deoptReasonName(deopt_meta.reason),
+      deopt_meta.innermostFrame().cause_instr_idx.value(),
+      resume_offset,
+      is_forced_deopt,
+      is_instrumentation_deopt);
+#endif
 
   // For instrumentation deopts where the bytecode's C call completed
   // (reason != kPeriodicTaskFailure), push its return value onto the
   // operand stack on top of the pre-instruction state restored by reifyStack.
-  if (is_instrumentation_deopt) {
+  if (is_patched_instrumentation) {
     if (deopt_meta.reason != DeoptReason::kPeriodicTaskFailure &&
         !PyErr_Occurred()) {
       PyObject* retval = reinterpret_cast<PyObject*>(
@@ -239,7 +356,7 @@ DeoptResult prepareForDeopt(
       deopt_jit_gen_object_only(gen);
     }
   }
-  if (!PyErr_Occurred() && !is_instrumentation_deopt) {
+  if (!PyErr_Occurred() && !is_instrumentation_deopt && !is_forced_deopt) {
     auto reason = deopt_meta.reason;
     switch (reason) {
       case DeoptReason::kGuardFailure: {
@@ -247,7 +364,8 @@ DeoptResult prepareForDeopt(
         break;
       }
       case DeoptReason::kRaise:
-      case DeoptReason::kYieldFrom: {
+      case DeoptReason::kYieldFrom:
+      case DeoptReason::kInstrumentation: {
         break;
       }
       case DeoptReason::kUnhandledNullField:
@@ -266,27 +384,50 @@ DeoptResult prepareForDeopt(
         JIT_ABORT("Lost exception when raising static exception");
     }
   }
-  jit::recordDeoptForRoiBackoff(
-      code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+  if (!is_forced_deopt) {
+    jit::recordDeoptForRoiBackoff(
+        code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+  }
   return {frame, is_instrumentation_deopt};
 }
 
 // Set up f_trace/f_trace_lines for sys.settrace compatibility on deopted
 // frames. CPython normally sets these during the RESUME opcode at function
 // entry, but deopted frames resume mid-function and skip RESUME.
-void setupTraceForDeoptedFrame(
+//
+// On 3.11 (RFC 3.3.4.5 item 7) the frame's tracing state is made explicit
+// without FORGING any of it: tstate->c_traceobj is the GLOBAL tracer, and
+// frame->f_trace is the LOCAL tracer that only a 'call' event's return
+// value installs (trace_trampoline dispatches every non-call event to
+// f_trace).  A mid-flight frame never had its 'call' event under the new
+// tracer, so its local tracer is legitimately absent -- copying the
+// global tracer in would hand 'line' events to a callable that may only
+// accept 'call' (a global tracer returning a distinct local tracer, or
+// returning None, is fully legal).  So: f_trace_lines is set, an f_trace
+// the user installed explicitly on the frame object is preserved as-is,
+// and an absent f_trace stays absent -- which also matches stock, where
+// the remaining events of an already-running frame are not delivered.
+// Returns false when materializing the frame object failed (the
+// exception -- a MemoryError -- is left in place for the caller to route
+// into the interpreter's error path; resuming "normally" with a live
+// exception would hand the evaluator a stale PyErr on a non-error path).
+bool setupTraceForDeoptedFrame(
     _PyInterpreterFrame* frame,
     PyThreadState* tstate) {
   if (tstate->c_tracefunc != nullptr &&
       frame->owner != FRAME_OWNED_BY_GENERATOR) {
     PyFrameObject* fobj = _PyFrame_GetFrameObject(frame);
-    if (fobj != nullptr) {
-      fobj->f_trace_lines = 1;
-      if (fobj->f_trace == nullptr && tstate->c_traceobj != nullptr) {
-        fobj->f_trace = Py_NewRef(tstate->c_traceobj);
-      }
+    if (fobj == nullptr) {
+      return false;
     }
+    fobj->f_trace_lines = 1;
+#if PY_VERSION_HEX >= 0x030C0000
+    if (fobj->f_trace == nullptr && tstate->c_traceobj != nullptr) {
+      fobj->f_trace = Py_NewRef(tstate->c_traceobj);
+    }
+#endif
   }
+  return true;
 }
 
 PyObject* resumeInInterpreter(
@@ -300,6 +441,24 @@ PyObject* resumeInInterpreter(
 
   const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 structurally forbids lightweight frames, so the patched
+  // instrumentation flavor cannot occur and prepareForDeopt's combined
+  // bit reduces to the polled predicate.  The trampoline forwards that
+  // bit through ARGUMENT_REGS[3]; this recomputation turns a
+  // mis-assembled fourth argument (historically a register residue
+  // behind a >= 3.12 gate) into a deterministic failure on every deopt
+  // instead of a build-dependent misroute.  A hard check, not a DCHECK:
+  // the deopt path is already slow, and a corrupt trampoline argument
+  // means the generated shim itself is wrong.
+  JIT_CHECK(
+      is_instrumentation_deopt ==
+          (deopt_meta.reason == DeoptReason::kInstrumentation),
+      "deopt trampoline forwarded a corrupt is_instrumentation_deopt for "
+      "reason {}",
+      deoptReasonName(deopt_meta.reason));
+#endif
+
   // For instrumentation deopts, only enter error handler if actually excepted.
   int err_occurred;
   if (is_instrumentation_deopt) {
@@ -309,6 +468,13 @@ PyObject* resumeInInterpreter(
   }
 
   PyObject* result = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  // The generated bind wrapper entered recursion for this real JIT frame.
+  // The anchored evaluator is about to Enter the same frame again. Transfer
+  // ownership first so boundary deopts do not fail the duplicate Enter and
+  // silently omit the deepest traceback frame.
+  JITRT_TransferRecursionToInterpreter311();
+#endif
   // Resume all of the inlined frames and the caller
   int inline_depth = deopt_meta.inline_depth();
   while (inline_depth >= 0) {
@@ -362,9 +528,47 @@ PyObject* resumeInInterpreter(
       }
     }
 
-    setupTraceForDeoptedFrame(frame, tstate);
+#if PY_VERSION_HEX < 0x030C0000
+    if (err_occurred == 0) {
+      if (!setupTraceForDeoptedFrame(frame, tstate)) {
+        // Frame-object materialization failed: the MemoryError it left
+        // becomes THIS resume's live exception, entering the evaluator
+        // on the error path at the deopt boundary instead of leaking a
+        // stale PyErr into a normal-path opcode.
+        err_occurred = 1;
+      }
+    }
+    // When the resume already carries an exception (err_occurred == 1),
+    // the setup is skipped outright: running a fallible materialization
+    // on top of a live PyErr could clobber the in-flight exception, and
+    // the no-forge tracing model needs nothing set for the unwind.
+#else
+    // 3.12+ keeps its existing unconditional shape.
+    (void)setupTraceForDeoptedFrame(frame, tstate);
+#endif
 
+#if PY_VERSION_HEX < 0x030C0000
+    // Pin the continuation to the evaluator that started this frame.
+    // _PyEval_EvalFrame() dispatches through interp->eval_frame at CALL
+    // time, so a PEP 523 client installed while machine code was running
+    // would retroactively receive the reified mid-frame -- and with it
+    // this branch's entry-frame clear-and-pop contract, which is anchored
+    // to the vendored 3.11 evaluator's return protocol.  Changing the
+    // evaluator affects future entries; a frame already in flight is
+    // finished by the interpreter that launched it.
+    // The trace transition can coincide with a call that raises.  That exit
+    // is classified by the failing CALL (UnhandledException), not by the
+    // following instrumentation poll, but it is still a continuation of an
+    // already-running frame and must not synthesize a second call event.
+    if (err_occurred &&
+        (tstate->c_tracefunc != nullptr || tstate->c_profilefunc != nullptr)) {
+      suppressSyntheticResumeCallEvents(tstate);
+    }
+    result = Ci_EvalFrameDefault_311(tstate, frame, err_occurred);
+    restoreSyntheticResumeCallEvents(tstate);
+#else
     result = _PyEval_EvalFrame(tstate, frame, err_occurred);
+#endif
 
     // If exception occurred before RETURN_GENERATOR, the generator was never
     // returned to anyone. The JIT created the generator early, but the caller
@@ -372,6 +576,24 @@ PyObject* resumeInInterpreter(
     if (result == nullptr && gen_to_cleanup != nullptr) {
       Py_DECREF(gen_to_cleanup);
     }
+
+#if PY_VERSION_HEX < 0x030C0000
+    // Stock 3.11 leaves entry-frame ownership with the caller: eval's
+    // exit paths return without clearing or popping the frame they were
+    // entered with (is_entry), and _PyEval_Vector performs the
+    // clear-and-pop afterwards.  Do that caller duty here, mirroring
+    // _PyEvalFrameClearAndPop (including the recursion_remaining dance so
+    // destructors run under the same headroom); without it every
+    // exception deopt leaks the reified frame's references and later
+    // datastack pushes reuse the never-cleared slots.  3.12+ eval pops
+    // the entry frame itself, so this block must not exist there.
+    if (frame->owner == FRAME_OWNED_BY_THREAD) {
+      tstate->recursion_remaining--;
+      _PyFrame_Clear(frame);
+      tstate->recursion_remaining++;
+      _PyThreadState_PopFrame(tstate, frame);
+    }
+#endif
 
     frame = prev_frame;
 
@@ -413,6 +635,78 @@ void* finalizeCode(arch::Builder& builder, std::string_view name) {
         DebugUtils::errorAsString(result.error))};
   }
   return result.addr;
+}
+
+size_t finalizeShadowCode(arch::Builder& builder, std::string_view name) {
+  if (auto err = builder.finalize(); err != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to finalize shadow asmjit builder for {}, got error code {}",
+        name,
+        DebugUtils::errorAsString(err))};
+  }
+
+  CodeHolder* code = builder.code();
+  bool validate_split_layout = false;
+#if defined(CINDER_AARCH64)
+  validate_split_layout = getConfig().multiple_code_sections &&
+      dynamic_cast<CodeAllocatorCinder*>(
+          cinderx::getModuleState()->code_allocator.get()) != nullptr;
+#endif
+  if (validate_split_layout) {
+    // Model a fresh split allocation without touching the allocator, using the
+    // production layout calculation so AArch64 alignment and displacement
+    // constraints cannot drift between the two paths.
+    size_t hot_size = 0;
+    size_t cold_size = 0;
+    for (Section* section : code->sections()) {
+      if (codeSectionFromName(section->name()) == CodeSection::kCold) {
+        cold_size += section->realSize();
+      } else {
+        hot_size += section->realSize();
+      }
+    }
+    SplitAllocationLayout layout =
+        computeSplitAllocationLayout(hot_size, cold_size);
+    size_t hot_offset = 0;
+    size_t cold_offset = layout.hot_capacity;
+    for (Section* section : code->sections()) {
+      if (codeSectionFromName(section->name()) == CodeSection::kCold) {
+        section->setOffset(cold_offset);
+        cold_offset += section->realSize();
+      } else {
+        section->setOffset(hot_offset);
+        hot_offset += section->realSize();
+      }
+    }
+  } else if (auto err = code->flatten(); err != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to flatten shadow code for {}, got error code {}",
+        name,
+        DebugUtils::errorAsString(err))};
+  }
+  if (auto err = code->resolveUnresolvedLinks(); err != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to resolve shadow code links for {}, got error code {}",
+        name,
+        DebugUtils::errorAsString(err))};
+  }
+
+  // Relocate against a representative address in the JIT image. This checks
+  // target displacement constraints without allocating executable memory.
+  constexpr uintptr_t kPageMask = ~uintptr_t{0xfff};
+  uintptr_t validation_base =
+      reinterpret_cast<uintptr_t>(&finalizeShadowCode) & kPageMask;
+  if (auto err = code->relocateToBase(validation_base); err != kErrorOk) {
+    throw std::runtime_error{fmt::format(
+        "Failed to relocate shadow code for {}, got error code {}",
+        name,
+        DebugUtils::errorAsString(err))};
+  }
+  size_t code_size = 0;
+  for (Section* section : code->sections()) {
+    code_size += section->realSize();
+  }
+  return code_size;
 }
 
 // Emit machine code from LIR blocks by translating each instruction via the
@@ -634,6 +928,21 @@ std::span<const std::byte> NativeGenerator::getCodeBuffer() const {
 }
 
 void* NativeGenerator::getVectorcallEntry() {
+  return compile(false);
+}
+
+size_t NativeGenerator::getShadowCodeSize() {
+  JIT_CHECK(
+      code_start_ == nullptr && vectorcall_entry_ == nullptr,
+      "NativeGenerator cannot be reused for shadow compilation");
+  if (GetFunction() == nullptr) {
+    return 0;
+  }
+  compile(true);
+  return compiled_size_;
+}
+
+void* NativeGenerator::compile(bool shadow) {
   if (vectorcall_entry_ != nullptr) {
     // already compiled
     return vectorcall_entry_;
@@ -641,10 +950,15 @@ void* NativeGenerator::getVectorcallEntry() {
 
   JIT_CHECK(as_ == nullptr, "Builder should not have been initialized.");
 
+  is_shadow_compile_ = shadow;
   CodeHolder code;
   ICodeAllocator* code_allocator =
       cinderx::getModuleState()->code_allocator.get();
-  code.init(code_allocator->asmJitEnvironment());
+  if (shadow) {
+    ASM_CHECK_THROW(code.init(code_allocator->asmJitEnvironment()));
+  } else {
+    code.init(code_allocator->asmJitEnvironment());
+  }
   ThrowableErrorHandler eh;
   code.setErrorHandler(&eh);
 
@@ -705,9 +1019,31 @@ void* NativeGenerator::getVectorcallEntry() {
 
   auto func = GetFunction();
 
-  env_.ctx = getContext();
-  env_.code_rt = env_.ctx->allocateCodeRuntime(
-      func->code.get(), func->builtins.get(), func->globals.get());
+  // Inline caches emitted during LIR generation must have the same lifetime as
+  // the discarded shadow artifact. Declare this before shadow_code_runtime so
+  // the CodeRuntime is torn down first.
+  std::unique_ptr<Context> shadow_context;
+  std::unique_ptr<CodeRuntime> shadow_code_runtime;
+  if (shadow) {
+    shadow_context = std::make_unique<Context>();
+    shadow_code_runtime = std::make_unique<CodeRuntime>(
+        func->code.get(), func->builtins.get(), func->globals.get());
+    env_.ctx = shadow_context.get();
+    env_.code_rt = shadow_code_runtime.get();
+  } else {
+    env_.ctx = getContext();
+    env_.code_rt = env_.ctx->allocateCodeRuntime(
+        func->code.get(), func->builtins.get(), func->globals.get());
+  }
+  SCOPE_EXIT(if (shadow) {
+    if (env_.code_rt != nullptr) {
+      env_.code_rt->releaseReferences();
+    }
+    lir_func_.reset();
+    env_.function_indirections.clear();
+    env_.code_rt = nullptr;
+    env_.ctx = nullptr;
+  });
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030E0000
   if (func->frameMode == FrameMode::kLightweight) {
     env_.code_rt->setReifier(func->reifier);
@@ -809,10 +1145,19 @@ void* NativeGenerator::getVectorcallEntry() {
       GetFunction()->fullname,
       *lir_func);
 
-  if (!verifyPostRegAllocInvariants(lir_func.get(), std::cerr)) {
+  std::ostringstream verifier_errors;
+  if (!verifyPostRegAllocInvariants(lir_func.get(), verifier_errors)) {
+    if (shadow) {
+      throw std::runtime_error{fmt::format(
+          "LIR for {} failed verification:\n{}\n{}",
+          GetFunction()->fullname,
+          verifier_errors.str(),
+          *lir_func)};
+    }
     JIT_ABORT(
-        "LIR for {} failed verification:\n{}",
+        "LIR for {} failed verification:\n{}\n{}",
         GetFunction()->fullname,
+        verifier_errors.str(),
         *lir_func);
   }
 
@@ -828,6 +1173,15 @@ void* NativeGenerator::getVectorcallEntry() {
     FormatOptions formatOptions;
     formatOptions.setFlags(FormatFlags::kHexImms);
     Formatter::formatNodeList(s, formatOptions, as_);
+    if (shadow) {
+      throw std::runtime_error{fmt::format(
+          "Failed to emit shadow code for '{}': '{}' failed with '{}'; "
+          "builder contents on failure:\n{}",
+          GetFunction()->fullname,
+          ex.expr,
+          ex.message,
+          s.data())};
+    }
     JIT_ABORT(
         "Failed to emit code for '{}': '{}' failed with '{}'\n\n"
         "Builder contents on failure:\n{}",
@@ -842,8 +1196,12 @@ void* NativeGenerator::getVectorcallEntry() {
    * JitRuntime::_add and may break in the future.
    */
 
-  JIT_DCHECK(code.codeSize() < INT_MAX, "Code size is larger than INT_MAX");
-  compiled_size_ = code.codeSize();
+  JIT_DCHECK(
+      is_shadow_compile_ || code.codeSize() < INT_MAX,
+      "Code size is larger than INT_MAX");
+  if (!is_shadow_compile_) {
+    compiled_size_ = code.codeSize();
+  }
   env_.code_rt->setFrameSize(env_.stack_frame_size);
   if (GetFunction()->code->co_flags & kCoFlagsAnyGenerator) {
     JIT_DCHECK(
@@ -852,7 +1210,7 @@ void* NativeGenerator::getVectorcallEntry() {
     env_.code_rt->setSpillWords(
         env_.shadow_frames_and_spill_size / kPointerSize);
   }
-  return vectorcall_entry_;
+  return shadow ? nullptr : vectorcall_entry_;
 }
 
 void* NativeGenerator::getStaticEntry() {
@@ -1196,9 +1554,12 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   as_->lea(deopt_scratch_reg, x86::ptr(env_.hard_exit_label));
   as_->mov(x86::ptr(x86::rsp, kPointerSize), deopt_scratch_reg);
 
-  auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? factory_.deoptTrampolineGenerators()
-      : factory_.deoptTrampoline();
+  void* trampoline = reinterpret_cast<void*>(1);
+  if (!is_shadow_compile_) {
+    trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
+        ? factory_.deoptTrampolineGenerators()
+        : factory_.deoptTrampoline();
+  }
   as_->mov(deopt_scratch_reg, reinterpret_cast<uint64_t>(trampoline));
   as_->jmp(deopt_scratch_reg);
 
@@ -1285,9 +1646,12 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
       deopt_scratch_reg,
       arch::ptr_resolve(as_, a64::sp, kPointerSize * 2, arch::reg_scratch_0));
 
-  auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? factory_.deoptTrampolineGenerators()
-      : factory_.deoptTrampoline();
+  void* trampoline = reinterpret_cast<void*>(1);
+  if (!is_shadow_compile_) {
+    trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
+        ? factory_.deoptTrampolineGenerators()
+        : factory_.deoptTrampoline();
+  }
   as_->mov(deopt_scratch_reg, trampoline);
   as_->br(deopt_scratch_reg);
 
@@ -1327,7 +1691,11 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   constexpr uint64_t kInlineValuesValuesOffset = offsetof(PyDictValues, values);
   constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
 
-  ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  if (is_shadow_compile_) {
+    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+  } else {
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  }
   as_->bind(env_.load_attr_invoke_stub);
 
   // x0=cache, x1=obj, x2=name
@@ -1421,7 +1789,11 @@ void NativeGenerator::emitAarch64ExactLongAddSubStubs(
   for (const auto& stub : env_.exact_long_add_sub_stubs) {
     Label generic_path = as_->newLabel();
 
-    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+    if (is_shadow_compile_) {
+      ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+    } else {
+      ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+    }
     as_->bind(stub.entry);
 
     // x0=left, x1=right. Exact checks exclude bool and int subclasses, whose
@@ -1802,7 +2174,11 @@ void NativeGenerator::generateCode(
   }
 #endif
 
-  code_start_ = finalizeCode(*as_, GetFunction()->fullname);
+  if (is_shadow_compile_) {
+    compiled_size_ = finalizeShadowCode(*as_, GetFunction()->fullname);
+  } else {
+    code_start_ = finalizeCode(*as_, GetFunction()->fullname);
+  }
 
   // ------------- code_start_
   // ^
@@ -1810,22 +2186,40 @@ void NativeGenerator::generateCode(
   // | JITRT_CALL_REENTRY_OFFSET (6 bytes)
   // v
   // ------------- vectorcall_entry_
-  if (has_static_entry) {
-    JIT_CHECK(
-        codeholder.labelOffsetFromBase(static_jmp_location) ==
-            codeholder.labelOffsetFromBase(vectorcall_entry_label) +
-                JITRT_STATIC_ENTRY_OFFSET,
-        "bad static-entry offset {} ",
-        codeholder.labelOffsetFromBase(vectorcall_entry_label) -
-            codeholder.labelOffsetFromBase(static_jmp_location));
+  auto validate_entry_offsets = [&]() -> std::optional<std::string> {
+    if (has_static_entry) {
+      bool valid_static_offset =
+          codeholder.labelOffsetFromBase(static_jmp_location) ==
+          codeholder.labelOffsetFromBase(vectorcall_entry_label) +
+              JITRT_STATIC_ENTRY_OFFSET;
+      if (!valid_static_offset) {
+        return fmt::format(
+            "bad static-entry offset {}",
+            codeholder.labelOffsetFromBase(vectorcall_entry_label) -
+                codeholder.labelOffsetFromBase(static_jmp_location));
+      }
+    }
+    bool valid_reentry_offset = codeholder.labelOffset(correct_args_entry) ==
+        codeholder.labelOffset(vectorcall_entry_label) +
+            JITRT_CALL_REENTRY_OFFSET;
+    if (!valid_reentry_offset) {
+      return fmt::format(
+          "bad re-entry offset, correct_args_entry={}, vectorcall_entry={}",
+          codeholder.labelOffset(correct_args_entry),
+          codeholder.labelOffset(vectorcall_entry_label));
+    }
+    return std::nullopt;
+  };
+  if (auto error = validate_entry_offsets()) {
+    if (is_shadow_compile_) {
+      throw std::runtime_error{std::move(*error)};
+    }
+    JIT_ABORT("{}", *error);
   }
-  JIT_CHECK(
-      codeholder.labelOffset(correct_args_entry) ==
-          codeholder.labelOffset(vectorcall_entry_label) +
-              JITRT_CALL_REENTRY_OFFSET,
-      "bad re-entry offset, correct_args_entry={}, vectorcall_entry={}",
-      codeholder.labelOffset(correct_args_entry),
-      codeholder.labelOffset(vectorcall_entry_label));
+
+  if (is_shadow_compile_) {
+    return;
+  }
 
   linkDeoptPatchers(codeholder);
   env_.code_rt->debugInfo()->resolvePending(

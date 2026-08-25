@@ -5,10 +5,13 @@
 #include "cinderx/Jit/threaded_compile.h"
 
 #include <stdexcept>
+#include <string>
 
 namespace jit {
 
 namespace {
+
+thread_local int g_shadow_compile_depth = 0;
 
 // Trim file paths to be rooted at "cinderx/" for cleaner log output.
 std::string_view trimSourcePath(std::string_view path) {
@@ -23,14 +26,28 @@ std::string_view trimSourcePath(std::string_view path) {
   return pos != std::string_view::npos ? path.substr(pos) : path;
 }
 
-[[noreturn]] JIT_COLD void abortImpl() {
-  fmt::print(stderr, "\n");
+[[noreturn]] JIT_COLD void abortImpl(const std::string& msg) {
+  if (g_shadow_compile_depth > 0) {
+    throw std::runtime_error{msg};
+  }
+  fmt::print(stderr, "{}\n", msg);
   std::fflush(stderr);
   jit::printPythonException();
   std::abort();
 }
 
 } // namespace
+
+void shadowCompileEnter() {
+  g_shadow_compile_depth++;
+}
+
+void shadowCompileLeave() {
+  if (g_shadow_compile_depth <= 0) {
+    abortImpl("JIT: shadow compile scope underflow");
+  }
+  g_shadow_compile_depth--;
+}
 
 JIT_COLD void logImplV(
     std::string_view file,
@@ -50,9 +67,10 @@ JIT_COLD void logImplV(
     int line,
     fmt::string_view format,
     fmt::format_args args) {
-  fmt::print(stderr, "JIT: {}:{} -- Abort\n", trimSourcePath(file), line);
-  fmt::vprint(stderr, format, args);
-  abortImpl();
+  std::string msg =
+      fmt::format("JIT: {}:{} -- Abort\n", trimSourcePath(file), line);
+  fmt::vformat_to(std::back_inserter(msg), format, args);
+  abortImpl(msg);
 }
 
 [[noreturn]] JIT_COLD void checkFailedImplV(
@@ -61,14 +79,13 @@ JIT_COLD void logImplV(
     std::string_view cond_str,
     fmt::string_view format,
     fmt::format_args args) {
-  fmt::print(
-      stderr,
+  std::string msg = fmt::format(
       "JIT: {}:{} -- Assertion failed: {}\n",
       trimSourcePath(file),
       line,
       cond_str);
-  fmt::vprint(stderr, format, args);
-  abortImpl();
+  fmt::vformat_to(std::back_inserter(msg), format, args);
+  abortImpl(msg);
 }
 
 [[noreturn]] JIT_COLD void throwImplV(

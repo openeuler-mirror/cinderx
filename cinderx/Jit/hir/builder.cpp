@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 #include "cinderx/Common/code.h"
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
@@ -40,6 +41,7 @@ extern "C" {
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -123,6 +125,19 @@ bool attrSlotTypeDefinesGetattr(const BytecodeInstruction& bc_instr) {
   }
   return _PyType_Lookup(type, &_Py_ID(__getattr__)) != nullptr;
 }
+#elif PY_VERSION_HEX < 0x030C0000
+// The LOAD_ATTR_SLOT fast path reads interp->types.type_version_cache, which
+// does not exist on 3.11.  The path is gated off there (slot_fast_path_enabled
+// is forced false), so these stubs report "no fast path" and are never
+// reached; they exist only to keep the shared LOAD_ATTR_SLOT case compilable.
+// A real 3.11 slot fast path is inline-cache work, out of scope here.
+PyMemberDef* attrSlotMemberDef(PyCodeObject*, const BytecodeInstruction&, int) {
+  return nullptr;
+}
+
+bool attrSlotTypeDefinesGetattr(const BytecodeInstruction&) {
+  return false;
+}
 #endif
 
 void rotateStackTop(OperandStack& stack, int count) {
@@ -142,7 +157,9 @@ void rotateStackTop(OperandStack& stack, int count) {
 // Check that an opcode is one we know how to translate into HIR.
 bool isSupportedOpcode(int opcode) {
   switch (opcode) {
+#if PY_VERSION_HEX >= 0x030C0000
     case BEFORE_ASYNC_WITH:
+#endif
     case BEFORE_WITH:
     case BINARY_ADD:
     case BINARY_AND:
@@ -181,7 +198,9 @@ bool isSupportedOpcode(int opcode) {
     case CALL_KW:
     case CALL_METHOD:
     case CAST:
+#if PY_VERSION_HEX >= 0x030C0000
     case CHECK_EG_MATCH:
+#endif
     case CHECK_EXC_MATCH:
     case CLEANUP_THROW:
     case COMPARE_OP:
@@ -198,7 +217,9 @@ bool isSupportedOpcode(int opcode) {
     case DUP_TOP:
     case DUP_TOP_TWO:
     case EAGER_IMPORT_NAME:
+#if PY_VERSION_HEX >= 0x030C0000
     case END_ASYNC_FOR:
+#endif
     case END_FOR:
     case END_SEND:
     case EXTENDED_ARG:
@@ -208,9 +229,11 @@ bool isSupportedOpcode(int opcode) {
     case FORMAT_WITH_SPEC:
     case FOR_ITER:
     case GEN_START:
+#if PY_VERSION_HEX >= 0x030C0000
     case GET_AITER:
     case GET_ANEXT:
     case GET_AWAITABLE:
+#endif
     case GET_ITER:
     case GET_LEN:
     case GET_YIELD_FROM_ITER:
@@ -283,15 +306,27 @@ bool isSupportedOpcode(int opcode) {
     case MAKE_CELL:
     case MAKE_FUNCTION:
     case MAP_ADD:
+#if PY_VERSION_HEX >= 0x030C0000
     case MATCH_CLASS:
     case MATCH_KEYS:
     case MATCH_MAPPING:
     case MATCH_SEQUENCE:
+#endif
     case NOP:
     case NOT_TAKEN:
     case POP_BLOCK:
     case POP_EXCEPT:
     case POP_ITER:
+#if PY_VERSION_HEX < 0x030C0000
+    case POP_JUMP_BACKWARD_IF_FALSE:
+    case POP_JUMP_BACKWARD_IF_NONE:
+    case POP_JUMP_BACKWARD_IF_NOT_NONE:
+    case POP_JUMP_BACKWARD_IF_TRUE:
+    case POP_JUMP_FORWARD_IF_FALSE:
+    case POP_JUMP_FORWARD_IF_NONE:
+    case POP_JUMP_FORWARD_IF_NOT_NONE:
+    case POP_JUMP_FORWARD_IF_TRUE:
+#endif
     case POP_JUMP_IF_FALSE:
     case POP_JUMP_IF_NONE:
     case POP_JUMP_IF_NONZERO:
@@ -299,6 +334,9 @@ bool isSupportedOpcode(int opcode) {
     case POP_JUMP_IF_TRUE:
     case POP_JUMP_IF_ZERO:
     case POP_TOP:
+#if PY_VERSION_HEX < 0x030C0000
+    case PRECALL:
+#endif
     case PRIMITIVE_BINARY_OP:
     case PRIMITIVE_BOX:
     case PRIMITIVE_COMPARE_OP:
@@ -362,6 +400,26 @@ bool isBannedName(std::string_view name) {
   return name == "eval" || name == "exec" || name == "locals";
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// co_names entries are Unicode objects, but CodeType.replace() can legally
+// insert a lone surrogate. PyUnicode_AsUTF8 then returns NULL and sets
+// UnicodeEncodeError; constructing a string_view from that pointer is UB.
+std::string_view
+nameAtOrRefuse(PyObject* names, Py_ssize_t i, const char** refuse) {
+  if (*refuse != nullptr) {
+    return {};
+  }
+  PyObject* item = PyTuple_GET_ITEM(names, i);
+  const char* utf8 = item != nullptr ? PyUnicode_AsUTF8(item) : nullptr;
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    *refuse = "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    return {};
+  }
+  return std::string_view(utf8);
+}
+#endif
+
 // True if the code object contains any branch back to an earlier instruction;
 // used as a structural proxy for "this function has a loop body" when gating
 // exact-int guard emission for specialized numeric opcodes.
@@ -397,6 +455,216 @@ bool hasArraySubscrStoreFastPathEvidence(
       (registerHasTypeEvidence(sub, TLongExact) &&
        registerHasTypeEvidence(value, TFloatExact));
 }
+struct LoadSuperAttrPattern311 {
+  int global_super_idx;
+  int type_global_idx;
+  int receiver_local_idx;
+  int name_idx;
+  bool load_method;
+  bool no_args_in_super_call;
+  int instrs_to_skip_after_super;
+};
+
+std::optional<LoadSuperAttrPattern311> matchLoadSuperAttrPattern311(
+    BorrowedRef<PyCodeObject> code,
+    BytecodeInstructionBlock::Iterator bc_it,
+    const BytecodeInstructionBlock& bc_block) {
+#if PY_VERSION_HEX < 0x030C0000
+  BytecodeInstruction load_global = *bc_it;
+  if (load_global.opcode() != LOAD_GLOBAL || !(load_global.oparg() & 1)) {
+    return std::nullopt;
+  }
+
+  int global_idx = loadGlobalIndex(load_global.oparg());
+  PyObject* global_name = PyTuple_GET_ITEM(code->co_names, global_idx);
+  if (PyUnicode_CompareWithASCIIString(global_name, "super") != 0) {
+    return std::nullopt;
+  }
+
+  ++bc_it;
+  if (bc_it == bc_block.end()) {
+    return std::nullopt;
+  }
+  BytecodeInstruction next = *bc_it;
+
+  bool no_args_in_super_call = true;
+  int type_global_idx = -1;
+  int receiver_local_idx = -1;
+  int instrs_to_skip_after_super = 3;
+
+  if (next.opcode() == LOAD_GLOBAL) {
+    type_global_idx = loadGlobalIndex(next.oparg());
+
+    ++bc_it;
+    if (bc_it == bc_block.end()) {
+      return std::nullopt;
+    }
+    BytecodeInstruction receiver = *bc_it;
+    if (receiver.opcode() != LOAD_FAST) {
+      return std::nullopt;
+    }
+    receiver_local_idx = receiver.oparg();
+
+    ++bc_it;
+    if (bc_it == bc_block.end()) {
+      return std::nullopt;
+    }
+    next = *bc_it;
+    no_args_in_super_call = false;
+    instrs_to_skip_after_super = 5;
+  }
+
+  if (next.opcode() != PRECALL ||
+      next.oparg() != (no_args_in_super_call ? 0 : 2)) {
+    return std::nullopt;
+  }
+
+  ++bc_it;
+  if (bc_it == bc_block.end()) {
+    return std::nullopt;
+  }
+  BytecodeInstruction call = *bc_it;
+  if (call.opcode() != CALL ||
+      call.oparg() != (no_args_in_super_call ? 0 : 2)) {
+    return std::nullopt;
+  }
+
+  ++bc_it;
+  if (bc_it == bc_block.end()) {
+    return std::nullopt;
+  }
+  BytecodeInstruction load_attr_or_method = *bc_it;
+  int opcode = load_attr_or_method.opcode();
+  if (opcode != LOAD_ATTR && opcode != LOAD_METHOD) {
+    return std::nullopt;
+  }
+
+  return LoadSuperAttrPattern311{
+      global_idx,
+      type_global_idx,
+      receiver_local_idx,
+      loadAttrIndex(load_attr_or_method.oparg()),
+      opcode == LOAD_METHOD,
+      no_args_in_super_call,
+      instrs_to_skip_after_super};
+#else
+  return std::nullopt;
+#endif
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+uint32_t readCacheU32(const _Py_CODEUNIT* cache) {
+  return static_cast<uint32_t>(cache[0]) |
+      (static_cast<uint32_t>(cache[1]) << 16);
+}
+
+PyObject* readCacheObj(const _Py_CODEUNIT* cache) {
+  uintptr_t result = 0;
+  for (std::size_t i = 0; i < sizeof(PyObject*) / sizeof(_Py_CODEUNIT); ++i) {
+    result |= static_cast<uintptr_t>(cache[i]) << (16 * i);
+  }
+  return reinterpret_cast<PyObject*>(result);
+}
+
+Py_ssize_t findActiveUnicodeDictEntryIndex(
+    BorrowedRef<PyDictObject> dict,
+    BorrowedRef<> name,
+    BorrowedRef<> expected_value) {
+  JIT_DCHECK(dict->ma_values == nullptr, "expected a combined dict");
+  JIT_DCHECK(hasOnlyUnicodeKeys(dict), "expected unicode keys");
+
+  PyDictKeysObject* keys = dict->ma_keys;
+  PyDictUnicodeEntry* entries = DK_UNICODE_ENTRIES(keys);
+  for (Py_ssize_t i = 0; i < keys->dk_nentries; ++i) {
+    PyDictUnicodeEntry* entry = &entries[i];
+    if (entry->me_key == nullptr || entry->me_value == nullptr) {
+      continue;
+    }
+    if (entry->me_key == name) {
+      return entry->me_value == expected_value ? i : -1;
+    }
+    int equal = PyObject_RichCompareBool(entry->me_key, name, Py_EQ);
+    if (equal < 0) {
+      PyErr_Clear();
+      return -1;
+    }
+    if (equal) {
+      return entry->me_value == expected_value ? i : -1;
+    }
+  }
+  return -1;
+}
+
+BorrowedRef<PyTypeObject> resolveMethodOwnerType(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyDictObject> globals) {
+  BorrowedRef<> qualname{func->func_qualname};
+  if (!PyUnicode_Check(qualname)) {
+    return nullptr;
+  }
+
+  Py_ssize_t qualname_size = 0;
+  const char* qualname_data = PyUnicode_AsUTF8AndSize(qualname, &qualname_size);
+  if (qualname_data == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  std::string_view qualname_view{
+      qualname_data, static_cast<std::size_t>(qualname_size)};
+  if (qualname_view.find("<locals>") != std::string_view::npos) {
+    return nullptr;
+  }
+
+  const std::size_t dot = qualname_view.find('.');
+  if (dot == std::string_view::npos || dot == 0 ||
+      dot + 1 == qualname_view.size() ||
+      qualname_view.find('.', dot + 1) != std::string_view::npos) {
+    return nullptr;
+  }
+
+  std::string_view owner_name = qualname_view.substr(0, dot);
+  std::string_view method_name = qualname_view.substr(dot + 1);
+  auto owner_key = Ref<>::steal(
+      PyUnicode_FromStringAndSize(owner_name.data(), owner_name.size()));
+  auto method_key = Ref<>::steal(
+      PyUnicode_FromStringAndSize(method_name.data(), method_name.size()));
+  if (owner_key == nullptr || method_key == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  ThreadedCompileSerialize guard;
+  PyObject* owner = PyDict_GetItemWithError(globals, owner_key);
+  if (owner == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return nullptr;
+  }
+  if (!PyType_Check(owner)) {
+    return nullptr;
+  }
+
+  auto owner_type = reinterpret_cast<PyTypeObject*>(owner);
+  if (owner_type->tp_dict == nullptr) {
+    return nullptr;
+  }
+
+  PyObject* descr = PyDict_GetItemWithError(owner_type->tp_dict, method_key);
+  if (descr == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return nullptr;
+  }
+  if (descr != func) {
+    return nullptr;
+  }
+
+  return owner_type;
+}
+#endif
 
 } // namespace
 
@@ -602,6 +870,16 @@ static bool should_snapshot(
     return false;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Instrumentation can be activated by any Python callback, including a
+  // destructor inserted later by the refcount pass.  Execute mode therefore
+  // needs one resumable Snapshot at every non-terminator bytecode boundary;
+  // insertInstrumentationPolls311 turns those snapshots into deopt checks.
+  if (getConfig().state == State::kRunning) {
+    return true;
+  }
+#endif
+
   switch (bci.opcode()) {
     // These instructions only modify frame state and are always safe to
     // replay. We don't snapshot these in order to limit the amount of
@@ -651,10 +929,11 @@ static bool should_snapshot(
     case JUMP_IF_NOT_EXC_MATCH:
     case RERAISE:
     case WITH_EXCEPT_START: {
-      JIT_THROW(
-          "Should not be compiling except blocks (opcode {}, {})\n",
-          bci.opcode(),
-          opcodeName(bci.opcode()));
+      // Exception-handler opcodes are translated when they appear on a
+      // reachable CFG edge.  Snapshotting after them is unnecessary: RERAISE
+      // terminates, and WITH_EXCEPT_START / JUMP_IF_NOT_EXC_MATCH either
+      // branch or are followed by a deopt-shaped recovery block.
+      return false;
     }
     // Take a snapshot after translating all other bytecode instructions. This
     // may generate unnecessary deoptimization metadata but will always be
@@ -835,6 +1114,362 @@ bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
   return numeric_binary_op_count > 1;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
+
+#if PY_VERSION_HEX >= 0x030B0000
+static bool hasIntConstLocalBinaryAccumulator311(
+    BorrowedRef<PyCodeObject> code) {
+  constexpr int kMaxCompactAccumulatorLocalsPlus = 8;
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto it = bc_instrs.begin(); it != bc_instrs.end(); ++it) {
+    BytecodeInstruction load = *it;
+    if (load.opcode() != LOAD_FAST) {
+      continue;
+    }
+
+    auto const_it = it;
+    ++const_it;
+    if (const_it == bc_instrs.end()) {
+      return false;
+    }
+    BytecodeInstruction load_const = *const_it;
+    if (load_const.opcode() != LOAD_CONST ||
+        load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
+      continue;
+    }
+    BorrowedRef<> const_value =
+        PyTuple_GET_ITEM(code->co_consts, load_const.oparg());
+    if (!PyLong_CheckExact(const_value)) {
+      continue;
+    }
+
+    auto binary_it = const_it;
+    ++binary_it;
+    if (binary_it == bc_instrs.end()) {
+      return false;
+    }
+    BytecodeInstruction binary = *binary_it;
+    if (binary.opcode() != BINARY_OP) {
+      continue;
+    }
+    auto inplace_op = getInPlaceOpKindFromOparg(binary.oparg());
+    if (!inplace_op.has_value()) {
+      continue;
+    }
+
+    auto store_it = binary_it;
+    ++store_it;
+    if (store_it == bc_instrs.end()) {
+      return false;
+    }
+    BytecodeInstruction store = *store_it;
+    if (store.opcode() == STORE_FAST && store.oparg() == load.oparg()) {
+      if ((*inplace_op == InPlaceOpKind::kAdd ||
+           *inplace_op == InPlaceOpKind::kSubtract) &&
+          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus) {
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
+#endif
+
+const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX >= 0x030B0000 && PY_VERSION_HEX < 0x030C0000
+  // AArch64 cond branches are ±1MiB. test_compile.test_extended_arg builds a
+  // 150KiB co_code whose shadow machine code cannot relocate
+  // (RelocOffsetOutOfRange). 64KiB bytecode is already outside any stdlib
+  // function observed on the 440-module surface.
+  constexpr Py_ssize_t kMaxShadowBytecodeBytes311 = 65536;
+  if (_PyCode_NBYTES(code) > kMaxShadowBytecodeBytes311) {
+    return "REFUSE_SHAPE_CODEGEN_SPAN";
+  }
+  if (hasIntConstLocalBinaryAccumulator311(code)) {
+    return "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY";
+  }
+  PyObject* names = code->co_names;
+  if (names == nullptr || !PyTuple_Check(names)) {
+    return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+  }
+  for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
+    PyObject* item = PyTuple_GET_ITEM(names, i);
+    if (item == nullptr || PyUnicode_AsUTF8(item) == nullptr) {
+      PyErr_Clear();
+      return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
+
+const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  PyObject* names = code->co_names;
+  const char* name_refuse = nullptr;
+  auto name_at = [&](Py_ssize_t i) {
+    return nameAtOrRefuse(names, i, &name_refuse);
+  };
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    switch (bc_it->opcode()) {
+      case CHECK_EG_MATCH:
+      case PREP_RERAISE_STAR:
+        return "REFUSE_EXCEPT_STAR_UNAUDITED";
+      case MATCH_CLASS:
+      case MATCH_KEYS:
+      case MATCH_MAPPING:
+      case MATCH_SEQUENCE:
+        return "REFUSE_PATTERN_MATCHING_UNAUDITED";
+      case IMPORT_FROM:
+        return "REFUSE_HELPER_UNAVAILABLE_PRE314";
+      case DELETE_DEREF:
+      case DELETE_GLOBAL:
+        return "REFUSE_UNPORTED";
+      case ASYNC_GEN_WRAP:
+      case BEFORE_ASYNC_WITH:
+      case END_ASYNC_FOR:
+      case GET_AITER:
+      case GET_ANEXT:
+      case GET_AWAITABLE:
+        // These opcodes are interpreter-only because they implement async
+        // execution. They still appear in *synchronous* factories that
+        // construct async genexpressions, so eligibility must return the
+        // registered async reason instead of SUPPORTED_OPCODE_FAILURE.
+        return "INTERP_ONLY_ASYNC_CODE";
+      case DELETE_NAME:
+      case IMPORT_STAR:
+      case LOAD_CLASSDEREF:
+      case LOAD_NAME:
+      case PRINT_EXPR:
+      case SETUP_ANNOTATIONS:
+      case STORE_NAME:
+        return "INTERP_ONLY_NON_FUNCTION_SCOPE";
+      case CACHE:
+      case DO_TRACING:
+        return "INTERP_ONLY_PSEUDO_SLOT";
+      default:
+        if (!isSupportedOpcode(bc_it->opcode())) {
+          // Reachable only for an opcode with no support-list row, or a
+          // refuse/interpreter-only row missing from this switch.
+          return "SUPPORTED_OPCODE_FAILURE";
+        }
+        if (bc_it->opcode() == LOAD_GLOBAL) {
+          int oparg = bc_it->oparg();
+          auto loaded = name_at(oparg >> 1);
+          if (name_refuse != nullptr) {
+            return name_refuse;
+          }
+          if ((oparg & 0x01) && loaded == "super" &&
+              !matchLoadSuperAttrPattern311(code, bc_it, bc_instrs)
+                   .has_value()) {
+            return "REFUSE_SHAPE_FRONTEND_POLICY";
+          }
+          if (isBannedName(loaded)) {
+            return "REFUSE_SHAPE_FRONTEND_POLICY";
+          }
+        }
+        break;
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Instruction indices reachable from entry through normal control flow
+// only -- exactly the set buildHIR will translate.  Exception-handler
+// regions are reachable solely through the exception table, never enter
+// machine code (a raise exits through the UnhandledException deopt and
+// the anchored evaluator runs the handler), and therefore must not be
+// held to the machine-code whitelist.  Returns false if a jump targets
+// something that is not an instruction start (fail closed).
+bool collectNormalFlowReachable311(
+    BorrowedRef<PyCodeObject> code,
+    std::set<int>& reachable) {
+  BytecodeInstructionBlock bc_instrs{code};
+  std::unordered_map<int, BytecodeInstruction> at_index;
+  for (const auto& instr : bc_instrs) {
+    at_index.emplace(instr.baseIndex().value(), instr);
+  }
+  std::vector<int> worklist{0};
+  while (!worklist.empty()) {
+    int index = worklist.back();
+    worklist.pop_back();
+    if (!reachable.insert(index).second) {
+      continue;
+    }
+    auto it = at_index.find(index);
+    if (it == at_index.end()) {
+      return false;
+    }
+    const BytecodeInstruction& instr = it->second;
+    if (instr.isBranch()) {
+      worklist.push_back(instr.getJumpTarget().asIndex().value());
+    }
+    bool falls_through = !instr.isReturn() && instr.opcode() != RAISE_VARARGS &&
+        instr.opcode() != RERAISE && instr.opcode() != JUMP_FORWARD &&
+        instr.opcode() != JUMP_BACKWARD &&
+        instr.opcode() != JUMP_BACKWARD_NO_INTERRUPT &&
+        instr.opcode() != JUMP_ABSOLUTE;
+    if (falls_through) {
+      int next = instr.nextInstrOffset().asIndex().value();
+      if (at_index.contains(next)) {
+        worklist.push_back(next);
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+#endif
+
+bool isExecuteOpcodeSupported311(int opcode) {
+#if PY_VERSION_HEX < 0x030C0000
+  switch (opcode) {
+    case BEFORE_WITH:
+    case BINARY_OP:
+    case BUILD_CONST_KEY_MAP:
+    case BUILD_LIST:
+    case BUILD_MAP:
+    case BUILD_SET:
+    case BUILD_TUPLE:
+    case CALL:
+    case CALL_FUNCTION_EX:
+    case CHECK_EXC_MATCH:
+    case COMPARE_OP:
+    case CONTAINS_OP:
+    case COPY:
+    case COPY_FREE_VARS:
+    case DELETE_FAST:
+    case DICT_MERGE:
+    case DICT_UPDATE:
+    case EXTENDED_ARG:
+    case FOR_ITER:
+    case GET_ITER:
+    case GET_YIELD_FROM_ITER:
+    case IS_OP:
+    case JUMP_BACKWARD:
+    case JUMP_BACKWARD_NO_INTERRUPT:
+    case JUMP_FORWARD:
+    case KW_NAMES:
+    case LIST_APPEND:
+    case LIST_EXTEND:
+    case LIST_TO_TUPLE:
+    case LOAD_ASSERTION_ERROR:
+    case LOAD_ATTR:
+    case LOAD_CLOSURE:
+    case LOAD_CONST:
+    case LOAD_DEREF:
+    case LOAD_FAST:
+    case LOAD_GLOBAL:
+    case LOAD_METHOD:
+    case MAKE_CELL:
+    case MAKE_FUNCTION:
+    case MAP_ADD:
+    case NOP:
+    case POP_JUMP_BACKWARD_IF_FALSE:
+    case POP_JUMP_BACKWARD_IF_NONE:
+    case POP_JUMP_BACKWARD_IF_NOT_NONE:
+    case POP_JUMP_BACKWARD_IF_TRUE:
+    case POP_JUMP_FORWARD_IF_FALSE:
+    case POP_JUMP_FORWARD_IF_NONE:
+    case POP_EXCEPT:
+    case POP_JUMP_FORWARD_IF_NOT_NONE:
+    case POP_JUMP_FORWARD_IF_TRUE:
+    case POP_TOP:
+    case PRECALL:
+    case PUSH_EXC_INFO:
+    case PUSH_NULL:
+    case RAISE_VARARGS:
+    case RERAISE:
+    case RESUME:
+    case RETURN_GENERATOR:
+    case RETURN_VALUE:
+    case SEND:
+    case SET_ADD:
+    case STORE_ATTR:
+    case STORE_FAST:
+    case SWAP:
+    case UNARY_INVERT:
+    case UNARY_NEGATIVE:
+    case UNARY_NOT:
+    case UNARY_POSITIVE:
+    case UNPACK_EX:
+    case UNPACK_SEQUENCE:
+    case WITH_EXCEPT_START:
+    case YIELD_VALUE:
+      return true;
+    default:
+      return false;
+  }
+#else
+  (void)opcode;
+  return false;
+#endif
+}
+
+ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
+  // family (including LOAD_GLOBAL without a speculative cache Guard,
+  // container builders used by CALL_FUNCTION_EX, MAKE_FUNCTION for
+  // genexp call sites, LOAD_DEREF/LOAD_CLOSURE/COPY_FREE_VARS/MAKE_CELL
+  // for nested-function cells) plus the MR-08 exception family.  The
+  // handler-body opcodes (PUSH_EXC_INFO, CHECK_EXC_MATCH, POP_EXCEPT,
+  // RERAISE, WITH_EXCEPT_START) are reachable only through the exception
+  // table, which HIR never translates.  RAISE_VARARGS,
+  // LOAD_ASSERTION_ERROR and BEFORE_WITH do run in normal flow and have
+  // translations.  MR-09 adds LOAD_ATTR and STORE_ATTR: attribute access
+  // executes through the pull-validated helper caches (or their
+  // guarded/generic fallbacks).  MR-10 adds the generator-body opcodes
+  // (RETURN_GENERATOR, YIELD_VALUE, SEND, GET_YIELD_FROM_ITER) so a
+  // sync CO_GENERATOR that stays on the rest of this whitelist can
+  // install and resume.  Only normal-flow-reachable instructions
+  // are checked: an opcode that occurs solely inside a handler region
+  // executes in the interpreter after the deopt regardless of what it
+  // is, so holding it to the machine-code whitelist would refuse
+  // functions this milestone fully supports.  Still out (on the
+  // reachable surface): subscripts, DELETE_ATTR, STORE_DEREF, except*
+  // and pattern matching (the latter two refused earlier by the
+  // whole-code translate scan, keeping their audited refusals).  The
+  // decoder yields unspecialized opcodes, so quickened forms cannot
+  // slip past.
+  std::set<int> reachable;
+  if (!collectNormalFlowReachable311(code, reachable)) {
+    return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
+  }
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    if (!reachable.contains(bc_it->baseIndex().value())) {
+      continue;
+    }
+    if (!isExecuteOpcodeSupported311(bc_it->opcode())) {
+      return {
+          "REFUSE_SHAPE_EXECUTE_SURFACE",
+          bc_it->opcode(),
+          bc_it->baseOffset().value()};
+    }
+  }
+#else
+  (void)code;
+#endif
+  return {};
+}
+
+const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
+  return unsupportedExecuteDetail311(code).reason;
+}
+
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
 }
@@ -855,6 +1490,23 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
   checkTranslate();
   code_has_backedge_ = codeHasBackedge(code_);
   code_is_simple_numeric_leaf_ = isSimpleNumericLeafFunction(code_);
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (code_->co_flags & kCoFlagsAsyncCode) {
+    JIT_THROW(
+        "async code is unsupported on CPython 3.11 in {}",
+        preloader_.fullname());
+  }
+#if PY_VERSION_HEX >= 0x030B0000
+  const char* shape_reason = unsupportedShapeReason311(code_);
+  if (shape_reason != nullptr) {
+    JIT_THROW(
+        "code shape {} is unsupported on CPython 3.11 in {}",
+        shape_reason,
+        preloader_.fullname());
+  }
+#endif
+#endif
 
   is_simple_leaf_function_ = isSimpleLeafFunction(code_);
 
@@ -943,6 +1595,7 @@ BasicBlock* HIRBuilder::buildHIRImpl(
     Function* irfunc,
     FrameState* frame_state) {
   temps_ = TempAllocator(&irfunc->env);
+  env_ = &irfunc->env;
 
   BytecodeInstructionBlock bc_instrs{code_};
   block_map_ = createBlocks(*irfunc, bc_instrs);
@@ -982,6 +1635,18 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   if (frame_state == nullptr) {
     entry_tc.emit<LoadFrame>();
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 localsplus start as NULL.  Arguments are defined by
+  // LoadArg above; remaining locals need an explicit reaching definition so
+  // LOAD_FAST unbound checks (and LIR Moves) do not see a missing operand
+  // after dead-branch elimination.  Must come after the Load* prologue:
+  // SSAify's verifier rejects LoadFrame after any non-LoadArg/LoadCurrentFunc/
+  // LoadFrame instruction.
+  for (int i = preloader_.numArgs(); i < numLocals(code_); ++i) {
+    entry_tc.emit<LoadConst>(entry_tc.frame.localsplus[i], TNullptr);
+  }
+#endif
 
   // "Initial Yield" has an explicit bytecode instruction in
   // "RETURN_GENERATOR" and so is emitted at the appropriate time.
@@ -1072,6 +1737,18 @@ void HIRBuilder::translate(
   std::deque<TranslationContext> queue = {initial_tc};
   std::unordered_set<BasicBlock*> processed;
   std::unordered_set<BasicBlock*> loop_headers;
+#if PY_VERSION_HEX < 0x030C0000
+  // One record per backward jump: the edge and the frame state AT the
+  // jump, after its stack effect.  The polls these become are inserted
+  // per edge (see insertRunPeriodicActivitesForBackedge), matching stock
+  // 3.11's eval-breaker placement and its traceback position.
+  struct BackedgePoll {
+    BasicBlock* src;
+    BasicBlock* target;
+    FrameState frame;
+  };
+  std::vector<BackedgePoll> backedge_polls;
+#endif
   bool entry_guards_emitted = false;
   bool in_entry_setup = true;
   bool saw_initial_yield = false;
@@ -1112,6 +1789,14 @@ void HIRBuilder::translate(
         JIT_DCHECK(
             tc.frame.stack.isEmpty(),
             "entry guards inserted with non-empty operand stack");
+        // Entry setup is done: arguments are bound and the cell slots
+        // hold their cells, so this is where the frame's observable
+        // localsplus gets its entry snapshot (executing mode, 3.11).
+        // This must precede the annotation guards: their Snapshot is the
+        // dominating FrameState for the instructions that follow, and the
+        // write-through calls are not replayable, so placing them after
+        // the guards would leave that stretch with no resume point.
+        emitLocalsplusWriteback311(tc);
         if (tc.frame.stack.isEmpty()) {
           emitted_entry_guards = emitTypeAnnotationGuards(tc);
         }
@@ -1224,6 +1909,11 @@ void HIRBuilder::translate(
           emitBuildConstKeyMap(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX < 0x030C0000
+        case PRECALL: {
+          break;
+        }
+#endif
         case CALL:
         case CALL_FUNCTION:
         case CALL_FUNCTION_EX:
@@ -1298,7 +1988,7 @@ void HIRBuilder::translate(
           break;
         }
         case LOAD_METHOD: {
-          emitLoadMethod(tc, bc_instr.oparg());
+          emitLoadMethod(tc, bc_instr);
           break;
         }
         case LOAD_METHOD_STATIC: {
@@ -1416,6 +2106,10 @@ void HIRBuilder::translate(
           break;
         }
         case LOAD_GLOBAL: {
+          if (tryEmitLoadMethodOrAttrSuper311(
+                  irfunc.cfg, tc, bc_it, bc_block)) {
+            break;
+          }
           emitLoadGlobal(tc, bc_instr);
           break;
         }
@@ -1430,6 +2124,9 @@ void HIRBuilder::translate(
           BasicBlock* target = getBlockAtOff(target_off);
           if (target_off <= bc_instr.baseOffset() || opcode != JUMP_ABSOLUTE) {
             loop_headers.emplace(target);
+#if PY_VERSION_HEX < 0x030C0000
+            backedge_polls.push_back({tc.block, target, tc.frame});
+#endif
           }
           tc.emit<Branch>(target);
           break;
@@ -1453,21 +2150,55 @@ void HIRBuilder::translate(
           break;
         }
         case POP_JUMP_IF_FALSE:
-        case POP_JUMP_IF_TRUE: {
+        case POP_JUMP_IF_TRUE:
+#if PY_VERSION_HEX < 0x030C0000
+        case POP_JUMP_BACKWARD_IF_FALSE:
+        case POP_JUMP_BACKWARD_IF_TRUE:
+        case POP_JUMP_FORWARD_IF_FALSE:
+        case POP_JUMP_FORWARD_IF_TRUE:
+#endif
+        {
           BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+#if PY_VERSION_HEX < 0x030C0000
+          BasicBlock* jump_block = tc.block;
+#endif
           if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIf(tc, bc_instr);
+#if PY_VERSION_HEX < 0x030C0000
+          if (bc_instr.isBackwardBranch()) {
+            // Recorded after the emit: the poll's frame state is the
+            // post-pop state at the jump.
+            backedge_polls.push_back({jump_block, target, tc.frame});
+          }
+#endif
           break;
         }
         case POP_JUMP_IF_NONE:
-        case POP_JUMP_IF_NOT_NONE: {
+        case POP_JUMP_IF_NOT_NONE:
+#if PY_VERSION_HEX < 0x030C0000
+        case POP_JUMP_BACKWARD_IF_NONE:
+        case POP_JUMP_BACKWARD_IF_NOT_NONE:
+        case POP_JUMP_FORWARD_IF_NONE:
+        case POP_JUMP_FORWARD_IF_NOT_NONE:
+#endif
+        {
           BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+#if PY_VERSION_HEX < 0x030C0000
+          BasicBlock* jump_block = tc.block;
+#endif
           if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIfNone(tc, bc_instr);
+#if PY_VERSION_HEX < 0x030C0000
+          if (bc_instr.isBackwardBranch()) {
+            // Recorded after the emit: the poll's frame state is the
+            // post-pop state at the jump.
+            backedge_polls.push_back({jump_block, target, tc.frame});
+          }
+#endif
           break;
         }
         case POP_ITER:
@@ -1521,10 +2252,12 @@ void HIRBuilder::translate(
           rotateStackTop(tc.frame.stack, bc_instr.oparg());
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case END_ASYNC_FOR: {
           emitEndAsyncFor(tc);
           break;
         }
+#endif
         case END_FOR: {
           // This instruction is only for use when FOR_ITER is specialized for a
           // generator. As we use unspecialized bytecode only, we modify
@@ -1572,6 +2305,7 @@ void HIRBuilder::translate(
           emitBuildSlice(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case GET_AITER: {
           emitGetAIter(tc);
           break;
@@ -1580,6 +2314,7 @@ void HIRBuilder::translate(
           emitGetANext(tc);
           break;
         }
+#endif
         case GET_ITER: {
           if constexpr (PY_VERSION_HEX >= 0x030F0000) {
             if (bc_instr.oparg() > 0) {
@@ -1667,10 +2402,12 @@ void HIRBuilder::translate(
           emitPopJumpIf(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
         case IMPORT_FROM: {
           emitImportFrom(tc, bc_instr);
           break;
         }
+#endif
         case EAGER_IMPORT_NAME:
         case IMPORT_NAME: {
           emitImportName(tc, bc_instr);
@@ -1692,10 +2429,12 @@ void HIRBuilder::translate(
           }
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case GET_AWAITABLE: {
           emitGetAwaitable(irfunc.cfg, tc, bc_instrs, bc_instr);
           break;
         }
+#endif
         case BUILD_STRING: {
           emitBuildString(tc, bc_instr);
           break;
@@ -1737,11 +2476,24 @@ void HIRBuilder::translate(
         case DELETE_FAST: {
           int var_idx = bc_instr.oparg();
           Register* var = tc.frame.localsplus[var_idx];
+#if PY_VERSION_HEX < 0x030C0000
+          // Stock raises UnboundLocalError when the slot is already
+          // empty (the interpreter's DELETE_FAST checks before
+          // clearing); the uninitialized-local TNullptr reaching
+          // definition makes this branch compilable, so without the
+          // check a `del x` on an unbound local would silently succeed.
+          // Gated to 3.11: the 3.12+ translation keeps its existing
+          // shape for reference-line neutrality.
+          tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
+#endif
           moveOverwrittenStackRegisters(tc, var);
           tc.emit<LoadConst>(var, TNullptr);
+          emitStoreFrameLocal311(tc, var_idx, var);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case BEFORE_ASYNC_WITH:
+#endif
         case BEFORE_WITH: {
           emitBeforeWith(tc, bc_instr);
           break;
@@ -1754,6 +2506,7 @@ void HIRBuilder::translate(
           emitSetupWith(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case MATCH_CLASS: {
           emitMatchClass(irfunc.cfg, tc, bc_instr);
           break;
@@ -1770,6 +2523,7 @@ void HIRBuilder::translate(
           emitMatchMappingSequence(irfunc.cfg, tc, Py_TPFLAGS_SEQUENCE);
           break;
         }
+#endif
         case GEN_START: {
           // In the interpreter this instruction behaves like POP_TOP because it
           // assumes a generator will always be sent a superfluous None value to
@@ -1841,10 +2595,15 @@ void HIRBuilder::translate(
           emitStoreGlobal(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case CHECK_EG_MATCH:
+#endif
         case CHECK_EXC_MATCH:
         case CLEANUP_THROW:
+        case POP_EXCEPT:
         case PUSH_EXC_INFO:
+        case RERAISE:
+        case WITH_EXCEPT_START:
           BUILDER_THROW(
               "{} appearing outside of exception handler", opcodeName(opcode));
         default: {
@@ -1943,9 +2702,24 @@ void HIRBuilder::translate(
       "Stashed a KW_NAMES value for function {} but never consumed it",
       irfunc.fullname);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Per-edge polls, not a header-shared check block: stock 3.11 checks the
+  // eval breaker inside the backward-jump handlers, on the taken branch
+  // only, and its traceback for an asynchronous exception names the jump.
+  // A shared check block in front of the header polls the loop-entry
+  // fallthrough and JUMP_BACKWARD_NO_INTERRUPT too -- positions stock
+  // never polls -- and can only carry the header's frame state, a
+  // different bytecode position than stock reports.
+  (void)loop_headers;
+  for (auto& poll : backedge_polls) {
+    insertRunPeriodicActivitesForBackedge(
+        irfunc.cfg, poll.src, poll.target, poll.frame);
+  }
+#else
   for (auto block : loop_headers) {
     insertRunPeriodicActivitesForLoop(irfunc.cfg, block);
   }
+#endif
 }
 
 void BlockCanonicalizer::InsertCopies(
@@ -2353,12 +3127,27 @@ void HIRBuilder::emitBinaryOp(
   // float-only leaf helpers can still lower to the existing unboxed fast paths.
   bool specialize_int_guards = !getConfig().backedge_gated_int_guards ||
       code_has_backedge_ || code_is_simple_numeric_leaf_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 reuses the same quickened BINARY_OP_* opcode for normal and
+  // in-place opargs. The typed fast paths below are only valid for normal
+  // binary operations; in-place operations must keep the generic semantics.
+  bool use_binary_op_type_guards =
+      opcode != BINARY_OP || getBinaryOpKindFromOparg(oparg).has_value();
+#else
+  constexpr bool use_binary_op_type_guards = true;
+#endif
+
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
       case BINARY_OP_MULTIPLY_INT:
       case BINARY_OP_SUBTRACT_INT:
+#if PY_VERSION_HEX < 0x030C0000
+        if (use_binary_op_type_guards) {
+#else
         if (specialize_int_guards) {
+#endif
           tc.emit<GuardType>(left, TLongExact, left, tc.frame);
           tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         }
@@ -2366,12 +3155,16 @@ void HIRBuilder::emitBinaryOp(
       case BINARY_OP_ADD_FLOAT:
       case BINARY_OP_MULTIPLY_FLOAT:
       case BINARY_OP_SUBTRACT_FLOAT:
-        tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
-        tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
+        if (use_binary_op_type_guards) {
+          tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
+          tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
+        }
         break;
       case BINARY_OP_ADD_UNICODE:
-        tc.emit<GuardType>(left, TUnicodeExact, left, tc.frame);
-        tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
+        if (use_binary_op_type_guards) {
+          tc.emit<GuardType>(left, TUnicodeExact, left, tc.frame);
+          tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
+        }
         break;
       case BINARY_SUBSCR_DICT:
       case BINARY_OP_SUBSCR_DICT:
@@ -2931,7 +3724,10 @@ void HIRBuilder::emitCompareOp(
     const jit::BytecodeInstruction& bc_instr) {
   int compare_op = bc_instr.oparg();
 
-  if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+  if constexpr (PY_VERSION_HEX < 0x030C0000) {
+    // CPython 3.11 uses the raw Py_LT..Py_GE values in COMPARE_OP. CPython
+    // 3.12+ packs the compare op with additional flag bits.
+  } else if constexpr (PY_VERSION_HEX >= 0x030E0000) {
     compare_op >>= 5;
   } else {
     compare_op >>= 4;
@@ -3129,7 +3925,17 @@ void HIRBuilder::emitLoadAttr(
     const jit::BytecodeInstruction& bc_instr) {
   int oparg = bc_instr.oparg();
   int name_idx = loadAttrIndex(oparg);
+
+  // Starting in CPython 3.12, LOAD_METHOD is merged into LOAD_ATTR and the low
+  // bit of the oparg selects method mode. CPython 3.11 still has a separate
+  // LOAD_METHOD opcode, so LOAD_ATTR's oparg is a raw name index there.
+#if PY_VERSION_HEX >= 0x030C0000
   bool is_method = (oparg & 1) != 0;
+#else
+  // 3.11 keeps a separate LOAD_METHOD opcode, so LOAD_ATTR's oparg is a raw
+  // name index and this path is never method-mode.
+  bool is_method = false;
+#endif
   int specialized_opcode = getConfig().specialized_opcodes
       ? bc_instr.specializedOpcode()
       : LOAD_ATTR;
@@ -3140,6 +3946,11 @@ void HIRBuilder::emitLoadAttr(
       specialized_opcode == LOAD_ATTR_METHOD_WITH_VALUES;
 #else
   bool method_with_values_fast_path_enabled = false;
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // The slot fast path needs the 3.14 type-version cache; it is out of scope
+  // on 3.11 and stays off (see the attrSlot* stubs above).
+  slot_fast_path_enabled = false;
 #endif
 #ifdef Py_GIL_DISABLED
   slot_fast_path_enabled = false;
@@ -3153,11 +3964,18 @@ void HIRBuilder::emitLoadAttr(
 
   Register* receiver = tc.frame.stack.pop();
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (tryEmitLoadAttrInstanceValue311(tc, bc_instr, receiver, name_idx)) {
+    return;
+  }
+#endif
+
   if (getConfig().specialized_opcodes) {
     switch (specialized_opcode) {
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
-        tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+        auto guard = tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+        receiver = guard->output();
         break;
       }
 #ifndef Py_GIL_DISABLED
@@ -3298,6 +4116,17 @@ void HIRBuilder::emitLoadAttr(
         return;
       }
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+      case LOAD_ATTR_INSTANCE_VALUE: {
+        BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
+        if (owner_type != nullptr) {
+          auto guard = tc.emit<GuardType>(
+              receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
+          receiver = guard->output();
+        }
+        break;
+      }
+#endif
       default:
         break;
     }
@@ -3306,6 +4135,54 @@ void HIRBuilder::emitLoadAttr(
   Register* result = temps_.AllocateStack();
   tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
   tc.frame.stack.push(result);
+}
+
+bool HIRBuilder::tryEmitLoadAttrInstanceValue311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr,
+    Register* receiver,
+    int name_idx) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (!getConfig().specialized_opcodes ||
+      bc_instr.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE) {
+    return false;
+  }
+
+  const _Py_CODEUNIT* instr = codeUnit(code_) + bc_instr.opcodeIndex().value();
+  auto cache = reinterpret_cast<const _PyAttrCache*>(instr + 1);
+  uint32_t type_version = readCacheU32(cache->version);
+  if (type_version == 0) {
+    return false;
+  }
+
+  BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
+  Register* name_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
+
+  Register* type_version_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(type_version_reg, Type::fromCUInt(type_version, TCUInt32));
+
+  Register* index_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      index_reg,
+      Type::fromCUInt(static_cast<uint64_t>(cache->index), TCUInt64));
+
+  Register* result = temps_.AllocateStack();
+  auto call = tc.emit<CallStatic>(
+      4,
+      result,
+      reinterpret_cast<void*>(JITRT_LoadAttrInstanceValueOrGeneric),
+      TOptObject);
+  call->SetOperand(0, receiver);
+  call->SetOperand(1, name_reg);
+  call->SetOperand(2, type_version_reg);
+  call->SetOperand(3, index_reg);
+  tc.emit<CheckExc>(result, result, tc.frame);
+  tc.frame.stack.push(result);
+  return true;
+#else
+  return false;
+#endif
 }
 
 void HIRBuilder::emitLoadMethod(TranslationContext& tc, int name_idx) {
@@ -3318,25 +4195,201 @@ void HIRBuilder::emitLoadMethod(TranslationContext& tc, int name_idx) {
   tc.frame.stack.push(method_instance);
 }
 
+void HIRBuilder::emitLoadMethod(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  if (tryEmitLoadMethodWithValues311(tc, bc_instr)) {
+    return;
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  // Mirror the LOAD_ATTR_MODULE pattern: a quickened module-method site
+  // guards the receiver as a module, which is the type proof the
+  // pull-validated LoadModuleMethodCached rewrite needs.  A non-module
+  // receiver fails the guard and re-executes LOAD_METHOD in the
+  // interpreter.
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == LOAD_METHOD_MODULE) {
+    Register* receiver = tc.frame.stack.pop();
+    Type type = Type::fromTypeExact(&PyModule_Type);
+    auto guard = tc.emit<GuardType>(receiver, type, receiver, tc.frame);
+    tc.frame.stack.push(guard->output());
+  }
+#endif
+  emitLoadMethod(tc, bc_instr.oparg());
+}
+
+bool HIRBuilder::tryEmitLoadMethodWithValues311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state == jit::State::kRunning ||
+      !getConfig().specialized_opcodes ||
+      bc_instr.specializedOpcode() != LOAD_METHOD_WITH_VALUES) {
+    return false;
+  }
+
+  const _Py_CODEUNIT* instr = codeUnit(code_) + bc_instr.opcodeIndex().value();
+  auto cache = reinterpret_cast<const _PyLoadMethodCache*>(instr + 1);
+  uint32_t type_version = readCacheU32(cache->type_version);
+  uint32_t keys_version = readCacheU32(cache->keys_version);
+  if (type_version == 0 || keys_version == 0) {
+    return false;
+  }
+
+  PyObject* descr = readCacheObj(cache->descr);
+  if (descr == nullptr || !PyFunction_Check(descr)) {
+    return false;
+  }
+
+  auto func = reinterpret_cast<PyFunctionObject*>(descr);
+  BorrowedRef<PyTypeObject> owner_type =
+      resolveMethodOwnerType(func, preloader_.globals());
+  if (owner_type == nullptr || owner_type->tp_version_tag != type_version ||
+      !PyType_HasFeature(owner_type, Py_TPFLAGS_MANAGED_DICT)) {
+    return false;
+  }
+
+  BorrowedRef<PyHeapTypeObject> heap_type{owner_type};
+  PyDictKeysObject* keys = heap_type->ht_cached_keys;
+  if (keys == nullptr || keys->dk_version != keys_version) {
+    return false;
+  }
+
+  Register* receiver = tc.frame.stack.pop();
+  Type expected_receiver_type = Type::fromTypeExact(owner_type);
+  if (!receiver->isA(expected_receiver_type)) {
+    auto guard = tc.emit<GuardType>(
+        receiver, expected_receiver_type, receiver, tc.frame);
+    receiver = guard->output();
+  }
+
+  auto emit_guard =
+      [&](Register* condition, Register* guilty, const char* descr) {
+        auto guard = tc.emit<Guard>(condition);
+        guard->setFrameState(tc.frame);
+        guard->setGuiltyReg(guilty);
+        guard->setDescr(descr);
+      };
+
+  Register* owner = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      owner, Type::fromObject(env_->addReference(BorrowedRef<>{owner_type})));
+
+  Register* current_type_version = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      current_type_version,
+      owner,
+      "tp_version_tag",
+      offsetof(PyTypeObject, tp_version_tag),
+      TCUInt32);
+  Register* expected_type_version = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      expected_type_version, Type::fromCUInt(type_version, TCUInt32));
+  Register* type_version_matches = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      type_version_matches,
+      PrimitiveCompareOp::kEqual,
+      current_type_version,
+      expected_type_version);
+  emit_guard(type_version_matches, receiver, "LOAD_METHOD type version");
+
+  Register* dict_ptr = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      dict_ptr, receiver, "__dict__", -3 * sizeof(PyObject*), TCUInt64);
+  Register* zero = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt64));
+  Register* no_dict = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      no_dict, PrimitiveCompareOp::kEqual, dict_ptr, zero);
+  emit_guard(no_dict, receiver, "LOAD_METHOD managed dict check");
+
+  Register* keys_ptr = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      keys_ptr,
+      owner,
+      "ht_cached_keys",
+      offsetof(PyHeapTypeObject, ht_cached_keys),
+      TCUInt64);
+  Register* keys_obj = temps_.AllocateNonStack();
+  tc.emit<BitCast>(keys_obj, keys_ptr, TOptObject);
+  Register* current_keys_version = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      current_keys_version,
+      keys_obj,
+      "dk_version",
+      offsetof(PyDictKeysObject, dk_version),
+      TCUInt32);
+  Register* expected_keys_version = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      expected_keys_version, Type::fromCUInt(keys_version, TCUInt32));
+  Register* keys_version_matches = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      keys_version_matches,
+      PrimitiveCompareOp::kEqual,
+      current_keys_version,
+      expected_keys_version);
+  emit_guard(keys_version_matches, receiver, "LOAD_METHOD keys version");
+
+  Register* func_reg = temps_.AllocateStack();
+  tc.emit<LoadConst>(
+      func_reg,
+      Type::fromObject(
+          env_->addReference(BorrowedRef<PyFunctionObject>{func})));
+  tc.frame.stack.push(func_reg);
+  tc.frame.stack.push(receiver);
+  return true;
+#else
+  return false;
+#endif
+}
+
 void HIRBuilder::emitLoadMethodOrAttrSuper(
     CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr,
     bool load_method) {
-  TranslationContext deopt_path{cfg.AllocateBlock(), tc.frame};
+  // Deopting from this instruction re-executes LOAD_SUPER_ATTR, which pops
+  // its three inputs, so the deopt frame is captured before the pops.
+  FrameState deopt_state{tc.frame};
   Register* receiver = tc.frame.stack.pop();
   Register* type = tc.frame.stack.pop();
   Register* global_super = tc.frame.stack.pop();
-  Register* result = temps_.AllocateStack();
 
   int oparg = bc_instr.oparg();
   int name_idx = oparg >> 2;
   load_method = oparg & 1;
   bool no_args_in_super_call = !(oparg & 2);
 
+  emitLoadMethodOrAttrSuper(
+      cfg,
+      tc,
+      name_idx,
+      global_super,
+      type,
+      receiver,
+      load_method,
+      no_args_in_super_call,
+      bc_instr.baseOffset(),
+      deopt_state);
+}
+
+void HIRBuilder::emitLoadMethodOrAttrSuper(
+    CFG& cfg,
+    TranslationContext& tc,
+    int name_idx,
+    Register* global_super,
+    Register* type,
+    Register* receiver,
+    bool load_method,
+    bool no_args_in_super_call,
+    BCOffset deopt_off,
+    const FrameState& deopt_state) {
+  TranslationContext deopt_path{cfg.AllocateBlock(), deopt_state};
+  Register* result = temps_.AllocateStack();
+
   // This is assumed to be a type object by the rest of the JIT.  Ideally it
   // would be typed by whatever pushes it onto the stack.
-  deopt_path.frame.cur_instr_offs = bc_instr.baseOffset();
+  deopt_path.frame.cur_instr_offs = deopt_off;
   deopt_path.emitSnapshot();
   deopt_path.emit<Deopt>();
   BasicBlock* fast_path = cfg.AllocateBlock();
@@ -3369,6 +4422,88 @@ void HIRBuilder::emitLoadMethodOrAttrSuper(
   tc.emit<GetSecondOutput>(method_instance, TOptObject, result);
   tc.frame.stack.push(result);
   tc.frame.stack.push(method_instance);
+}
+
+bool HIRBuilder::tryEmitLoadMethodOrAttrSuper311(
+    CFG& cfg,
+    TranslationContext& tc,
+    jit::BytecodeInstructionBlock::Iterator& bc_it,
+    const jit::BytecodeInstructionBlock& bc_block) {
+  auto pattern = matchLoadSuperAttrPattern311(code_, bc_it, bc_block);
+  if (!pattern.has_value()) {
+    return false;
+  }
+
+  BytecodeInstruction load_global = *bc_it;
+  Register* global_super = temps_.AllocateStack();
+  tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
+
+  Register* type = temps_.AllocateStack();
+  Register* receiver = nullptr;
+
+  if (pattern->no_args_in_super_call) {
+    int class_idx = -1;
+    for (int i = 0; i < numLocalsplus(code_); ++i) {
+      PyObject* name = getVarname(code_, i);
+      if (PyUnicode_CompareWithASCIIString(name, "__class__") == 0) {
+        class_idx = i;
+        break;
+      }
+    }
+    if (class_idx < 0 || numLocals(code_) == 0) {
+      return false;
+    }
+
+    Register* type_cell = tc.frame.localsplus[class_idx];
+    tc.emit<LoadCellItem>(type, type_cell);
+    BorrowedRef<> class_name = getVarname(code_, class_idx);
+    if (class_idx < PyCode_GetFirstFree(code_)) {
+      tc.emit<CheckVar>(type, type, class_name, tc.frame);
+    } else {
+      tc.emit<CheckFreevar>(type, type, class_name, tc.frame);
+    }
+
+    receiver = tc.frame.localsplus[0];
+    BorrowedRef<> receiver_name = getVarname(code_, 0);
+#if PY_VERSION_HEX < 0x030C0000
+    _PyLocals_Kind receiver_kind =
+        _PyLocals_GetKind(code_->co_localspluskinds, 0);
+    if (receiver_kind & CO_FAST_CELL) {
+      Register* receiver_cell = receiver;
+      receiver = temps_.AllocateStack();
+      tc.emit<LoadCellItem>(receiver, receiver_cell);
+    }
+#endif
+    tc.emit<CheckVar>(receiver, receiver, receiver_name, tc.frame);
+  } else {
+    tc.emit<LoadGlobal>(type, pattern->type_global_idx, tc.frame);
+    receiver = tc.frame.localsplus[pattern->receiver_local_idx];
+    tc.emit<CheckVar>(
+        receiver,
+        receiver,
+        getVarname(code_, pattern->receiver_local_idx),
+        tc.frame);
+  }
+
+  // Deopting resumes at the LOAD_GLOBAL that begins the matched sequence;
+  // none of the synthesized registers were pushed onto the operand stack, so
+  // the current frame is the correct resume state.
+  emitLoadMethodOrAttrSuper(
+      cfg,
+      tc,
+      pattern->name_idx,
+      global_super,
+      type,
+      receiver,
+      pattern->load_method,
+      pattern->no_args_in_super_call,
+      load_global.baseOffset(),
+      tc.frame);
+
+  for (int i = 0; i < pattern->instrs_to_skip_after_super; ++i) {
+    ++bc_it;
+  }
+  return true;
 }
 
 void HIRBuilder::emitMakeCell(TranslationContext& tc, int local_idx) {
@@ -3499,7 +4634,12 @@ void HIRBuilder::emitLoadFast(
     const jit::BytecodeInstruction& bc_instr) {
   int var_idx = bc_instr.oparg();
   Register* var = tc.frame.localsplus[var_idx];
-  if (bc_instr.opcode() == LOAD_FAST_CHECK) {
+#if PY_VERSION_HEX < 0x030C0000
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST;
+#else
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST_CHECK;
+#endif
+  if (needs_unbound_check) {
     tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
   }
   tc.frame.stack.push(var);
@@ -4036,12 +5176,104 @@ void HIRBuilder::emitSequenceSet(
       element_type_from_seq_type(oparg));
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr,
+    int name_idx,
+    Register* result) {
+  if (!getConfig().stable_frame || bc_instr.opcode() != LOAD_GLOBAL) {
+    return false;
+  }
+
+  BorrowedRef<PyDictObject> globals = preloader_.globals();
+  if (globals->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
+    return false;
+  }
+
+  BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
+  PyObject* value = PyDict_GetItemWithError(globals, name);
+  if (value == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return false;
+  }
+
+  Py_ssize_t index = -1;
+  uint32_t keys_version = 0;
+  if (bc_instr.specializedOpcode() == LOAD_GLOBAL_MODULE) {
+    const _Py_CODEUNIT* instr =
+        codeUnit(code_) + bc_instr.opcodeIndex().value();
+    auto cache = reinterpret_cast<const _PyLoadGlobalCache*>(instr + 1);
+    keys_version = readCacheU32(cache->module_keys_version);
+    index = cache->index;
+  } else {
+    index = findActiveUnicodeDictEntryIndex(globals, name, value);
+    if (index < 0) {
+      return false;
+    }
+    keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+  }
+  if (keys_version == 0) {
+    return false;
+  }
+
+  Register* globals_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      globals_reg,
+      Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
+
+  Register* name_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
+
+  Register* keys_version_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(keys_version_reg, Type::fromCUInt(keys_version, TCUInt32));
+
+  Register* index_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
+
+  auto call = tc.emit<CallStatic>(
+      4,
+      result,
+      reinterpret_cast<void*>(JITRT_LoadGlobalModuleValue),
+      TOptObject);
+  call->SetOperand(0, globals_reg);
+  call->SetOperand(1, name_reg);
+  call->SetOperand(2, keys_version_reg);
+  call->SetOperand(3, index_reg);
+
+  tc.emitSnapshot();
+  auto guard = tc.emit<Guard>(result);
+  guard->setFrameState(tc.frame);
+  guard->setGuiltyReg(result);
+  guard->setDescr(
+      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+
+  tc.emit<RefineType>(result, TObject, result);
+  return true;
+}
+#endif
+
 void HIRBuilder::emitLoadGlobal(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   int name_idx = loadGlobalIndex(bc_instr.oparg());
   Register* result = temps_.AllocateStack();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Snapshot the pre-opcode stack so a GuardFailure re-executes
+  // LOAD_GLOBAL without a second PUSH_NULL.  The NULL (oparg & 1) is
+  // pushed only after the guard succeeds.
+  bool fast = tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
+  if (bc_instr.oparg() & 1) {
+    emitPushNull(tc);
+  }
+  if (!fast) {
+    tc.emit<LoadGlobal>(result, name_idx, tc.frame);
+  }
+  tc.frame.stack.push(result);
+#else
   if constexpr (PY_VERSION_HEX < 0x030E0000) {
     if (bc_instr.oparg() & 1) {
       emitPushNull(tc);
@@ -4080,6 +5312,7 @@ void HIRBuilder::emitLoadGlobal(
       emitPushNull(tc);
     }
   }
+#endif
 }
 
 void HIRBuilder::emitMakeFunction(
@@ -4288,13 +5521,23 @@ void HIRBuilder::emitPopJumpIf(
   auto opcode = bc_instr.opcode();
   switch (opcode) {
     case POP_JUMP_IF_ZERO:
-    case POP_JUMP_IF_FALSE: {
+    case POP_JUMP_IF_FALSE:
+#if PY_VERSION_HEX < 0x030C0000
+    case POP_JUMP_BACKWARD_IF_FALSE:
+    case POP_JUMP_FORWARD_IF_FALSE:
+#endif
+    {
       true_offset = bc_instr.nextInstrOffset();
       false_offset = bc_instr.getJumpTarget();
       break;
     }
     case POP_JUMP_IF_NONZERO:
-    case POP_JUMP_IF_TRUE: {
+    case POP_JUMP_IF_TRUE:
+#if PY_VERSION_HEX < 0x030C0000
+    case POP_JUMP_BACKWARD_IF_TRUE:
+    case POP_JUMP_FORWARD_IF_TRUE:
+#endif
+    {
       true_offset = bc_instr.getJumpTarget();
       false_offset = bc_instr.nextInstrOffset();
       break;
@@ -4311,7 +5554,14 @@ void HIRBuilder::emitPopJumpIf(
   BasicBlock* false_block = getBlockAtOff(false_offset);
 
   if (bc_instr.opcode() == POP_JUMP_IF_FALSE ||
-      bc_instr.opcode() == POP_JUMP_IF_TRUE) {
+      bc_instr.opcode() == POP_JUMP_IF_TRUE
+#if PY_VERSION_HEX < 0x030C0000
+      || bc_instr.opcode() == POP_JUMP_BACKWARD_IF_FALSE ||
+      bc_instr.opcode() == POP_JUMP_BACKWARD_IF_TRUE ||
+      bc_instr.opcode() == POP_JUMP_FORWARD_IF_FALSE ||
+      bc_instr.opcode() == POP_JUMP_FORWARD_IF_TRUE
+#endif
+  ) {
     Register* is_true = temps_.AllocateNonStack();
     // In 3.14+ coercion to exactly Py_True or Py_False is performed by earlier
     // instructions. See GH-106008.
@@ -4343,6 +5593,10 @@ void HIRBuilder::emitPopJumpIfNone(
   tc.emit<LoadConst>(none, Type::fromObject(Py_None));
   auto is_true = temps_.AllocateNonStack();
   auto op = bc_instr.opcode() == POP_JUMP_IF_NONE
+#if PY_VERSION_HEX < 0x030C0000
+          || bc_instr.opcode() == POP_JUMP_BACKWARD_IF_NONE ||
+          bc_instr.opcode() == POP_JUMP_FORWARD_IF_NONE
+#endif
       ? PrimitiveCompareOp::kEqual
       : PrimitiveCompareOp::kNotEqual;
   tc.emit<PrimitiveCompare>(is_true, op, var, none);
@@ -4412,6 +5666,61 @@ void HIRBuilder::moveOverwrittenStackRegisters(
     }
   }
 }
+// MR-08 frame observability (3.11, executing mode): the materialized
+// _PyInterpreterFrame is what sys._getframe() / frame.f_locals /
+// sys._current_frames() readers see while machine code runs.  Stock 3.11
+// keeps localsplus current at every store, so mirror that: seed the frame
+// with the entry bindings (arguments and cells) once the entry setup is
+// done, and write every STORE_FAST / DELETE_FAST through.  Values keep
+// living in registers for computation; the frame's copy is for observers,
+// owned by the frame and released by the existing clear paths
+// (JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear).
+void HIRBuilder::emitStoreFrameLocal311(
+    [[maybe_unused]] TranslationContext& tc,
+    [[maybe_unused]] int idx,
+    [[maybe_unused]] Register* value) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  Register* idx_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      idx_reg, Type::fromCUInt(static_cast<uint64_t>(idx), TCUInt64));
+  Register* out = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      2, out, reinterpret_cast<void*>(JITRT_StoreFrameLocal311), TCUInt64);
+  call->SetOperand(0, idx_reg);
+  call->SetOperand(1, value);
+#endif
+}
+
+void HIRBuilder::emitLocalsplusWriteback311(
+    [[maybe_unused]] TranslationContext& tc) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  bool emitted = false;
+  for (std::size_t i = 0; i < tc.frame.localsplus.size(); i++) {
+    Register* value = tc.frame.localsplus[i];
+    if (value == nullptr || value->isA(TNullptr)) {
+      // Unbound slots are already null in the frame.
+      continue;
+    }
+    emitStoreFrameLocal311(tc, static_cast<int>(i), value);
+    emitted = true;
+  }
+  if (emitted) {
+    // The write-through calls are not replayable, so any Snapshot before
+    // them no longer dominates what follows; re-establish the resume
+    // point here.  The boundary logic reuses a trailing Snapshot in
+    // place, which would otherwise leave the stretch up to the next
+    // boundary with no FrameState for bindGuards to bind.
+    tc.emitSnapshot();
+  }
+#endif
+}
+
 void HIRBuilder::emitStoreFast(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
@@ -4420,6 +5729,7 @@ void HIRBuilder::emitStoreFast(
   JIT_DCHECK(dst != nullptr, "no register");
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, bc_instr.oparg(), dst);
 }
 
 void HIRBuilder::emitStoreFastStoreFast(
@@ -4439,11 +5749,16 @@ void HIRBuilder::emitStoreFastStoreFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // Stock executes the fused superinstruction as two SETLOCALs in order:
+  // the first slot's write-through (and its old-value release, which can
+  // run reentrant code) completes before the second store begins.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   src = tc.frame.stack.pop();
   dst = tc.frame.localsplus[var_idx2];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, var_idx2, dst);
 }
 
 void HIRBuilder::emitStoreFastLoadFast(
@@ -4463,6 +5778,10 @@ void HIRBuilder::emitStoreFastLoadFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // The fused store's write-through (and old-value release) completes
+  // before the load half runs, matching stock's SETLOCAL-then-GETLOCAL
+  // order.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   Register* var = tc.frame.localsplus[var_idx2];
   tc.frame.stack.push(var);
@@ -5950,6 +7269,67 @@ void HIRBuilder::insertRunPeriodicActivitesForLoop(
   insertRunPeriodicActivites(cfg, check_block, loop_header, *fs);
 }
 
+void HIRBuilder::insertRunPeriodicActivitesForBackedge(
+    CFG& cfg,
+    BasicBlock* src,
+    BasicBlock* target,
+    const FrameState& frame) {
+  // One poll per back edge, on the taken path only.  This is stock 3.11's
+  // shape exactly: the eval-breaker check runs inside the backward-jump
+  // handlers on the taken branch, so the loop-entry fallthrough never
+  // polls and JUMP_BACKWARD_NO_INTERRUPT never polls.  The header-shared
+  // alternative -- one check block in front of the loop header, fed by
+  // every predecessor -- polls both of those, and can only name the
+  // header's frame state.
+  //
+  // Two frame states serve two consumers.  The service itself
+  // (RunPeriodicTasks) carries the state AT the jump: a failure there is
+  // stock's "exception raised by the eval-breaker check inside the jump
+  // handler", whose traceback names the jump -- the deopt's default
+  // advance reproduces that, and a failure never resumes, so the advanced
+  // position is never executed.  The bytecode-boundary snapshots around it
+  // carry the TARGET's entry state: an instrumentation transition observed
+  // by the polls after them resumes at the jump target, which the jump has
+  // already reached -- resuming at the jump itself would execute it a
+  // second time against a stack that already had its operand popped.
+  auto check_block = cfg.AllocateBlock();
+  Instr* terminator = src->GetTerminator();
+  JIT_CHECK(terminator != nullptr, "backedge source has no terminator");
+  bool retargeted = false;
+  for (std::size_t i = 0; i < terminator->numEdges(); i++) {
+    if (terminator->successor(i) == target) {
+      terminator->set_successor(i, check_block);
+      retargeted = true;
+    }
+  }
+  JIT_CHECK(
+      retargeted,
+      "backedge from block {} no longer targets block {}",
+      src->id,
+      target->id);
+
+  auto snap = target->entrySnapshot();
+  JIT_CHECK(snap != nullptr, "block {} has no entry snapshot", target->id);
+  auto target_fs = snap->frameState();
+  JIT_CHECK(
+      target_fs != nullptr,
+      "entry snapshot for block {} has no FrameState",
+      target->id);
+
+  TranslationContext check(check_block, *target_fs);
+  TranslationContext body(cfg.AllocateBlock(), *target_fs);
+  if constexpr (kFreeThreadedBuild) {
+    check.emit<AtQuiescentState>();
+  }
+  Register* eval_breaker = temps_.AllocateStack();
+  check.emit<LoadEvalBreaker>(eval_breaker);
+  check.emit<CondBranch>(eval_breaker, body.block, target);
+  body.emitSnapshot();
+  body.emit<RunPeriodicTasks>(temps_.AllocateStack(), frame);
+  body.emitSnapshot();
+  body.emit<Branch>(target);
+}
+
 void HIRBuilder::insertRunPeriodicActivitesForExcept(
     CFG& cfg,
     TranslationContext& tc) {
@@ -5973,15 +7353,29 @@ BorrowedRef<> HIRBuilder::constArg(const BytecodeInstruction& bc_instr) {
 void HIRBuilder::checkTranslate() {
   PyObject* names = code_->co_names;
   std::unordered_set<Py_ssize_t> banned_name_ids;
+#if PY_VERSION_HEX < 0x030C0000
+  const char* name_refuse = nullptr;
+  auto name_at = [&](Py_ssize_t i) {
+    return nameAtOrRefuse(names, i, &name_refuse);
+  };
+#else
   auto name_at = [&](Py_ssize_t i) {
     return std::string_view(PyUnicode_AsUTF8(PyTuple_GET_ITEM(names, i)));
   };
+#endif
   for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
     if (isBannedName(name_at(i))) {
       banned_name_ids.insert(i);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (name_refuse != nullptr) {
+      throw std::runtime_error{name_refuse};
+    }
+#endif
   }
-  for (auto& bci : BytecodeInstructionBlock{code_}) {
+  BytecodeInstructionBlock bc_instrs{code_};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    auto bci = *bc_it;
     auto opcode = bci.opcode();
     int oparg = bci.oparg();
     if (!isSupportedOpcode(opcode)) {
@@ -5992,13 +7386,22 @@ void HIRBuilder::checkTranslate() {
           opcode,
           opcodeName(opcode))};
     } else if (opcode == LOAD_GLOBAL) {
-      if ((oparg & 0x01) && name_at(oparg >> 1) == "super") {
-        // LOAD_GLOBAL NULL + super, super isn't being used with a
-        // LOAD_SUPER_ATTR.
-        throw std::runtime_error{fmt::format(
-            "Cannot compile {} to HIR because it uses super() without an "
-            "attribute or method after it",
-            preloader_.fullname())};
+      auto loaded = name_at(oparg >> 1);
+#if PY_VERSION_HEX < 0x030C0000
+      if (name_refuse != nullptr) {
+        throw std::runtime_error{name_refuse};
+      }
+#endif
+      if ((oparg & 0x01) && loaded == "super") {
+        if (!matchLoadSuperAttrPattern311(code_, bc_it, bc_instrs)
+                 .has_value()) {
+          // LOAD_GLOBAL NULL + super, super isn't being used with a
+          // LOAD_SUPER_ATTR or a CPython 3.11 super().attr/method sequence.
+          throw std::runtime_error{fmt::format(
+              "Cannot compile {} to HIR because it uses super() without an "
+              "attribute or method after it",
+              preloader_.fullname())};
+        }
       }
       oparg = oparg >> 1;
       if (banned_name_ids.contains(oparg)) {

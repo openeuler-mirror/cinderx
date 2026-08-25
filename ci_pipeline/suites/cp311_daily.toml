@@ -1,0 +1,105 @@
+# CPython 3.11 daily-tier arms (dev plan v2.1, MR-01 build matrix).
+#
+# Heavier legs than the PR gate: the ASAN compile leg and the full
+# RuntimeTests census.  The 3.14 reference-line differential (§3.5 of the
+# plan) needs a 3.14 toolchain and runs on the 3.14 runner via
+# ci_pipeline/scripts/rt314_differential.sh; it has no job here.
+
+fail_fast = false
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+# MR-02 acceptance item 9, wired here: the full source set compiles under
+# AddressSanitizer.  Running instrumented suites is a later leg.
+# Runner provisioning: needs the libasan runtime package (the gcc packaging
+# ships only a dangling libasan.so symlink without it).
+[[jobs]]
+name = "asan_build_311"
+command = "bash -lc 'ci_pipeline/scripts/run_asan_build_311.sh \"{run_dir}/asan-build\"'"
+
+# Full RuntimeTests census: must run to completion (a crash fails), and the
+# green baseline must hold inside the same run.
+# Baseline self-extension guard, fail-closed: the scheduler MUST pass the
+# merge-base SHA as RT311_BASELINE_BASE (the job refuses to start without
+# it, and the script refuses an unresolvable ref).  While the baseline
+# file does not yet exist at the protected base, the script pins the
+# committed baseline to the audited bootstrap digest instead.
+[[jobs]]
+name = "runtime_tests_311_census"
+command = "bash -lc ': ${{RT311_BASELINE_BASE:?RT311_BASELINE_BASE must be set to the merge-base SHA by the scheduler}} && ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-census-build\" --census'"
+
+# The full driver suite under the stage-default judges: every driver runs a
+# real child workload and the capability-gate expectations must hold.  This
+# keeps the drivers themselves regression-protected between the MRs that
+# flip their judges.
+[[jobs]]
+name = "jit311_drivers"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners'"
+
+# Debug arm of the build matrix: assertions and -O0 compile the full set.
+[[jobs]]
+name = "debug_build_311"
+command = "bash -lc 'ci_pipeline/scripts/run_debug_build_311.sh \"{run_dir}/debug-build\"'"
+
+# Completion-oriented pyperformance leg: the provisioned package's own
+# applicable set (`pyperformance list`), one name at a time so a dead
+# worker keeps its identity. Worker crashes, unknown rejects and
+# supported-opcode failures are red. pyperformance==1.13.0 is the MR-03
+# pin (docs/cp311-anchor.md). The 33-name pyperf_benchmarks.txt tranche
+# remains the local `--pyperf` shortcut; daily must not shrink to it.
+# A runner that cannot provision the pin fails loud.
+[[jobs]]
+name = "jit311_pyperf_completeness"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperformance-all'"
+
+# MR-03 completeness bar: actually execute the frozen 440-module regrtest
+# surface and the full test_cinderx tree under shadow (interpreter runs the
+# tests; the compiler discards the artifact). The 72-module import driver
+# on the PR gate is only the MR-05 canary. Per-module and per-case
+# completeness is written to completeness.json; worker crashes, unknown
+# rejects and any machine-code side effect are red.
+# The same completion leg under canary execution (MR-04): benchmark
+# drivers must finish with a closed ledger while eligible machinery
+# functions genuinely execute machine code in the driver process.
+# Each worker attests its own mode, allocator and wheel, and the leg
+# rejects a run where the workers neither executed machine code nor
+# refused anything.  The canary tranche is the committed benchmark
+# list, not the full applicable set -- the leg prints its own coverage,
+# and full-surface completeness stays on the shadow job above.
+[[jobs]]
+name = "jit311_pyperf_canary"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-canary'"
+
+# MR-11 acceptance: the execute completion leg covers the full applicable
+# set in the product spelling, three consecutive rounds, zero worker
+# crashes in every round.  Each worker attests its mode; a round that
+# crashes or leaves the ledger open is red on its own.
+[[jobs]]
+name = "jit311_pyperf_execute"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf-execute-all --rounds 3'"
+
+# MR-11 acceptance 11: the 72-module surface under execute must match
+# stock per testcase (importing a module is not running it), and the leg
+# fails closed unless the execute arm actually entered machine code.
+[[jobs]]
+name = "libtest_execute_diff_72"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py execute-gate --out \"{run_dir}/libtest-execute\"'"
+
+# MR-11 acceptance 14: regrtest -R over the execute mode, on a Py_DEBUG
+# CPython 3.11.6 the leg builds and caches itself.  Fails closed on its
+# own premises (debug interpreter, CinderX loaded, evaluator installed,
+# machine code entered) before reading any verdict, and "memory blocks"
+# figures are verified by quickened_artifact.py rather than believed --
+# the vendored evaluator's _Py_QuickenedCount double-copy makes
+# regrtest's derived figure unsound (mechanism: quickened_artifact.py's
+# module docstring).
+[[jobs]]
+name = "jit311_refleak_execute"
+command = "bash -lc 'ci_pipeline/scripts/run_refleak_311.sh \"{run_dir}/refleak\"'"
+
+[[jobs]]
+name = "jit311_shadow_surface"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --shadow-surface --out \"{run_dir}/shadow-surface\"'"

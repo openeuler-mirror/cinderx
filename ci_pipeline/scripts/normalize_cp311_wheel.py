@@ -54,7 +54,11 @@ NEEDED_ALLOWLIST = {
 PROVENANCE_PATH = "cinderx/_native/build_info_311.json"
 NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]")
 DECLARE_RE = re.compile(r"cinderx_declare_dependency\(\s*([\w-]+)\s+(\S+)\s+(\S+)", re.S)
-DEPENDENCY_MANIFESTS = ("CMakeLists.txt", "cinderx/RuntimeTests/CMakeLists.txt")
+# The release provenance contract covers what ships in the wheel; the
+# RuntimeTests manifest holds test-only dependencies (googletest), which
+# deliberately stay on a tag until the mirror lineages are unified
+# (issue #18) and therefore are not held to the commit-SHA rule.
+DEPENDENCY_MANIFESTS = ("CMakeLists.txt",)
 
 
 class NormalizeError(Exception):

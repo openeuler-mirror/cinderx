@@ -111,6 +111,14 @@ bool checkCFG(const Function& func, std::ostream& err) {
 void checkPhi(CheckEnv& env) {
   auto& phi = static_cast<const Phi&>(*env.instr);
   auto block = phi.block();
+  if (phi.NumOperands() == 0) {
+    fmt::print(
+        env.err,
+        "ERROR: Empty Phi instruction '{}' in bb {}\n",
+        phi,
+        block->id);
+    env.ok = false;
+  }
   std::unordered_set<const BasicBlock*> preds;
   for (auto edge : block->in_edges()) {
     preds.emplace(edge->from());
@@ -362,6 +370,9 @@ Register* SSAify::getDefine(SSABasicBlock* ssablock, Register* reg) {
           (it->IsLoadArg() || it->IsLoadCurrentFunc() || it->IsLoadFrame())) {
         ++it;
       }
+      JIT_CHECK(
+          it != ssablock->block->end(),
+          "SSAify: entry block has no insertion point for unbound local");
       null_reg_ = env_->AllocateRegister();
       auto loadnull = LoadConst::create(null_reg_, TNullptr);
       loadnull->copyBytecodeOffset(*it);

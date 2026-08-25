@@ -152,6 +152,54 @@ BB %6
 
 #if defined(CINDER_AARCH64)
 
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(LIRPostGenerationRewriteTest, LegalizesBothSelectImmediateValues) {
+  Function func;
+  BasicBlock* block = func.allocateBasicBlock();
+  Instruction* condition = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutVReg{DataType::k32bit},
+      Imm{1, DataType::k32bit});
+  Instruction* select64 = block->allocateInstr(
+      Instruction::kSelect,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      VReg{condition},
+      Imm{0, DataType::k64bit},
+      Imm{UINT64_MAX, DataType::k64bit});
+  Instruction* select32 = block->allocateInstr(
+      Instruction::kSelect,
+      nullptr,
+      OutVReg{DataType::k32bit},
+      VReg{condition},
+      Imm{0, DataType::k32bit},
+      Imm{UINT32_MAX, DataType::k32bit});
+
+  codegen::Environ env;
+  PostGenerationRewrite(&func, &env).run();
+
+  auto expect_materialized = [](Instruction* select,
+                                size_t input_idx,
+                                DataType data_type,
+                                uint64_t value) {
+    ASSERT_TRUE(select->getInput(input_idx)->isLinked());
+    auto* linked = static_cast<LinkedOperand*>(select->getInput(input_idx));
+    Instruction* move = linked->getLinkedInstr();
+    ASSERT_TRUE(move->isMove());
+    EXPECT_EQ(move->output()->dataType(), data_type);
+    ASSERT_TRUE(move->getInput(0)->isImm());
+    EXPECT_EQ(move->getInput(0)->dataType(), data_type);
+    EXPECT_EQ(move->getInput(0)->getConstant(), value);
+  };
+
+  expect_materialized(select64, 1, DataType::k64bit, 0);
+  expect_materialized(select64, 2, DataType::k64bit, UINT64_MAX);
+  expect_materialized(select32, 1, DataType::k32bit, 0);
+  expect_materialized(select32, 2, DataType::k32bit, UINT32_MAX);
+}
+#endif
+
 TEST_F(LIRPostGenerationRewriteTest, RetainsSplitAddSubImmediate) {
   const char* lir_input_str = R"(Function:
 BB %0

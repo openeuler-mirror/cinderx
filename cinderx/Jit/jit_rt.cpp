@@ -8,17 +8,23 @@
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
+#include "cinderx/Jit/trigger_stats.h"
 // NOLINTNEXTLINE(facebook-unused-include-check)
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -39,13 +45,42 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <memory>
+#include <new>
+#include <vector>
+
+// Argument binding is not a pure function: keyword equality and
+// kwdefaults lookup can run arbitrary Python.  The binder therefore
+// distinguishes three outcomes so a pending exception is never replayed
+// through CPython's vectorcall, and so a successful bind re-enters the
+// snapshot captured before any of that Python ran.
+enum class BindKwStatus { Error, Fallback, Bound };
+
+template <typename T>
+std::unique_ptr<T[]> allocateBindArray(size_t n) {
+  try {
+    return std::make_unique<T[]>(n);
+  } catch (const std::bad_alloc&) {
+    PyErr_NoMemory();
+    return nullptr;
+  }
+}
+
+// Caller-provided args stay borrowed.  Defaults / kwdefaults are owned
+// until reentry returns: __defaults__ and __kwdefaults__ can be rebound
+// while the compiled body is running.
+static void bindOwnedDefault(
+    std::vector<Ref<PyObject>>& owned_defaults,
+    PyObject** slot,
+    PyObject* def) {
+  owned_defaults.emplace_back(Ref<>::create(def));
+  *slot = owned_defaults.back().get();
+}
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
 // **args / nargsf.
-// One significant difference is we don't need to incref the args
-// in the new array.
-static int JITRT_BindKeywordArgs(
+static BindKwStatus JITRT_BindKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -53,9 +88,11 @@ static int JITRT_BindKeywordArgs(
     PyObject** arg_space,
     Py_ssize_t total_args,
     Ref<PyObject>& kwdict,
-    Ref<PyObject>& varargs) {
+    Ref<PyObject>& varargs,
+    std::vector<Ref<PyObject>>& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
+  const Py_ssize_t named_args = co->co_argcount + co->co_kwonlyargcount;
 
   for (int i = 0; i < total_args; i++) {
     arg_space[i] = nullptr;
@@ -65,7 +102,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_flags & CO_VARKEYWORDS) {
     kwdict = Ref<>::steal(PyDict_New());
     if (kwdict == nullptr) {
-      return 0;
+      return BindKwStatus::Error;
     }
     arg_space[total_args - 1] = kwdict;
   }
@@ -80,7 +117,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_flags & CO_VARARGS) {
     varargs = Ref<>::steal(Cix_PyTuple_FromArray(args + n, argcount - n));
     if (varargs == nullptr) {
-      return 0;
+      return BindKwStatus::Error;
     }
 
     Py_ssize_t i = total_args - 1;
@@ -97,13 +134,22 @@ static int JITRT_BindKeywordArgs(
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
 
+      // 3.11: exact str only.  A str subclass with __eq__ must not be
+      // rich-compared here: a miss would Fallback and CPython would
+      // run __eq__ again.  3.12+ Static Python primitive prologues
+      // treat Fallback as a TypeError sentinel, so they keep
+      // PyUnicode_Check and still accept str subclasses.
+#if PY_VERSION_HEX < 0x030C0000
+      if (keyword == nullptr || !PyUnicode_CheckExact(keyword)) {
+#else
       if (keyword == nullptr || !PyUnicode_Check(keyword)) {
-        return 0;
+#endif
+        return BindKwStatus::Fallback;
       }
 
       // Speed hack: do raw pointer compares. As names are
       //    normally interned this should almost always hit.
-      for (j = co->co_posonlyargcount; j < total_args; j++) {
+      for (j = co->co_posonlyargcount; j < named_args; j++) {
         PyObject* name = jit::getVarname(co, j);
         if (name == keyword) {
           goto kw_found;
@@ -111,24 +157,27 @@ static int JITRT_BindKeywordArgs(
       }
 
       // Slow fallback, just in case
-      for (j = co->co_posonlyargcount; j < total_args; j++) {
+      for (j = co->co_posonlyargcount; j < named_args; j++) {
         PyObject* name = jit::getVarname(co, j);
         int cmp = PyObject_RichCompareBool(keyword, name, Py_EQ);
         if (cmp > 0) {
           goto kw_found;
         } else if (cmp < 0) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
 
-      if (kwdict == nullptr || PyDict_SetItem(kwdict, keyword, value) == -1) {
-        return 0;
+      if (kwdict == nullptr) {
+        return BindKwStatus::Fallback;
+      }
+      if (PyDict_SetItem(kwdict, keyword, value) == -1) {
+        return BindKwStatus::Error;
       }
       continue;
 
     kw_found:
       if (arg_space[j] != nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
       arg_space[j] = value;
     }
@@ -136,7 +185,7 @@ static int JITRT_BindKeywordArgs(
 
   // Check the number of positional arguments
   if ((argcount > co->co_argcount) && !(co->co_flags & CO_VARARGS)) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   // Add missing positional arguments (copy default values from defs)
@@ -149,7 +198,7 @@ static int JITRT_BindKeywordArgs(
     // a required positional argument.
     for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
       if (arg_space[i] == nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
     }
 
@@ -160,7 +209,8 @@ static int JITRT_BindKeywordArgs(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          arg_space[arg_index] = defs[def_index];
+          bindOwnedDefault(
+              owned_defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
@@ -170,7 +220,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_kwonlyargcount > 0) {
     Py_ssize_t missing = 0;
     PyObject* kwdefs = func->func_kwdefaults;
-    for (Py_ssize_t i = co->co_argcount; i < total_args; i++) {
+    for (Py_ssize_t i = co->co_argcount; i < named_args; i++) {
       PyObject* name;
       if (arg_space[i] != nullptr) {
         continue;
@@ -179,52 +229,236 @@ static int JITRT_BindKeywordArgs(
       if (kwdefs != nullptr) {
         PyObject* def = PyDict_GetItemWithError(kwdefs, name);
         if (def) {
-          arg_space[i] = def;
+          bindOwnedDefault(owned_defaults, &arg_space[i], def);
           continue;
         } else if (_PyErr_Occurred(_PyThreadState_GET())) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
       missing++;
     }
     if (missing) {
-      return 0;
+      return BindKwStatus::Fallback;
     }
   }
 
-  return 1;
+  return BindKwStatus::Bound;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// The generated vectorcall prologue dispatches here, then re-enters the
+// compiled body at JITRT_CALL_REENTRY_OFFSET before the vectorcall entry.
+// On 3.11 func->vectorcall is Ci_JitShell311_GuardedEntry, not that
+// generated entry, so subtracting the offset from it would jump into
+// unrelated bytes.  Use the invocation snapshot first: GuardedEntry pins
+// the CompiledFunction for this call, and binding must not re-query
+// function state after keyword equality has run.  InstalledArtifact is
+// only the fallback when this helper is entered without a snapshot.
+static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InvocationArtifact());
+  if (compiled == nullptr) {
+    compiled = reinterpret_cast<jit::CompiledFunction*>(
+        Ci_JitShell311_InstalledArtifact(func));
+  }
+  if (compiled != nullptr) {
+    return JITRT_GET_REENTRY(compiled->vectorcallEntry());
+  }
+  return getInterpretedVectorcall(func);
+}
+#define JITRT_CAPTURE_REENTRY(func) jitrtBoundArgsReentry(func)
+
+static PyThreadState* allocate_and_link_interpreter_frame(
+    PyFunctionObject* func,
+    PyCodeObject* co);
+
+thread_local _PyInterpreterFrame* t_prelinked_recursion_frame = nullptr;
+thread_local int t_jit_recursion_entries = 0;
+
+// CPython 3.11 binds in initialize_locals, then consumes a recursion
+// slot only after the attempted frame is linked at start_frame. Binding stays
+// in the generated prologue. This scope then prelinks the real JIT frame,
+// consumes the recursion slot, and lets LoadFrame consume that prelinked frame
+// instead of allocating a second one. A failed Enter unlinks the attempted
+// frame exactly once and returns RecursionError to the caller.
+class RecursiveCallAfterBind {
+ public:
+  explicit RecursiveCallAfterBind(PyFunctionObject* func)
+      : entries_before_{t_jit_recursion_entries} {
+    JIT_CHECK(
+        t_prelinked_recursion_frame == nullptr,
+        "nested prelinked CPython 3.11 recursion frame");
+    PyThreadState* tstate = allocate_and_link_interpreter_frame(
+        func, reinterpret_cast<PyCodeObject*>(func->func_code));
+    t_prelinked_recursion_frame = currentFrame(tstate);
+    if (Ci_JitRecursionBoundary311_IsActive()) {
+      Ci_JitRecursionBoundary311_Refuse(tstate);
+      t_prelinked_recursion_frame = nullptr;
+      tstate->recursion_remaining--;
+      JITRT_UnlinkFrame(tstate);
+      tstate->recursion_remaining++;
+      return;
+    }
+    if (_Py_EnterRecursiveCallTstate(tstate, "") == 0) {
+      entered_ = true;
+      t_jit_recursion_entries++;
+      if (tstate->recursion_remaining == 0) {
+        Ci_JitRecursionBoundary311_Enter();
+        boundary_active_ = true;
+      }
+      return;
+    }
+
+    // _Py_CheckRecursiveCall restored recursion_remaining after setting the
+    // exception. Stock temporarily consumes one slot while clearing the
+    // failed entry frame (_PyEvalFrameClearAndPop); mirror that headroom.
+    t_prelinked_recursion_frame = nullptr;
+    tstate->recursion_remaining--;
+    JITRT_UnlinkFrame(tstate);
+    tstate->recursion_remaining++;
+  }
+  ~RecursiveCallAfterBind() {
+    if (t_prelinked_recursion_frame != nullptr) {
+      // Reentry failed before LoadFrame consumed the prelinked frame (for
+      // example, a static type check). Keep the frame chain balanced.
+      PyThreadState* tstate = PyThreadState_GET();
+      t_prelinked_recursion_frame = nullptr;
+      JITRT_UnlinkFrame(tstate);
+    }
+    if (boundary_active_ && Ci_JitRecursionBoundary311_IsActive()) {
+      Ci_JitRecursionBoundary311_Leave();
+    }
+    if (entered_ && t_jit_recursion_entries == entries_before_ + 1) {
+      t_jit_recursion_entries--;
+      _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
+    } else if (entered_) {
+      JIT_CHECK(
+          t_jit_recursion_entries == entries_before_,
+          "unbalanced transferred 3.11 recursion slot: before={} after={}",
+          entries_before_,
+          t_jit_recursion_entries);
+    }
+  }
+  RecursiveCallAfterBind(const RecursiveCallAfterBind&) = delete;
+  RecursiveCallAfterBind& operator=(const RecursiveCallAfterBind&) = delete;
+  bool entered() const {
+    return entered_;
+  }
+
+ private:
+  bool entered_{false};
+  bool boundary_active_{false};
+  int entries_before_;
+};
+
+void JITRT_TransferRecursionToInterpreter311() {
+  if (t_jit_recursion_entries == 0) {
+    return;
+  }
+  if (Ci_JitRecursionBoundary311_IsActive()) {
+    Ci_JitRecursionBoundary311_Leave();
+  }
+  t_jit_recursion_entries--;
+  _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
+}
+
+void JITRT_GetRecursionState311(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries) {
+  PyThreadState* tstate = PyThreadState_GET();
+  *remaining = tstate->recursion_remaining;
+  *headroom = tstate->recursion_headroom;
+  *boundary_active = Ci_JitRecursionBoundary311_IsActive();
+  *jit_entries = t_jit_recursion_entries;
+}
+
+static PyObject* jitrtReenterAfterBind(
+    vectorcallfunc reentry,
+    PyObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  RecursiveCallAfterBind rec{reinterpret_cast<PyFunctionObject*>(func)};
+  if (!rec.entered()) {
+    return nullptr;
+  }
+  return reentry(func, args, nargsf, kwnames);
+}
+
+// Equal-argcount positional path: the prologue has already bound by
+// matching nargs.  kwnames is unused; reentry always sees nullptr.
+PyObject* JITRT_ReenterAfterBind(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* /*kwnames*/) {
+  return jitrtReenterAfterBind(
+      JITRT_CAPTURE_REENTRY(func),
+      reinterpret_cast<PyObject*>(func),
+      args,
+      nargsf,
+      nullptr);
+}
+
+#else
+#define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
+#endif
 
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
 // arguments.   We then turn around and dispatch to the
 // JITed function with the newly packed args.
-// Rather than copying over all of the error reporting we instead
-// just dispatch to the normal _PyFunction_Vectorcall if anything
-// goes wrong which is indicated by JITRT_BindKeywordArgs returning 0.
+// Capture the reentry target before binding: the binder can run
+// arbitrary Python.  Only CPython TypeError construction (missing /
+// duplicate / unexpected keyword) falls back to the interpreter with
+// the original vectorcall layout.  A pending exception is returned
+// immediately and is never replayed.
 PyObject* JITRT_CallWithKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
       ((co->co_flags & CO_VARARGS) ? 1 : 0);
-  auto arg_space = std::make_unique<PyObject*[]>(total_args);
+  auto arg_space =
+      allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
+  if (arg_space == nullptr) {
+    return nullptr;
+  }
   Ref<PyObject> kwdict, varargs;
+  std::vector<Ref<PyObject>> owned_defaults;
 
-  if (JITRT_BindKeywordArgs(
-          func,
-          args,
-          nargsf,
-          kwnames,
+  switch (JITRT_BindKeywordArgs(
+      func,
+      args,
+      nargsf,
+      kwnames,
+      arg_space.get(),
+      total_args,
+      kwdict,
+      varargs,
+      owned_defaults)) {
+    case BindKwStatus::Bound: {
+      size_t new_nargsf = total_args;
+#if PY_VERSION_HEX < 0x030C0000
+      return jitrtReenterAfterBind(
+          reentry,
+          reinterpret_cast<PyObject*>(func),
           arg_space.get(),
-          total_args,
-          kwdict,
-          varargs)) {
-    size_t new_nargsf = total_args;
-    return JITRT_GET_REENTRY(func->vectorcall)(
-        (PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+          new_nargsf,
+          nullptr);
+#else
+      return reentry((PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+#endif
+    }
+    case BindKwStatus::Error:
+      return nullptr;
+    case BindKwStatus::Fallback:
+      break;
   }
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
@@ -247,16 +481,22 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
+    // Fallback to the default _PyFunction_Vectorcall implementation
+    // to produce an appropriate exception.
     auto interpVectorcall = getInterpretedVectorcall(func);
     interpVectorcall((PyObject*)func, args, nargsf, nullptr);
     return {0.0, 0.0};
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<PyObject*[]>(argcount);
+  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
+  if (arg_space == nullptr) {
+    return {0.0, 0.0};
+  }
   Py_ssize_t defaulted_args = argcount - nargs;
 
   if (nargs + defcount < argcount || nargs > argcount) {
@@ -271,16 +511,22 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     arg_space[i] = *args++;
   }
 
+  std::vector<Ref<PyObject>> owned_defaults;
   PyObject** def_items =
       &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    arg_space[i] = *def_items++;
+    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
   }
 
   size_t new_nargsf = argcount;
 
-  return reinterpret_cast<staticvectorcallfuncfp>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+#if PY_VERSION_HEX < 0x030C0000
+  RecursiveCallAfterBind rec{func};
+  if (!rec.entered()) {
+    return {0.0, 0.0};
+  }
+#endif
+  return reinterpret_cast<staticvectorcallfuncfp>(reentry)(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -299,6 +545,7 @@ JITRT_CallWithIncorrectArgcount(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
@@ -313,7 +560,14 @@ JITRT_CallWithIncorrectArgcount(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<PyObject*[]>(argcount);
+  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
+  if (arg_space == nullptr) {
+#ifdef _WIN32
+    return nullptr;
+#else
+    return {nullptr, nullptr};
+#endif
+  }
   Py_ssize_t defaulted_args = argcount - nargs;
 
   if (nargs + defcount < argcount || nargs > argcount) {
@@ -331,20 +585,30 @@ JITRT_CallWithIncorrectArgcount(
     arg_space[i] = *args++;
   }
 
+  std::vector<Ref<PyObject>> owned_defaults;
   PyObject** def_items =
       &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    arg_space[i] = *def_items++;
+    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
   }
 
   size_t new_nargsf = argcount;
 
+#if PY_VERSION_HEX < 0x030C0000
+  RecursiveCallAfterBind rec{func};
+  if (!rec.entered()) {
 #ifdef _WIN32
-  return JITRT_GET_REENTRY(func->vectorcall)(
+    return nullptr;
+#else
+    return {nullptr, nullptr};
+#endif
+  }
+#endif
+#ifdef _WIN32
+  return reentry(
       (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
 #else
-  return reinterpret_cast<staticvectorcallfunc>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+  return reinterpret_cast<staticvectorcallfunc>(reentry)(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -409,14 +673,29 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     PyObject** args,
     size_t nargsf,
     _PyTypedArgsInfo* arg_info) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<void*[]>(nargs);
+  auto arg_space = allocateBindArray<void*>(static_cast<size_t>(nargs));
+  if (arg_space == nullptr) {
+    return TRetType();
+  }
   if (JITRT_PackStaticArgs(args, arg_info, arg_space.get(), nargs)) {
     goto fail;
   }
 
-  return reinterpret_cast<TVectorcall>(JITRT_GET_REENTRY(func->vectorcall))(
+#if PY_VERSION_HEX < 0x030C0000
+  {
+    RecursiveCallAfterBind rec{func};
+    if (!rec.entered()) {
+      return TRetType();
+    }
+    return reinterpret_cast<TVectorcall>(reentry)(
+        (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
+  }
+#else
+  return reinterpret_cast<TVectorcall>(reentry)(
       (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
+#endif
 
 fail:
   auto interpVectorcall = getInterpretedVectorcall(func);
@@ -451,25 +730,36 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
         ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
         ((co->co_flags & CO_VARARGS) ? 1 : 0);
-    auto arg_space = std::make_unique<PyObject*[]>(total_args);
+    auto arg_space =
+        allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
+    if (arg_space == nullptr) {
+      return TRetType();
+    }
     Ref<PyObject> kwdict, varargs;
+    std::vector<Ref<PyObject>> owned_defaults;
 
-    if (JITRT_BindKeywordArgs(
+    switch (JITRT_BindKeywordArgs(
+        func,
+        args,
+        nargsf,
+        kwnames,
+        arg_space.get(),
+        total_args,
+        kwdict,
+        varargs,
+        owned_defaults)) {
+      case BindKwStatus::Bound:
+        return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
+            TRetType,
+            TVectorcall>(
             func,
-            args,
-            nargsf,
-            kwnames,
             arg_space.get(),
-            total_args,
-            kwdict,
-            varargs)) {
-      return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
-          TRetType,
-          TVectorcall>(
-          func,
-          arg_space.get(),
-          total_args | vectorcall_flags(nargsf),
-          arg_info);
+            total_args | vectorcall_flags(nargsf),
+            arg_info);
+      case BindKwStatus::Error:
+        return TRetType();
+      case BindKwStatus::Fallback:
+        break;
     }
 
     auto interpVectorcall = getInterpretedVectorcall(func);
@@ -598,8 +888,31 @@ static PyThreadState* allocate_and_link_interpreter_frame(
   PyThreadState* tstate = PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (t_prelinked_recursion_frame != nullptr) {
+    _PyInterpreterFrame* frame = t_prelinked_recursion_frame;
+    JIT_CHECK(
+        currentFrame(tstate) == frame && frame->f_func == func &&
+            frame->f_code == co,
+        "prelinked recursion frame does not match compiled body");
+    t_prelinked_recursion_frame = nullptr;
+    return tstate;
+  }
+#endif
+
+#if PY_VERSION_HEX >= 0x030C0000
   _PyInterpreterFrame* frame =
       Cix_PyThreadState_PushFrame(tstate, co->co_framesize);
+#else
+  // 3.11 has no co_framesize; the frame size is localsplus + stack depth plus
+  // the frame-header specials.
+  _PyInterpreterFrame* frame = Cix_PyThreadState_PushFrame(
+      tstate, co->co_nlocalsplus + co->co_stacksize + FRAME_SPECIALS_SIZE);
+  // This helper is the 3.11 entry glue: every machine-code invocation of a
+  // compiled function links its frame here, so this is the counting point
+  // the trigger-stats contract promises (trigger_stats.h).
+  jit::triggerStatsOnMachineCodeEntry(co);
+#endif
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 
   init_and_link_interpreter_frame(
@@ -664,6 +977,13 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
       co, spill_words * sizeof(uint64_t) + sizeof(jit::GenDataFooter));
 
   gen->gi_frame_state = FRAME_CREATED;
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock 3.11 make_gen() holds gi_code independently of the frame's
+  // f_code.  The two refs are balanced on clear/deopt/dealloc; omitting
+  // this one leaves g.gi_code NULL and leaks the code object the frame
+  // does not own.
+  gen->gi_code = reinterpret_cast<PyCodeObject*>(Py_NewRef(func->func_code));
+#endif
   gen->gi_weakreflist = nullptr;
   gen->gi_exc_state.exc_value = nullptr;
   gen->gi_exc_state.previous_item = nullptr;
@@ -711,6 +1031,15 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->yieldPoint = nullptr;
   footer->gen = static_cast<PyGenObject*>(gen);
   footer->code_rt = code_rt;
+#if PY_VERSION_HEX < 0x030C0000
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InvocationArtifact());
+  JIT_CHECK(
+      compiled != nullptr,
+      "3.11 JIT generator created without an invocation artifact");
+  footer->compiled =
+      reinterpret_cast<jit::CompiledFunction*>(Py_NewRef(compiled));
+#endif
   footer->tree_iter_state = nullptr;
   footer->originalFramePointer = original_frame_pointer;
   footer->linkAddress =
@@ -863,6 +1192,69 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
   return result;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value) {
+  // MR-08 frame observability: keep the materialized frame's localsplus
+  // current so sys._getframe()/f_locals readers see what stock 3.11
+  // shows.  The frame owns its copy (the existing clear paths --
+  // JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear -- release it);
+  // computation keeps using registers.  The old value's release can run
+  // __del__, which observes the frame already holding the new value,
+  // exactly like stock SETLOCAL.
+  _PyInterpreterFrame* frame = interpFrameFromThreadState(_PyThreadState_GET());
+  PyObject* old = frame->localsplus[idx];
+  frame->localsplus[idx] = Py_XNewRef(value);
+  Py_XDECREF(old);
+  return 0;
+}
+
+int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id) {
+  if (code_rt == nullptr) {
+    return 0;
+  }
+  return code_rt->consumeForcedDeopt(static_cast<std::size_t>(deopt_id));
+}
+
+PyObject* JITRT_LoadGlobalModuleValue(
+    PyObject* globals,
+    PyObject* name,
+    uint32_t keys_version,
+    Py_ssize_t index) {
+  if (!PyDict_CheckExact(globals) || index < 0) {
+    return nullptr;
+  }
+
+  auto dict = reinterpret_cast<PyDictObject*>(globals);
+  PyDictKeysObject* keys = dict->ma_keys;
+  if (keys->dk_version != keys_version || index >= keys->dk_nentries ||
+      dict->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
+    return nullptr;
+  }
+
+  PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[index];
+  if (entry->me_key == nullptr || entry->me_value == nullptr) {
+    return nullptr;
+  }
+  if (entry->me_key != name) {
+    int equal = PyObject_RichCompareBool(entry->me_key, name, Py_EQ);
+    if (equal < 0) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    if (!equal) {
+      return nullptr;
+    }
+  }
+
+  PyObject* result = entry->me_value;
+  if (result == nullptr) {
+    return nullptr;
+  }
+  Py_INCREF(result);
+  return result;
+}
+#endif
+
 PyObject* JITRT_LoadGlobalFromThreadState(
     PyThreadState* tstate,
     PyObject* name) {
@@ -964,13 +1356,36 @@ static bool is_eval_breaker_set(PyThreadState* tstate) {
   return value->load(std::memory_order_relaxed);
 }
 
+// 3.12 CALL checks the eval breaker after a non-Python callable
+// returns.  3.11 CALL does the same via CHECK_EVAL_BREAKER /
+// eval_frame_handle_pending (signals, pending calls, GIL drop,
+// async exceptions).  Py_MakePendingCalls covers only the first two.
 static bool handle_periodic_activities_on_call(
     PyThreadState* tstate,
     PyObject* res,
     PyObject* callable) {
   JITRT_AtQuiescentState(tstate);
   return res != nullptr && !PyFunction_Check(callable) &&
-      is_eval_breaker_set(tstate) && _Py_HandlePending(tstate) != 0;
+      is_eval_breaker_set(tstate) &&
+#if PY_VERSION_HEX < 0x030C0000
+      Ci_EvalFrameHandlePending_311(tstate) != 0;
+#else
+      _Py_HandlePending(tstate) != 0;
+#endif
+}
+
+// CALL_FUNCTION_EX always CHECK_EVAL_BREAKER after do_call_core,
+// including when the callee is a Python function.
+static bool handle_periodic_activities_on_call_ex(
+    PyThreadState* tstate,
+    PyObject* res) {
+  JITRT_AtQuiescentState(tstate);
+  return res != nullptr && is_eval_breaker_set(tstate) &&
+#if PY_VERSION_HEX < 0x030C0000
+      Ci_EvalFrameHandlePending_311(tstate) != 0;
+#else
+      _Py_HandlePending(tstate) != 0;
+#endif
 }
 
 PyObject*
@@ -996,6 +1411,20 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
       if (PyDict_Update(d, kwargs) != 0) {
         Py_DECREF(d);
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+#if PY_VERSION_HEX < 0x030C0000
+          // ceval format_kwargs_error clears first: FunctionStr is not
+          // safe with AttributeError still set.
+          PyErr_Clear();
+          PyObject* funcstr = _PyObject_FunctionStr(func);
+          if (funcstr != nullptr) {
+            PyErr_Format(
+                PyExc_TypeError,
+                "%U argument after ** must be a mapping, not %.200s",
+                funcstr,
+                kwargs->ob_type->tp_name);
+            Py_DECREF(funcstr);
+          }
+#else
           PyErr_Format(
               PyExc_TypeError,
               "%.200s%.200s argument after ** "
@@ -1003,6 +1432,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
               PyEval_GetFuncName(func),
               PyEval_GetFuncDesc(func),
               kwargs->ob_type->tp_name);
+#endif
         }
         return nullptr;
       }
@@ -1013,6 +1443,22 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   }
   if (!PyTuple_CheckExact(pargs)) {
     if (pargs->ob_type->tp_iter == nullptr && !PySequence_Check(pargs)) {
+#if PY_VERSION_HEX < 0x030C0000
+      // Stock 3.11 uses _PyObject_FunctionStr so the message carries the
+      // qualified name (module.qualname) rather than co_name + "()".
+      // Clear first: ceval check_args_iterable may run with a live
+      // exception, and FunctionStr is not exception-safe.
+      PyErr_Clear();
+      PyObject* funcstr = _PyObject_FunctionStr(func);
+      if (funcstr != nullptr) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "%U argument after * must be an iterable, not %.200s",
+            funcstr,
+            Py_TYPE(pargs)->tp_name);
+        Py_DECREF(funcstr);
+      }
+#else
       PyErr_Format(
           PyExc_TypeError,
           "%.200s%.200s argument after * "
@@ -1020,6 +1466,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
           PyEval_GetFuncName(func),
           PyEval_GetFuncDesc(func),
           pargs->ob_type->tp_name);
+#endif
       return nullptr;
     }
     pargs = PySequence_Tuple(pargs);
@@ -1035,7 +1482,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   // In 3.12 calls to non-Python functions will check for the eval breaker
   // We handle that here rather than bloat every function call w/ an extra
   // check.
-  if (handle_periodic_activities_on_call(tstate, res, func)) {
+  if (handle_periodic_activities_on_call_ex(tstate, res)) {
     Py_DECREF(res);
     return nullptr;
   }
@@ -1052,6 +1499,28 @@ PyObject* JITRT_Call(
       (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET),
       "JITRT_Call must always be called as a vectorcall");
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 CALL has two dummy slots that HIR CallMethod encodes as operands:
+  // PUSH_NULL / LOAD_GLOBAL|1 puts nullptr in the callable slot and the
+  // callable in self(); a LOAD_METHOD miss puts Py_None in the callable
+  // slot (HIR uses None, not nullptr, because nullptr means deopt) and
+  // the attribute in self().  Calling a real None uses LOAD_FAST /
+  // LOAD_CONST then PUSH_NULL, so callable is None and self is nullptr
+  // -- that is not a miss, and shifting would vectorcall a null
+  // pointer.  Only treat Py_None as a dummy when self is present.
+  // The offset flag is dropped because the slot below the shifted args
+  // is that dummy, not callee scratch.
+  constexpr size_t kVectorcallOffset =
+      static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
+  if (callable == nullptr || (callable == Py_None && args[0] != nullptr)) {
+    callable = args[0];
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  } else if (args[0] == nullptr) {
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  }
+#else
   if constexpr (PY_VERSION_HEX >= 0x030E0000) {
     // Calling a bound method leaves us with an unused first arg.
     if (args[0] == nullptr) {
@@ -1071,6 +1540,7 @@ PyObject* JITRT_Call(
       nargsf -= 1;
     }
   }
+#endif
 
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
@@ -1100,6 +1570,17 @@ PyObject* JITRT_VectorcallTstate(
     return nullptr;
   }
   return res;
+}
+
+PyObject* JITRT_VectorcallPythonFunction(
+    PyThreadState*,
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  JIT_DCHECK(PyFunction_Check(callable), "expected exact Python function");
+  PyFunctionObject* func = reinterpret_cast<PyFunctionObject*>(callable);
+  return func->vectorcall(callable, args, nargsf, kwnames);
 }
 
 PyObject* JITRT_UnaryNot(PyObject* value) {
@@ -1168,6 +1649,155 @@ LoadMethodResult JITRT_LoadAttrMethodWithValues(
 }
 #endif
 
+PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
+    PyObject* obj,
+    PyObject* name,
+    uint32_t type_version,
+    Py_ssize_t index) {
+#if PY_VERSION_HEX < 0x030C0000
+  PyTypeObject* type = Py_TYPE(obj);
+  if (type->tp_version_tag == type_version &&
+      PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT)) {
+    PyDictValues* values = *_PyObject_ValuesPointer(obj);
+    if (values != nullptr) {
+      PyObject* value = values->values[index];
+      if (value != nullptr) {
+        Py_INCREF(value);
+        return value;
+      }
+    }
+  }
+#else
+  (void)type_version;
+  (void)index;
+#endif
+  return PyObject_GetAttr(obj, name);
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+static PyTypeObject* supercheck_builtin(PyTypeObject* type, PyObject* obj) {
+  if (PyType_Check(obj) &&
+      PyType_IsSubtype(reinterpret_cast<PyTypeObject*>(obj), type)) {
+    Py_INCREF(obj);
+    return reinterpret_cast<PyTypeObject*>(obj);
+  }
+
+  if (PyType_IsSubtype(Py_TYPE(obj), type)) {
+    Py_INCREF(Py_TYPE(obj));
+    return Py_TYPE(obj);
+  }
+
+  PyObject* class_attr = nullptr;
+  if (_PyObject_LookupAttr(obj, &_Py_ID(__class__), &class_attr) < 0) {
+    return nullptr;
+  }
+  if (class_attr != nullptr && PyType_Check(class_attr) &&
+      reinterpret_cast<PyTypeObject*>(class_attr) != Py_TYPE(obj)) {
+    int ok =
+        PyType_IsSubtype(reinterpret_cast<PyTypeObject*>(class_attr), type);
+    if (ok) {
+      return reinterpret_cast<PyTypeObject*>(class_attr);
+    }
+  }
+  Py_XDECREF(class_attr);
+
+  PyErr_SetString(
+      PyExc_TypeError,
+      "super(type, obj): obj must be an instance or subtype of type");
+  return nullptr;
+}
+
+static PyObject* super_lookup_descr_builtin(
+    PyTypeObject* type,
+    PyTypeObject* obj_type,
+    PyObject* name) {
+  PyObject* mro = obj_type->tp_mro;
+  if (mro == nullptr) {
+    return nullptr;
+  }
+
+  JIT_DCHECK(PyTuple_Check(mro), "expected type MRO to be a tuple");
+  Py_ssize_t n = PyTuple_GET_SIZE(mro);
+  Py_ssize_t i = 0;
+  for (; i + 1 < n; i++) {
+    if (reinterpret_cast<PyObject*>(type) == PyTuple_GET_ITEM(mro, i)) {
+      break;
+    }
+  }
+  i++;
+  if (i >= n) {
+    return nullptr;
+  }
+
+  Py_INCREF(mro);
+  for (; i < n; i++) {
+    PyObject* obj = PyTuple_GET_ITEM(mro, i);
+    PyObject* dict = reinterpret_cast<PyTypeObject*>(obj)->tp_dict;
+    JIT_DCHECK(dict != nullptr && PyDict_Check(dict), "expected type dict");
+
+    PyObject* res = PyDict_GetItemWithError(dict, name);
+    if (res != nullptr) {
+      Py_INCREF(res);
+      Py_DECREF(mro);
+      return res;
+    }
+    if (PyErr_Occurred()) {
+      Py_DECREF(mro);
+      return nullptr;
+    }
+  }
+  Py_DECREF(mro);
+  return nullptr;
+}
+
+static PyObject* super_lookup_builtin(
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    int* meth_found) {
+  if (meth_found) {
+    *meth_found = 0;
+  }
+
+  Ref<PyTypeObject> obj_type =
+      Ref<PyTypeObject>::steal(supercheck_builtin(type, self));
+  if (obj_type == nullptr) {
+    return nullptr;
+  }
+
+  PyObject* res = super_lookup_descr_builtin(type, obj_type, name);
+  if (res != nullptr) {
+    if (meth_found &&
+        (PyFunction_Check(res) ||
+         PyType_HasFeature(Py_TYPE(res), Py_TPFLAGS_METHOD_DESCRIPTOR))) {
+      *meth_found = 1;
+      return res;
+    }
+
+    descrgetfunc f = Py_TYPE(res)->tp_descr_get;
+    if (f != nullptr) {
+      PyObject* descr_res = f(
+          res,
+          self == reinterpret_cast<PyObject*>(obj_type.get()) ? nullptr : self,
+          reinterpret_cast<PyObject*>(obj_type.get()));
+      Py_DECREF(res);
+      res = descr_res;
+    }
+    return res;
+  }
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+
+  Ref<> super_instance = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(&PySuper_Type), type, self, NULL));
+  if (super_instance == nullptr) {
+    return nullptr;
+  }
+  return PyObject_GetAttr(super_instance, name);
+}
+#endif
+
 static inline PyObject* super_lookup_method_or_attr(
     PyObject* global_super,
     PyTypeObject* type,
@@ -1186,18 +1816,21 @@ static inline PyObject* super_lookup_method_or_attr(
     if (super_instance == nullptr) {
       return nullptr;
     }
-    BorrowedRef<> result = PyObject_GetAttr(super_instance, name);
     if (meth_found) {
       *meth_found = 0;
     }
-    return result;
+    return PyObject_GetAttr(super_instance, name);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  return super_lookup_builtin(type, self, name, meth_found);
+#else
   // Check Py_TYPE(self) because in a class method super call
   // self can be a type. https://github.com/python/cpython/pull/106977
   if (Py_TYPE(self)->tp_getattro != PyObject_GenericGetAttr) {
     meth_found = nullptr;
   }
   return _PySuper_Lookup(type, self, name, meth_found);
+#endif
 }
 
 LoadMethodResult JITRT_GetMethodFromSuper(
@@ -2133,8 +2766,32 @@ DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(GreaterThanEqual, >=, Py_GE)
 #undef DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL
 #endif
 
+PyObject* JITRT_RichCompare(PyObject* v, PyObject* w, int op) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock 3.11's warmed exact-int COMPARE_OP does not enter Python
+  // recursion. The generic JIT helper does, so at the last admitted JIT
+  // frame it would raise before the recursive CALL and move the traceback
+  // cursor. Borrow CPython recovery headroom only around this exact-builtin
+  // operation; user-defined comparison slots never receive it.
+  PyThreadState* tstate = PyThreadState_GET();
+  bool exact_long_boundary = Ci_JitRecursionBoundary311_IsActive() &&
+      tstate->recursion_headroom == 0 && PyLong_CheckExact(v) &&
+      PyLong_CheckExact(w);
+  if (exact_long_boundary) {
+    tstate->recursion_headroom++;
+  }
+#endif
+  PyObject* result = PyObject_RichCompare(v, w, op);
+#if PY_VERSION_HEX < 0x030C0000
+  if (exact_long_boundary) {
+    tstate->recursion_headroom--;
+  }
+#endif
+  return result;
+}
+
 static int JITRT_RichCompareBoolGeneric(PyObject* v, PyObject* w, int op) {
-  Ref<> res = Ref<>::steal(PyObject_RichCompare(v, w, op));
+  Ref<> res = Ref<>::steal(JITRT_RichCompare(v, w, op));
 
   if (res == nullptr) {
     return -1;
@@ -2279,15 +2936,25 @@ void JITRT_FormatAwaitableError(
   _PyErr_Format(tstate, PyExc_TypeError, msg, type->tp_name);
 }
 
+// See ref.cpp: the 3.12 helpers do not exist on 3.11, where the total is
+// a process-wide global.
 void JITRT_IncRefTotal() {
 #ifdef Py_REF_DEBUG
+#if PY_VERSION_HEX >= 0x030C0000
   _Py_INCREF_IncRefTotal();
+#else
+  _Py_RefTotal++;
+#endif
 #endif
 }
 
 void JITRT_DecRefTotal() {
 #ifdef Py_REF_DEBUG
+#if PY_VERSION_HEX >= 0x030C0000
   _Py_DECREF_DecRefTotal();
+#else
+  _Py_RefTotal--;
+#endif
 #endif
 }
 
@@ -2348,10 +3015,12 @@ void JITRT_AtQuiescentState([[maybe_unused]] PyThreadState* tstate) {
 #endif
 }
 
+// clang-format off
 PyObject JITRT_IterDoneSentinel = {
     _PyObject_EXTRA_INIT
-#if PY_VERSION_HEX >= 0x030E0000
-// clang-format off
+#if PY_VERSION_HEX < 0x030C0000
+    1,
+#elif PY_VERSION_HEX >= 0x030E0000
 #ifdef Py_GIL_DISABLED
     .ob_tid = _Py_UNOWNED_TID,
     .ob_flags = _Py_STATICALLY_ALLOCATED_FLAG,
@@ -2363,12 +3032,11 @@ PyObject JITRT_IterDoneSentinel = {
     {.ob_refcnt = _Py_IMMORTAL_INITIAL_REFCNT,
      .ob_flags = _Py_STATIC_FLAG_BITS},
 #endif
-// clang-format on
-
 #else
     {.ob_refcnt = _Py_IMMORTAL_REFCNT},
 #endif
     nullptr};
+// clang-format on
 
 PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   iternextfunc iternext_f = Py_TYPE(iterator)->tp_iternext;
@@ -2389,7 +3057,10 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
     }
     PyErr_Clear();
   }
-  Py_INCREF(&JITRT_IterDoneSentinel);
+  // The sentinel is a borrowed address marker: consumers only compare
+  // the pointer and nothing in the tree decrefs it.  On 3.11 it is
+  // MORTAL, so an incref here leaked one reference per exhausted loop
+  // (on 3.12+ it is immortal and an incref was merely a no-op).
   return &JITRT_IterDoneSentinel;
 }
 
@@ -2603,17 +3274,18 @@ void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {
   jit::clearTreeIterState(footer);
 }
 
-static int JITRT_BindKeywordArgsSimple(
+static BindKwStatus JITRT_BindKeywordArgsSimple(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames,
     PyObject** arg_space,
-    Py_ssize_t total_args) {
+    Py_ssize_t total_args,
+    std::vector<Ref<PyObject>>& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   if (argcount > co->co_argcount) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   for (int i = 0; i < total_args; i++) {
@@ -2633,8 +3305,9 @@ static int JITRT_BindKeywordArgsSimple(
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
 
-      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
-        return 0;
+      // Exact str only; subclass __eq__ is CPython's once, not twice.
+      if (keyword == nullptr || !PyUnicode_CheckExact(keyword)) {
+        return BindKwStatus::Fallback;
       }
 
       // Speed hack: do raw pointer compares.
@@ -2652,15 +3325,15 @@ static int JITRT_BindKeywordArgsSimple(
         if (cmp > 0) {
           goto kw_found;
         } else if (cmp < 0) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
 
-      return 0;
+      return BindKwStatus::Fallback;
 
     kw_found:
       if (arg_space[j] != nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
       arg_space[j] = value;
     }
@@ -2668,7 +3341,7 @@ static int JITRT_BindKeywordArgsSimple(
 
   // Check number of positional arguments
   if ((argcount > co->co_argcount) && kwnames == nullptr) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   // Add missing positional arguments (copy default values from defs)
@@ -2679,7 +3352,7 @@ static int JITRT_BindKeywordArgsSimple(
 
     for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
       if (arg_space[i] == nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
     }
 
@@ -2689,13 +3362,14 @@ static int JITRT_BindKeywordArgsSimple(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          arg_space[arg_index] = defs[def_index];
+          bindOwnedDefault(
+              owned_defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
   }
 
-  return 1;
+  return BindKwStatus::Bound;
 }
 
 PyObject* JITRT_CallWithKeywordArgsSimple(
@@ -2703,6 +3377,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   JIT_DCHECK(
       !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)),
@@ -2714,12 +3389,27 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
 
   // stack allocate
   auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
+  std::vector<Ref<PyObject>> owned_defaults;
 
-  if (JITRT_BindKeywordArgsSimple(
-          func, args, nargsf, kwnames, arg_space, total_args)) {
-    size_t new_nargsf = total_args;
-    return JITRT_GET_REENTRY(func->vectorcall)(
-        (PyObject*)func, arg_space, new_nargsf, nullptr);
+  switch (JITRT_BindKeywordArgsSimple(
+      func, args, nargsf, kwnames, arg_space, total_args, owned_defaults)) {
+    case BindKwStatus::Bound: {
+      size_t new_nargsf = total_args;
+#if PY_VERSION_HEX < 0x030C0000
+      return jitrtReenterAfterBind(
+          reentry,
+          reinterpret_cast<PyObject*>(func),
+          arg_space,
+          new_nargsf,
+          nullptr);
+#else
+      return reentry((PyObject*)func, arg_space, new_nargsf, nullptr);
+#endif
+    }
+    case BindKwStatus::Error:
+      return nullptr;
+    case BindKwStatus::Fallback:
+      break;
   }
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);

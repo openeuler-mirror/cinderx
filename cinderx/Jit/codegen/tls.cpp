@@ -82,6 +82,17 @@ void initThreadStateOffset() {
     return;
   }
 
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  // The stock 3.11 manylinux AArch64 build used for pyperformance is a
+  // stripped/static Python where the private thread-state accessor is not
+  // reliably discoverable as a stable TLS load pattern. A bad offset corrupts
+  // PyThreadState/cframe state and later C API calls can observe "no GIL".
+  // Prefer the slower direct helper call on this compatibility target.
+  module_state->tstate_offset = -1;
+  module_state->tstate_offset_inited = true;
+  return;
+#endif
+
   // The repetitive single byte checks here are ugly but they guarantee
   // that we're not reading unsafe memory. If we just tried to do a big
   // comparison we might encounter assembly that ends, but as long as

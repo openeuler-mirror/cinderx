@@ -23,10 +23,12 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/global_cache.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/symbolizer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/StaticPython/_static.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
@@ -300,7 +302,8 @@ PyObject* cinder_is_immortal(PyObject* /* mod */, PyObject* obj) {
 }
 
 PyObject* compile_perf_trampoline_pre_fork(PyObject* mod, PyObject*) {
-#if !defined(WIN32) && (ENABLE_PERF_TRAMPOLINE || PY_VERSION_HEX >= 0x030D0000)
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000 && \
+    (ENABLE_PERF_TRAMPOLINE || PY_VERSION_HEX >= 0x030D0000)
   if (!jit::perf::isPreforkCompilationEnabled()) {
     Py_RETURN_NONE;
   }
@@ -325,7 +328,7 @@ PyObject* compile_perf_trampoline_pre_fork(PyObject* mod, PyObject*) {
 }
 
 PyObject* is_compile_perf_trampoline_pre_fork_enabled(PyObject*, PyObject*) {
-#ifndef WIN32
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000
   if (jit::perf::isPreforkCompilationEnabled()) {
     Py_RETURN_TRUE;
   }
@@ -419,7 +422,7 @@ int ensurePyFunctionVectorcall() {
 // compiling a perf trampoline for the Python function.
 void scheduleCompile(BorrowedRef<PyFunctionObject> func) {
   bool scheduled = jit::scheduleJitCompile(func);
-#ifndef WIN32
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000
   if (!scheduled && jit::perf::isPreforkCompilationEnabled()) {
     auto& perf_trampoline_worklist =
         cinderx::getModuleState()->perf_trampoline_worklist;
@@ -782,7 +785,20 @@ void module_free(void* raw_mod) {
   // destroy the state object and return. Skip all global cleanup since it
   // belongs to the main interpreter.
   if (!state->fully_initialized) {
+    // Initialization can fail after setModuleState() and, in shadow mode,
+    // after publishing a JIT context. Clean up that owned global state before
+    // destroying the storage; a subinterpreter's local state never owns it.
+    bool owns_global_state = cinderx::getModuleState() == state;
+    if (owns_global_state) {
+      jit::finalize();
+#if PY_VERSION_HEX < 0x030C0000
+      Ci_Observe311_Finalize();
+#endif
+    }
     state->cinderx::ModuleState::~ModuleState();
+    if (owns_global_state) {
+      cinderx::removeModuleState();
+    }
     return;
   }
 
@@ -797,6 +813,10 @@ void module_free(void* raw_mod) {
   Ci_FiniFrameEvalFunc();
 
   jit::finalize();
+
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_Observe311_Finalize();
+#endif
 
   jit::finiOSRCodeExtraIndex();
   finiCodeExtraIndex();
@@ -881,13 +901,198 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 }
 #endif
 
+// Trigger-proof counters (cinderx/Jit/trigger_stats.h).  Deliberately
+// available regardless of whether the JIT initialized: on capability-gated
+// builds the report asserts these stay zero, on execution-capable builds it
+// asserts they moved.
+static PyObject* get_trigger_stats(PyObject*, PyObject*) {
+  jit::TriggerStats stats = jit::triggerStatsSnapshot();
+  return Py_BuildValue(
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+      "executable_alloc_calls",
+      static_cast<unsigned long long>(stats.executable_alloc_calls),
+      "executable_alloc_bytes",
+      static_cast<unsigned long long>(stats.executable_alloc_bytes),
+      "compiled_function_creations",
+      static_cast<unsigned long long>(stats.compiled_function_creations),
+      "machine_code_entries",
+      static_cast<unsigned long long>(stats.machine_code_entries),
+      "resident_code_buffers",
+      static_cast<unsigned long long>(stats.resident_code_buffers),
+      "resident_code_extra_blocks",
+      static_cast<unsigned long long>(liveCodeExtraBlocks()),
+      "shadow_compile_success",
+      static_cast<unsigned long long>(stats.shadow_compile_success),
+      "shadow_specialized_opcodes_consumed",
+      static_cast<unsigned long long>(
+          stats.shadow_specialized_opcodes_consumed),
+      "shadow_codegen_bytes",
+      static_cast<unsigned long long>(stats.shadow_codegen_bytes),
+      "code_destroyed_notifications",
+      static_cast<unsigned long long>(stats.code_destroyed_notifications),
+      "function_destroyed_notifications",
+      static_cast<unsigned long long>(stats.function_destroyed_notifications),
+      "forced_deopt_hits",
+      static_cast<unsigned long long>(stats.forced_deopt_hits),
+      "organic_deopt_hits",
+      static_cast<unsigned long long>(stats.organic_deopt_hits));
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+static void get_recursion_state_for_test(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries) {
+  JITRT_GetRecursionState311(remaining, headroom, boundary_active, jit_entries);
+}
+
+static PyObject* native_recursion_state_for_test(PyObject*, PyObject*) {
+  int remaining;
+  int headroom;
+  int boundary_active;
+  int jit_entries;
+  get_recursion_state_for_test(
+      &remaining, &headroom, &boundary_active, &jit_entries);
+  return Py_BuildValue(
+      "{s:i,s:i,s:O,s:i}",
+      "recursion_remaining",
+      remaining,
+      "recursion_headroom",
+      headroom,
+      "boundary_active",
+      boundary_active ? Py_True : Py_False,
+      "jit_entries",
+      jit_entries);
+}
+
+// Test-only native recursion probe.  It deliberately calls the public C API
+// directly, without going through Ci_EvalFrame, so the runtime-transition
+// freeze validation can compare Stock and JIT behavior at the last admitted
+// Python frame.
+static PyObject* native_enter_recursive_call_for_test(PyObject*, PyObject*) {
+  int before_remaining;
+  int before_headroom;
+  int before_boundary;
+  int before_jit_entries;
+  get_recursion_state_for_test(
+      &before_remaining,
+      &before_headroom,
+      &before_boundary,
+      &before_jit_entries);
+
+  int rc = Py_EnterRecursiveCall("");
+  int error_occurred = PyErr_Occurred() != nullptr;
+  const char* exception_type = nullptr;
+  Ref<> exception_message;
+  if (error_occurred) {
+    PyObject* type = nullptr;
+    PyObject* value = nullptr;
+    PyObject* traceback = nullptr;
+    PyErr_Fetch(&type, &value, &traceback);
+    if (type != nullptr && PyType_Check(type)) {
+      exception_type = reinterpret_cast<PyTypeObject*>(type)->tp_name;
+    }
+    if (value != nullptr) {
+      exception_message = Ref<>::steal(PyObject_Str(value));
+      if (exception_message == nullptr) {
+        PyErr_Clear();
+      }
+    }
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+  } else if (rc == 0) {
+    Py_LeaveRecursiveCall();
+  }
+
+  int after_remaining;
+  int after_headroom;
+  int after_boundary;
+  int after_jit_entries;
+  get_recursion_state_for_test(
+      &after_remaining, &after_headroom, &after_boundary, &after_jit_entries);
+  return Py_BuildValue(
+      "{s:O,s:i,s:O,s:z,s:O,s:{s:i,s:i,s:O,s:i},s:{s:i,s:i,s:O,s:i}}",
+      "entered",
+      rc == 0 ? Py_True : Py_False,
+      "return_code",
+      rc,
+      "error_occurred",
+      error_occurred ? Py_True : Py_False,
+      "exception_type",
+      exception_type,
+      "exception_message",
+      exception_message != nullptr ? exception_message.get() : Py_None,
+      "before",
+      "recursion_remaining",
+      before_remaining,
+      "recursion_headroom",
+      before_headroom,
+      "boundary_active",
+      before_boundary ? Py_True : Py_False,
+      "jit_entries",
+      before_jit_entries,
+      "after",
+      "recursion_remaining",
+      after_remaining,
+      "recursion_headroom",
+      after_headroom,
+      "boundary_active",
+      after_boundary ? Py_True : Py_False,
+      "jit_entries",
+      after_jit_entries);
+}
+
+static PyObject* native_recursion_probe_add(PyObject*, PyObject*) {
+  return native_enter_recursive_call_for_test(nullptr, nullptr);
+}
+
+static PyObject* native_recursion_probe_operand_for_test(PyObject*, PyObject*) {
+  static PyType_Slot slots[] = {
+      {Py_nb_add, reinterpret_cast<void*>(native_recursion_probe_add)},
+      {Py_tp_new, reinterpret_cast<void*>(PyType_GenericNew)},
+      {0, nullptr},
+  };
+  static PyType_Spec spec = {
+      "_cinderx._NativeRecursionProbeOperand",
+      sizeof(PyObject),
+      0,
+      Py_TPFLAGS_DEFAULT,
+      slots,
+  };
+  Ref<> type = Ref<>::steal(PyType_FromSpec(&spec));
+  if (type == nullptr) {
+    return nullptr;
+  }
+  return PyObject_CallNoArgs(type);
+}
+#endif
+
 PyMethodDef _cinderx_methods[] = {
 #if PY_VERSION_HEX < 0x030C0000
     {"_get_observe_stats",
      get_observe_stats,
      METH_NOARGS,
      PyDoc_STR("Snapshot of observe-mode counters and scheduling events.")},
+    {"_native_enter_recursive_call",
+     native_enter_recursive_call_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only direct Py_EnterRecursiveCall probe.")},
+    {"_native_recursion_state",
+     native_recursion_state_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only CPython 3.11 recursion accounting snapshot.")},
+    {"_native_recursion_probe_operand",
+     native_recursion_probe_operand_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only number operand whose add slot probes recursion.")},
 #endif
+    {"_get_trigger_stats",
+     get_trigger_stats,
+     METH_NOARGS,
+     PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
+               "compiled-function creations and machine-code entries.")},
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,
@@ -1071,9 +1276,8 @@ int _cinderx_exec_impl(PyObject* m) {
   cinderx::setModuleState(m);
 
 #if PY_VERSION_HEX >= 0x030C0000
-  // The global cache serves JIT-compiled code only, and 3.11 does not build
-  // the JIT.  Its slot stays empty rather than holding an object nothing can
-  // reach.
+  // The global cache serves installed JIT code. CPython 3.11 shadow lowers
+  // globals without creating process-lifetime caches or dict watchers.
   auto cache_manager = new (std::nothrow) jit::GlobalCacheManager();
   if (cache_manager == nullptr) {
     return -1;
@@ -1108,10 +1312,11 @@ int _cinderx_exec_impl(PyObject* m) {
   state->async_lazy_value.reset(async_lazy_value);
 #endif
 
-#if PY_VERSION_HEX >= 0x030C0000
-  // These types belong to JIT-compiled generators, coroutines and awaitables.
-  // 3.11 builds no JIT, so no instance of them can ever exist and the module
-  // does not create them.
+  // JitGen / JitCoro host the machine-code generator object model, including
+  // the trailing GenDataFooter* that giJITDataOffset() reads at codegen.
+  // 3.11 canary executes synchronous generators, so the types must exist
+  // there too. Coroutine compile stays refused; the coro type is still
+  // required for layout identity and init_jit_genobject_type().
   PyTypeObject* gen_type = (PyTypeObject*)PyType_FromSpec(&jit::JitGen_Spec);
   if (gen_type == nullptr) {
     return -1;
@@ -1124,7 +1329,8 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->coro_type = Ref<PyTypeObject>::steal(coro_type);
 
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX < 0x030E0000
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000 && \
+    PY_VERSION_HEX < 0x030E0000
   Ref<PyTypeObject> frame_reifier_type = Ref<PyTypeObject>::steal(
       (PyTypeObject*)PyType_FromSpec(&jit::JitFrameReifier_Spec));
   if (frame_reifier_type == nullptr) {
@@ -1154,6 +1360,7 @@ int _cinderx_exec_impl(PyObject* m) {
     return -1;
   }
 
+#if PY_VERSION_HEX >= 0x030C0000
   PyTypeObject* anext_awaitable_type =
       (PyTypeObject*)PyType_FromSpec(&jit::JitAnextAwaitable_Spec);
   if (anext_awaitable_type == nullptr) {

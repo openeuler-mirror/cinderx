@@ -142,6 +142,10 @@ class Preloader {
 
   bool hasPrimitiveArgs() const;
 
+  BorrowedRef<PyTypeObject> methodOwnerType() const {
+    return method_owner_type_.type;
+  }
+
   BorrowedRef<> reifier() const;
 
   // OSR entry target offsets (BCOffset, byte offsets).
@@ -167,6 +171,9 @@ class Preloader {
   BorrowedRef<> constArg(BytecodeInstruction& bc_instr) const;
   PyObject** getGlobalCache(BorrowedRef<> name) const;
   bool canCacheGlobals() const;
+#if PY_VERSION_HEX < 0x030C0000
+  void preloadMethodOwnerType();
+#endif
   bool preload();
 
   // Preload information only relevant to Static Python functions.
@@ -195,6 +202,7 @@ class Preloader {
   // Keyed by locals index.
   SortedVecMap<int, OwnedType> check_arg_types_;
   std::optional<OwnedType> inferred_self_type_;
+  OwnedType method_owner_type_;
   // Keyed by name index, names borrowed from code object.
   GlobalNamesMap global_names_;
   Type return_type_{TObject};

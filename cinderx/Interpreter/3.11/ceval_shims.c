@@ -105,15 +105,20 @@ int _PySys_Audit(
 }
 
 // The common Release 34 Borrow cache already owns the exact datastack growth
-// implementation. This symbol is the name expected by CPython's inline helper.
-extern _PyInterpreterFrame* _PyThreadState_PushFrame(
+// implementation, emitted as Cix_PyThreadState_PushFrame (the stock
+// _PyThreadState_BumpFramePointerSlow body; stock 3.11 has no
+// _PyThreadState_PushFrame symbol).  Provide the out-of-line symbol CPython's
+// inline frame push expects by forwarding to that copy.  This translation
+// unit does not include the Borrow header, so the reference is declared
+// directly rather than via the Cix_ rename.
+extern _PyInterpreterFrame* Cix_PyThreadState_PushFrame(
     PyThreadState* tstate,
     size_t size);
 
 _PyInterpreterFrame* _PyThreadState_BumpFramePointerSlow(
     PyThreadState* tstate,
     size_t size) {
-  return _PyThreadState_PushFrame(tstate, size);
+  return Cix_PyThreadState_PushFrame(tstate, size);
 }
 
 #if defined(HAVE_PTHREAD_CONDATTR_SETCLOCK) && defined(HAVE_CLOCK_GETTIME) && \

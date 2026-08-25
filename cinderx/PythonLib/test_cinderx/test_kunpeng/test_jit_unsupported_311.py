@@ -1,11 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""The JIT is not part of a CPython 3.11 build.
+"""Machine-code execution is capability-gated off on CPython 3.11.
 
-This release ships the buildable base and the custom interpreter loop; the
-JIT source set is not compiled at all, so machine-code execution is not
-merely disabled but absent. These tests pin that: compilation requests are
-refused, and refusing them leaves the program running normally.
+The JIT source set is compiled and linked, but jit::initialize() returns
+before initializing anything, so the runtime never becomes usable.  These
+tests pin the gate: compilation requests are refused, nothing is ever
+compiled, and refusing leaves the program running normally.
 """
 
 import sys

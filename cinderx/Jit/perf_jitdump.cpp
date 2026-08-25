@@ -63,6 +63,32 @@ FileInfo g_jitdump_file;
 void* g_jitdump_mmap_addr = nullptr;
 const size_t kJitdumpMmapSize = 1;
 
+void writePerfMapEntry(
+    const void* code_addr,
+    unsigned int code_size,
+    const char* entry_name) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (g_pid_map.file == nullptr) {
+    return;
+  }
+  std::fprintf(
+      g_pid_map.file,
+      "%zx %x %s\n",
+      reinterpret_cast<size_t>(code_addr),
+      code_size,
+      entry_name);
+  std::fflush(g_pid_map.file);
+#else
+  PyUnstable_WritePerfMapEntry(code_addr, code_size, entry_name);
+#endif
+}
+
+void finiPerfMapState() {
+#if PY_VERSION_HEX >= 0x030C0000
+  PyUnstable_PerfMapState_Fini();
+#endif
+}
+
 // C++-friendly wrapper around strerror_r().
 std::string string_error(int errnum) {
   char buf[1024];
@@ -336,7 +362,7 @@ int copyJitFile(const std::string& parent_filename) {
     buf[strcspn(buf, "\n")] = '\0';
     auto jit_entry = parseJitEntry(buf);
     try {
-      PyUnstable_WritePerfMapEntry(
+      writePerfMapEntry(
           std::get<0>(jit_entry),
           std::get<1>(jit_entry),
           std::get<2>(jit_entry));
@@ -368,7 +394,7 @@ int copyJitEntries(const std::string& parent_filename) {
       buf[strcspn(buf, "\n")] = '\0';
       auto jit_entry = parseJitEntry(buf);
       try {
-        PyUnstable_WritePerfMapEntry(
+        writePerfMapEntry(
             std::get<0>(jit_entry),
             std::get<1>(jit_entry),
             std::get<2>(jit_entry));
@@ -507,8 +533,7 @@ void registerFunction(
     void* code = section_and_size.first;
     std::size_t size = section_and_size.second;
     auto jit_entry = fmt::format("{}:{}", prefix, name);
-    PyUnstable_WritePerfMapEntry(
-        static_cast<const void*>(code), size, jit_entry.c_str());
+    writePerfMapEntry(static_cast<const void*>(code), size, jit_entry.c_str());
   }
 
   if (auto file = g_jitdump_file.file) {
@@ -545,7 +570,7 @@ void afterForkChild() {
 #ifndef WIN32
   // Make sure the parent processes map is closed before copying into it,
   // otherwise init is a nop.
-  PyUnstable_PerfMapState_Fini();
+  finiPerfMapState();
   copyParentPidMap();
   copyJitdumpFile();
 #endif

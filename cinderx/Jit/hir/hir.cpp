@@ -368,6 +368,7 @@ bool Instr::isReplayable() const {
     case Opcode::kBuildString:
     case Opcode::kCast:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckExc:
     case Opcode::kCheckField:
     case Opcode::kCheckFreevar:
@@ -700,6 +701,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kAssign:
     case Opcode::kBitCast:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckExc:
     case Opcode::kCheckField:
     case Opcode::kCheckFreevar:

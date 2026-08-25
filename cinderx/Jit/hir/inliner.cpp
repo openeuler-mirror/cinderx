@@ -162,6 +162,13 @@ bool canInline(Function& caller, AbstractCall* call_instr) {
     if (bci.opcode() == EAGER_IMPORT_NAME) {
       return fail(InlineFailureType::kHasEagerImportName);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    // Keep CPython 3.11 callee frames that mutate module globals out of the
+    // inliner until the stock-runtime refcount contract is audited there.
+    if (bci.opcode() == STORE_GLOBAL) {
+      return fail(InlineFailureType::kHasStoreGlobal);
+    }
+#endif
   }
 
   return true;

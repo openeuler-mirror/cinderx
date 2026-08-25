@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
@@ -453,12 +454,19 @@ def test(value: int) -> int:
   std::string cpp_exception_message;
   {
     ScopedStaticArgChecksReplacement replacement{func->func_code, bad_local};
+    // The deletion this test stages lands mid-preload, inside a death
+    // callback where nothing may throw.  Arming the deleted-units record
+    // fault here pins the containment: the record-taking failure must not
+    // escape the callback, must not disturb the preload's own error, and
+    // must not stop the chained ambient callback from seeing the event.
+    jit::failJitPublishStepForTest(9);
     try {
       (void)jit::preloadFuncAndDeps(func);
     } catch (const std::runtime_error& exn) {
       cpp_exception_escaped = true;
       cpp_exception_message = exn.what();
     }
+    jit::failJitPublishStepForTest(0);
 
     EXPECT_TRUE(cpp_exception_escaped);
     EXPECT_NE(cpp_exception_message.find("hit bad local"), std::string::npos);

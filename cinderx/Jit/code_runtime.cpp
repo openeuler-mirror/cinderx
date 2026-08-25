@@ -93,6 +93,27 @@ GenYieldPoint* CodeRuntime::addGenYieldPoint(GenYieldPoint&& gen_yield_point) {
 }
 
 std::size_t CodeRuntime::addDeoptMetadata(DeoptMetadata&& deopt_meta) {
+  if (!deopt_meta.frame_meta.empty()) {
+    uint32_t seq = 0;
+    for (const DeoptMetadata& existing : deopt_metadatas_) {
+      if (existing.frame_meta.empty()) {
+        continue;
+      }
+      if (existing.code() == deopt_meta.code() &&
+          existing.innermostFrame().cause_instr_idx ==
+              deopt_meta.innermostFrame().cause_instr_idx &&
+          existing.reason == deopt_meta.reason &&
+          existing.inline_depth() == deopt_meta.inline_depth()) {
+        ++seq;
+      }
+    }
+    deopt_meta.site_id = computeDeoptSiteId(
+        deopt_meta.code(),
+        deopt_meta.innermostFrame().cause_instr_idx.asOffset(),
+        deopt_meta.reason,
+        deopt_meta.inline_depth(),
+        seq);
+  }
   deopt_metadatas_.emplace_back(std::move(deopt_meta));
   return deopt_metadatas_.size() - 1;
 }
@@ -107,6 +128,57 @@ const DeoptMetadata& CodeRuntime::getDeoptMetadata(std::size_t id) const {
 
 const std::vector<DeoptMetadata>& CodeRuntime::deoptMetadatas() const {
   return deopt_metadatas_;
+}
+
+bool CodeRuntime::armForcedDeopt(uint64_t site_id, int n, bool at_or_after) {
+  if (n < 1) {
+    return false;
+  }
+  bool armed = false;
+  for (DeoptMetadata& meta : deopt_metadatas_) {
+    if (meta.frame_meta.empty() || meta.site_id != site_id) {
+      continue;
+    }
+    if (!meta.forceable) {
+      continue;
+    }
+    meta.force_mode = at_or_after ? 2 : 1;
+    meta.force_countdown = n;
+    meta.consumed_forced = false;
+    armed = true;
+  }
+  if (armed) {
+    forced_deopt_armed_ = 1;
+  }
+  return armed;
+}
+
+bool CodeRuntime::consumeForcedDeopt(std::size_t deopt_id) {
+  if (deopt_id >= deopt_metadatas_.size()) {
+    return false;
+  }
+  DeoptMetadata& meta = deopt_metadatas_[deopt_id];
+  if (meta.force_mode == 0) {
+    return false;
+  }
+  if (meta.force_countdown > 0) {
+    --meta.force_countdown;
+  }
+  if (meta.force_countdown > 0) {
+    return false;
+  }
+  if (meta.force_mode == 1) {
+    meta.force_mode = 0;
+    forced_deopt_armed_ = 0;
+    for (const DeoptMetadata& other : deopt_metadatas_) {
+      if (other.force_mode != 0) {
+        forced_deopt_armed_ = 1;
+        break;
+      }
+    }
+  }
+  meta.consumed_forced = true;
+  return true;
 }
 
 std::size_t CodeRuntime::addOSRMetadata(OSRMetadata&& osr_meta) {

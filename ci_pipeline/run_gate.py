@@ -66,7 +66,12 @@ PIPELINES = {
     # CPython 3.11 runners invoke these; the suite's [target] check keeps a
     # mis-provisioned runner loud instead of silently green.
     "pr311": (("cp311_gate", False),),
-    "daily311": (("cp311_gate", False),),
+    "daily311": (
+        ("cp311_gate", False),
+        ("cp311_daily", False),
+    ),
+    # Runs on the 3.14 runner; RT314_BASE_REF must carry the merge-base SHA.
+    "ref314": (("cp314_reference", False),),
 }
 DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),

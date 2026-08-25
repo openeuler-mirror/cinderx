@@ -152,6 +152,15 @@ consteval FrameInitTable buildFrameInitTable() {
       FrameFieldKind::kOwnerThread,
       DataType::k8bit);
 
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX < 0x030C0000
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
+      FrameFieldKind::kGlobals,
+      DataType::kObject);
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
+      FrameFieldKind::kBuiltins,
+      DataType::kObject);
+#endif
+
 #ifndef ENABLE_LIGHTWEIGHT_FRAMES
   // Without ENABLE_LIGHTWEIGHT_FRAMES there is no lazy reification so
   // we must initialize every field the interpreter expects.
@@ -165,9 +174,15 @@ consteval FrameInitTable buildFrameInitTable() {
       FrameFieldKind::kZero,
       DataType::kObject);
 
+#if PY_VERSION_HEX >= 0x030C0000
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, return_offset)),
       FrameFieldKind::kZero,
       DataType::k16bit);
+#else
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
+      FrameFieldKind::kZero,
+      DataType::k8bit);
+#endif
 #if PY_VERSION_HEX >= 0x030E0000
   // ugly, visited is a bitfield on debug builds and we can't use offset of on
   // it.

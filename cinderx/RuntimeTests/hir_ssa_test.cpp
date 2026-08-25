@@ -105,6 +105,21 @@ TEST(CheckFuncTest, NonFirstPhi) {
   EXPECT_EQ(err.str(), expected_err);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+TEST(CheckFuncTest, EmptyPhi) {
+  Function func;
+  auto block = func.cfg.entry_block = func.cfg.AllocateBlock();
+  auto output = func.env.AllocateRegister();
+  std::unordered_map<BasicBlock*, Register*> no_inputs;
+  block->append<Phi>(output, no_inputs);
+  block->append<Return>(output);
+
+  std::ostringstream err;
+  ASSERT_FALSE(checkFunc(func, err));
+  EXPECT_EQ(err.str(), "ERROR: Empty Phi instruction 'v0 = Phi' in bb 0\n");
+}
+#endif
+
 TEST(CheckFuncTest, RegisterInstr) {
   Function func;
   auto b0 = func.cfg.entry_block = func.cfg.AllocateBlock();

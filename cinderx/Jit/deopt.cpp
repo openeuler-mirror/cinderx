@@ -157,6 +157,24 @@ static void reifyLocalsplus(
 
   BorrowedRef<PyCodeObject> code = frameCode(frame);
   int free_offset = numLocalsplus(code) - numFreevars(code);
+#if PY_VERSION_HEX < 0x030C0000
+  // The executing mode writes locals through to the frame for observers
+  // (MR-08 frame observability), so these slots may hold owned
+  // references that the reified value replaces.
+  for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
+       i++) {
+    const LiveValue* value = meta.getLocalValue(i, frame_meta);
+    PyObject* prev = *localsplus;
+    if (value == nullptr) {
+      // Value is dead
+      *localsplus = nullptr;
+    } else {
+      *localsplus = mem.readOwned(*value).release();
+    }
+    Py_XDECREF(prev);
+    localsplus++;
+  }
+#else
   // Local variables are not initialized in the frame
   for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
        i++) {
@@ -170,6 +188,7 @@ static void reifyLocalsplus(
     }
     localsplus++;
   }
+#endif
 
   // Free variables are initialized
   for (std::size_t i = free_offset; i < frame_meta.localsplus.size(); i++) {
@@ -259,33 +278,51 @@ static BCIndex getDeoptResumeIndex(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame,
     bool forced_deopt,
-    bool is_instrumentation_deopt = false) {
+    bool is_patched_instrumentation = false) {
   // We only need to consider guards as the deopt cause in the inner-most
   // inlined location. If we are reifying the conceptual frames for an inlined
   // function's callers then these will be resumed by the interpreter in
   // future and will never be a JIT guard failure.
   bool is_innermost = &frame == &meta.innermostFrame();
 
-  // For instrumentation deopts: kPeriodicTaskFailure means the bytecode
-  // hasn't completed (RunPeriodicTasks) — re-execute. Other reasons mean
-  // the bytecode's C call completed — advance past it.
-  if (is_instrumentation_deopt && is_innermost) {
-    if (meta.reason == DeoptReason::kPeriodicTaskFailure) {
-      return frame.cause_instr_idx;
-    }
+  // The patched instrumentation flavor stops with the PRE-instruction
+  // state and the completed call's result recovered from a register:
+  // advance past the completed instruction.  This flag is the patched
+  // flavor only -- a combined "is instrumentation" bit was tried here and
+  // made the polled flavor advance too, skipping the instruction its own
+  // frame state names; the polled and periodic-task flavors are recognized
+  // below by their reasons instead.  (A patched stop never carries
+  // kPeriodicTaskFailure: patched means the call completed, the periodic
+  // failure means it did not.)
+  if (is_patched_instrumentation && is_innermost) {
     return BytecodeInstruction(frame.code, frame.cause_instr_idx)
         .nextInstrOffset();
   }
 
   if ((is_innermost &&
        (meta.reason == DeoptReason::kGuardFailure ||
-        meta.reason == DeoptReason::kRaise)) ||
+        meta.reason == DeoptReason::kRaise ||
+        // A polled instrumentation exit's frame state IS the resume
+        // point: the poll sits after the per-bytecode snapshot, whose
+        // state has the completed instruction's result on the operand
+        // stack and names the instruction to execute next.  Advancing
+        // would skip that instruction outright.
+        // kPeriodicTaskFailure is deliberately NOT in this list.  On 3.11
+        // the back-edge polls are per edge and carry the frame state AT
+        // the backward jump (see insertRunPeriodicActivitesForBackedge),
+        // and stock 3.11 raises the asynchronous exception after the jump
+        // has executed -- its eval-breaker check runs inside the
+        // backward-jump handler, so tb_lasti names the jump.  The
+        // error-resume position below reproduces that exactly: the
+        // reified frame reads "the jump just executed", and the pending
+        // exception is raised before anything at that position runs.
+        meta.reason == DeoptReason::kInstrumentation)) ||
       forced_deopt) {
     return frame.cause_instr_idx;
   }
 
-#if PY_VERSION_HEX >= 0x030E0000
   if (PyErr_Occurred() && is_innermost) {
+#if PY_VERSION_HEX >= 0x030E0000
     // On 3.14+ the traceback is going to be generated based on instr_ptr
     // and then we'll dispatch to the error handler. We're never going to
     // execute the instruction but we need the instr_ptr to point at the
@@ -294,8 +331,24 @@ static BCIndex getDeoptResumeIndex(
                .nextInstrOffset()
                .asIndex() -
         1;
-  }
+#elif PY_VERSION_HEX < 0x030C0000
+    // On 3.11 the error resume enters the anchored evaluator at
+    // resume_with_error, which reads prev_instr for both the traceback
+    // entry (PyTraceBack_Here) and the exception-table lookup
+    // (INSTR_OFFSET()-1). Ordinary raising opcodes reach `goto error`
+    // before advancing over their inline caches, so their traceback names
+    // the opcode unit. CALL-family propagated errors are different: Stock's
+    // inlined Python-call path advances the caller over the CALL caches before
+    // entering the callee, and a later exception therefore keeps the caller
+    // at the last cache unit. The installed PEP 523 evaluator prevents that
+    // inlining, so the JIT has to reproduce the Stock cursor explicitly.
+    BytecodeInstruction cause{frame.code, frame.cause_instr_idx};
+    if (cause.opcode() == CALL) {
+      return cause.nextInstrOffset();
+    }
+    return cause.opcodeIndex() + 1;
 #endif
+  }
   return BytecodeInstruction(frame.code, frame.cause_instr_idx)
       .nextInstrOffset();
 }
@@ -304,6 +357,9 @@ bool shouldResumeInterpreterInErrorHandler(DeoptReason reason) {
   switch (reason) {
     case DeoptReason::kGuardFailure:
     case DeoptReason::kRaise:
+    // Not an error path: the instrumentation resume decides error state
+    // from PyErr_Occurred() alone.
+    case DeoptReason::kInstrumentation:
       return false;
     case DeoptReason::kYieldFrom:
     case DeoptReason::kUnhandledException:
@@ -324,17 +380,18 @@ static void reifyFrameImpl(
     const DeoptFrameMetadata& frame_meta,
     bool forced_deopt,
     const uint64_t* regs,
-    bool is_instrumentation_deopt = false) {
+    bool is_patched_instrumentation = false) {
   // Note frame->prev_instr doesn't point to the previous instruction, it
   // actually points to the memory location sizeof(Py_CODEUNIT) bytes before
   // the next instruction to execute. This means it might point to inline-
   // cache data or a negative location.
   //
-  // For instrumentation deopts, getDeoptResumeIndex re-executes for
-  // kPeriodicTaskFailure and advances for all other reasons.
+  // For instrumentation exits, getDeoptResumeIndex advances only for the
+  // patched flavor (the completed call's result is recovered separately);
+  // the polled and periodic-task flavors resume at their own frame state.
   int prev_idx =
       (getDeoptResumeIndex(
-           meta, frame_meta, forced_deopt, is_instrumentation_deopt) -
+           meta, frame_meta, forced_deopt, is_patched_instrumentation) -
        1)
           .value();
 
@@ -361,18 +418,17 @@ void reifyFrame(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame_meta,
     const uint64_t* regs,
-    [[maybe_unused]] bool is_instrumentation_deopt) {
-#if PY_VERSION_HEX >= 0x030C0000
+    bool is_patched_instrumentation) {
+  // Forwarded on every version.  The 3.11 branch used to drop this flag,
+  // which made the resume selection of every instrumentation-family exit
+  // depend on the default value instead of the caller's answer.
   reifyFrameImpl(
       frame,
       meta,
       frame_meta,
       false /* forced_deopt */,
       regs,
-      is_instrumentation_deopt);
-#else
-  reifyFrameImpl(frame, meta, frame_meta, false /* forced_deopt */, regs);
-#endif
+      is_patched_instrumentation);
 }
 
 void reifyGeneratorFrame(
@@ -410,7 +466,7 @@ void releaseRefs(const DeoptMetadata& meta, const void* base) {
   releaseRefs(meta, MemoryView{regs});
 }
 
-static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
+DeoptReason deoptReasonFor(const jit::hir::DeoptBase& instr) {
   switch (instr.opcode()) {
     case jit::hir::Opcode::kCheckVar: {
       return DeoptReason::kUnhandledUnboundLocal;
@@ -435,12 +491,26 @@ static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
     case jit::hir::Opcode::kRaiseStatic: {
       return DeoptReason::kRaiseStatic;
     }
+    case jit::hir::Opcode::kCheckInstrumentation: {
+      return DeoptReason::kInstrumentation;
+    }
     case jit::hir::Opcode::kRunPeriodicTasks: {
       return DeoptReason::kPeriodicTaskFailure;
     }
     default: {
       return DeoptReason::kUnhandledException;
     }
+  }
+}
+
+bool isForceableDeoptInstr(const jit::hir::DeoptBase& instr) {
+  switch (instr.opcode()) {
+    case jit::hir::Opcode::kGuard:
+    case jit::hir::Opcode::kGuardIs:
+    case jit::hir::Opcode::kGuardType:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -550,7 +620,8 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
   }
 
   meta.nonce = instr.nonce();
-  meta.reason = getDeoptReason(instr);
+  meta.reason = deoptReasonFor(instr);
+  meta.forceable = isForceableDeoptInstr(instr);
   JIT_CHECK(
       meta.reason != DeoptReason::kUnhandledNullField ||
           meta.guilty_value != -1,
@@ -569,6 +640,31 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
   meta.descr = interned.c_str();
 
   return meta;
+}
+
+uint64_t computeDeoptSiteId(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset bc_offset,
+    DeoptReason reason,
+    size_t inline_depth,
+    uint32_t seq) {
+  auto mix = [](uint64_t h, uint64_t k) {
+    k ^= k >> 30;
+    k *= 0xbf58476d1ce4e5b9ULL;
+    k ^= k >> 27;
+    k *= 0x94d049bb133111ebULL;
+    k ^= k >> 31;
+    h ^= k;
+    h *= 0x9e3779b97f4a7c15ULL;
+    return h;
+  };
+  uint64_t h = mix(0xC1DE711ULL, reinterpret_cast<uintptr_t>(code.get()));
+  h = mix(h, static_cast<uint64_t>(bc_offset.value()));
+  h = mix(h, static_cast<uint64_t>(static_cast<unsigned char>(reason)));
+  // Inline path is empty this MR; keep the dimension in the mix.
+  h = mix(h, inline_depth);
+  h = mix(h, seq);
+  return h;
 }
 
 } // namespace jit

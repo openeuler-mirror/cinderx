@@ -85,16 +85,16 @@ struct LiveValue {
   }
 };
 
-#define DEOPT_REASONS(X)                                                \
-  X(GuardFailure)                                                       \
-  X(YieldFrom)                                                          \
-  X(Raise)                                                              \
-  X(RaiseStatic)                                                        \
-  X(UnhandledException)                                                 \
-  X(UnhandledUnboundLocal)                                              \
-  X(UnhandledUnboundFreevar)                                            \
-  X(UnhandledNullField)                                                 \
-  /* TODO(T262710971): Add a dedicated Instrumentation deopt reason. */ \
+#define DEOPT_REASONS(X)     \
+  X(GuardFailure)            \
+  X(YieldFrom)               \
+  X(Raise)                   \
+  X(RaiseStatic)             \
+  X(UnhandledException)      \
+  X(UnhandledUnboundLocal)   \
+  X(UnhandledUnboundFreevar) \
+  X(UnhandledNullField)      \
+  X(Instrumentation)         \
   X(PeriodicTaskFailure)
 
 enum class DeoptReason : char {
@@ -106,6 +106,13 @@ enum class DeoptReason : char {
 bool shouldResumeInterpreterInErrorHandler(DeoptReason reason);
 
 const char* deoptReasonName(DeoptReason reason);
+
+DeoptReason deoptReasonFor(const hir::DeoptBase& instr);
+
+// True only for conditional guards that receive a force-deopt helper in LIR.
+// Deopt and DeoptPatchpoint also use kGuardFailure, but cannot implement an
+// Nth-visit trigger and therefore must not be armed by the test API.
+bool isForceableDeoptInstr(const hir::DeoptBase& instr);
 
 // Deopt metadata that is specific to a particular frame whose code may have
 // been inlined.
@@ -154,6 +161,23 @@ struct DeoptMetadata {
 
   // Why we are de-opting
   DeoptReason reason{DeoptReason::kUnhandledException};
+
+  // Whether generated code consumes force_countdown before this site.
+  bool forceable{false};
+
+  // Process-local stable site identity: code identity + bytecode offset +
+  // site kind + inline path.  It is stable across recompilation of the same
+  // code object, not across processes.  The inline-path dimension is hashed
+  // even while the inliner is closed (always depth 0 this MR) so opening it
+  // later does not change how existing sites are named.
+  uint64_t site_id{0};
+
+  // Test-only force-deopt arming.  force_mode is 0 when idle, 1 for the
+  // Nth visit, 2 for at-or-after N.  Unarmed sites take the ordinary
+  // guard path; the extra load is a no-op until a test arms a site.
+  int32_t force_mode{0};
+  int32_t force_countdown{0};
+  bool consumed_forced{false};
 
   BorrowedRef<PyCodeObject> code() const {
     return innermostFrame().code;
@@ -216,6 +240,15 @@ struct DeoptMetadata {
   static DeoptMetadata fromInstr(const jit::hir::DeoptBase& instr);
 };
 
+// Mix the RFC site-identity tuple into a stable 64-bit id.  `seq`
+// disambiguates two sites that share code, offset, kind and inline depth.
+uint64_t computeDeoptSiteId(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset bc_offset,
+    DeoptReason reason,
+    size_t inline_depth,
+    uint32_t seq);
+
 using CiPyFrameObjType = _PyInterpreterFrame;
 
 // Update `frame` so that execution can resume in the interpreter.
@@ -240,7 +273,7 @@ void reifyFrame(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame_meta,
     const uint64_t* regs,
-    bool is_instrumentation_deopt = false);
+    bool is_patched_instrumentation = false);
 
 // Like reifyFrame(), but for a suspended generator. Takes a single base
 // pointer for spill data rather than a full set of registers.

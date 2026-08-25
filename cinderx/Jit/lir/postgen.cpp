@@ -622,9 +622,11 @@ RewriteResult rewritePushImmediateToVreg(instr_iter_t instr_iter) {
   return lowerImmediateInputToVreg(instr_iter, 0) ? kChanged : kUnchanged;
 }
 
-RewriteResult rewriteSelectFalseImmediateToVreg(instr_iter_t instr_iter) {
-  // ARM csel is register-only; the false_val (input 2) must be a register.
-  return lowerImmediateInputToVreg(instr_iter, 2) ? kChanged : kUnchanged;
+RewriteResult rewriteSelectImmediateValuesToVreg(instr_iter_t instr_iter) {
+  // ARM csel is register-only; both value inputs must be registers.
+  bool changed = lowerImmediateInputToVreg(instr_iter, 1);
+  changed |= lowerImmediateInputToVreg(instr_iter, 2);
+  return changed ? kChanged : kUnchanged;
 }
 
 RewriteResult rewriteMemoryMoveImmediateToVreg(instr_iter_t instr_iter) {
@@ -642,7 +644,7 @@ RewriteResult rewriteNonBinaryImmediateToVreg(instr_iter_t instr_iter) {
     case Instruction::kPush:
       return rewritePushImmediateToVreg(instr_iter);
     case Instruction::kSelect:
-      return rewriteSelectFalseImmediateToVreg(instr_iter);
+      return rewriteSelectImmediateValuesToVreg(instr_iter);
     case Instruction::kMove:
     case Instruction::kMoveRelaxed:
       // Lower immediate input ONLY when the output is memory (Ind or Stack).

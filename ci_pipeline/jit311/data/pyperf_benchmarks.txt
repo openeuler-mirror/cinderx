@@ -1,0 +1,52 @@
+# Local `--pyperf` shortcut: first tranche of the plan's applicable suite,
+# pure-Python benchmarks with no external service dependencies. Daily
+# completeness uses `--pyperformance-all` (the provisioned pyperformance's
+# own list) instead of this file. Names here are still validated against
+# that list.
+#
+# Format, one line per pyperformance TASK:
+#
+#   task: result_name [result_name ...]
+#
+# The left column is what `pyperformance run --benchmarks` selects and is
+# validated against the provisioned tool's own list by the self-tests.
+# The right column is the EXACT set of result names that task must report
+# under the pinned pyperformance: the two namespaces differ -- a task may
+# emit several results (scimark emits scimark_sor, scimark_fft, ... and
+# never one under its own name).  The completeness judge requires the
+# reported result-name set to equal the union of the right column exactly,
+# so a task that silently stops reporting -- or a tool upgrade that
+# renames or adds results -- is a manifest edit, never an accident.
+chaos: chaos
+crypto_pyaes: crypto_pyaes
+deepcopy: deepcopy deepcopy_memo deepcopy_reduce
+deltablue: deltablue
+fannkuch: fannkuch
+float: float
+go: go
+hexiom: hexiom
+json_dumps: json_dumps
+json_loads: json_loads
+logging: logging_format logging_silent logging_simple
+mdp: mdp
+meteor_contest: meteor_contest
+nbody: nbody
+nqueens: nqueens
+pickle: pickle
+pickle_dict: pickle_dict
+pickle_list: pickle_list
+pidigits: pidigits
+pprint: pprint_pformat pprint_safe_repr
+pyflate: pyflate
+raytrace: raytrace
+regex_compile: regex_compile
+regex_dna: regex_dna
+regex_effbot: regex_effbot
+regex_v8: regex_v8
+richards: richards
+scimark: scimark_fft scimark_lu scimark_monte_carlo scimark_sor scimark_sparse_mat_mult
+spectral_norm: spectral_norm
+telco: telco
+unpack_sequence: unpack_sequence
+unpickle: unpickle
+unpickle_list: unpickle_list

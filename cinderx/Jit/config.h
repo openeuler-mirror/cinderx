@@ -10,20 +10,19 @@
 
 namespace jit {
 
-// Lifetime diagram of the JIT compiler:
+// Lifetime transitions of the JIT compiler:
 //
-//   NotInitialized <---------+
-//        |                   |
-//        v                   |
-//     Running <---> Paused   |
-//        |            |      |
-//        v            |      |
-//    Finalizing <-----+      |
-//        |                   |
-//        |                   |
-//        +-------------------+
+//   Non-executing: NotInitialized -> Shadow -> Finalizing -> NotInitialized
+//   Executing:     NotInitialized -> Running <-> Paused
+//                                      |           |
+//                                      +-> Finalizing -> NotInitialized
+//
+// Shadow never transitions to Running or Paused.
 enum class State : uint8_t {
   kNotInitialized,
+  // The compiler pipeline is available, but generated code is never
+  // published or entered.
+  kShadow,
   kRunning,
   kPaused,
   kFinalizing,
@@ -189,6 +188,24 @@ struct Config {
   // the interpreter
   bool support_instrumentation{false};
 
+  // Permit CPython 3.11 synchronous generators on the execute surface.
+  // Explicit force/canary compilation is enabled (MR-10); automatic
+  // compilation of generators stays off by policy (MR-11): the measured
+  // verdict is that compiling generators only on request beats both
+  // compiling them all and interpreting them all.
+  bool sync_generator_jit{true};
+
+  // CPython 3.11 auto-JIT (MR-11): how many fresh function objects over an
+  // already-compiled code object may attach to its artifact automatically.
+  // 3.11 has no function-creation watcher, so a fresh function (a closure,
+  // lambda or comprehension re-created per call) is noticed at its first
+  // interpreted frame and attached for its later calls.  Each attachment
+  // costs a full publication; the budget keeps churn-heavy shapes (a new
+  // closure per call, called once) from paying it forever, while stable
+  // instance sets attach in full.  0 disables automatic attachment;
+  // force_compile() of a fresh function is never budgeted.
+  uint32_t fresh_attach_budget{8};
+
   // Add RefineType instructions for Static Python values before they get
   // typechecked.  Enabled by default as HIR doesn't pass through Static Python
   // types very well right now.  Disable to expose new typing opportunities in
@@ -290,12 +307,15 @@ inline Config& getMutableConfig() {
   return s_jit_config;
 }
 
-// Check that the JIT is initialized.  Though it might be paused and or
-// finalizing, it's not necessarily usable.
+// Check that the JIT has initialized state. It may be shadow-compiling, paused,
+// or finalizing, so this does not imply that machine-code execution is usable.
 bool isJitInitialized();
 
 // Check that the JIT is initialized and is currently usable.
 bool isJitUsable();
+
+// Check that only the non-executing shadow compiler is initialized.
+bool isJitShadow();
 
 // Check that the JIT is initialized but currently paused and unusable.
 bool isJitPaused();

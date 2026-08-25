@@ -1,0 +1,51 @@
+# Libtest modules that collect zero junit cases on the 3.11 linux
+# shadow-surface host (platform skip, missing GUI/SSL data, or nested
+# asyncio files that regrtest does not execute as named targets).
+# Dual-run still requires shadow to match JIT-off. Modules not on this
+# list cannot go green with an empty junit on both arms.
+test.test_asyncio.test_base_events
+test.test_asyncio.test_events
+test.test_asyncio.test_futures
+test.test_asyncio.test_pep492
+test.test_asyncio.test_proactor_events
+test.test_asyncio.test_runners
+test.test_asyncio.test_selector_events
+test.test_asyncio.test_sendfile
+test.test_asyncio.test_server
+test.test_asyncio.test_sock_lowlevel
+test.test_asyncio.test_ssl
+test.test_asyncio.test_sslproto
+test.test_asyncio.test_streams
+test.test_asyncio.test_subprocess
+test.test_asyncio.test_tasks
+test.test_asyncio.test_unix_events
+test.test_asyncio.test_windows_events
+test.test_asyncio.test_windows_utils
+test_asdl_parser
+test_check_c_globals
+test_clinic
+test_curses
+test_devpoll
+test_gdb
+test_idle
+test_ioctl
+test_kqueue
+test_launcher
+test_msilib
+test_ossaudiodev
+test_peg_generator
+test_socketserver
+test_ssl
+test_startfile
+test_tcl
+test_timeout
+test_tix
+test_tk
+test_ttk_guionly
+test_ttk_textonly
+test_turtle
+test_winconsoleio
+test_winreg
+test_winsound
+test_xmlrpc_net
+test_zipfile64

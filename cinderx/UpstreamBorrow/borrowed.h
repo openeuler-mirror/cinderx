@@ -196,7 +196,14 @@ PyAPI_FUNC(_PyStackRef) _PyFloat_FromDouble_ConsumeInputs(
 #define Cix_Py_union_type_or _Py_union_type_or
 #define Cix_PyCode_InitAddressRange _PyCode_InitAddressRange
 #define Cix_PyLineTable_NextAddressRange _PyLineTable_NextAddressRange
+#define Cix_PyDict_LoadGlobal _PyDict_LoadGlobal
+#if PY_VERSION_HEX >= 0x030C0000
+// On 3.11 the borrow library defines a real function under the Cix name
+// (borrowed-3.11.gen_cached.c); _PyThreadState_PushFrame itself is not
+// linkable there, so the renaming define stays 3.12+.
 #define Cix_PyThreadState_PushFrame _PyThreadState_PushFrame
+#endif
+#define Cix_PyThreadState_PopFrame _PyThreadState_PopFrame
 #define Cix_PyFrame_ClearExceptCode _PyFrame_ClearExceptCode
 #define Cix_PyTypeAlias_Type _PyTypeAlias_Type
 

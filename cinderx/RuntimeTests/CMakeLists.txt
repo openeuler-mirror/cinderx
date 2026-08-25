@@ -3,10 +3,17 @@
 include(FetchContent)
 include(GoogleTest)
 
+# Deliberately a tag, not a commit pin: build environments resolve
+# github.com through differing lineages (some via curated local mirrors
+# whose googletest history is not the public upstream's), so no single
+# commit SHA exists in all of them, while the v1.17.0 tag resolves in
+# each.  googletest is a test-only dependency and never ships in a
+# wheel; pinning it by SHA waits until the lineages are unified
+# (issue #18).
 cinderx_declare_dependency(
   googletest
   https://github.com/google/googletest.git
-  262727f0a23e27678c4aa939fc00d32b00661b7c # tag v1.17.0
+  v1.17.0
 )
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
@@ -18,6 +25,18 @@ file(GLOB RUNTIME_TEST_SOURCES CONFIGURE_DEPENDS
   ${PROJECT_SOURCE_DIR}/RuntimeTests/main.cpp
   ${PROJECT_SOURCE_DIR}/RuntimeTests/testutil.cpp
 )
+
+if (${PY_VERSION} EQUAL 3.11)
+  # OSR is out of scope on CPython 3.11 (Jit/osr.cpp is excluded from the
+  # build in favour of Jit/osr_stub_311.cpp); its tests exercise the OSR
+  # C-API and 3.14 frame internals, so they are excluded with it.
+  list(FILTER RUNTIME_TEST_SOURCES EXCLUDE REGEX ".*/osr_[a-z_]*_test\\.cpp$")
+  # The sanity suite is execution-focused (it runs compiled code and the
+  # Static Python data model); the capability-gated 3.11 build executes no
+  # machine code and does not build Static Python.  Re-enabled with the
+  # execution MR, guarded per test.
+  list(FILTER RUNTIME_TEST_SOURCES EXCLUDE REGEX ".*/sanity_test\\.cpp$")
+endif()
 
 add_executable(runtime_tests ${RUNTIME_TEST_SOURCES} ${CINDERX_LIB_SOURCES})
 

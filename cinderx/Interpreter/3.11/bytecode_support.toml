@@ -1,0 +1,256 @@
+# CPython 3.11 bytecode support list.
+#
+# Single fact source for how the 3.11 JIT front end treats every opcode the
+# anchored interpreter defines.  Consumers: the front end's eligibility
+# pre-scan and normalization tables (which must be generated from or verified
+# against this file), the opcode coverage reporter, and the CI consistency
+# gate (ci_pipeline/check_bytecode_support_311.py).  Rows change only
+# together with the translator work that justifies them.
+#
+# States:
+#   translate        the translator carries the full 3.11 semantics of the
+#                    opcode: exceptions, eval-breaker obligations and deopt
+#                    sites included.
+#   normalize        a quickened form (adaptive family, specialized variant
+#                    or superinstruction).  The instruction decoder rewrites
+#                    it to `to` before translation; `cache` records the
+#                    inline-cache slots that follow it in the stream.
+#   refuse           deliberately not compiled: hitting it refuses the whole
+#                    code object with `reason` before any JIT state exists.
+#   interpreter-only never reaches the translator at all: the opcode occurs
+#                    only in code shapes eligibility refuses wholesale
+#                    (async code, module/class/REPL bodies) or in dispatch
+#                    pseudo-slots that never appear in co_code.
+#
+# Refusal reasons below are stable identifiers, extended only with review.
+# Opcode reasons apply to individual rows.  Shape reasons reject an entire
+# code object during eligibility and therefore never appear on opcode rows.
+#
+# Provenance: opcode numbers, cache widths and specialization families come
+# from the anchored openEuler python3-3.11.6 opcode tables, cross-checked
+# against the vendored pristine upstream/opcode_targets.h; the initial
+# translate/refuse split was extracted from the dryrun reference translator
+# (dryrun-311-base @ a6648617, isSupportedOpcode evaluated for a 3.11
+# build) and then hand-reviewed.  Planned columns not yet recorded here
+# (stack effects, may-raise, eval-breaker obligation, corpus references)
+# land with the 3.11 front end change that consumes them.
+
+[meta]
+python = "3.11.6"
+slots = 256
+
+[refusal_reasons.opcode]
+REFUSE_PATTERN_MATCHING_UNAUDITED = "MATCH_* helper and protocol audit pending"
+REFUSE_EXCEPT_STAR_UNAUDITED = "except* stays refused after the MR-08 audit: PREP_RERAISE_STAR has no reference implementation, and the exception-group injection surface that would validate a from-scratch pairing is not built"
+REFUSE_HELPER_UNAVAILABLE_PRE314 = "required CPython helper is unavailable before 3.14"
+REFUSE_UNPORTED = "opcode has no audited 3.11 translation"
+INTERP_ONLY_ASYNC_CODE = "opcode occurs only in async code rejected by eligibility"
+INTERP_ONLY_NON_FUNCTION_SCOPE = "opcode occurs only in module, class, or REPL code"
+INTERP_ONLY_PSEUDO_SLOT = "dispatch slot is never emitted into co_code"
+
+[refusal_reasons.shape]
+REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED = "synchronous generator execution is disabled by the CPython 3.11 capability switch"
+REFUSE_SHAPE_GENERATOR_AUTO_DISABLED = "synchronous generators compile on explicit request only; automatic generator compilation is off by policy (MR-11)"
+REFUSE_SHAPE_ASYNC_CODE = "coroutine and async-generator execution is not eligible"
+REFUSE_SHAPE_NON_FUNCTION_SCOPE = "module, class, and REPL code is not eligible"
+REFUSE_SHAPE_NAMESPACE_UNSUPPORTED = "function globals or builtins namespace cannot be safely preloaded"
+REFUSE_SHAPE_INT_ACCUMULATOR_POLICY = "integer constant-accumulator shapes outside the audited compact add/subtract path are excluded from MR-03"
+REFUSE_SHAPE_JIT_SUPPRESSED = "the code object explicitly suppresses JIT compilation"
+REFUSE_SHAPE_FRONTEND_POLICY = "the code object uses a front-end policy pattern that is not eligible for shadow compilation"
+REFUSE_SHAPE_CODEGEN_SPAN = "shadow AArch64 relocation cannot encode the generated span (pathological EXTENDED_ARG tests, or RelocOffsetOutOfRange)"
+REFUSE_SHAPE_STATIC_RUNTIME_CACHE = "shadow codegen cannot retain the runtime cache required by a static invoke"
+REFUSE_SHAPE_INVALID_UTF8_NAME = "co_names contains a string that is not valid UTF-8, so eligibility cannot read it"
+REFUSE_SHAPE_EXECUTE_SURFACE = "the code object uses instructions outside the machine-code execution whitelist"
+REFUSE_SHAPE_VARIADIC_ARGS_UNAUDITED = "retired: generated prologue binds *args and **kwargs (kept for observe id stability)"
+REFUSE_SHAPE_KEYWORD_ARGS_UNAUDITED = "retired: generated prologue binds keyword-only parameters (kept for observe id stability)"
+REFUSE_SHAPE_ARG_DEFAULTS_UNAUDITED = "retired: generated prologue rebinds live defaults (kept for observe id stability)"
+REFUSE_SHAPE_SPECULATIVE_GUARD = "the optimized artifact holds a DeoptPatchpoint; IC patchpoints stay refused until MR-09"
+REFUSE_SHAPE_CODE_ARTIFACT_ALREADY_PUBLISHED = "the code object already has a published compiled artifact under a different globals/builtins namespace; one artifact per code object (same-namespace functions attach to it)"
+REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE = "retired: same-namespace functions share the code object's artifact since MR-11 (kept for observe id stability)"
+REFUSE_SHAPE_AUTO_JIT_DISABLED = "automatic compilation of the code object was disabled after its one failed or refused automatic attempt (execute mode)"
+REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP = "import machinery is kept interpreted on 3.11; compiling it taxes startup and is not a steady-state win"
+REFUSE_SHAPE_CINDER_MODULE = "compiling cinderx keeps the extension module alive past finalize"
+
+[opcodes]
+ASYNC_GEN_WRAP = { num = 87, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+BEFORE_ASYNC_WITH = { num = 52, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+BEFORE_WITH = { num = 53, state = "translate", cache = 0 }
+BINARY_OP = { num = 122, state = "translate", cache = 1 }
+BINARY_OP_ADAPTIVE = { num = 3, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_ADD_FLOAT = { num = 4, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_ADD_INT = { num = 5, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_ADD_UNICODE = { num = 6, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_INPLACE_ADD_UNICODE = { num = 7, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_MULTIPLY_FLOAT = { num = 8, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_MULTIPLY_INT = { num = 13, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_SUBTRACT_FLOAT = { num = 14, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_OP_SUBTRACT_INT = { num = 16, state = "normalize", cache = 1, to = "BINARY_OP" }
+BINARY_SUBSCR = { num = 25, state = "translate", cache = 4 }
+BINARY_SUBSCR_ADAPTIVE = { num = 17, state = "normalize", cache = 4, to = "BINARY_SUBSCR" }
+BINARY_SUBSCR_DICT = { num = 18, state = "normalize", cache = 4, to = "BINARY_SUBSCR" }
+BINARY_SUBSCR_GETITEM = { num = 19, state = "normalize", cache = 4, to = "BINARY_SUBSCR" }
+BINARY_SUBSCR_LIST_INT = { num = 20, state = "normalize", cache = 4, to = "BINARY_SUBSCR" }
+BINARY_SUBSCR_TUPLE_INT = { num = 21, state = "normalize", cache = 4, to = "BINARY_SUBSCR" }
+BUILD_CONST_KEY_MAP = { num = 156, state = "translate", cache = 0 }
+BUILD_LIST = { num = 103, state = "translate", cache = 0 }
+BUILD_MAP = { num = 105, state = "translate", cache = 0 }
+BUILD_SET = { num = 104, state = "translate", cache = 0 }
+BUILD_SLICE = { num = 133, state = "translate", cache = 0 }
+BUILD_STRING = { num = 157, state = "translate", cache = 0 }
+BUILD_TUPLE = { num = 102, state = "translate", cache = 0 }
+CACHE = { num = 0, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_PSEUDO_SLOT" }
+CALL = { num = 171, state = "translate", cache = 4 }
+CALL_ADAPTIVE = { num = 22, state = "normalize", cache = 4, to = "CALL" }
+CALL_FUNCTION_EX = { num = 142, state = "translate", cache = 0 }
+CALL_PY_EXACT_ARGS = { num = 23, state = "normalize", cache = 4, to = "CALL" }
+CALL_PY_WITH_DEFAULTS = { num = 24, state = "normalize", cache = 4, to = "CALL" }
+CHECK_EG_MATCH = { num = 37, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED", note = "MR-08 audit: the dryrun reference translator supported this opcode, but its partner PREP_RERAISE_STAR has no reference implementation; the pair is refused together until the exception-group injection surface exists to validate a from-scratch pairing" }
+CHECK_EXC_MATCH = { num = 36, state = "translate", cache = 0 }
+COMPARE_OP = { num = 107, state = "translate", cache = 2 }
+COMPARE_OP_ADAPTIVE = { num = 26, state = "normalize", cache = 2, to = "COMPARE_OP" }
+COMPARE_OP_FLOAT_JUMP = { num = 27, state = "normalize", cache = 2, to = "COMPARE_OP" }
+COMPARE_OP_INT_JUMP = { num = 28, state = "normalize", cache = 2, to = "COMPARE_OP" }
+COMPARE_OP_STR_JUMP = { num = 29, state = "normalize", cache = 2, to = "COMPARE_OP" }
+CONTAINS_OP = { num = 118, state = "translate", cache = 0 }
+COPY = { num = 120, state = "translate", cache = 0 }
+COPY_FREE_VARS = { num = 149, state = "translate", cache = 0 }
+DELETE_ATTR = { num = 96, state = "translate", cache = 0 }
+DELETE_DEREF = { num = 139, state = "refuse", cache = 0, reason = "REFUSE_UNPORTED" }
+DELETE_FAST = { num = 126, state = "translate", cache = 0 }
+DELETE_GLOBAL = { num = 98, state = "refuse", cache = 0, reason = "REFUSE_UNPORTED" }
+DELETE_NAME = { num = 91, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+DELETE_SUBSCR = { num = 61, state = "translate", cache = 0 }
+DICT_MERGE = { num = 164, state = "translate", cache = 0 }
+DICT_UPDATE = { num = 165, state = "translate", cache = 0 }
+DO_TRACING = { num = 255, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_PSEUDO_SLOT" }
+END_ASYNC_FOR = { num = 54, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+EXTENDED_ARG = { num = 144, state = "translate", cache = 0 }
+EXTENDED_ARG_QUICK = { num = 34, state = "normalize", cache = 0, to = "EXTENDED_ARG" }
+FORMAT_VALUE = { num = 155, state = "translate", cache = 0 }
+FOR_ITER = { num = 93, state = "translate", cache = 0 }
+GET_AITER = { num = 50, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+GET_ANEXT = { num = 51, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+GET_AWAITABLE = { num = 131, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }
+GET_ITER = { num = 68, state = "translate", cache = 0 }
+GET_LEN = { num = 30, state = "translate", cache = 0 }
+GET_YIELD_FROM_ITER = { num = 69, state = "translate", cache = 0 }
+IMPORT_FROM = { num = 109, state = "refuse", cache = 0, reason = "REFUSE_HELPER_UNAVAILABLE_PRE314" }
+IMPORT_NAME = { num = 108, state = "translate", cache = 0 }
+IMPORT_STAR = { num = 84, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+IS_OP = { num = 117, state = "translate", cache = 0 }
+JUMP_BACKWARD = { num = 140, state = "translate", cache = 0 }
+JUMP_BACKWARD_NO_INTERRUPT = { num = 134, state = "translate", cache = 0 }
+JUMP_BACKWARD_QUICK = { num = 38, state = "normalize", cache = 0, to = "JUMP_BACKWARD" }
+JUMP_FORWARD = { num = 110, state = "translate", cache = 0 }
+JUMP_IF_FALSE_OR_POP = { num = 111, state = "translate", cache = 0 }
+JUMP_IF_TRUE_OR_POP = { num = 112, state = "translate", cache = 0 }
+KW_NAMES = { num = 172, state = "translate", cache = 0 }
+LIST_APPEND = { num = 145, state = "translate", cache = 0 }
+LIST_EXTEND = { num = 162, state = "translate", cache = 0 }
+LIST_TO_TUPLE = { num = 82, state = "translate", cache = 0 }
+LOAD_ASSERTION_ERROR = { num = 74, state = "translate", cache = 0 }
+LOAD_ATTR = { num = 106, state = "translate", cache = 4 }
+LOAD_ATTR_ADAPTIVE = { num = 39, state = "normalize", cache = 4, to = "LOAD_ATTR" }
+LOAD_ATTR_INSTANCE_VALUE = { num = 40, state = "normalize", cache = 4, to = "LOAD_ATTR" }
+LOAD_ATTR_MODULE = { num = 41, state = "normalize", cache = 4, to = "LOAD_ATTR" }
+LOAD_ATTR_SLOT = { num = 42, state = "normalize", cache = 4, to = "LOAD_ATTR" }
+LOAD_ATTR_WITH_HINT = { num = 43, state = "normalize", cache = 4, to = "LOAD_ATTR" }
+LOAD_BUILD_CLASS = { num = 71, state = "translate", cache = 0 }
+LOAD_CLASSDEREF = { num = 148, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+LOAD_CLOSURE = { num = 136, state = "translate", cache = 0 }
+LOAD_CONST = { num = 100, state = "translate", cache = 0 }
+LOAD_CONST__LOAD_FAST = { num = 44, state = "normalize", cache = 0, to = "LOAD_CONST" }
+LOAD_DEREF = { num = 137, state = "translate", cache = 0 }
+LOAD_FAST = { num = 124, state = "translate", cache = 0 }
+LOAD_FAST__LOAD_CONST = { num = 45, state = "normalize", cache = 0, to = "LOAD_FAST" }
+LOAD_FAST__LOAD_FAST = { num = 46, state = "normalize", cache = 0, to = "LOAD_FAST" }
+LOAD_GLOBAL = { num = 116, state = "translate", cache = 5 }
+LOAD_GLOBAL_ADAPTIVE = { num = 47, state = "normalize", cache = 5, to = "LOAD_GLOBAL" }
+LOAD_GLOBAL_BUILTIN = { num = 48, state = "normalize", cache = 5, to = "LOAD_GLOBAL" }
+LOAD_GLOBAL_MODULE = { num = 55, state = "normalize", cache = 5, to = "LOAD_GLOBAL" }
+LOAD_METHOD = { num = 160, state = "translate", cache = 10 }
+LOAD_METHOD_ADAPTIVE = { num = 56, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_METHOD_CLASS = { num = 57, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_METHOD_MODULE = { num = 58, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_METHOD_NO_DICT = { num = 59, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_METHOD_WITH_DICT = { num = 62, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_METHOD_WITH_VALUES = { num = 63, state = "normalize", cache = 10, to = "LOAD_METHOD" }
+LOAD_NAME = { num = 101, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+MAKE_CELL = { num = 135, state = "translate", cache = 0 }
+MAKE_FUNCTION = { num = 132, state = "translate", cache = 0 }
+MAP_ADD = { num = 147, state = "translate", cache = 0 }
+MATCH_CLASS = { num = 152, state = "refuse", cache = 0, reason = "REFUSE_PATTERN_MATCHING_UNAUDITED" }
+MATCH_KEYS = { num = 33, state = "refuse", cache = 0, reason = "REFUSE_PATTERN_MATCHING_UNAUDITED" }
+MATCH_MAPPING = { num = 31, state = "refuse", cache = 0, reason = "REFUSE_PATTERN_MATCHING_UNAUDITED" }
+MATCH_SEQUENCE = { num = 32, state = "refuse", cache = 0, reason = "REFUSE_PATTERN_MATCHING_UNAUDITED" }
+NOP = { num = 9, state = "translate", cache = 0 }
+POP_EXCEPT = { num = 89, state = "translate", cache = 0 }
+POP_JUMP_BACKWARD_IF_FALSE = { num = 175, state = "translate", cache = 0 }
+POP_JUMP_BACKWARD_IF_NONE = { num = 174, state = "translate", cache = 0 }
+POP_JUMP_BACKWARD_IF_NOT_NONE = { num = 173, state = "translate", cache = 0 }
+POP_JUMP_BACKWARD_IF_TRUE = { num = 176, state = "translate", cache = 0 }
+POP_JUMP_FORWARD_IF_FALSE = { num = 114, state = "translate", cache = 0 }
+POP_JUMP_FORWARD_IF_NONE = { num = 129, state = "translate", cache = 0 }
+POP_JUMP_FORWARD_IF_NOT_NONE = { num = 128, state = "translate", cache = 0 }
+POP_JUMP_FORWARD_IF_TRUE = { num = 115, state = "translate", cache = 0 }
+POP_TOP = { num = 1, state = "translate", cache = 0 }
+PRECALL = { num = 166, state = "translate", cache = 1 }
+PRECALL_ADAPTIVE = { num = 64, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_BOUND_METHOD = { num = 65, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_BUILTIN_CLASS = { num = 66, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_BUILTIN_FAST_WITH_KEYWORDS = { num = 67, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS = { num = 72, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_BUILTIN_FAST = { num = 73, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_BUILTIN_O = { num = 76, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_ISINSTANCE = { num = 77, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_LEN = { num = 78, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_LIST_APPEND = { num = 79, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_METHOD_DESCRIPTOR_FAST = { num = 80, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_METHOD_DESCRIPTOR_NOARGS = { num = 81, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_METHOD_DESCRIPTOR_O = { num = 113, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_STR_1 = { num = 121, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_TUPLE_1 = { num = 127, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_NO_KW_TYPE_1 = { num = 141, state = "normalize", cache = 1, to = "PRECALL" }
+PRECALL_PYFUNC = { num = 143, state = "normalize", cache = 1, to = "PRECALL" }
+PREP_RERAISE_STAR = { num = 88, state = "refuse", cache = 0, reason = "REFUSE_EXCEPT_STAR_UNAUDITED", note = "MR-08 audit: no reference implementation exists; refused together with CHECK_EG_MATCH" }
+PRINT_EXPR = { num = 70, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+PUSH_EXC_INFO = { num = 35, state = "translate", cache = 0 }
+PUSH_NULL = { num = 2, state = "translate", cache = 0 }
+RAISE_VARARGS = { num = 130, state = "translate", cache = 0 }
+RERAISE = { num = 119, state = "translate", cache = 0 }
+RESUME = { num = 151, state = "translate", cache = 0 }
+RESUME_QUICK = { num = 150, state = "normalize", cache = 0, to = "RESUME" }
+RETURN_GENERATOR = { num = 75, state = "translate", cache = 0 }
+RETURN_VALUE = { num = 83, state = "translate", cache = 0 }
+SEND = { num = 123, state = "translate", cache = 0 }
+SETUP_ANNOTATIONS = { num = 85, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+SET_ADD = { num = 146, state = "translate", cache = 0 }
+SET_UPDATE = { num = 163, state = "translate", cache = 0 }
+STORE_ATTR = { num = 95, state = "translate", cache = 4 }
+STORE_ATTR_ADAPTIVE = { num = 153, state = "normalize", cache = 4, to = "STORE_ATTR" }
+STORE_ATTR_INSTANCE_VALUE = { num = 154, state = "normalize", cache = 4, to = "STORE_ATTR" }
+STORE_ATTR_SLOT = { num = 158, state = "normalize", cache = 4, to = "STORE_ATTR" }
+STORE_ATTR_WITH_HINT = { num = 159, state = "normalize", cache = 4, to = "STORE_ATTR" }
+STORE_DEREF = { num = 138, state = "translate", cache = 0 }
+STORE_FAST = { num = 125, state = "translate", cache = 0 }
+STORE_FAST__LOAD_FAST = { num = 161, state = "normalize", cache = 0, to = "STORE_FAST" }
+STORE_FAST__STORE_FAST = { num = 167, state = "normalize", cache = 0, to = "STORE_FAST" }
+STORE_GLOBAL = { num = 97, state = "translate", cache = 0 }
+STORE_NAME = { num = 90, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_NON_FUNCTION_SCOPE" }
+STORE_SUBSCR = { num = 60, state = "translate", cache = 1 }
+STORE_SUBSCR_ADAPTIVE = { num = 168, state = "normalize", cache = 1, to = "STORE_SUBSCR" }
+STORE_SUBSCR_DICT = { num = 169, state = "normalize", cache = 1, to = "STORE_SUBSCR" }
+STORE_SUBSCR_LIST_INT = { num = 170, state = "normalize", cache = 1, to = "STORE_SUBSCR" }
+SWAP = { num = 99, state = "translate", cache = 0 }
+UNARY_INVERT = { num = 15, state = "translate", cache = 0 }
+UNARY_NEGATIVE = { num = 11, state = "translate", cache = 0 }
+UNARY_NOT = { num = 12, state = "translate", cache = 0 }
+UNARY_POSITIVE = { num = 10, state = "translate", cache = 0 }
+UNPACK_EX = { num = 94, state = "translate", cache = 0 }
+UNPACK_SEQUENCE = { num = 92, state = "translate", cache = 1 }
+UNPACK_SEQUENCE_ADAPTIVE = { num = 177, state = "normalize", cache = 1, to = "UNPACK_SEQUENCE" }
+UNPACK_SEQUENCE_LIST = { num = 178, state = "normalize", cache = 1, to = "UNPACK_SEQUENCE" }
+UNPACK_SEQUENCE_TUPLE = { num = 179, state = "normalize", cache = 1, to = "UNPACK_SEQUENCE" }
+UNPACK_SEQUENCE_TWO_TUPLE = { num = 180, state = "normalize", cache = 1, to = "UNPACK_SEQUENCE" }
+WITH_EXCEPT_START = { num = 49, state = "translate", cache = 0 }
+YIELD_VALUE = { num = 86, state = "translate", cache = 0 }

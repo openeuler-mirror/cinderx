@@ -16,6 +16,16 @@ enum class Result : int32_t {
   // method of the class is not a function.
   CANNOT_SPECIALIZE,
 
+  // The function stopped holding the code object the request named.
+  //
+  // Separate from every other refusal because it describes the FUNCTION,
+  // not the code: compilation runs arbitrary Python (death-watch
+  // registration, preloading, publication allocations), and 3.11 permits
+  // `__code__` to be reassigned whenever the free-variable counts match.
+  // Mapping this onto a code-specific failure would spend a code object's
+  // one automatic attempt on something it did not do.
+  CODE_MOVED,
+
   // A JIT-list is in use and this function is not on it.
   NOT_ON_JITLIST,
 

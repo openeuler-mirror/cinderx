@@ -245,6 +245,7 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kBuildString:
     case Opcode::kBuildTemplate:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckExc:
     case Opcode::kCheckNeg:
     case Opcode::kCheckSequenceBounds:

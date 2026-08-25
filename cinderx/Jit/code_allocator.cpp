@@ -5,6 +5,7 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Jit/codegen/code_section.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/trigger_stats.h"
 
 #ifdef WIN32
 #include <Windows.h>
@@ -29,9 +30,13 @@ namespace {
 
 // 2MiB to match Linux's huge-page size.
 constexpr size_t kAllocSize = 1024 * 1024 * 2;
+constexpr size_t kAArch64InstructionAlignment = 4;
 
 // Allocate memory for JIT'd code.
 uint8_t* allocPages(size_t size) {
+  // Trigger-proof accounting: every executable-memory allocation the JIT
+  // makes funnels through here.
+  triggerStatsOnExecutableAlloc(size);
 #ifndef WIN32
   void* res = mmap(
       nullptr,
@@ -81,6 +86,20 @@ void flushInstructionCache(
 
 } // namespace
 
+SplitAllocationLayout computeSplitAllocationLayout(
+    size_t hot_needed,
+    size_t cold_needed) {
+  size_t total_needed = hot_needed + cold_needed;
+  size_t chunk_size = ((total_needed / kAllocSize) + 1) * kAllocSize;
+  size_t surplus = chunk_size - total_needed;
+  size_t hot_capacity = asmjit::Support::alignUp(
+      hot_needed + surplus / 2, kAArch64InstructionAlignment);
+  JIT_CHECK(
+      hot_capacity + cold_needed <= chunk_size,
+      "Aligned split-code layout exceeds its allocation");
+  return {chunk_size, hot_capacity};
+}
+
 ICodeAllocator* CodeAllocator::make() {
   if (getConfig().use_huge_pages) {
     return new CodeAllocatorCinder{};
@@ -89,11 +108,33 @@ ICodeAllocator* CodeAllocator::make() {
 }
 
 AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
+  // The executable-allocation trigger metric counts pool-level
+  // allocations: the Cinder allocator counts its chunk mmaps in
+  // allocPages(), so this allocator watches the underlying block pool
+  // grow rather than counting per-artifact spans -- the metric must not
+  // change meaning with the allocator choice.
+  const size_t reserved_before =
+      runtime_.allocator()->statistics().reservedSize();
   void* addr = nullptr;
   asmjit::Error error = runtime_.add(&addr, code);
 
   if (addr != nullptr && error == asmjit::kErrorOk) {
-    used_bytes_.fetch_add(code->codeSize(), std::memory_order_relaxed);
+    const size_t reserved_after =
+        runtime_.allocator()->statistics().reservedSize();
+    if (reserved_after > reserved_before) {
+      triggerStatsOnExecutableAlloc(reserved_after - reserved_before);
+    }
+    // Account the physical span rather than the logical code size: the
+    // allocator hands back aligned blocks and releaseCode() can only
+    // subtract what query() reports, so symmetric accounting is what makes
+    // used_bytes_ return to its plateau under compile/release churn --
+    // asymmetric accounting underflows the counter one alignment gap at a
+    // time.
+    asmjit::JitAllocator::Span span;
+    JIT_CHECK(
+        runtime_.allocator()->query(span, addr) == asmjit::kErrorOk,
+        "Code allocator cannot answer for a span it just allocated");
+    used_bytes_.fetch_add(span.size(), std::memory_order_relaxed);
   }
 
   return AllocateResult{addr, error};
@@ -174,16 +215,17 @@ void CodeAllocatorCinder::ensureSplitSpace(
 
   // When either side needs a new allocation, allocate a single contiguous
   // region and split it. This guarantees hot and cold code are always within
-  // the same mmap region, so cross-section jumps stay within ARM64's relative
-  // branch range (±128MB for B/BL, ±1MB for B.cond). Without this,
+  // the same mmap region, so cross-section links share one relative address
+  // space. Without this,
   // independent mmap() calls could place hot and cold regions too far apart,
   // causing asmjit's relocateToBase()/resolveUnresolvedLinks() to fail with
   // kErrorInvalidDisplacement.
   lost_bytes_.fetch_add(
       hot_alloc_free_ + cold_alloc_free_, std::memory_order_relaxed);
 
-  size_t total_needed = hot_needed + cold_needed;
-  size_t chunk_size = ((total_needed / kAllocSize) + 1) * kAllocSize;
+  SplitAllocationLayout layout =
+      computeSplitAllocationLayout(hot_needed, cold_needed);
+  size_t chunk_size = layout.chunk_size;
   uint8_t* res = allocPages(chunk_size);
   if (setHugePages(res, chunk_size)) {
     huge_allocs_.fetch_add(1, std::memory_order_relaxed);
@@ -195,8 +237,7 @@ void CodeAllocatorCinder::ensureSplitSpace(
   // Hot code grows forward from the start, cold code grows forward from a
   // split point. Split proportionally so each side gets at least what it
   // requested, distributing any surplus evenly.
-  size_t surplus = chunk_size - total_needed;
-  size_t hot_share = hot_needed + surplus / 2;
+  size_t hot_share = layout.hot_capacity;
   hot_alloc_ = res;
   hot_alloc_free_ = hot_share;
   cold_alloc_ = res + hot_share;
@@ -218,10 +259,14 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
 
   // Ensure we have enough space for both hot and cold code.
 #if defined(__aarch64__)
-  // On ARM64, branch displacements are limited (±128MB for B/BL, ±1MB for
-  // B.cond). Allocate hot and cold from a single contiguous region so
-  // cross-section jumps are always in range.
+  // Keep hot and cold in one relative address space and preserve instruction
+  // alignment for cross-section links.
   ensureSplitSpace(hot_size, cold_size);
+  JIT_CHECK(
+      static_cast<size_t>(cold_alloc_ - hot_alloc_) %
+              kAArch64InstructionAlignment ==
+          0,
+      "AArch64 split-code sections must be instruction-aligned");
 #else
   // On x86-64, RIP-relative addressing has a ±2GB range which is large enough
   // that independent allocations are unlikely to exceed it in practice.

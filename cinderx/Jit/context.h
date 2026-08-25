@@ -121,6 +121,27 @@ struct CompilationKey {
   constexpr bool operator==(const CompilationKey& other) const = default;
 };
 
+// Numeric-only test/diagnostic census for CPython 3.11 lifecycle discovery.
+// No field owns or returns a Python/runtime object.
+struct LifecycleSnapshot311 {
+  size_t compiled_codes{0};
+  size_t installed_functions{0};
+  size_t associated_functions{0};
+  size_t parked_functions{0};
+  size_t watched_functions{0};
+  size_t artifact_members{0};
+  size_t deferred_anchor_releases{0};
+  size_t active_compiles{0};
+  size_t completed_compiles{0};
+  size_t deferred_finalizations{0};
+  size_t orphaned_compiled_codes{0};
+  size_t code_dedup_entries{0};
+  size_t code_outer_functions{0};
+  size_t context_references{0};
+  size_t code_runtimes_allocated{0};
+  size_t code_runtimes_live{0};
+};
+
 } // namespace jit
 
 template <>
@@ -151,10 +172,97 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void addDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Arm the death watch (idempotent); false on allocation failure, no
+   * error pending.  Arming is a precondition of recording any borrowed
+   * registry pointer.
+   */
+  bool watchFunctionDeath(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Drop the watch for a function that has died.  Called from the callback,
+   * and by publication when it unwinds an arm it created.
+   */
+  void forgetFunctionDeathWatch(PyFunctionObject* func);
+
+  /*
+   * True while the function's death is already in flight: its watch has been
+   * cleared by the collector but the callback has not landed yet.  During a
+   * cyclic collection the weak references of the doomed are cleared, and
+   * their callbacks run, before anything is untracked -- so a query from a
+   * user callback in that batch sees the function still tracked while it is
+   * already condemned.  The cleared watch is the only oracle for that state.
+   */
+  bool isFunctionDeathPending(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * Drop every watch.  Teardown only: after this the JIT stops being told
+   * about function deaths.
+   */
+  void clearFunctionDeathWatch();
+
+  /* Number of functions currently watched; read by tests and reports. */
+  size_t watchedFunctionCount() const;
+#endif
+
   /*
    * Removes a function from the deopted functions set.
    */
   void removeDeoptedFunc(BorrowedRef<PyFunctionObject> func);
+
+  /* Empty the deopted set, releasing whatever it owns. */
+  void clearDeoptedFuncs();
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Release every displaced anchor a publication deferred.  Runs arbitrary
+   * Python: call only from a control-plane boundary, with no registry walk
+   * active and no computed-but-unreported verdict.  Reentrancy-safe -- one
+   * reference is released at a time and the queue is re-read, so a release
+   * that publishes again and defers more anchors extends the same drain.
+   */
+  void drainDeferredAnchorReleases();
+
+  /*
+   * Park a reference on the deferred-release queue, for a caller outside
+   * finalizeFunc() that must not run the reference's destructor inside
+   * its own operation.  The caller drains at its boundary.
+   */
+  void deferAnchorRelease(Ref<> anchor);
+
+  /*
+   * Whether any compilation state is attached to this function: an
+   * association (which survives parking and __code__ swaps), a parked
+   * entry, or an installation.  This is the force-uncompile predicate.
+   * It is deliberately NOT isJitCompiled(), which answers the narrower
+   * question "will the next call execute machine code" and is false in
+   * exactly the states -- parked, __code__ swapped, evaluator away --
+   * whose retained state force_uncompile() exists to remove.
+   */
+  bool hasCompilationState(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * The artifact the association map claims for this function, or null.
+   * The association is the authoritative answer to "which artifact":
+   * func_code is writable Python state and may point at another live
+   * function's code by the time anyone asks.
+   */
+  BorrowedRef<CompiledFunction> findAssociated(
+      BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * Retire a compiled-code entry by ARTIFACT identity: the key is built
+   * from the artifact's own runtime (code, builtins, globals), never from
+   * the function's current code object.  force_uncompile() retires the
+   * artifact its association claimed; keying by the function's mutable
+   * func_code cleared whichever artifact currently owned that code -- a
+   * donor function's, after a __code__ swap.
+   */
+  void forgetCodeForArtifact(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+#endif
 
   /*
    * Fully remove all effects of compilation from a function.
@@ -194,6 +302,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * Adds a compiled function to the Context. Returns false if the function was
    * previously added.
    */
+  // Record the artifact for a function.  Allocates only the map node and
+  // runs no Python, so a subject validated before the call is still valid
+  // inside it.
+  bool commitCompiledFunc(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+
   bool addCompiledFunc(
       BorrowedRef<PyFunctionObject> func,
       BorrowedRef<CompiledFunction> compiled);
@@ -256,6 +371,18 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * Remove the specified code object from the known compiled codes.
    */
   void forgetCode(BorrowedRef<PyFunctionObject> func);
+
+ private:
+  /*
+   * Shared tail of forgetCode()/forgetCodeForArtifact(): nested-list
+   * cleanup, cache and dedup-index drops, the artifact clear, and the
+   * erase of the given entry.
+   */
+  void forgetCodeEntry(
+      UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>>::iterator it,
+      BorrowedRef<PyFunctionObject> func);
+
+ public:
   /*
    * Remove the specified code object from the known compiled codes.
    */
@@ -298,6 +425,17 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * deopted.
    */
   const UnorderedSet<BorrowedRef<PyFunctionObject>>& deoptedFuncs();
+
+  LifecycleSnapshot311 lifecycleSnapshot311();
+  std::vector<std::string> lifecycleInvariantErrors311() const;
+
+  // Hand a retired artifact's cleared CodeRuntime back to the slab for
+  // reuse, after purging every side table keyed by its address so the
+  // slot's next tenant cannot inherit the old one's state.
+  void recycleCodeRuntime(CodeRuntime* runtime) override;
+
+  // Whether the runtime lives in this context's slab storage.
+  bool ownsCodeRuntime(const CodeRuntime* runtime) const override;
 
   /*
    * Get the total time spent compiling functions thus far.
@@ -459,7 +597,11 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   // compile the CompiledFunction will immediately be created, otherwise the
   // CompiledFunctionData will be preserved until the multi-threaded compile can
   // finalize things.
-  void codeCompiled(
+  //
+  // Returns whether the result was published (or deferred for later
+  // publication).  A false return means the compile succeeded but nothing
+  // was installed -- the caller must not report the function as compiled.
+  bool codeCompiled(
       BorrowedRef<PyFunctionObject> func,
       CompilationKey& key,
       CompiledFunctionData&& compiled_func);
@@ -481,6 +623,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   // Allocate all CodeRuntimes together so they can be mlocked() without
   // including any other data that happened to be on the same page.
+  std::shared_ptr<CodeRuntimeLifetime> code_runtime_lifetime_{
+      std::make_shared<CodeRuntimeLifetime>()};
   SlabArena<CodeRuntime> code_runtimes_;
 
   // These SlabAreas hold data that is allocated at compile-time and likely to
@@ -562,8 +706,64 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   UnorderedMap<BorrowedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>
       compiled_funcs_;
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Which artifact claims each function: the inverse of the artifacts'
+   * artifacts' member sets, and the lookup the installed registry cannot
+   * answer.  Association identity and installation identity are distinct
+   * states on this branch: compiled_funcs_ records what is installed right
+   * now and empties on a deopt, while the association survives parking so
+   * a paused function can walk back onto its own artifact.  Severing an
+   * old claim when a function re-associates -- above all after a __code__
+   * swap, which unmoors the association from every code-keyed structure --
+   * needs this map, because the function is then neither installed nor
+   * reachable through its current code object.
+   *
+   * Entries are borrowed on both sides and move together with the
+   * artifacts' member sets: created in finalizeFunc(), transferred by its
+   * stale-claim severing, and erased by funcDestroyed() and by the death
+   * of the claiming artifact (forgetCompiledFunction).
+   */
+  UnorderedMap<BorrowedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>
+      associated_funcs_;
+
+  /*
+   * Displaced dictionary anchors awaiting release.  A takeover displaces
+   * the prior artifact's owning reference, and releasing it anywhere
+   * inside the publication call stack runs arbitrary Python at a point
+   * where a verdict has been computed but not yet reported, or where a
+   * registry walk is active: a __del__ calling disable() would unpublish
+   * a function whose compile is about to report OK, and one firing inside
+   * the enable() reattach walk would mutate the set being iterated.
+   * finalizeFunc() parks the displaced reference here; control-plane
+   * boundaries drain the queue where no walk is active, then re-verify
+   * whatever they are about to report.
+   */
+  std::vector<Ref<>> deferred_anchor_releases_;
+#endif
+
   /* Set of which functions were JIT-compiled but have since been deopted. */
   UnorderedSet<BorrowedRef<PyFunctionObject>> deopted_funcs_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Weak references standing in for 3.11's missing function watcher.  JIT
+   * ownership is what makes cycle deaths deliver (a watch owned by the
+   * dying graph is cleared silently); entries deliberately outlive
+   * registration -- a stale watch is one weak reference that finds
+   * nothing to erase.
+   */
+  UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+
+  /*
+   * Death-watch owner token: capsule-held cell naming this context, shared
+   * by every armed callback.  ClearWeakRefs snapshots callbacks before
+   * invoking any, so a raw Context* can dangle; the cell is nulled by
+   * ~Context, outlives it by refcount, and is per-instance (a recycled
+   * address cannot impersonate a dead owner).
+   */
+  Ref<> death_watch_owner_token_;
+#endif
 
   /*
    * Set of compilations that are currently active, across all threads.

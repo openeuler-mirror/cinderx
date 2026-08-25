@@ -3,9 +3,11 @@
 # Scenario 5 (the CPython 3.14 reference line stays unchanged) is covered by
 # the existing 3.14 suites and has no job here.
 #
-# Wired as the pr311/daily311 pipelines in run_gate.py.  Every job runs on
-# the venv the first build job creates, so the suite is self-contained in a
-# clean worktree.
+# Wired as the pr311/daily311 pipelines in run_gate.py.  The wheel job runs
+# first and provisions the suite's entire toolchain -- the venv with the
+# built wheel and a pinned pytest -- so every later job runs on that venv
+# and the suite is self-contained on a runner that has only python3.11,
+# a compiler toolchain and network access to the package index.
 
 fail_fast = true
 
@@ -13,12 +15,6 @@ fail_fast = true
 python = "3.11"
 arch = "arm64"
 system = "Linux"
-
-# The differential engine is this suite's judge; its own unit tests run
-# first, so a broken judge can never wave anything through.
-[[jobs]]
-name = "diff_engine_selftest"
-command = "python3.11 -m pytest -q ci_pipeline/test_libtest_diff_311.py"
 
 # The vendored interpreter sources must match their pinned manifest before
 # anything is built from them.
@@ -29,7 +25,36 @@ command = "bash -lc 'cd cinderx/Interpreter/3.11/upstream && sha256sum --check -
 # Scenario 1: build a wheel, install it into a clean venv, import it.
 [[jobs]]
 name = "wheel_build_import"
-command = "bash -lc 'python3.11 -m pip wheel . -w \"{run_dir}/wheels\" --no-deps --no-build-isolation && python3.11 -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\"'"
+command = "bash -lc 'python3.11 -m pip wheel . -w \"{run_dir}/wheels\" --no-deps --no-build-isolation && python3.11 -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\" && \"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pytest==8.3.4 && \"{run_dir}/venv/bin/python\" -m pytest --version'"
+
+# Scenario 1b: the same thing at CMAKE_BUILD_TYPE=Release, running the
+# canary suite against it.  The default wheel is RelWithDebInfo, so without
+# this job nothing proves the prologue, the guarded entry, the materialized
+# frame or the reference cleanup behave the same once the optimizer has had
+# its way with them -- which is exactly what a release build ships.
+[[jobs]]
+name = "release_canary_execute"
+command = "bash -lc 'CMAKE_BUILD_TYPE=Release python3.11 -m pip wheel . -w \"{run_dir}/release-wheels\" --no-deps --no-build-isolation && if ! grep -qx \"CMAKE_BUILD_TYPE:STRING=Release\" scratch/*/CMakeCache.txt; then echo \"the wheel was not built at Release; setup.py reuses a cached build tree, so the build type has to be proven, not assumed\"; grep -h \"^CMAKE_BUILD_TYPE\" scratch/*/CMakeCache.txt; exit 1; fi && python3.11 -m venv \"{run_dir}/release-venv\" && \"{run_dir}/release-venv/bin/pip\" install \"{run_dir}\"/release-wheels/cinderx-*.whl && cd cinderx/PythonLib && \"{run_dir}/release-venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_canary_execute_311'"
+
+# MR-10 generator acceptance: every state-machine case has an interpreted
+# oracle, executes generated code in canary mode under the debug allocator,
+# and must preserve both its semantic outcome and its reference-count drift.
+[[jobs]]
+name = "generator_corpus_canary"
+command = "bash -lc 'mkdir -p \"{run_dir}/generator-corpus\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_generators interp \"{run_dir}/generator-corpus/interp.json\" && CINDERX_JIT_MODE=canary PYTHONJITGENERATOR=1 PYTHONMALLOC=debug \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_generators jit \"{run_dir}/generator-corpus/jit.json\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py diff \"{run_dir}/generator-corpus/interp.json\" \"{run_dir}/generator-corpus/jit.json\"'"
+
+# The differential engine is this suite's judge; its own unit tests run
+# before the engine judges anything, on the venv the wheel job provisioned.
+[[jobs]]
+name = "diff_engine_selftest"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_libtest_diff_311.py'"
+
+# The bytecode support list is the fact source the 3.11 JIT front end is
+# held to.  Its checker's own fault-injection tests run first, so a checker
+# that cannot see mutations can never wave a stale list through.
+[[jobs]]
+name = "bytecode_support_gate"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_check_bytecode_support_311.py ci_pipeline/test_bytecode_support_311_registry.py && \"{run_dir}/venv/bin/python\" ci_pipeline/check_bytecode_support_311.py'"
 
 # The module exports its init function and nothing else: the vendored
 # interpreter's PyAPI definitions must never reach the dynamic symbol table.
@@ -42,6 +67,27 @@ command = "bash -lc 'SO=$(\"{run_dir}/venv/bin/python\" -c \"import _cinderx; pr
 [[jobs]]
 name = "interpreter_and_eval_hook"
 command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_interpreter_311 test_cinderx.test_kunpeng.test_jit_unsupported_311'"
+
+# Counter-backed capability-gate proof: under load and forced compile
+# requests, executable allocations and CompiledFunction creations stay zero
+# -- while the canary child (MR-04) proves the same counters genuinely move
+# when execution is explicitly requested, with attribute caches still off.
+[[jobs]]
+name = "trigger_stats_gate"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_trigger_stats_311 test_cinderx.test_kunpeng.test_canary_execute_311'"
+
+# The trigger-proof drivers' own red paths run before anything consumes
+# them: an expected trigger that does not fire must fail, a dead worker must
+# never count as a skip, and configuration must be asserted in the child.
+[[jobs]]
+name = "jit311_runner_selftests"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_jit311_runners.py ci_pipeline/test_jit311_corpus.py ci_pipeline/test_jit311_shadow_surface.py ci_pipeline/test_jit311_lifecycle_census.py'"
+
+# RuntimeTests on 3.11: the green baseline (LIR, register allocation,
+# dataflow, utilities, shadow compile, and HIRBuildTest) must stay green.
+[[jobs]]
+name = "runtime_tests_311_green"
+command = "bash -lc 'ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-build\"'"
 
 # Scenario 3: the full stdlib suite behaves identically with and without the
 # CinderX evaluator installed.  Only regressions are red, and the excluded
@@ -64,7 +110,15 @@ command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m un
 # test_sysconfig/test_venv.
 [[jobs]]
 name = "libtest_jitoff_diff"
-command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py gate --out \"{run_dir}/libtest\" --exclude test_ftplib --exclude test_httplib --exclude test_imaplib --exclude test_nntplib --exclude test_poplib --exclude test_smtplib --exclude test_smtpnet --exclude test_telnetlib --exclude test_urllib --exclude test_urllib2 --exclude test_urllib2net --exclude test_urllibnet --exclude test_urllib2_localnet --exclude test_robotparser --exclude test_logging --exclude test_xml_etree --exclude test_xml_etree_c'"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py gate --out \"{run_dir}/libtest\"'"
+
+# The unified run report exists as a checked artifact, not a schema on
+# paper: the aggregator merges the libtest leg's field emission with a
+# fresh gate-child snapshot and validates every field strictly typed --
+# a missing or null field turns the gate red.
+[[jobs]]
+name = "unified_report_gate"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners --unify \"{run_dir}/libtest/trigger_report_fields.json\" -o \"{run_dir}/unified_report.json\"'"
 
 # Scenario 4: observe mode counts hot code, emits one scheduling request per
 # code object, and the compile entry point refuses before any bytecode is
@@ -72,3 +126,68 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.
 [[jobs]]
 name = "observe_gate"
 command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_observe_311'"
+
+# MR-11: the product auto-JIT.  CINDERX_JIT_MODE=execute compiles, installs
+# and enters machine code from the same scheduling request observe refuses
+# and shadow discards; one code object gets one attempt (a failed attempt
+# disables it, force_compile stays available); fresh function objects over
+# compiled code attach within the per-code budget and outlive the instance
+# that was compiled; the interpreter's CALL keeps its legal specializations
+# and enters compiled callees; a third-party evaluator degrades the JIT
+# safely; thresholds 1 / 2 / 4 / default / very high and ten shutdown
+# repetitions run clean.
+# MR-11 acceptance 14a: the reference-count contract under Auto-JIT.
+# The generator leg above reaches machine code through force_compile(),
+# which skips everything MR-11 adds -- the frame-entry dispatch, the
+# one-attempt verdict, outer anchoring and fresh attachment never run.
+# This leg reaches it the way production does, by calling the function,
+# and pins how many cases the scheduler must still be taking on its own:
+# "no drift" and "nothing was compiled" produce the same table otherwise.
+# The two cases below the floor are the ones whose every call raises, which
+# the exception-rate freeze returns to the interpreter by design.
+[[jobs]]
+name = "jit311_rcm_execute"
+command = "bash -lc 'mkdir -p \"{run_dir}/rcm-execute\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_execute_min interp \"{run_dir}/rcm-execute/interp.json\" && CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 PYTHONMALLOC=debug \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py ci_pipeline/jit311 corpus_execute_min auto \"{run_dir}/rcm-execute/auto.json\" && \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/refcount_matrix.py diff \"{run_dir}/rcm-execute/interp.json\" \"{run_dir}/rcm-execute/auto.json\" 11'"
+
+# MR-11 acceptance 14b: nothing MR-11 allocates may accumulate.  The
+# matrix above watches the reference counts of objects the corpus names;
+# it cannot see an artifact buffer that outlives its last anchor, a
+# code-extra block for a dead code object, or an observer slot that is
+# never recycled, because none of those is reachable from a named target
+# -- and the first and last are not Python objects at all, so a
+# gc.get_objects() census is blind to them too.  This leg runs the whole
+# lifecycle -- schedule, attach, park, resume, retire, die -- repeatedly
+# and censuses BOTH the Python objects and the runtime's own residency
+# gauges, reporting only what grows in every round.  It fails closed if a
+# round did not compile, attach and retire.
+#
+# Not regrtest's -R: that needs sys.gettotalrefcount and therefore a
+# Py_DEBUG interpreter, which this platform's 3.11.6 is not.  The name
+# says what the leg actually does.
+[[jobs]]
+name = "jit311_lifecycle_census"
+command = "bash -lc 'CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \"{run_dir}/release-venv/bin/python\" ci_pipeline/jit311/lifecycle_census.py --rounds 6 --out \"{run_dir}/lifecycle-census.json\"'"
+
+[[jobs]]
+name = "execute_gate"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_execute_311'"
+
+# MR-03 blocking proof: real cold, warm and threshold-driven requests traverse
+# the complete shadow compiler, while code allocation, installation and entry
+# counters remain zero. The same driver covers lifecycle churn, five shutdown
+# repetitions, the configuration matrix and the 72-module import canary.
+# Frozen-surface execution (440 modules + test_cinderx under shadow) lives
+# on the daily completeness job, not this fail-fast PR suite.
+#
+# From MR-04 the same driver also runs the canary children, where those
+# counters are required to move instead: cold and warm force-compile against
+# an interpreted oracle, organic-threshold execution, the 72-module import
+# under execution, and ten shutdown repetitions. Each child asserts its own
+# mode, so a shadow judge can never accept a canary run or the reverse.
+# From MR-11 the driver also runs the product spelling: the execute_auto
+# child (organic install plus budgeted fresh attachment) and the execute
+# rows of the configuration matrix (thresholds 1 / 2 / 4 / default / very
+# high, the last one armed but never compiling).
+[[jobs]]
+name = "shadow_compile_gate"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners'"

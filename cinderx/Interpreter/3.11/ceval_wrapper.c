@@ -15,7 +15,10 @@
 #define _PyInterpreterFrame_GetLine Ci_PyInterpreterFrame_GetLine_311
 
 #include "Python.h"
+#include "internal/pycore_code.h"
 #include "internal/pycore_dict.h"
+#include "internal/pycore_opcode.h"
+#include "internal/pycore_pystate.h"
 
 #include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
 #include "cinderx/Interpreter/3.11/interpreter_internal.h"
@@ -40,4 +43,39 @@
 // disabled; CinderX's independent ENABLE_USDT instrumentation remains intact.
 #undef WITH_DTRACE
 
+// With a PEP 523 evaluator installed, CPython's CALL handler cannot use its
+// inlined-Python-function path. The generic vectorcall path invokes the callee
+// before advancing over CALL's inline caches, so an introspecting Python
+// callee would otherwise observe a caller position different from Stock.
+// Route only evaluator-local vectorcalls through this cursor shim: ordinary
+// raising opcodes and calls to C objects keep their original opcode position.
+static PyObject* Ci_PyObject_Vectorcall_311(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  if (PyFunction_Check(callable)) {
+    PyThreadState* tstate = _PyThreadState_GET();
+    _PyInterpreterFrame* frame = tstate->cframe->current_frame;
+    if (frame != NULL && frame->prev_instr >= _PyCode_CODE(frame->f_code) &&
+        frame->prev_instr <
+            _PyCode_CODE(frame->f_code) + Py_SIZE(frame->f_code)) {
+      int opcode = _Py_OPCODE(*frame->prev_instr);
+      if (_PyOpcode_Deopt[opcode] == CALL) {
+        frame->prev_instr += INLINE_CACHE_ENTRIES_CALL;
+      }
+    }
+  }
+  return PyObject_Vectorcall(callable, args, nargsf, kwnames);
+}
+
+#define PyObject_Vectorcall Ci_PyObject_Vectorcall_311
 #include "upstream/ceval.c"
+#undef PyObject_Vectorcall
+
+// Defined after the include so the static eval_frame_handle_pending() above
+// is in scope.  The wrapper adds nothing: the anchored source stays the
+// oracle for what a back edge must service.
+int Ci_EvalFrameHandlePending_311(PyThreadState* tstate) {
+  return eval_frame_handle_pending(tstate);
+}

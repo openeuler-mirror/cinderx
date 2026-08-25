@@ -16,6 +16,47 @@
 
 #define JIT_TEST_MOD_NAME "jittestmodule"
 
+#if PY_VERSION_HEX < 0x030C0000
+static inline PyCodeObject* PyUnstable_Code_New(
+    int argcount,
+    int kwonlyargcount,
+    int nlocals,
+    int stacksize,
+    int flags,
+    PyObject* code,
+    PyObject* consts,
+    PyObject* names,
+    PyObject* varnames,
+    PyObject* freevars,
+    PyObject* cellvars,
+    PyObject* filename,
+    PyObject* name,
+    PyObject* qualname,
+    int firstlineno,
+    PyObject* linetable,
+    PyObject* exceptiontable) {
+  return PyCode_NewWithPosOnlyArgs(
+      argcount,
+      /*posonlyargcount=*/0,
+      kwonlyargcount,
+      nlocals,
+      stacksize,
+      flags,
+      code,
+      consts,
+      names,
+      varnames,
+      freevars,
+      cellvars,
+      filename,
+      name,
+      qualname,
+      firstlineno,
+      linetable,
+      exceptiontable);
+}
+#endif
+
 #define THROW(...)                                      \
   {                                                     \
     if (PyErr_Occurred()) {                             \
@@ -222,6 +263,13 @@ class RuntimeTest : public ::testing::Test {
   }
 
   Ref<> MakeGlobalsStrict() {
+#if PY_VERSION_HEX < 0x030C0000
+    // Static Python is not built on 3.11, so no fixture ever requests
+    // strict globals there (isStaticCompiler() is never true).  Fail
+    // loudly if one does instead of linking the strict-module machinery.
+    ADD_FAILURE() << "strict globals require Static Python (3.12+)";
+    return Ref<>(nullptr);
+#else
     auto globals = Ref<>::steal(PyDict_New());
     if (globals == nullptr) {
       return globals;
@@ -257,6 +305,7 @@ class RuntimeTest : public ::testing::Test {
       return Ref<>(nullptr);
     }
     return globals;
+#endif
   }
 
   bool AddModuleWithBuiltins(BorrowedRef<> module, BorrowedRef<> globals) {

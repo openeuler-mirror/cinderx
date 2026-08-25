@@ -664,6 +664,10 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
     proof.field_name = lf->name();
     proof.name_idx = tupleNameIndex(func.code->co_names, lf->name().c_str());
     proof.value_offset = static_cast<intptr_t>(lf->offset());
+#if PY_VERSION_HEX >= 0x030E0000
+    // Inline values (the tp_flag, and the PyDictValues 'valid' member) exist
+    // only from 3.14; earlier versions have no inline-values layout to refine
+    // against, so the proof stays a plain slot/member access.
     if (node_pytype != nullptr &&
         PyType_HasFeature(
             node_pytype,
@@ -676,6 +680,7 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
             node_pytype->tp_basicsize + offsetof(PyDictValues, valid);
       }
     }
+#endif
     // guard_source, layout_dependency, and fallback_shape are left at defaults
     // (production stubs).
     proof.runtime_failure_action = RuntimeFailureAction::kExperimentalFailClosed;

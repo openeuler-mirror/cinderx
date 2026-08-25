@@ -83,6 +83,36 @@ class BlockCanonicalizer {
 // analysis.
 std::unique_ptr<Function> buildHIR(const Preloader& preloader);
 
+// Return the stable refusal reason for a CPython 3.11 code-object shape, or
+// nullptr when the shape may proceed to bytecode/HIR translation.
+const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code);
+
+// Return the stable refusal reason for the first unsupported CPython 3.11
+// opcode/front-end policy in code, or nullptr when checkTranslate() may run.
+const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code);
+
+// Execute surface: nullptr when every instruction of the code object is
+// inside the audited machine-code whitelist (MR-04 leaf ops plus the
+// MR-06 CALL family), otherwise the registered shape-refusal reason.
+const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code);
+
+struct ExecuteRefusal311 {
+  const char* reason{nullptr};
+  int opcode{-1};
+  int offset{-1};
+};
+
+// The same execute-surface decision with the exact first rejected opcode and
+// byte offset.  A malformed control-flow graph has no trustworthy opcode and
+// therefore returns -1/-1; the acceptance treats that as unexpected rather than
+// widening the ordinary execute-surface allowance.
+ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code);
+
+// Single source of truth for the 3.11 execute whitelist.  The frozen stdlib
+// manifest freezes this set so removing a supported opcode cannot silently turn
+// into a broad REFUSE_SHAPE_EXECUTE_SURFACE pass.
+bool isExecuteOpcodeSupported311(int opcode);
+
 // Inlining merges all of the different callee Returns (which terminate blocks,
 // leading to a bunch of distinct exit blocks) into Branches to one Return
 // block (one exit block), which the caller can transform into an Assign to the
@@ -184,12 +214,41 @@ class HIRBuilder {
       Register* receiver,
       uint32_t type_version,
       const char* descr);
+  bool tryEmitLoadAttrInstanceValue311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      Register* receiver,
+      int name_idx);
+  void emitStoreFrameLocal311(TranslationContext& tc, int idx, Register* value);
+  void emitLocalsplusWriteback311(TranslationContext& tc);
   void emitLoadMethod(TranslationContext& tc, int name_idx);
+  void emitLoadMethod(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
+  bool tryEmitLoadMethodWithValues311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
   void emitLoadMethodOrAttrSuper(
       CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr,
       bool load_method);
+  void emitLoadMethodOrAttrSuper(
+      CFG& cfg,
+      TranslationContext& tc,
+      int name_idx,
+      Register* global_super,
+      Register* type,
+      Register* receiver,
+      bool load_method,
+      bool no_args_in_super_call,
+      BCOffset deopt_off,
+      const FrameState& deopt_state);
+  bool tryEmitLoadMethodOrAttrSuper311(
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_block);
   void emitCopy(TranslationContext& tc, int item_idx);
   void emitCopyFreeVars(TranslationContext& tc, int nfreevars);
   void emitSwap(TranslationContext& tc, int item_idx);
@@ -491,6 +550,14 @@ class HIRBuilder {
 
   bool emitTypeAnnotationGuards(TranslationContext& tc);
 
+#if PY_VERSION_HEX < 0x030C0000
+  bool tryEmitLoadGlobalModuleValue311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      int name_idx,
+      Register* result);
+#endif
+
   void emitBuildInterpolation(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
@@ -521,6 +588,11 @@ class HIRBuilder {
 
   ExecutionBlock popBlock(CFG& cfg, TranslationContext& tc);
   void insertRunPeriodicActivitesForLoop(CFG& cfg, BasicBlock* loop_header);
+  void insertRunPeriodicActivitesForBackedge(
+      CFG& cfg,
+      BasicBlock* src,
+      BasicBlock* target,
+      const FrameState& frame);
   void insertRunPeriodicActivitesForExcept(CFG& cfg, TranslationContext& tc);
   void insertRunPeriodicActivites(
       CFG& cfg,
@@ -581,6 +653,7 @@ class HIRBuilder {
   const Preloader& preloader_;
 
   TempAllocator temps_{nullptr};
+  Environment* env_{nullptr};
 
   // Tracks the function for compilations that require it.
   Register* func_{nullptr};

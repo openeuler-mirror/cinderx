@@ -18,6 +18,32 @@ PyObject* _Py_HOT_FUNCTION Ci_EvalFrameDefault_311(
     struct _PyInterpreterFrame* frame,
     int throwflag);
 
+// The vendored evaluator's own eval-breaker service, exposed for the JIT's
+// loop back edges.  Py_MakePendingCalls covers only signals and pending
+// calls; the anchored 3.11.6 eval_frame_handle_pending() additionally
+// honours a GIL drop request and delivers asynchronous exceptions, and a
+// compiled loop owes its thread exactly those semantics.  Returns 0, or -1
+// with an exception set.
+int Ci_EvalFrameHandlePending_311(PyThreadState* tstate);
+
+// The last admitted compiled Python frame records a CinderX-owned logical
+// boundary without borrowing CPython's overflow-recovery headroom. Any nested
+// Python frame fails at that logical boundary after its arguments are bound.
+int Ci_JitRecursionBoundary311_IsActive(void);
+void Ci_JitRecursionBoundary311_Enter(void);
+void Ci_JitRecursionBoundary311_Leave(void);
+int Ci_JitRecursionBoundary311_Refuse(PyThreadState* tstate);
+
+// The single in-process dict-keys version allocator (specialize_wrapper.c).
+// Assigns from the top half of the 32-bit range -- disjoint from libpython's
+// private bottom-up counter -- and returns 0 at exhaustion, which every
+// consumer treats as "cannot be versioned, do not cache".  Both the vendored
+// specializer and the JIT's pull-validated attribute caches must use this
+// stream: a version proves identity only while no two keys objects can hold
+// the same number.
+struct _dictkeysobject;
+uint32_t Ci_GetDictKeysVersion_311(struct _dictkeysobject* keys);
+
 #ifdef __cplusplus
 }
 #endif

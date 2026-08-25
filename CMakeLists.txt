@@ -57,6 +57,12 @@ if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11)
   # There is no 3.11 product without the interpreter loop: the runtime paths
   # call into it unconditionally, so the option cannot be turned off here.
   set(ENABLE_INTERPRETER_LOOP ON)
+  # The materialized _PyInterpreterFrame is the only frame mode in the 3.11
+  # delivery; a lightweight-frames build would silently change frame
+  # ownership semantics, so it fails here instead of at runtime.
+  if (DEFINED ENABLE_LIGHTWEIGHT_FRAMES AND ${ENABLE_LIGHTWEIGHT_FRAMES})
+    message(FATAL_ERROR "ENABLE_LIGHTWEIGHT_FRAMES is not supported on CPython 3.11")
+  endif()
 endif()
 
 set_flag(ENABLE_ADAPTIVE_STATIC_PYTHON)
@@ -496,6 +502,7 @@ if (${PY_VERSION} EQUAL 3.11)
   # so cinder_opcode.c and the header-copy step below do not apply.
   set(INTERP_SOURCES
     ${PROJECT_SOURCE_DIR}/Interpreter/interpreter_base.cpp
+    ${PROJECT_SOURCE_DIR}/Interpreter/iter_helpers.c
     ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
   )
   if (${ENABLE_INTERPRETER_LOOP})
@@ -588,13 +595,16 @@ target_link_libraries(static-python PRIVATE fmt::fmt asmjit::asmjit common borro
 ########################################
 # Jit/
 
+# The full JIT source set compiles on every supported version, 3.11 included.
+# On 3.11 the explicit shadow mode initializes only the compiler pipeline;
+# generated code is relocated for validation and discarded. Observe/off never
+# initialize it, and no 3.11 mode publishes or enters machine code.
+file(GLOB_RECURSE JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/*.cpp ${PROJECT_SOURCE_DIR}/Jit/*.c)
 if (${PY_VERSION} EQUAL 3.11)
-  # This SR ships only the JIT scheduling shell on 3.11: the JIT source set is
-  # not compiled, and machine-code execution is structurally impossible.  The
-  # stub carries the module-facing API surface and refuses compilation.
-  set(JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/pyjit_stub_311.cpp)
-else()
-  file(GLOB_RECURSE JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/*.cpp ${PROJECT_SOURCE_DIR}/Jit/*.c)
+  # OSR is out of scope on 3.11: Jit/osr.cpp is 3.14 machine-code machinery
+  # (reads _PyStackRef and internal/pycore_interpframe.h).  It is excluded and
+  # Jit/osr_stub_311.cpp supplies inert OSR symbols in its place.
+  list(REMOVE_ITEM JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/osr.cpp)
 endif()
 
 add_library(jit ${JIT_SOURCES})

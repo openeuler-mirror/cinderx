@@ -1,0 +1,93 @@
+{
+  "format": "cp311-jit-execution-deviations-v1",
+  "deviations": [
+    {
+      "id": "EXECUTION-DIS-001",
+      "lane": "C",
+      "testcase": "test.test_dis.DisTests.test_loop_quicken",
+      "stock_observable": "pass",
+      "jit_observable": "failure",
+      "reason": "Compile-All publishes the function before the testcase can observe CPython adaptive quickening.",
+      "rfc_or_issue": "cp311-execution-infrastructure.md, C-lane adaptive disassembly deviations (archived: cinderx_oe branch cp311-jit-acceptance-docs-archive)",
+      "owner": "CinderX JIT",
+      "reviewer": "campaign RFC approved capability decision",
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "BINARY_OP_ADAPTIVE",
+          "LOAD_GLOBAL_MODULE",
+          "PRECALL_PYFUNC",
+          "CALL_PY_WITH_DEFAULTS",
+          "JUMP_BACKWARD_QUICK"
+        ]
+      }
+    },
+    {
+      "id": "EXECUTION-DIS-002",
+      "lane": "C",
+      "testcase": "test.test_dis.DisTests.test_super_instructions",
+      "stock_observable": "pass",
+      "jit_observable": "failure",
+      "reason": "Compile-All publishes the function before the testcase can observe CPython superinstruction quickening.",
+      "rfc_or_issue": "cp311-execution-infrastructure.md, C-lane adaptive disassembly deviations (archived: cinderx_oe branch cp311-jit-acceptance-docs-archive)",
+      "owner": "CinderX JIT",
+      "reviewer": "campaign RFC approved capability decision",
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "LOAD_FAST__LOAD_FAST",
+          "STORE_FAST__STORE_FAST",
+          "STORE_FAST__LOAD_FAST"
+        ]
+      }
+    },
+    {
+      "id": "EXECUTION-DIS-003",
+      "lane": "C",
+      "testcase": "test.test_dis.DisWithFileTests.test_loop_quicken",
+      "stock_observable": "pass",
+      "jit_observable": "failure",
+      "reason": "The file-output variant observes the same Compile-All versus adaptive quickening difference.",
+      "rfc_or_issue": "cp311-execution-infrastructure.md, C-lane adaptive disassembly deviations (archived: cinderx_oe branch cp311-jit-acceptance-docs-archive)",
+      "owner": "CinderX JIT",
+      "reviewer": "campaign RFC approved capability decision",
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "BINARY_OP_ADAPTIVE",
+          "LOAD_GLOBAL_MODULE",
+          "PRECALL_PYFUNC",
+          "CALL_PY_WITH_DEFAULTS",
+          "JUMP_BACKWARD_QUICK"
+        ]
+      }
+    },
+    {
+      "id": "EXECUTION-DIS-004",
+      "lane": "C",
+      "testcase": "test.test_dis.DisWithFileTests.test_super_instructions",
+      "stock_observable": "pass",
+      "jit_observable": "failure",
+      "reason": "The file-output variant observes the same Compile-All versus superinstruction difference.",
+      "rfc_or_issue": "cp311-execution-infrastructure.md, C-lane adaptive disassembly deviations (archived: cinderx_oe branch cp311-jit-acceptance-docs-archive)",
+      "owner": "CinderX JIT",
+      "reviewer": "campaign RFC approved capability decision",
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "LOAD_FAST__LOAD_FAST",
+          "STORE_FAST__STORE_FAST",
+          "STORE_FAST__LOAD_FAST"
+        ]
+      }
+    }
+  ]
+}

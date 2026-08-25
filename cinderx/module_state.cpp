@@ -107,10 +107,14 @@ bool ModuleState::initBuiltinMembers() {
     builtin_members.emplace(type, std::move(type_members));
   }
 
+#endif
+  // Version-independent: hookUsesGenericGetAttr compares against this on
+  // every Python version.  Leaving it null on 3.11 silently disabled the
+  // whole __getattr__-hook cache family (every hook-type fill bailed),
+  // which made the hook protocol dead code there.
   object_getattribute = Ref<>::create(
       _PyType_Lookup(&PyBaseObject_Type, &_Py_ID(__getattribute__)));
 
-#endif
   return true;
 }
 

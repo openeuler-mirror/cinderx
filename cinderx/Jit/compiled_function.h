@@ -74,13 +74,19 @@ bool isJitCompiled(const PyFunctionObject* func);
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/hir.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <unordered_set>
 #include <utility>
 
 namespace jit {
+
+struct CodeRuntimeLifetime {
+  std::atomic<bool> alive{true};
+};
 
 // Data members extracted from CompiledFunction to enable separate storage.
 // CompiledFunction is a GC tracked object and cannot be constructed during
@@ -99,6 +105,7 @@ struct CompiledFunctionData {
   std::vector<std::unique_ptr<CodePatcher>> code_patchers;
   std::unique_ptr<hir::Function> irfunc;
   CodeRuntime* runtime{nullptr};
+  std::shared_ptr<CodeRuntimeLifetime> runtime_lifetime;
   // Whether the compilation produced OSR entry stubs.
   bool osr_aware{false};
   bool has_osr_entries{false};
@@ -123,6 +130,11 @@ class CompiledFunctionOwner {
   virtual void forgetCompiledFunction(CompiledFunction& function) = 0;
 
   virtual void unwatch(TypeDeoptPatcher*) = 0;
+
+  // Hand a cleared CodeRuntime's storage back for reuse.  Called by
+  // CompiledFunction::clear() after the runtime's references are released,
+  // never during context finalization (the storage dies wholesale there).
+  virtual void recycleCodeRuntime(CodeRuntime* runtime) = 0;
 };
 
 // CompiledFunction is a Python GC object that contains a pointer to the native
@@ -212,6 +224,24 @@ class CompiledFunction {
     owner_ = owner;
   }
 
+  // The context this artifact belongs to, or null once it has been
+  // retired.  A publication that ran Python mid-transaction re-checks this
+  // before completing: a retirement in that window empties the member set
+  // and detaches the artifact, and finishing the publication onto it would
+  // leave registry entries the retirement can no longer reach.
+  CompiledFunctionOwner* owner() const {
+    return owner_;
+  }
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Forget the functions this artifact serves, without touching them.
+   * For detach paths: no death routes back here afterwards, so a retained
+   * entry would outlive what it points at.
+   */
+  void forgetFunctions();
+#endif
+
   std::unordered_set<BorrowedRef<PyFunctionObject>>& functions() {
     return functions_;
   }
@@ -219,11 +249,20 @@ class CompiledFunction {
   // Traverse all GC-reachable objects for the GC.
   int traverse(visitproc visit, void* arg);
 
-  // Clear all references held by this CompiledFunction and deopt all
-  // associated functions.
-  void clear(bool context_finalizing = false);
+  // Deopt all associated functions and optionally clear the references held
+  // by the CodeRuntime. 3.11 retirement can leave a suspended generator as
+  // the artifact's final owner; that path keeps the runtime references until
+  // the generator publishes stock state and drops its owner.
+  void clear(
+      bool context_finalizing = false,
+      bool release_runtime_references = true);
 
  private:
+#if PY_VERSION_HEX < 0x030C0000
+  // Whether data_.runtime still points at live storage; see the definition.
+  bool runtimeStorageAlive() const;
+#endif
+
   explicit CompiledFunction(CompiledFunctionData&& data)
       : data_(std::move(data)) {}
 
@@ -247,10 +286,19 @@ BorrowedRef<PyTypeObject> getCompiledFunctionType();
 
 // Associate a function with a CompiledFunction and store a reference to the
 // CompiledFunction in the function's __dict__.
+//
+// When `displaced_anchor` is given, the value the dictionary write displaces
+// is detained into it instead of being released in place.  On 3.11 that
+// value is the prior artifact's owning reference: releasing it inside the
+// write would let its destructor run arbitrary Python in the middle of a
+// publication (a __del__ can reenter force_compile()), and the caller also
+// needs it as the restore token if the publication is rolled back.  The
+// caller releases the reference only after its transaction has settled.
 bool associateFunctionWithCompiled(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled,
-    bool is_nested);
+    bool is_nested,
+    Ref<>* displaced_anchor = nullptr);
 
 } // namespace jit
 

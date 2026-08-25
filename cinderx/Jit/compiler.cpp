@@ -3,6 +3,7 @@
 #include "cinderx/Jit/compiler.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
@@ -19,9 +20,9 @@
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
-#include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/primitive_box_remat.h"
 #include "cinderx/Jit/hir/primitive_unbox_cse.h"
+#include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
@@ -31,6 +32,18 @@
 
 #include <chrono>
 #include <iostream>
+#include <sstream>
+
+#if PY_VERSION_HEX < 0x030C0000
+// Records a refusal reason the scheduling gate reports; defined in
+// Jit/pyjit_311_gate.cpp.
+extern "C" void Ci_JitShell311_SetExecuteRefusal(const char* reason);
+namespace {
+void setLast311ExecuteRefusal(const char* reason) {
+  Ci_JitShell311_SetExecuteRefusal(reason);
+}
+} // namespace
+#endif
 
 namespace jit {
 
@@ -156,6 +169,67 @@ void Compiler::runPasses(
       irfunc);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Meta-style instrumentation fallback must also catch activation from inside
+// an already-running frame.  CPython 3.11 has no monitoring watcher and the
+// AArch64 normal-frame mode cannot patch native return addresses, so execute
+// mode carries a safe deopt point after every bytecode boundary.  The poll
+// runs before the normal pass pipeline so SSA/refcount insertion records the
+// complete live state needed by the interpreter continuation.
+void insertInstrumentationPolls311(hir::Function& irfunc) {
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      hir::Instr& instr = *it;
+      ++it;
+      if (instr.opcode() == hir::Opcode::kSnapshot) {
+        if (it == block.end()) {
+          continue;
+        }
+        auto& snapshot = static_cast<hir::Snapshot&>(instr);
+        hir::FrameState* state = snapshot.frameState();
+        if (state == nullptr) {
+          continue;
+        }
+        hir::Instr* check = hir::CheckInstrumentation::create(*state);
+        check->copyBytecodeOffset(instr);
+        check->InsertBefore(*it);
+      } else if (instr.opcode() == hir::Opcode::kRunPeriodicTasks) {
+        auto& periodic = static_cast<hir::DeoptBase&>(instr);
+        hir::FrameState* state = periodic.frameState();
+        // A following Snapshot gets its own target-boundary poll.  Only add
+        // the service-state poll when no such boundary exists.
+        if (state != nullptr && it != block.end() &&
+            it->opcode() != hir::Opcode::kSnapshot) {
+          hir::Instr* check = hir::CheckInstrumentation::create(*state);
+          check->copyBytecodeOffset(instr);
+          check->InsertBefore(*it);
+        }
+      }
+    }
+  }
+}
+
+PassConfig createConfig();
+
+std::unique_ptr<hir::Function> compileToFinalHIRForTest(
+    BorrowedRef<PyFunctionObject> func) {
+  std::unique_ptr<hir::Preloader> preloader =
+      hir::Preloader::make(func, makeFrameReifier(func->func_code));
+  if (preloader == nullptr) {
+    return nullptr;
+  }
+  std::unique_ptr<hir::Function> irfunc(hir::buildHIR(*preloader));
+  if (irfunc == nullptr) {
+    return nullptr;
+  }
+  if (getConfig().state == State::kRunning) {
+    insertInstrumentationPolls311(*irfunc);
+  }
+  Compiler::runPasses(*irfunc, createConfig());
+  return irfunc;
+}
+#endif
+
 std::optional<CompiledFunctionData> Compiler::Compile(
     BorrowedRef<PyFunctionObject> func) {
   JIT_CHECK(PyFunction_Check(func), "Expected PyFunctionObject");
@@ -165,6 +239,27 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   std::unique_ptr<hir::Preloader> preloader =
       hir::Preloader::make(func, makeFrameReifier(func->func_code));
   return preloader ? Compile(*preloader) : std::nullopt;
+}
+
+std::optional<ShadowCompileResult> Compiler::CompileShadow(
+    BorrowedRef<PyFunctionObject> func) {
+  ShadowCompileScope shadow_scope;
+  JIT_CHECK(PyFunction_Check(func), "Expected PyFunctionObject");
+  JIT_CHECK(
+      !getThreadedCompileContext().compileRunning(),
+      "multi-thread compile must preload first");
+  std::unique_ptr<hir::Preloader> preloader =
+      hir::Preloader::make(func, makeFrameReifier(func->func_code));
+  if (preloader == nullptr) {
+    const char* name = "<unknown>";
+    if (func->func_qualname != nullptr) {
+      if (const char* utf8 = PyUnicode_AsUTF8(func->func_qualname)) {
+        name = utf8;
+      }
+    }
+    JIT_THROW("shadow preload failed for {}", name);
+  }
+  return CompileShadow(*preloader);
 }
 
 PassConfig createConfig() {
@@ -196,7 +291,75 @@ PassConfig createConfig() {
   set(hir_opts.simplify, PassConfig::kSimplify);
   set(hir_opts.tree_iter_state_machine, PassConfig::kTreeIterStateMachine);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // FloatAccumulatorPromotion still stays off in the executing mode: it
+  // is a speculative rewrite whose deopt metadata is not yet the MR-07
+  // subject.  Simplify returns so compact-long / float / x**2 guards
+  // ship with stable site ids.
+  if (getConfig().state == State::kRunning) {
+    result &= ~static_cast<uint64_t>(PassConfig::kFloatAccumulatorPromotion);
+  }
+#endif
+
   return static_cast<PassConfig>(result);
+}
+
+std::optional<ShadowCompileResult> Compiler::CompileShadow(
+    const jit::hir::Preloader& preloader) {
+  ShadowCompileScope shadow_scope;
+  const std::string& fullname = preloader.fullname();
+  if (!PyDict_CheckExact(preloader.globals()) ||
+      !PyDict_CheckExact(preloader.builtins())) {
+    JIT_DLOG(
+        "Refusing shadow compilation for {}: globals and builtins must be "
+        "exact dicts",
+        fullname);
+    return std::nullopt;
+  }
+
+  std::unique_ptr<hir::Function> irfunc(hir::buildHIR(preloader));
+  irfunc->reifier = ThreadedRef<>::create(preloader.reifier());
+  Compiler::runPasses(*irfunc, createConfig());
+
+  // Unlike the per-pass debug checks, the shadow verifier is part of the
+  // release gate: malformed CFG, missing terminators/definitions, bad phi
+  // edges, and illegal typed operands must become a stable compile failure.
+  std::ostringstream verifier_errors;
+  if (!hir::checkFunc(*irfunc, verifier_errors) ||
+      !hir::funcTypeChecks(*irfunc, verifier_errors)) {
+    JIT_DLOG(
+        "Shadow HIR for {} failed verification:\n{}\n{}",
+        fullname,
+        verifier_errors.str(),
+        *irfunc);
+    JIT_THROW(
+        "Shadow HIR for {} failed verification: {}",
+        fullname,
+        verifier_errors.str());
+  }
+
+  ShadowCompileResult result;
+  result.hir_opcode_counts = hir::count_opcodes(*irfunc);
+  for (const auto& instr : BytecodeInstructionBlock{preloader.code()}) {
+    int physical_opcode = instr.specializedOpcode();
+    if (physical_opcode != unspecialize(physical_opcode)) {
+      result.specialized_opcodes++;
+    }
+  }
+
+  auto ngen = ngen_factory_(irfunc.get());
+  if (ngen == nullptr) {
+    JIT_THROW("shadow native generator missing for {}", fullname);
+  }
+  result.code_size = ngen->getShadowCodeSize();
+  if (result.code_size == 0) {
+    JIT_THROW("shadow codegen produced no bytes for {}", fullname);
+  }
+  JIT_DLOG(
+      "Finished shadow compilation for {}, code size: {} bytes",
+      fullname,
+      result.code_size);
+  return result;
 }
 
 std::optional<CompiledFunctionData> Compiler::Compile(
@@ -248,6 +411,12 @@ std::optional<CompiledFunctionData> Compiler::Compile(
     irfunc->setCompilationPhaseTimer(std::move(compilation_phase_timer));
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state == State::kRunning) {
+    insertInstrumentationPolls311(*irfunc);
+  }
+#endif
+
   PassConfig config = createConfig();
   COMPILE_TIMER(
       irfunc->compilation_phase_timer,
@@ -258,6 +427,27 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   }
 
   hir::OpcodeCounts hir_opcode_counts = hir::count_opcodes(*irfunc);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Any reason left by an earlier attempt belongs to that attempt.
+  setLast311ExecuteRefusal(nullptr);
+  // Guard / GuardIs / GuardType / Deopt are the MR-07 restore surface.
+  // DeoptPatchpoint is the IC / watcher patch hook and stays refused
+  // until MR-09.
+  if (getConfig().state == State::kRunning) {
+    int count =
+        hir_opcode_counts[static_cast<size_t>(hir::Opcode::kDeoptPatchpoint)];
+    if (count > 0) {
+      setLast311ExecuteRefusal("REFUSE_SHAPE_SPECULATIVE_GUARD");
+      JIT_DLOG(
+          "Refusing MR-07 execution for {}: optimized HIR holds {} "
+          "DeoptPatchpoint instruction(s); IC patchpoints are MR-09 work",
+          fullname,
+          count);
+      return std::nullopt;
+    }
+  }
+#endif
 
   auto ngen = ngen_factory_(irfunc.get());
   if (ngen == nullptr) {

@@ -59,6 +59,22 @@ std::string repr(BorrowedRef<> obj);
 // first.
 void setRuntimeError(const std::exception& exn);
 
+// Shadow compilation must not abort the process: JIT_ABORT / JIT_CHECK
+// failures become exceptions so the observe event can record a stable reason.
+void shadowCompileEnter();
+void shadowCompileLeave();
+
+struct ShadowCompileScope {
+  ShadowCompileScope() {
+    shadowCompileEnter();
+  }
+  ~ShadowCompileScope() {
+    shadowCompileLeave();
+  }
+  ShadowCompileScope(const ShadowCompileScope&) = delete;
+  ShadowCompileScope& operator=(const ShadowCompileScope&) = delete;
+};
+
 // Outlined logging implementations to reduce code size on hot paths.
 JIT_COLD void logImplV(
     std::string_view file,
@@ -136,13 +152,15 @@ template <typename... Args>
     }                                                               \
   }
 
-#define JIT_CHECK_ONCE(COND, ...)   \
-  {                                 \
-    static bool checked = false;    \
-    if (!checked) {                 \
-      checked = true;               \
-      JIT_CHECK(COND, __VA_ARGS__); \
-    }                               \
+#define JIT_CHECK_ONCE(COND, ...)                                     \
+  {                                                                   \
+    static bool checked = false;                                      \
+    if (!checked) {                                                   \
+      if (!(COND)) {                                                  \
+        jit::checkFailedImpl(__FILE__, __LINE__, #COND, __VA_ARGS__); \
+      }                                                               \
+      checked = true;                                                 \
+    }                                                                 \
   }
 
 #define JIT_ABORT(...) jit::abortImpl(__FILE__, __LINE__, __VA_ARGS__)

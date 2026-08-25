@@ -2,12 +2,16 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/codegen/gen_asm.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/builder.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+#include "cinderx/module_state.h"
 
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -18,6 +22,13 @@ using namespace jit::hir;
 
 class ASMGeneratorTest : public RuntimeTest {
  public:
+  void SetUp() override {
+    RuntimeTest::SetUp();
+#if PY_VERSION_HEX < 0x030C0000
+    GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
+#endif
+  }
+
   Ref<CompiledFunction> GenerateCode(PyObject* func) {
     auto func_obj = reinterpret_cast<PyFunctionObject*>(func);
 
@@ -34,6 +45,281 @@ class ASMGeneratorTest : public RuntimeTest {
         func_obj, key, std::move(*compiled_func));
   }
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+class ShadowCompileTest : public RuntimeTest {};
+
+TEST_F(ShadowCompileTest, ShadowCompileDoesNotAllocateOrInstallCode) {
+  const char* pycode = R"(
+def func(value):
+  return value + 1
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  auto* module_state = cinderx::getModuleState();
+  ASSERT_NE(module_state, nullptr);
+  ASSERT_NE(module_state->code_allocator, nullptr);
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      module_state->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  size_t used_before = module_state->code_allocator->usedBytes();
+  Py_ssize_t code_refcount_before = Py_REFCNT(pyfunc->func_code);
+  Py_ssize_t globals_refcount_before = Py_REFCNT(pyfunc->func_globals);
+  Py_ssize_t builtins_refcount_before = Py_REFCNT(pyfunc->func_builtins);
+  jit::TriggerStats trigger_before = jit::triggerStatsSnapshot();
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+  jit::TriggerStats trigger_after = jit::triggerStatsSnapshot();
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->code_size, 0u);
+  EXPECT_EQ(module_state->code_allocator->usedBytes(), used_before);
+  EXPECT_EQ(
+      trigger_after.executable_alloc_calls,
+      trigger_before.executable_alloc_calls);
+  EXPECT_EQ(
+      trigger_after.executable_alloc_bytes,
+      trigger_before.executable_alloc_bytes);
+  EXPECT_EQ(
+      trigger_after.compiled_function_creations,
+      trigger_before.compiled_function_creations);
+  EXPECT_EQ(
+      trigger_after.machine_code_entries, trigger_before.machine_code_entries);
+  EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_code), code_refcount_before);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_globals), globals_refcount_before);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_builtins), builtins_refcount_before);
+}
+
+TEST_F(ShadowCompileTest, ShadowCompileUsesEphemeralInlineCaches) {
+  const char* pycode = R"(
+def func(value):
+  return value.member
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  auto* module_state = cinderx::getModuleState();
+  ASSERT_NE(module_state, nullptr);
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      module_state->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  size_t used_before = module_state->code_allocator->usedBytes();
+  Py_ssize_t code_refcount_before = Py_REFCNT(pyfunc->func_code);
+  Py_ssize_t globals_refcount_before = Py_REFCNT(pyfunc->func_globals);
+  Py_ssize_t builtins_refcount_before = Py_REFCNT(pyfunc->func_builtins);
+
+  for (int i = 0; i < 32; i++) {
+    auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+    ASSERT_TRUE(result.has_value()) << i;
+    EXPECT_GT(result->code_size, 0u) << i;
+  }
+
+  EXPECT_EQ(module_state->code_allocator->usedBytes(), used_before);
+  EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_code), code_refcount_before);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_globals), globals_refcount_before);
+  EXPECT_EQ(Py_REFCNT(pyfunc->func_builtins), builtins_refcount_before);
+}
+
+TEST_F(ShadowCompileTest, TryLoopReturningHandlerPassesShadowVerifier) {
+  const char* pycode = R"(
+class Done(Exception):
+  pass
+
+def func(limit):
+  try:
+    i = 0
+    while True:
+      i += 1
+      if i >= limit:
+        raise Done(i)
+  except Done as exc:
+    return exc.args[0]
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+  EXPECT_EQ(unsupportedShapeReason311(pyfunc->func_code), nullptr);
+
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->code_size, 0u);
+  EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+}
+
+TEST_F(ShadowCompileTest, UnboundLocalCasesPassShadowVerifier) {
+  const char* pycode = R"(
+def read_before_assign():
+  if False:
+    x = 1
+  return x
+
+def annotation_only_then_read():
+  x: int
+  return x
+
+def walrus_dead_branch():
+  if False:
+    y = (w := 10)
+  return w
+)";
+
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  for (const char* name :
+       {"read_before_assign",
+        "annotation_only_then_read",
+        "walrus_dead_branch"}) {
+    Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, name));
+    ASSERT_NE(pyfunc, nullptr) << name;
+    auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+    ASSERT_TRUE(result.has_value()) << name;
+    EXPECT_GT(result->code_size, 0u) << name;
+    EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr) << name;
+  }
+}
+
+TEST_F(ShadowCompileTest, StringSubscriptPassesShadowVerifier) {
+  const char* pycode = R"(
+def func(name):
+  return len(name) > 4 and name[:2] == name[-2:] == "__" and name[2] != "_"
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+  EXPECT_EQ(unsupportedShapeReason311(pyfunc->func_code), nullptr);
+
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->code_size, 0u);
+  EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+}
+
+TEST_F(ShadowCompileTest, WithStatementPassesShadowVerifier) {
+  const char* pycode = R"(
+class Ctx:
+  def __enter__(self):
+    return self
+  def __exit__(self, *exc):
+    return False
+
+def func():
+  with Ctx():
+    return 1
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+  EXPECT_EQ(unsupportedShapeReason311(pyfunc->func_code), nullptr);
+
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->code_size, 0u);
+  EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+}
+
+TEST_F(ShadowCompileTest, ShadowAbortBecomesCompileFailure) {
+  // Nested try/except/with surfaces exception-table opcodes.  Shadow
+  // compilation must report a C++ exception rather than aborting the process.
+  const char* pycode = R"(
+def func(items):
+  total = 0
+  try:
+    for item in items:
+      total += item
+  except TypeError:
+    return None
+  return total
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  try {
+    auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+    EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+    if (result.has_value()) {
+      EXPECT_GT(result->code_size, 0u);
+    }
+  } catch (const std::exception&) {
+    EXPECT_EQ(jit_ctx->lookupFunc(pyfunc), nullptr);
+  }
+}
+
+TEST_F(ShadowCompileTest, ShadowCompileValidatesSplitCodeLayout) {
+  Config saved_config = getConfig();
+  getMutableConfig().multiple_code_sections = true;
+  SCOPE_EXIT(getMutableConfig() = saved_config);
+
+  const char* pycode = R"(
+def func(value):
+  if value:
+    return value + 1
+  raise ValueError("value")
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  auto* module_state = cinderx::getModuleState();
+  ASSERT_NE(module_state, nullptr);
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      module_state->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->code_size, 0u);
+}
+
+TEST_F(ShadowCompileTest, ShadowCompileCountsSpecializedOpcodes) {
+  const char* pycode = R"(
+def func(left, right):
+  return left + right
+
+for _ in range(100):
+  func(1, 2)
+)";
+
+  Ref<PyFunctionObject> pyfunc(compileAndGet(pycode, "func"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  auto* module_state = cinderx::getModuleState();
+  ASSERT_NE(module_state, nullptr);
+  auto* jit_ctx = reinterpret_cast<jit::CompilerContext<Compiler>*>(
+      module_state->jit_context.get());
+  ASSERT_NE(jit_ctx, nullptr);
+
+  auto result = jit_ctx->compiler().CompileShadow(pyfunc);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_GT(result->specialized_opcodes, 0u);
+}
+#endif
 
 TEST_F(ASMGeneratorTest, SanityCheck) {
   const char* pycode = R"(
@@ -1396,6 +1682,10 @@ class NewASMGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(NewASMGeneratorTest, Linear) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
+#endif
+
   const char* src = R"(
 def func(x):
   return 16 + x
@@ -1416,6 +1706,10 @@ def func(x):
 }
 
 TEST_F(NewASMGeneratorTest, DiamondControlBlock) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
+#endif
+
   const char* src = R"(
 def func(a, b):
   c = 0

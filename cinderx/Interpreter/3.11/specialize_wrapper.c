@@ -33,7 +33,11 @@
 static uint32_t ci_next_dict_keys_version_311 = CI_VERSION_RANGE_BASE;
 static uint32_t ci_next_func_version_311 = CI_VERSION_RANGE_BASE;
 
-static uint32_t Ci_GetDictKeysVersion_311(PyDictKeysObject* keys) {
+// Non-static: the JIT's pull-validated attribute caches (MR-09) must draw
+// keys versions from THIS stream.  A second allocator would eventually hand
+// the same number to two different keys objects, and a version's only job
+// is to make that impossible.  Declared in interpreter_contract.h.
+uint32_t Ci_GetDictKeysVersion_311(PyDictKeysObject* keys) {
   if (keys->dk_version != 0) {
     return keys->dk_version;
   }

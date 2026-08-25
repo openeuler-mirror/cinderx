@@ -11,8 +11,14 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/parser.h"
+#include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/parser.h"
+#include "cinderx/Jit/lir/postalloc.h"
+#include "cinderx/Jit/lir/postgen.h"
+#include "cinderx/Jit/lir/regalloc.h"
+#include "cinderx/Jit/lir/target_select.h"
+#include "cinderx/Jit/lir/verify.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
 #include <math.h>
@@ -63,6 +69,9 @@ class LIRGeneratorTest : public RuntimeTest {
     env.ctx = getContext();
 
     jit::CodeRuntime runtime{func};
+#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+    // Frame reifiers exist only on the lightweight-frames runtime; the 3.11
+    // materialized-frame build has no reifier to attach.
     Ref<> reifier;
     if (irfunc->reifier != nullptr) {
       runtime.setReifier(irfunc->reifier);
@@ -70,6 +79,7 @@ class LIRGeneratorTest : public RuntimeTest {
       reifier = makeFrameReifier(func->func_code);
       runtime.setReifier(reifier);
     }
+#endif
     env.code_rt = &runtime;
 
     LIRGenerator lir_gen(irfunc.get(), &env);
@@ -101,6 +111,136 @@ class LIRGeneratorTest : public RuntimeTest {
     return output_s;
   }
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(LIRGeneratorTest, PrimitiveBoxBoolSelectUsesVRegInputs) {
+  const char* hir_source = R"(fun test {
+  bb 0 {
+    v0 = LoadConst<CBool[true]>
+    v1 = PrimitiveBoxBool v0
+    Return v1
+  }
+}
+)";
+
+  std::unique_ptr<hir::Function> irfunc = hir::HIRParser{}.ParseHIR(hir_source);
+  ASSERT_NE(irfunc, nullptr);
+
+  jit::codegen::Environ env;
+  env.ctx = getContext();
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto lir_func = lir_gen.TranslateFunction();
+
+  bool found_select = false;
+  for (const auto& block : lir_func->basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      if (instr->opcode() != Instruction::kSelect) {
+        continue;
+      }
+      found_select = true;
+      ASSERT_EQ(instr->getInput(1)->type(), OperandBase::kVreg);
+      ASSERT_EQ(instr->getInput(2)->type(), OperandBase::kVreg);
+    }
+  }
+  EXPECT_TRUE(found_select);
+}
+
+TEST_F(LIRGeneratorTest, IsNegativeAndErrOccurredSetErrBranchesToDone) {
+  const char* hir_source = R"(fun test {
+  bb 0 {
+    v0 = LoadConst<CInt64[-1]>
+    v1 = IsNegativeAndErrOccurred v0 {
+      FrameState {
+        CurInstrOffset 0
+      }
+    }
+    Return v1
+  }
+}
+)";
+
+  std::unique_ptr<hir::Function> irfunc = hir::HIRParser{}.ParseHIR(hir_source);
+  ASSERT_NE(irfunc, nullptr);
+
+  jit::codegen::Environ env;
+  jit::CodeRuntime code_runtime{
+      irfunc->code, irfunc->builtins, irfunc->globals};
+  env.ctx = getContext();
+  env.code_rt = &code_runtime;
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto lir_func = lir_gen.TranslateFunction();
+
+  bool found_dec_then_branch = false;
+  for (const auto& block : lir_func->basicblocks()) {
+    const auto& instructions = block->instructions();
+    if (instructions.size() < 2) {
+      continue;
+    }
+    auto iter = instructions.rbegin();
+    const Instruction* branch = iter->get();
+    ++iter;
+    const Instruction* decrement = iter->get();
+    if (decrement->opcode() == Instruction::kDec &&
+        branch->opcode() == Instruction::kBranch) {
+      found_dec_then_branch = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_dec_then_branch);
+}
+
+TEST_F(LIRGeneratorTest, RaiseOnlyFunctionHasVerifierSafeSyntheticExit) {
+  const char* src = R"(
+def test(value):
+    raise RuntimeError(value)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<hir::Function> irfunc(buildHIR(func));
+  Compiler::runPasses(*irfunc, PassConfig::kAllExceptInliner);
+
+  jit::codegen::Environ env;
+  env.ctx = getContext();
+  jit::CodeRuntime runtime{func};
+  env.code_rt = &runtime;
+
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto lir_func = lir_gen.TranslateFunction();
+
+  ASSERT_NE(lir_func->exitBlock(), nullptr);
+  ASSERT_FALSE(lir_func->exitBlock()->instructions().empty());
+  EXPECT_EQ(
+      lir_func->exitBlock()->instructions().front()->opcode(),
+      Instruction::kMove)
+      << *lir_func;
+
+  for (const auto* block : lir_func->basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      if (instr->opcode() == Instruction::kPhi) {
+        EXPECT_GT(instr->getNumInputs(), 0u) << *lir_func;
+      }
+    }
+  }
+
+  PostGenerationRewrite post_gen(lir_func.get(), &env);
+  post_gen.run();
+  eliminateDeadCode(lir_func.get());
+  selectTargetOpcodes(lir_func.get());
+
+  LinearScanAllocator allocator(lir_func.get());
+  allocator.run();
+  env.shadow_frames_and_spill_size = allocator.getFrameSize();
+  env.changed_regs = allocator.getChangedRegs();
+
+  PostRegAllocRewrite post_alloc(lir_func.get(), &env);
+  post_alloc.run();
+
+  std::ostringstream errors;
+  EXPECT_TRUE(verifyPostRegAllocInvariants(lir_func.get(), errors))
+      << errors.str() << *lir_func;
+}
+#endif
 
 TEST_F(LIRGeneratorTest, BroadPythonTranslationCoverage) {
   const char* snippets[] = {
@@ -281,6 +421,9 @@ fun known_exact {
 #endif
 }
 
+// CPython 3.11 intentionally links static_python_stub.cpp and does not provide
+// the _static module required by these translation tests.
+#if PY_VERSION_HEX >= 0x030C0000
 TEST_F(LIRGeneratorTest, BroadStaticTranslationCoverage) {
   const char* snippets[] = {
       R"(
@@ -422,6 +565,7 @@ BB %3 - preds: %0 - succs: %12
        %8:Double = Fadd %5:Double, %7:Double)";
   ASSERT_EQ(lir_expected, lir_expected);
 }
+#endif
 
 // disabled due to unstable Guard instruction
 TEST_F(LIRGeneratorTest, DISABLED_Fallthrough) {
@@ -800,7 +944,7 @@ BB %6 - preds: %1
                    Unreachable
 
 BB %10
-      %11:Object = Phi
+      %11:Object = Move 0(0x0):Object
                    EpilogueEnd %11:Object
 
 
@@ -808,9 +952,9 @@ BB %10
       PhyLocation{10, 64},
       PhyLocation{11, 64},
 #if defined(CINDER_X86_64)
-      PhyLocation{7, 64}
+      PhyLocation { 7, 64 }
 #else
-      PhyLocation{0, 64}
+      PhyLocation { 0, 64 }
 #endif
   );
 #else
@@ -842,7 +986,7 @@ BB %6 - preds: %1
                    Unreachable
 
 BB %10
-      %11:Object = Phi
+      %11:Object = Move 0(0x0):Object
                    EpilogueEnd %11:Object
 
 
@@ -850,9 +994,9 @@ BB %10
       PhyLocation{10, 64},
       PhyLocation{11, 64},
 #if defined(CINDER_X86_64)
-      PhyLocation{7, 64}
+      PhyLocation { 7, 64 }
 #else
-      PhyLocation{0, 64}
+      PhyLocation { 0, 64 }
 #endif
   );
 #endif

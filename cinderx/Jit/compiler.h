@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/preload.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -20,6 +21,12 @@ namespace jit {
 
 using PostPassFunction = std::function<
     void(hir::Function& func, std::string_view pass_name, std::size_t time_ns)>;
+
+struct ShadowCompileResult {
+  size_t code_size{0};
+  hir::OpcodeCounts hir_opcode_counts{};
+  uint64_t specialized_opcodes{0};
+};
 
 // Controls what compiler passes are run.
 enum PassConfig : uint64_t {
@@ -65,6 +72,13 @@ class Compiler {
   std::optional<CompiledFunctionData> Compile(
       BorrowedRef<PyFunctionObject> func);
 
+  // Validate the entire compilation pipeline without allocating executable
+  // memory, creating a CompiledFunction, or installing an entry point.
+  std::optional<ShadowCompileResult> CompileShadow(
+      const hir::Preloader& preloader);
+  std::optional<ShadowCompileResult> CompileShadow(
+      BorrowedRef<PyFunctionObject> func);
+
   // Runs all the compiler passes on the HIR function.
   static void runPasses(hir::Function&, PassConfig config);
 
@@ -79,5 +93,14 @@ class Compiler {
   DISALLOW_COPY_AND_ASSIGN(Compiler);
   codegen::NativeGeneratorFactory ngen_factory_;
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+// Test-only: run the executing mode's exact HIR pipeline -- preload, build,
+// instrumentation polls, passes -- and return the final HIR, so RuntimeTests
+// can assert structural invariants (e.g. every Decref precedes the next
+// boundary poll) on what codegen would actually consume.
+std::unique_ptr<hir::Function> compileToFinalHIRForTest(
+    BorrowedRef<PyFunctionObject> func);
+#endif
 
 } // namespace jit

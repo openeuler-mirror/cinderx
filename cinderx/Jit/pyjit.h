@@ -49,6 +49,16 @@ void finalize();
  */
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+// CPython 3.11 execute mode: register `outer` as the outer function of the
+// nested code objects in its constants, arming the death watch that keeps
+// the registration honest.  A nested artifact compiled afterwards is
+// anchored by `outer`'s __cinderx_nested_compiled_funcs__ list -- the
+// residency 3.12+ gets from the function-creation watcher -- so it outlives
+// the fresh function objects that come and go.
+void trackOuterFunction311(BorrowedRef<PyFunctionObject> outer);
+#endif
+
 void recordDeoptForRoiBackoff(
     CodeRuntime* code_runtime,
     DeoptReason reason,
@@ -61,7 +71,17 @@ bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
  *
  * On success, positional only calls to func will use the JIT compiled version.
  */
-Result compileFunction(BorrowedRef<PyFunctionObject> func);
+// Compile `func`.
+//
+// `expected_code` fixes the subject: the compile refuses with CODE_MOVED
+// the moment the function stops holding it, at every boundary that can
+// run Python.  Pass nullptr to compile whatever the function holds, which
+// pins it at entry instead -- the caller then has no opinion about which
+// code object it asked for, but the compile still may not switch subjects
+// halfway through.
+Result compileFunction(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> expected_code = nullptr);
 
 void uncompile(BorrowedRef<PyFunctionObject> func);
 
@@ -86,6 +106,49 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
  */
 void codeDestroyed(BorrowedRef<PyCodeObject> code);
 void funcDestroyed(BorrowedRef<PyFunctionObject> func);
+
+/*
+ * funcDestroyed() minus the death-notification counter: administrative
+ * unpublication (force_uncompile of a live function) must not claim a
+ * death.
+ */
+void funcUnpublished(BorrowedRef<PyFunctionObject> func);
+
+/*
+ * Context-explicit forms: a death belongs to the context whose watch
+ * delivered it, never to whichever context the module currently holds.
+ */
+void funcUnpublishedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
+void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
+
+/*
+ * Record that a unit-deletion notification may have been lost (the record's
+ * allocation failed inside a death callback, where nothing may throw).  The
+ * batch-compile entry points consume the mark and fail conservatively: a
+ * batch whose deleted-units view is incomplete must not compile.
+ */
+void poisonUnitDeletionTracking();
+
+/*
+ * Read and clear the poison mark.  The batch-compile entry points call this
+ * before trusting their deleted-units view; fault-injection tests call it to
+ * assert containment happened.
+ */
+bool consumeUnitDeletionTrackingPoison();
+
+/*
+ * Test-only: invoked between force_uncompile()'s unpublication and its
+ * artifact retirement, so a native case can drop the last external
+ * reference in the middle of the operation.
+ */
+void setUncompileMidpointHookForTest(void (*hook)());
+
+/*
+ * Test-only: drive the registration path (register a function for future
+ * compilation without compiling it), which is otherwise reachable only
+ * through entry points the canary does not publish.
+ */
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func);
 void funcModified(BorrowedRef<PyFunctionObject> func);
 void typeDestroyed(BorrowedRef<PyTypeObject> type);
 void typeModified(BorrowedRef<PyTypeObject> type);

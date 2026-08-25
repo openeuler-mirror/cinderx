@@ -1,0 +1,21 @@
+# Environment-failure allowlist for the 3.14 reference differential
+# (dev plan section 3.5).  A failure may be excused ONLY when it appears
+# identically on both sides AND is listed here.  Any failure outside this
+# list is red even when symmetric -- a symmetrically broken environment
+# must never certify neutrality.  Changes to this list require their own
+# justification.
+#
+# OSRDetectionTest.* below: aarch64 3.14 builds ENABLE_LIGHTWEIGHT_FRAMES
+# by default, and PYTHONJITLIGHTWEIGHTFRAME is mutually exclusive with
+# CINDERX_OSR_ENABLED.  The same conflict already allowlists
+# CmdLineTest.OSREnabledFlag; the hot-loop tests do not skip on LWF, so
+# TryOSR never fires.  Registering them does not change 3.14 OSR behavior.
+CmdLineTest.OSREnabledFlag
+CmdLineTest.OSREnabledFlagSyncsRuntimeGate
+CodegenTest.DetectsThreadStateOffset
+LIRGeneratorTest.ParserTest
+OSRDetectionTest.HotWhileLoopAtThresholdCallsTryOSRAndContinues
+OSRDetectionTest.TryOSRClearingCountersDoesNotAffectCurrentLoop
+OSRDetectionTest.TryOSRReturnMinusOneFromEntryFrameReturnsNull
+OSRDetectionTest.TryOSRReturnMinusOnePropagatesToPythonCaller
+OSRDetectionTest.TryOSRReturnOnePushesResultToPythonCaller

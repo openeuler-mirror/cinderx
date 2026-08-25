@@ -55,6 +55,11 @@ class NativeGenerator {
   // time this method is called.
   void* getVectorcallEntry();
 
+  // Run the complete native-code generation pipeline without publishing any
+  // executable code or retaining runtime metadata. Returns the relocated code
+  // size.
+  size_t getShadowCodeSize();
+
   // Get the entry point of the compiled function if it is called via a Static
   // Python call.
   void* getStaticEntry();
@@ -88,6 +93,7 @@ class NativeGenerator {
   int inline_stack_size_;
 
   bool hasStaticEntry() const;
+  void* compile(bool shadow);
   int calcInlineStackSize(const hir::Function* func);
   void generatePrologueBlocks(lir::BasicBlock* frameSetupBlock);
   void generateCode(asmjit::CodeHolder& code, lir::BasicBlock* frameSetupBlock);
@@ -149,6 +155,7 @@ class NativeGenerator {
   std::unique_ptr<lir::Function> lir_func_;
   Environ env_;
   NativeGeneratorFactory& factory_;
+  bool is_shadow_compile_{false};
 };
 
 // Factory class for creating instances of NativeGenerator that reuse the same

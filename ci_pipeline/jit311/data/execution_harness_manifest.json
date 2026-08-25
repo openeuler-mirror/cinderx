@@ -1,0 +1,25 @@
+{
+  "format": "cp311-jit-execution-harness-v1",
+  "entries": [
+    {
+      "source": "cinderx/PythonLib/test_cinderx",
+      "destination": "test_cinderx",
+      "kind": "tree"
+    },
+    {
+      "source": "ci_pipeline/jit311",
+      "destination": "ci_pipeline/jit311",
+      "kind": "tree"
+    },
+    {
+      "source": "ci_pipeline/libtest_diff_311.py",
+      "destination": "ci_pipeline/libtest_diff_311.py",
+      "kind": "file"
+    },
+    {
+      "source": "cinderx/Interpreter/3.11/bytecode_support.toml",
+      "destination": "cinderx/Interpreter/3.11/bytecode_support.toml",
+      "kind": "file"
+    }
+  ]
+}

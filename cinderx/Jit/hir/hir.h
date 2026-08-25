@@ -1248,6 +1248,20 @@ class CheckBase : public DeoptBase {
 // If so, transfer control to the exception handler for the block.
 DEFINE_SIMPLE_INSTR(CheckErrOccurred, (), Operands<0>, CheckBase);
 
+// Leave machine code if legacy instrumentation became active.  CPython
+// 3.11 has no hook that could tell the JIT about PyEval_SetTrace() or
+// PyEval_SetProfile() -- there are no monitoring events and no watchers
+// -- so the transition is observable only by polling.  This is the poll:
+// placed after every instruction that can run arbitrary Python (and
+// after the back edge's eval-breaker service, which executes pending
+// calls), it deopts to the interpreter when a trace or profile function
+// has appeared, carrying the complete post-instruction frame state.  The
+// interpreter then delivers everything the instrumentation is owed --
+// the remaining line events and the frame's PyTrace_RETURN.  It is not a
+// speculative guard: like the error exits, it sits on an audited path
+// and asserts nothing about values.
+DEFINE_SIMPLE_INSTR(CheckInstrumentation, (), Operands<0>, CheckBase);
+
 // Check if an exception has occurred (implied by var being NULL).
 // If so, transfer control to the exception handler for the block.
 DEFINE_SIMPLE_INSTR(
@@ -1326,7 +1340,7 @@ DEFINE_SIMPLE_INSTR(
     Operands<1>,
     DeoptBase);
 
-class INSTR_CLASS(LoadField, (TOptObject), HasOutput, Operands<1>) {
+class INSTR_CLASS(LoadField, (TOptObject | TCPtr), HasOutput, Operands<1>) {
  public:
   LoadField(
       Register* dst,
@@ -4179,7 +4193,8 @@ struct TypedArgument {
     "it is a vectorcalled static function with pimitive args")             \
   V(GlobalsNotDict, "globals is not a dict")                               \
   V(BuiltinsNotDict, "builtins is not a dict")                             \
-  V(HasEagerImportName, "has an eager import name instruction")
+  V(HasEagerImportName, "has an eager import name instruction")            \
+  V(HasStoreGlobal, "it stores a global")
 
 enum class InlineFailureType {
 #define DECLARE_FAILURE_TYPE(failure, msg) k##failure,

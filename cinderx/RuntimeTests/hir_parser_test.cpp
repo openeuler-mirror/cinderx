@@ -312,6 +312,11 @@ fun test {
 }
 
 TEST_F(HIRParserTest, InvokeStaticFunction) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP()
+      << "CPython 3.11 does not provide Static Python class-loader resolution";
+#endif
+
   const char* hir_src = R"(
 fun test {
   bb 0 {

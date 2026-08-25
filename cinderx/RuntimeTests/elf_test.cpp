@@ -146,19 +146,31 @@ def func(x):
 
   BorrowedRef<PyFunctionObject> func{func_obj};
   BorrowedRef<PyCodeObject> code{func->func_code};
+#if PY_VERSION_HEX < 0x030C0000
+  alignas(4) std::array<std::byte, 8> compiled_code{};
+#else
   std::optional<CompiledFunctionData> compiled_data = Compiler().Compile(func);
   ASSERT_TRUE(compiled_data.has_value());
   auto compiled_func =
       CompiledFunction::create(std::move(*compiled_data), false);
+#endif
 
   std::stringstream ss;
 
   elf::CodeEntry entry;
   entry.code = code;
+#if PY_VERSION_HEX < 0x030C0000
+  // Shadow mode does not initialize CompiledFunction, but ELF serialization
+  // only needs a code span and entries within it.
+  entry.compiled_code = compiled_code;
+  entry.normal_entry = compiled_code.data() + 4;
+  entry.static_entry = nullptr;
+#else
   entry.compiled_code = compiled_func->codeBuffer();
   entry.normal_entry =
       reinterpret_cast<void*>(compiled_func->vectorcallEntry());
   entry.static_entry = compiled_func->staticEntry();
+#endif
   entry.func_name = "func";
   entry.file_name = "spaghetti.exe";
   entry.lineno = 15;
@@ -183,6 +195,10 @@ def func(x):
   ASSERT_LT(note_data.size, 10000);
   ASSERT_GT(note_data.normal_entry_offset, 0);
   ASSERT_LT(note_data.normal_entry_offset, 10000);
+#if PY_VERSION_HEX < 0x030C0000
+  ASSERT_EQ(note_data.size, compiled_code.size());
+  ASSERT_EQ(note_data.normal_entry_offset, 4);
+#endif
   ASSERT_EQ(note_data.static_entry_offset, std::nullopt);
 }
 

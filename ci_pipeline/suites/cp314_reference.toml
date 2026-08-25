@@ -1,0 +1,19 @@
+# CPython 3.14 reference-line suite (dev plan v2.1 \u00a73.5).
+#
+# Runs on the 3.14 runner (python3.14 + cmake + a C++ toolchain on PATH);
+# the scheduler must pass the merge-base SHA explicitly via
+# RT314_BASE_REF (a fork-local branch name is not a safe default).  Braces are doubled
+# because job commands pass through Python str.format() first.  This is the operative
+# definition of "the 3.14 reference line stays unchanged" -- import-level
+# smoke is not a substitute.
+
+fail_fast = true
+
+[target]
+python = "3.14"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "rt314_differential"
+command = "bash -lc 'ci_pipeline/scripts/rt314_differential.sh ${{RT314_BASE_REF:?RT314_BASE_REF must be set to the merge-base SHA by the scheduler}} \"{run_dir}/rt314\"'"

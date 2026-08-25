@@ -1,11 +1,17 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/lir/generator.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
 
 extern "C" {
 #include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
+#include "internal/pycore_gc.h"
+#if PY_VERSION_HEX >= 0x030C0000
 #include "internal/pycore_intrinsics.h"
+#endif
 
 #if PY_VERSION_HEX >= 0x030D0000
 #include "internal/pycore_setobject.h"
@@ -13,6 +19,7 @@ extern "C" {
 
 #include "internal/pycore_import.h"
 #include "internal/pycore_interp.h"
+#include "internal/pycore_long.h"
 #include "internal/pycore_pyerrors.h"
 #if PY_VERSION_HEX >= 0x030E0000
 #include "internal/pycore_interpolation.h"
@@ -48,8 +55,10 @@ extern "C" {
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <sstream>
 
 // XXX: this file needs to be revisited when we optimize HIR-to-LIR translation
@@ -247,13 +256,13 @@ LIRGenerator::LIRGenerator(
       is_gen_(
           func->code != nullptr &&
           (func->code->co_flags & kCoFlagsAnyGenerator)) {
+  JIT_CHECK(env_->ctx != nullptr, "LIR generation requires a cache context");
   for (int i = 0, n = func->env.numLoadTypeAttrCaches(); i < n; i++) {
-    load_type_attr_caches_.emplace_back(
-        getContext()->allocateLoadTypeAttrCache());
+    load_type_attr_caches_.emplace_back(env_->ctx->allocateLoadTypeAttrCache());
   }
   for (int i = 0, n = func->env.numLoadTypeMethodCaches(); i < n; i++) {
     load_type_method_caches_.emplace_back(
-        getContext()->allocateLoadTypeMethodCache());
+        env_->ctx->allocateLoadTypeMethodCache());
   }
 }
 
@@ -891,9 +900,9 @@ void GenerateArgcountCheckBlocks(
     // Two blocks:
     //   kw_dispatch: test kwnames → if null, branch to argcount_check;
     //                otherwise call JITRT_CallWithKeywordArgs → exit.
-    //   argcount_check: cmp nargsf with numArgs → if equal, branch to
-    //                   next_block; otherwise call incorrect-argcount
-    //                   helper → exit.
+    //   argcount_check: cmp nargsf with numArgs.  On 3.11 a match
+    //                   re-enters the body after Py_EnterRecursiveCall;
+    //                   a mismatch calls the incorrect-argcount helper.
     auto* kw_dispatch = lir_func->allocateBasicBlock();
     auto* argcount_check = lir_func->allocateBasicBlock();
 
@@ -936,16 +945,42 @@ void GenerateArgcountCheckBlocks(
         nullptr,
         PhyReg{nargsf_reg, OperandBase::k32bit},
         PhyReg{kwnames_reg, OperandBase::k32bit});
-    argcount_check->allocateInstr(
-        Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
+#if PY_VERSION_HEX < 0x030C0000
+    // 3.11: a matching count is a successful bind.  Consume recursion at
+    // body reentry instead of jumping into the body from GuardedEntry
+    // without an Enter.  Primitive-double returns keep the old jump;
+    // that ABI is not the canary vectorcall.
+    if (!returns_primitive_double) {
+      auto* wrong_count = lir_func->allocateBasicBlock();
+      argcount_check->allocateInstr(
+          Instruction::kBranchNE, nullptr, Lbl{wrong_count});
+      argcount_check->addSuccessor(wrong_count);
+      argcount_check->allocateInstr(
+          Instruction::kCall,
+          nullptr,
+          Imm{reinterpret_cast<uint64_t>(JITRT_ReenterAfterBind)});
+      argcount_check->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
-    // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
-    auto helper = returns_primitive_double
-        ? reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)
-        : reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
-    argcount_check->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
-    argcount_check->allocateInstr(
-        Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+      emitAnnotation(wrong_count, "Fill defaults or fallback");
+      auto helper = reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
+      wrong_count->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
+      wrong_count->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+    } else
+#endif
+    {
+      argcount_check->allocateInstr(
+          Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
+
+      // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
+      auto helper = returns_primitive_double
+          ? reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)
+          : reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
+      argcount_check->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
+      argcount_check->allocateInstr(
+          Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
+    }
 
   } else {
     // have_varargs or kwonlyargcount > 0: always dispatch through the
@@ -1149,41 +1184,59 @@ void GenerateBoxedReturnWrapperBlocks(
   box_block->allocateInstr(Instruction::kBranch, nullptr, AsmLbl{wrapper_exit});
 }
 
-void LIRGenerator::GenerateExitBlocks() {
+void LIRGenerator::GenerateExitBlocks(bool has_normal_return) {
   if (!is_gen_) {
     auto* block = lir_func_->allocateBasicBlock();
     exit_block_ = block;
-
-    // func_->code may be null in unit tests that parse HIR directly.
-    if (func_->code == nullptr) {
-      exit_phi_ = block->allocateInstr(
-          Instruction::kPhi, nullptr, OutVReg{DataType::kObject});
-      block->allocateInstr(Instruction::kEpilogueEnd, nullptr, VReg{exit_phi_});
-      return;
-    }
 
     BasicBlockBuilder bbb{env_, lir_func_};
     bbb.switchBlock(block);
 
     auto ret_data_type = hirTypeToDataType(func_->return_type);
-    exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
-
-    // Unlink frame before epilogue. Non-generators always unlink.
-    bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
-    if (func_->frameMode == FrameMode::kNormal) {
-      bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+    if (has_normal_return) {
+      exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
+    } else if (ret_data_type == DataType::kDouble) {
+      Instruction* zero_bits = bbb.appendInstr(
+          OutVReg{DataType::k64bit}, Instruction::kMove, Imm{0});
+      exit_phi_ = bbb.appendInstr(
+          OutVReg{DataType::kDouble}, Instruction::kMove, VReg{zero_bits});
     } else {
-      PyObject* executable;
-      std::optional<destructor> exec_dtor;
+      // The epilogue is unreachable from the function body, but deopt exits
+      // still reference its hard-exit label. Give it a defined placeholder
+      // value instead of manufacturing a zero-input Phi.
+      exit_phi_ = bbb.appendInstr(
+          OutVReg{ret_data_type}, Instruction::kMove, Imm{0, ret_data_type});
+    }
+
+    // func_->code may be null in unit tests that parse HIR directly.
+    if (func_->code == nullptr) {
+      bbb.appendInstr(Instruction::kEpilogueEnd, VReg{exit_phi_});
+      return;
+    }
+
+    // Unlink frame before epilogue.  Skip it when the body has no normal
+    // return: this block is disconnected, deopt jumps to hard_exit_label
+    // (EpilogueEnd) and never executes UnlinkFrame, and body SSA values
+    // such as LoadFrame's func vreg are not live here.  Using them leaves
+    // a kNone operand after register allocation (Move: Reg + None).
+    if (has_normal_return) {
+      bool has_freevars =
+          func_->code != nullptr && func_->code->co_nfreevars > 0;
+      if (func_->frameMode == FrameMode::kNormal) {
+        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+      } else {
+        PyObject* executable;
+        std::optional<destructor> exec_dtor;
 #if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-      executable = env_->code_rt->reifier().get();
-      exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
+        executable = env_->code_rt->reifier().get();
+        exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
 #else
-      executable = reinterpret_cast<PyObject*>(func_->code.get());
-      exec_dtor = PyCode_Type.tp_dealloc;
+        executable = reinterpret_cast<PyObject*>(func_->code.get());
+        exec_dtor = PyCode_Type.tp_dealloc;
 #endif
-      emitUnlinkFrame(
-          bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
+        emitUnlinkFrame(
+            bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
+      }
     }
 
     // EpilogueEnd goes on the builder's current block which may differ
@@ -1369,7 +1422,16 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
     }
   }
 
-  GenerateExitBlocks();
+  bool has_normal_return = std::any_of(
+      translated.begin(), translated.end(), [](const hir::BasicBlock* block) {
+        const auto* terminator = block->GetTerminator();
+        if (terminator->opcode() != Opcode::kReturn) {
+          return false;
+        }
+        const auto* ret = static_cast<const Return*>(terminator);
+        return !(ret->GetOperand(0)->type() <= TBottom);
+      });
+  GenerateExitBlocks(has_normal_return);
 
   // Track the exit block explicitly so the block sorter doesn't have to
   // rely on it being basic_blocks_.back().
@@ -1401,10 +1463,16 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
         break;
       }
       case Opcode::kReturn: {
-        last_bb->addSuccessor(exit_block_);
         auto* ret = static_cast<const Return*>(hir_term);
-        return_edges_.push_back(
-            {last_bb, phi_bbb.getDefInstr(ret->GetOperand(0))});
+        Instruction* return_value = phi_bbb.getDefInstr(ret->GetOperand(0));
+        if (return_value == nullptr) {
+          JIT_CHECK(
+              ret->GetOperand(0)->type() <= TBottom,
+              "missing LIR definition for non-Bottom return value");
+          break;
+        }
+        last_bb->addSuccessor(exit_block_);
+        return_edges_.push_back({last_bb, return_value});
         break;
       }
       default:
@@ -1487,6 +1555,9 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
 void LIRGenerator::appendGuardAlwaysFail(
     BasicBlockBuilder& bbb,
     const hir::DeoptBase& hir_instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  appendForcedDeoptCheck(bbb, hir_instr);
+#endif
   auto deopt_id = bbb.makeDeoptMetadata();
   Instruction* instr = bbb.appendInstr(
       Instruction::kGuard,
@@ -1496,6 +1567,48 @@ void LIRGenerator::appendGuardAlwaysFail(
       Imm{0});
   addLiveRegOperands(bbb, instr, hir_instr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void LIRGenerator::appendForcedDeoptCheck(
+    BasicBlockBuilder& bbb,
+    const hir::DeoptBase& hir_instr) {
+  if (forced_deopt_check_for_ == &hir_instr) {
+    return;
+  }
+  if (!isForceableDeoptInstr(hir_instr)) {
+    return;
+  }
+  forced_deopt_check_for_ = &hir_instr;
+  auto deopt_id = bbb.makeDeoptMetadata();
+
+  Instruction* armed = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      MemImm{env_->code_rt->forcedDeoptArmedAddress()});
+  BasicBlock* slow = bbb.allocateBlock();
+  BasicBlock* cont = bbb.allocateBlock();
+  bbb.appendBranch(Instruction::kCondBranch, armed, slow, cont);
+
+  bbb.switchBlock(slow);
+  Instruction* flag = bbb.appendCallInstruction(
+      OutVReg{DataType::k64bit},
+      JITRT_ConsumeForcedDeopt,
+      env_->code_rt,
+      static_cast<uint64_t>(deopt_id));
+  // kZero: the helper returns 0 when the site is idle.  Deopt only when it
+  // returns nonzero (armed).  kNotZero would deopt on the idle 0 and abort
+  // every CheckExc AlwaysFail with "unhandled exception without error set".
+  Instruction* instr = bbb.appendInstr(
+      Instruction::kGuard,
+      Imm{static_cast<uint64_t>(InstrGuardKind::kZero)},
+      Imm{deopt_id},
+      VReg{flag},
+      Imm{0});
+  addLiveRegOperands(bbb, instr, hir_instr);
+  bbb.appendBranch(Instruction::kBranch, cont);
+  bbb.switchBlock(cont);
+}
+#endif
 
 void LIRGenerator::addLiveRegOperands(
     BasicBlockBuilder& bbb,
@@ -1869,7 +1982,9 @@ void LIRGenerator::makeDecrefGILEnabled(
 
   if (destructor.has_value()) {
 #ifdef Py_TRACE_REFS
-    bbb.appendInvokeInstruction(_Py_ForgetReference, obj);
+    // A custom destructor bypasses _Py_Dealloc, where the refchain
+    // unlink normally happens, so unlink here.
+    bbb.appendInvokeInstruction(_Py_ForgetReference, instr);
 #endif
 
     bbb.appendInvokeInstruction(destructor.value(), instr);
@@ -2392,8 +2507,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto false_addr = reinterpret_cast<uint64_t>(Py_False);
         Instruction* temp_true = bbb.appendInstr(
             Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{true_addr});
-        bbb.appendInstr(
-            dest, Instruction::kSelect, src, temp_true, Imm{false_addr});
+        Instruction* temp_false = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{false_addr});
+        bbb.appendInstr(dest, Instruction::kSelect, src, temp_true, temp_false);
         break;
       }
       case Opcode::kPrimitiveBox: {
@@ -2410,7 +2526,69 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         } else if (src_type <= TCUInt64) {
           func = reinterpret_cast<uint64_t>(JITRT_BoxU64);
         } else if (src_type <= TCInt64) {
+#if PY_VERSION_HEX >= 0x030C0000
           func = reinterpret_cast<uint64_t>(JITRT_BoxI64);
+#else
+          // The inline small-int box fast path is part of the CPython 3.11
+          // delivery only; 3.12+ keeps the plain helper call above.
+          if (src->output()->dataType() != DataType::k64bit) {
+            src = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kSext, src);
+          }
+
+          auto small_block = bbb.allocateBlock();
+          auto slow_block = bbb.allocateBlock();
+          auto done_block = bbb.allocateBlock();
+
+          Instruction* shifted = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kAdd,
+              src,
+              Imm{_PY_NSMALLNEGINTS});
+          Instruction* is_small = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kLessThanUnsigned,
+              shifted,
+              Imm{_PY_NSMALLNEGINTS + _PY_NSMALLPOSINTS});
+          bbb.appendBranch(
+              Instruction::kCondBranch, is_small, small_block, slow_block);
+
+          bbb.switchBlock(small_block);
+          Instruction* scale = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{sizeof(PyLongObject)});
+          Instruction* base = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&_PyLong_SMALL_INTS[0]),
+                  DataType::kObject});
+          Instruction* small_int = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMulAdd,
+              shifted,
+              scale,
+              base);
+          makeIncref(bbb, small_int, false, true);
+          BasicBlock* small_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_block);
+          Instruction* boxed = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject}, JITRT_BoxI64, src);
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
+          BasicBlock* slow_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(done_block);
+          Instruction* phi =
+              bbb.appendInstr(instr->output(), Instruction::kPhi);
+          phi->allocateLabelInput(small_pred);
+          phi->allocateLinkedInput(small_int);
+          phi->allocateLabelInput(slow_pred);
+          phi->allocateLinkedInput(boxed);
+          break;
+#endif
         } else if (src_type <= TCUInt32) {
           func = reinterpret_cast<uint64_t>(JITRT_BoxU32);
         } else if (src_type <= TCInt32) {
@@ -2473,7 +2651,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kCondBranch, is_not_negative, done, check_err);
         bbb.switchBlock(check_err);
 
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* curexc = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
 
@@ -2486,6 +2669,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         // Set to -1 in the error case.
         bbb.appendInstr(Instruction::kDec, instr->output());
+        bbb.appendBranch(Instruction::kBranch, done);
         bbb.switchBlock(done);
         break;
       }
@@ -2727,7 +2911,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadAttrCache();
+        auto cache = env_->ctx->allocateLoadAttrCache();
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
     !defined(Py_GIL_DISABLED)
         bbb.appendInstr(
@@ -2853,7 +3037,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->receiver();
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadMethodCache();
+        auto cache = env_->ctx->allocateLoadMethodCache();
         if (getConfig().collect_attr_cache_stats) {
           BorrowedRef<PyCodeObject> code = instr->frameState()->code;
           cache->initCacheStats(
@@ -2870,7 +3054,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             "Inline caches must be enabled to use LoadModuleAttrCached");
         auto instr = static_cast<const LoadModuleAttrCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadModuleAttrCache();
+        auto cache = env_->ctx->allocateLoadModuleAttrCache();
         bbb.appendCallInstruction(
             instr->output(),
             LoadModuleAttrCache::lookupHelper,
@@ -2885,7 +3069,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             "Inline caches must be enabled to use LoadModuleMethodCached");
         auto instr = static_cast<const LoadModuleMethodCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache_entry = getContext()->allocateLoadModuleMethodCache();
+        auto cache_entry = env_->ctx->allocateLoadModuleMethodCache();
         appendCall2RetValues(
             bbb,
             instr->output(),
@@ -2992,6 +3176,162 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kLongInPlaceOp: {
         auto instr = static_cast<const LongInPlaceOp*>(&i);
+#if PY_VERSION_HEX < 0x030C0000
+        // The compact-long in-place add/subtract fast path is part of the
+        // CPython 3.11 delivery only; 3.12+ keeps the plain helper lowering
+        // below.
+        if (instr->op() == InPlaceOpKind::kAdd ||
+            instr->op() == InPlaceOpKind::kSubtract) {
+          auto emit_is_compact_long = [&](Instruction* obj) {
+            int32_t size_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+            Instruction* size = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Ind{obj, size_offset});
+            Instruction* shifted = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kAdd, size, Imm{1});
+            return bbb.appendInstr(
+                OutVReg{DataType::k8bit},
+                Instruction::kLessThanUnsigned,
+                shifted,
+                Imm{3});
+          };
+
+          auto emit_compact_long_unbox = [&](Instruction* obj) {
+            int32_t size_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+            int32_t digit_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_digit));
+            Instruction* size = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Ind{obj, size_offset});
+            Instruction* digit = bbb.appendInstr(
+                OutVReg{DataType::k32bit},
+                Instruction::kMove,
+                Ind{obj, digit_offset});
+            Instruction* digit64 = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kZext, digit);
+            Instruction* neg_digit = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kNegate, digit64);
+            Instruction* is_negative = bbb.appendInstr(
+                OutVReg{DataType::k8bit},
+                Instruction::kLessThanSigned,
+                size,
+                Imm{0});
+            Instruction* nonzero_result = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kSelect,
+                is_negative,
+                neg_digit,
+                digit64);
+            Instruction* is_zero = bbb.appendInstr(
+                OutVReg{DataType::k8bit}, Instruction::kEqual, size, Imm{0});
+            return bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kSelect,
+                is_zero,
+                Imm{0},
+                nonzero_result);
+          };
+
+          Instruction* left = bbb.getDefInstr(instr->left());
+          Instruction* right = bbb.getDefInstr(instr->right());
+          Instruction* is_left_compact = emit_is_compact_long(left);
+          Instruction* is_right_compact = emit_is_compact_long(right);
+          Instruction* both_compact = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kAnd,
+              is_left_compact,
+              is_right_compact);
+
+          BasicBlock* compact_block = bbb.allocateBlock();
+          BasicBlock* slow_block = bbb.allocateBlock();
+          BasicBlock* small_box_block = bbb.allocateBlock();
+          BasicBlock* slow_box_block = bbb.allocateBlock();
+          BasicBlock* done_block = bbb.allocateBlock();
+          bbb.appendBranch(
+              Instruction::kCondBranch,
+              both_compact,
+              compact_block,
+              slow_block);
+
+          bbb.switchBlock(compact_block);
+          Instruction* unboxed_left = emit_compact_long_unbox(left);
+          Instruction* unboxed_right = emit_compact_long_unbox(right);
+          Instruction* primitive_result = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              instr->op() == InPlaceOpKind::kAdd ? Instruction::kAdd
+                                                 : Instruction::kSub,
+              unboxed_left,
+              unboxed_right);
+          Instruction* shifted_result = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kAdd,
+              primitive_result,
+              Imm{_PY_NSMALLNEGINTS});
+          Instruction* is_small = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kLessThanUnsigned,
+              shifted_result,
+              Imm{_PY_NSMALLNEGINTS + _PY_NSMALLPOSINTS});
+          bbb.appendBranch(
+              Instruction::kCondBranch,
+              is_small,
+              small_box_block,
+              slow_box_block);
+
+          bbb.switchBlock(small_box_block);
+          Instruction* scale = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{sizeof(PyLongObject)});
+          Instruction* base = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&_PyLong_SMALL_INTS[0]),
+                  DataType::kObject});
+          Instruction* small_int = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMulAdd,
+              shifted_result,
+              scale,
+              base);
+          makeIncref(bbb, small_int, false, true);
+          BasicBlock* small_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_box_block);
+          Instruction* boxed = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject}, JITRT_BoxI64, primitive_result);
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
+          BasicBlock* slow_box_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_block);
+          Instruction* fallback = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject},
+              instr->slotMethod(),
+              instr->left(),
+              instr->right());
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, fallback);
+          BasicBlock* slow_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(done_block);
+          Instruction* phi =
+              bbb.appendInstr(instr->output(), Instruction::kPhi);
+          phi->allocateLabelInput(small_pred);
+          phi->allocateLinkedInput(small_int);
+          phi->allocateLabelInput(slow_box_pred);
+          phi->allocateLinkedInput(boxed);
+          phi->allocateLabelInput(slow_pred);
+          phi->allocateLinkedInput(fallback);
+          break;
+        }
+#endif
+
         if (instr->op() == InPlaceOpKind::kPower) {
           bbb.appendCallInstruction(
               instr->output(),
@@ -3079,7 +3419,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         JIT_CHECK(op <= Py_GE, "invalid compare op {}", op);
         bbb.appendCallInstruction(
             instr->output(),
-            PyObject_RichCompare,
+            JITRT_RichCompare,
             instr->left(),
             instr->right(),
             op);
@@ -3388,10 +3728,33 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kCheckErrOccurred: {
         const auto& instr = static_cast<const DeoptBase&>(i);
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* load = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
         appendGuard(bbb, InstrGuardKind::kZero, instr, load);
+        break;
+      }
+      case Opcode::kCheckInstrumentation: {
+        const auto& instr = static_cast<const DeoptBase&>(i);
+        // Two independent loads and exits rather than an OR: either
+        // registration alone is the transition, and the deopt carries
+        // the complete post-instruction frame state, so nothing here
+        // depends on which one fired.
+        Instruction* trace = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_tracefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, trace);
+        Instruction* profile = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_profilefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, profile);
         break;
       }
       case Opcode::kCheckExc:
@@ -3487,7 +3850,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
         hir::Register* value = instr->GetOperand(1);
-        auto cache = getContext()->allocateStoreAttrCache();
+        auto cache = env_->ctx->allocateStoreAttrCache();
         Instruction* result = bbb.appendCallInstruction(
             OutVReg{OperandBase::k32bit},
             jit::StoreAttrCache::invoke,
@@ -3504,7 +3867,14 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           break;
         }
         size_t flags = 0;
+#if PY_VERSION_HEX < 0x030C0000
+        // _PyObject_VectorcallTstate is a static inline on 3.11 and cannot
+        // be materialized as a call target; the jit_rt helper wraps it.
+        uint64_t func =
+            reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
+#else
         uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
+#endif
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
@@ -3588,6 +3958,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCallIntrinsic: {
+#if PY_VERSION_HEX < 0x030C0000
+        JIT_ABORT("CALL_INTRINSIC is not supported on Python 3.11");
+#else
         auto& hir_instr = static_cast<const CallIntrinsic&>(i);
         uint64_t func_addr;
         switch (hir_instr.NumOperands()) {
@@ -3624,6 +3997,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
+#endif
         break;
       }
       case Opcode::kCallMethod: {
@@ -4020,6 +4394,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               instr->GetOperand(0),
               instr->GetOperand(1),
               instr->GetOperand(2));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyDict_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
         } else {
           bbb.appendCallInstruction(
               instr->output(),
@@ -4089,7 +4470,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             PyNumber_InPlaceXor,
         };
         JIT_CHECK(
-            static_cast<unsigned long>(instr->op()) < sizeof(helpers),
+            static_cast<size_t>(instr->op()) < std::size(helpers),
             "unsupported inplaceop");
 
         auto op_kind = static_cast<int>(instr->op());
@@ -4198,6 +4579,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyList_Append,
               instr->GetOperand(0),
               instr->GetOperand(1));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
         } else {
           bbb.appendCallInstruction(
               instr->output(),
@@ -4270,8 +4657,21 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kRunPeriodicTasks: {
+#if PY_VERSION_HEX < 0x030C0000
+        // Py_MakePendingCalls services signals and pending calls only.  The
+        // eval breaker this back edge just observed is also raised for a
+        // GIL drop request and for PyThreadState_SetAsyncExc(), and the
+        // anchored 3.11.6 evaluator services all four in
+        // eval_frame_handle_pending() -- so a compiled loop calling the
+        // narrow helper would hold the GIL for its whole run and deliver
+        // async exceptions only at return.  Call the vendored handler
+        // itself; same contract, 0 or -1 with an exception set.
+        auto helper = Ci_EvalFrameHandlePending_311;
+        bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
+#else
         auto helper = _Py_HandlePending;
         bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
+#endif
         break;
       }
       case Opcode::kSnapshot: {
@@ -4532,6 +4932,40 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCompactLongUnbox: {
+#if PY_VERSION_HEX < 0x030C0000
+        Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
+        int32_t size_offset =
+            static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+        int32_t digit_offset =
+            static_cast<int32_t>(offsetof(PyLongObject, ob_digit));
+        Instruction* size = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{obj, size_offset});
+        Instruction* digit = bbb.appendInstr(
+            OutVReg{DataType::k32bit},
+            Instruction::kMove,
+            Ind{obj, digit_offset});
+        Instruction* digit64 = bbb.appendInstr(
+            OutVReg{DataType::k64bit}, Instruction::kZext, digit);
+        Instruction* neg_digit = bbb.appendInstr(
+            OutVReg{DataType::k64bit}, Instruction::kNegate, digit64);
+        Instruction* is_negative = bbb.appendInstr(
+            OutVReg{DataType::k8bit},
+            Instruction::kLessThanSigned,
+            size,
+            Imm{0});
+        Instruction* nonzero_result = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kSelect,
+            is_negative,
+            neg_digit,
+            digit64);
+        Instruction* is_zero = bbb.appendInstr(
+            OutVReg{DataType::k8bit}, Instruction::kEqual, size, Imm{0});
+        bbb.appendInstr(
+            i.output(), Instruction::kSelect, is_zero, Imm{0}, nonzero_result);
+#else
         // Inline _PyLong_CompactValue: sign * (Py_ssize_t)ob_digit[0]
         // where sign = 1 - (lv_tag & 3).
         Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
@@ -4564,6 +4998,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutVReg{DataType::k64bit}, Instruction::kZext, digit);
         // result = sign * digit
         bbb.appendInstr(i.output(), Instruction::kMul, sign, digit64);
+#endif
         break;
       }
       case Opcode::kIsCompactLong: {
@@ -4585,6 +5020,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               shifted,
               Imm{2 * kMaxDigit + 1});
         } else {
+#if PY_VERSION_HEX < 0x030C0000
+          Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
+          int32_t size_offset =
+              static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+          Instruction* size = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Ind{obj, size_offset});
+          Instruction* shifted = bbb.appendInstr(
+              OutVReg{DataType::k64bit}, Instruction::kAdd, size, Imm{1});
+          bbb.appendInstr(
+              i.output(), Instruction::kLessThanUnsigned, shifted, Imm{3});
+#else
           // Load lv_tag from PyLongObject and check < (2 << 3) i.e. < 16.
           Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
           int32_t lv_tag_offset =
@@ -4598,6 +5046,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               Instruction::kLessThanUnsigned,
               lv_tag,
               Imm{2 << _PyLong_NON_SIZE_BITS});
+#endif
         }
         break;
       }
@@ -4995,6 +5444,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         case Opcode::kCheckErrOccurred:
         case Opcode::kCheckExc:
         case Opcode::kCheckField:
+        case Opcode::kCheckInstrumentation:
         case Opcode::kCheckNeg:
         case Opcode::kCheckVar:
         case Opcode::kCompareBool:
@@ -5021,9 +5471,30 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           auto& pb = static_cast<const PrimitiveBox&>(i);
           JIT_DCHECK(
               !(pb.value()->type() <= TCBool), "should not be able to deopt");
+#if PY_VERSION_HEX < 0x030C0000
+          // The 3.11 inline small-int box lowering guards its own slow path,
+          // so signed 64-bit boxes carry no trailing exception check there.
+          if (pb.value()->type() <= TCInt64 &&
+              !(pb.value()->type() <= TCUInt64)) {
+            break;
+          }
+#endif
           emitExceptionCheck(*db, bbb);
           break;
         }
+#if PY_VERSION_HEX < 0x030C0000
+        case Opcode::kLongInPlaceOp: {
+          // The 3.11 compact-long in-place lowering guards both of its own
+          // call sites; other in-place ops keep the generic check.
+          auto& inplace = static_cast<const LongInPlaceOp&>(i);
+          if (inplace.op() == InPlaceOpKind::kAdd ||
+              inplace.op() == InPlaceOpKind::kSubtract) {
+            break;
+          }
+          emitExceptionCheck(*db, bbb);
+          break;
+        }
+#endif
         default: {
           emitExceptionCheck(*db, bbb);
           break;
@@ -5116,7 +5587,16 @@ void LIRGenerator::resolvePhiOperands(
 
   for (auto& block : basic_blocks_) {
     block->foreachPhiInstr([&](Instruction* instr) {
-      auto hir_instr = static_cast<const Phi*>(instr->origin());
+      if (instr->getNumInputs() != 0) {
+        return;
+      }
+
+      const auto* origin = instr->origin();
+      if (origin == nullptr || !origin->IsPhi()) {
+        return;
+      }
+
+      auto hir_instr = static_cast<const Phi*>(origin);
       for (size_t i = 0; i < hir_instr->NumOperands(); ++i) {
         hir::BasicBlock* hir_block = hir_instr->basic_blocks().at(i);
         hir::Register* hir_value = hir_instr->GetOperand(i);
@@ -5855,9 +6335,14 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[0]},
         PhyReg{codegen::arch::reg_general_return_loc});
   }
-#if PY_VERSION_HEX >= 0x030C0000
   // Fourth argument: is_instrumentation_deopt returned by
-  // prepareForDeopt.  Save it before being overwritten below.
+  // prepareForDeopt.  Save it before being overwritten below.  This move
+  // is assembled on every version: it used to sit behind a >= 3.12 gate,
+  // which left resumeInInterpreter's fourth argument a register residue
+  // on 3.11 -- a value that happened to agree with the reason-derived
+  // answer for every reason whose error state matched, and silently
+  // depended on the build for the rest.  resumeInInterpreter cross-checks
+  // the forwarded flag against the deopt metadata on 3.11.
   if (codegen::ARGUMENT_REGS[3] !=
       codegen::arch::reg_general_auxilary_return_loc) {
     block->allocateInstr(
@@ -5866,7 +6351,6 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[3]},
         PhyReg{codegen::arch::reg_general_auxilary_return_loc});
   }
-#endif
   // arg1 = code_rt from stack (fp - 3*8)
   block->allocateInstr(
       Instruction::kMove,

@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/frame_header.h"
 
+#include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/config.h"
 
@@ -12,7 +13,8 @@ int frameHeaderSize(BorrowedRef<PyCodeObject> code) {
     return 0;
   }
 
-  return kFrameHeaderOverhead + sizeof(PyObject*) * code->co_framesize;
+  return kFrameHeaderOverhead +
+      sizeof(PyObject*) * frameSlotsForCodeObject(code);
 }
 
 } // namespace jit

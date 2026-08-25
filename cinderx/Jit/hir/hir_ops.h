@@ -34,6 +34,7 @@ namespace jit::hir {
   V(CheckVar)                      \
   V(CheckFreevar)                  \
   V(CheckField)                    \
+  V(CheckInstrumentation)          \
   V(CheckTreeIterChildEntry)       \
   V(CIntToCBool)                   \
   V(ClearTreeIterState)            \

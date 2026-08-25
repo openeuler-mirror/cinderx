@@ -898,6 +898,11 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
       NEW_INSTR(CheckSequenceBounds, dst, sequence, idx);
       break;
     }
+    case Opcode::kIsNegativeAndErrOccurred: {
+      auto operand = ParseRegister();
+      instruction = newInstr<IsNegativeAndErrOccurred>(dst, operand);
+      break;
+    }
     case Opcode::kSnapshot: {
       auto snapshot = Snapshot::create();
       if (peekNextToken() == "{") {
@@ -1008,6 +1013,7 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
     case Opcode::kCallStaticRetVoid:
     case Opcode::kCast:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCheckNeg:
     case Opcode::kCheckFreevar:
     case Opcode::kCheckField:
@@ -1030,7 +1036,6 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
     case Opcode::kIndexUnbox:
     case Opcode::kInvokeIterNext:
     case Opcode::kIsInstance:
-    case Opcode::kIsNegativeAndErrOccurred:
     case Opcode::kListExtend:
     case Opcode::kLoadFieldAddress:
     case Opcode::kLoadAttrSpecial:

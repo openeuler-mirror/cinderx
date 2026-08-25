@@ -250,6 +250,18 @@ int rewriteVectorCallCommon(
       ARGUMENT_REGS[reg_offset + 1],
       ARGUMENT_REGS[reg_offset + 2],
       base_offset);
+#if PY_VERSION_HEX < 0x030C0000
+  // Since we set PY_VECTORCALL_ARGUMENTS_OFFSET, args[-1] must hold the
+  // callable for the 3.11 vectorcall callees that read the offset slot.
+  block->allocateInstrBefore(
+      instr_iter,
+      Instruction::kMove,
+      OutInd{
+          ARGUMENT_REGS[reg_offset + 1],
+          -static_cast<int>(sizeof(void*)),
+          DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[reg_offset], DataType::k64bit});
+#endif
 
   auto last_input = instr->releaseInput(instr->getNumInputs() - 1);
   if (kwnames_idx < ARGUMENT_REGS.size()) {
@@ -648,7 +660,11 @@ Instruction* findFusibleCompare(
     instr_iter_t cond_branch_iter,
     BasicBlock* block) {
   auto cond_branch = cond_branch_iter->get();
-  auto input_reg = cond_branch->getInput(0)->getPhyRegister();
+  auto input = cond_branch->getInput(0);
+  if (!input->isReg()) {
+    return nullptr;
+  }
+  auto input_reg = input->getPhyRegister();
 
   // Walk backwards from the CondBranch looking for the defining compare.
   auto& instrs = block->instructions();
@@ -716,6 +732,16 @@ void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   } else {
 #if defined(CINDER_AARCH64)
     // On aarch64, use cbz/cbnz directly instead of test+branch.
+    if (!input->isReg()) {
+      if (input->isImm()) {
+        target_block = input->getConstant() ? true_block : false_block;
+        instr->setOpcode(Instruction::kBranch);
+        instr->setNumInputs(0);
+        instr->allocateLabelInput(target_block);
+        return;
+      }
+      return;
+    }
     Instruction::Opcode cbz_opcode;
     if (true_block == next_block) {
       cbz_opcode = Instruction::kCmpBranchZero;

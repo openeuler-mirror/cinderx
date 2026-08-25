@@ -11,6 +11,8 @@
 
 namespace jit {
 
+class CompiledFunction;
+
 // In a regular JIT function spill-data is stored at negative offsets from the
 // frame pointer and the frame pointer points into the system stack. In JIT
 // generators spilled data is still stored backwards from the frame pointer, but
@@ -56,6 +58,13 @@ struct GenDataFooter {
 
   // JIT metadata for associated code object
   CodeRuntime* code_rt{nullptr};
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 guarded entry can retire the function-level artifact while this
+  // generator is suspended.  Keep the exact artifact used to create the
+  // generator alive until completion, deopt, or destruction.
+  CompiledFunction* compiled{nullptr};
+#endif
 
   // State machine state for the TreeIter optimisation.  Null for non-TreeIter
   // generators and before the first resume of an optimised generator.

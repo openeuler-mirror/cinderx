@@ -20,12 +20,24 @@ def _cinderx_jit_disabled():
     )
 
 
+def _cinderx_311_execute_mode():
+    # On CPython 3.11 the JIT runs only in the explicit execute mode
+    # (CINDERX_JIT_MODE=execute, or its test-only spelling "canary"); off,
+    # observe and shadow publish no cinderjit module.  The native side
+    # applies the same rule (observe.c), disable switches included.
+    return os.environ.get("CINDERX_JIT_MODE", "off") in ("execute", "canary")
+
+
 if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     import _cinderx  # noqa: F401
 
-    if _cinderx_jit_disabled() or sys.version_info[:2] < (3, 12):
-        # The 3.11 capability contract forbids JIT machine-code execution.
+    if _cinderx_jit_disabled():
         cinderjit = None
+    elif sys.version_info[:2] < (3, 12):
+        if _cinderx_311_execute_mode():
+            import cinderjit  # noqa: F401
+        else:
+            cinderjit = None
     else:
         import cinderjit  # noqa: F401
 

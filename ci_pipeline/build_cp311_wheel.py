@@ -90,6 +90,10 @@ def build(image: str, out_dir: Path, git_sha: str, deps_cache: Path | None) -> P
     cmd = [
         "docker", "run", "--rm",
         "--ulimit", ULIMIT_NOFILE,
+        # A linked worktree's /src/.git points outside the mount. Git's
+        # system-config command still probes the current directory, so start
+        # outside /src; the build script enters its copied source explicitly.
+        "--workdir", "/tmp",
         "-v", f"{REPO_ROOT}:/src:ro",
         "-v", f"{out_dir}:/out",
         # Pass-through knobs; docker omits any that are unset here.
