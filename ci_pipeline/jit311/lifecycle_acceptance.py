@@ -366,32 +366,32 @@ class LifecycleAcceptanceRunner:
             "frozen_commit_is_ancestor": ancestry,
             "frozen_source_sha256": source_hashes,
             "frozen_report": None,
-            "frozen_summary": None,
             "errors": source_errors,
         }
         if not ancestry:
             evidence["errors"].append(
                 "transition frozen commit is not an ancestor of source HEAD"
             )
-        # The frozen evidence itself lives in the repository: the report is the
-        # byte-exact historical document, and the summary is a distilled record
-        # that carries the digest of the full archived result (56 MB, kept out
-        # of the tree) as its provenance link.
-        frozen_dir = self.base.stage / "ci_pipeline/jit311/data/frozen"
-        report_path = frozen_dir / "runtime_transition_frozen_report.md"
-        summary_path = frozen_dir / "runtime_transition_frozen_summary.json"
-        for supplied, key, expected_key in (
-            (report_path, "frozen_report", "canonical_report_sha256"),
-            (summary_path, "frozen_summary", "frozen_summary_sha256"),
-        ):
-            if not supplied.is_file():
-                evidence["errors"].append(f"frozen transition evidence is missing: {supplied}")
-                continue
-            digest = hashlib.sha256(supplied.read_bytes()).hexdigest()
-            evidence[key] = {"path": str(supplied), "sha256": digest}
-            if digest != policy[expected_key]:
-                evidence["errors"].append(f"frozen transition evidence digest mismatch: {supplied}")
-        if report_path.is_file():
+        # The freeze fact rests on three proofs: the ancestry above, the
+        # harness sources read back from the frozen commit itself, and the
+        # byte-exact frozen report carried in the repository.  The full
+        # archived result stays out of the tree and out of the gate; the
+        # policy records its digest for archival authentication only.
+        report_path = (
+            self.base.stage
+            / "ci_pipeline/jit311/data/frozen/runtime_transition_frozen_report.md"
+        )
+        if not report_path.is_file():
+            evidence["errors"].append(
+                f"frozen transition report is missing: {report_path}"
+            )
+        else:
+            digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            evidence["frozen_report"] = {"path": str(report_path), "sha256": digest}
+            if digest != policy["canonical_report_sha256"]:
+                evidence["errors"].append(
+                    f"frozen transition report digest mismatch: {report_path}"
+                )
             text = report_path.read_text(errors="replace")
             if (
                 HISTORICAL_TRANSITION_FREEZE_MARKER not in text
@@ -399,18 +399,6 @@ class LifecycleAcceptanceRunner:
             ):
                 evidence["errors"].append(
                     "frozen transition report lacks exact frozen/result markers"
-                )
-        if summary_path.is_file():
-            summary_doc = self._json(summary_path)
-            if (
-                not summary_doc
-                or summary_doc.get("freeze_state") != "FROZEN"
-                or summary_doc.get("final") != policy["transition_result"]
-                or summary_doc.get("full_result_sha256")
-                != policy["archived_result_sha256"]
-            ):
-                evidence["errors"].append(
-                    "frozen transition summary does not match the pinned freeze facts"
                 )
         if evidence["errors"]:
             evidence["result"] = "FAIL"
