@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 #include "cinderx/Jit/hir/instr_effects.h"
@@ -9,6 +10,8 @@
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <unordered_set>
 
 using namespace jit::hir;
 
@@ -26,6 +29,32 @@ int countIf(const Function& func, auto pred) {
     }
   }
   return count;
+}
+
+std::unordered_set<int> publishedOffsets(const Function& func) {
+  std::unordered_set<int> offsets;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsUpdatePrevInstr()) {
+        offsets.insert(instr.bytecodeOffset().asIndex().value());
+      }
+    }
+  }
+  return offsets;
+}
+
+int firstPublishedOffset(
+    BorrowedRef<PyCodeObject> code,
+    int opcode,
+    bool after_caches) {
+  for (const auto& instr : jit::BytecodeInstructionBlock{code}) {
+    if (instr.opcode() != opcode) {
+      continue;
+    }
+    return after_caches ? instr.nextInstrOffset().asIndex().value() - 1
+                        : instr.opcodeIndex().value();
+  }
+  return -1;
 }
 
 std::unique_ptr<Function> compileAndRunPass(
@@ -88,3 +117,47 @@ def test(a):
       countIf(*irfunc, [](const Instr& i) { return i.IsUpdatePrevInstr(); });
   EXPECT_GT(update_count, 0);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(
+    InsertUpdatePrevInstrTest,
+    PythonVisibleBoundariesPublishPrecisePositions) {
+  struct Case {
+    const char* source;
+    int opcode;
+    bool after_caches;
+  };
+  const Case cases[] = {
+      {R"(
+def test(function):
+  return function()
+)",
+       CALL,
+       true},
+      {R"(
+def test(value):
+  return value.member
+)",
+       LOAD_ATTR,
+       false},
+      {R"(
+def test(value):
+  return value + 1
+)",
+       BINARY_OP,
+       false},
+  };
+
+  for (const Case& test_case : cases) {
+    auto irfunc = compileAndRunPass(this, test_case.source);
+    ASSERT_NE(irfunc, nullptr);
+    int expected = firstPublishedOffset(
+        irfunc->code, test_case.opcode, test_case.after_caches);
+    ASSERT_GE(expected, 0);
+    auto offsets = publishedOffsets(*irfunc);
+    EXPECT_TRUE(offsets.contains(expected))
+        << "missing Stock-compatible publication for opcode "
+        << test_case.opcode << " at code-unit " << expected;
+  }
+}
+#endif

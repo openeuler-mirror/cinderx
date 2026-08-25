@@ -416,7 +416,16 @@ TEST_F(CmdLineTest, BasicFlags) {
           L"jit-huge-pages=1",
           "PYTHONJITHUGEPAGES=1",
           []() {},
-          []() { ASSERT_TRUE(getConfig().use_huge_pages); }),
+          []() {
+#if PY_VERSION_HEX < 0x030C0000
+            // The 3.11 surface answers an explicit huge-page request with
+            // the reclaiming allocator, and the configuration must read
+            // the effective policy rather than the request.
+            ASSERT_FALSE(getConfig().use_huge_pages);
+#else
+            ASSERT_TRUE(getConfig().use_huge_pages);
+#endif
+          }),
       0);
 
   ASSERT_EQ(

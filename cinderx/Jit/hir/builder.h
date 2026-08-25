@@ -96,6 +96,23 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code);
 // MR-06 CALL family), otherwise the registered shape-refusal reason.
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code);
 
+struct ExecuteRefusal311 {
+  const char* reason{nullptr};
+  int opcode{-1};
+  int offset{-1};
+};
+
+// The same execute-surface decision with the exact first rejected opcode and
+// byte offset.  A malformed control-flow graph has no trustworthy opcode and
+// therefore returns -1/-1; the acceptance treats that as unexpected rather than
+// widening the ordinary execute-surface allowance.
+ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code);
+
+// Single source of truth for the 3.11 execute whitelist.  The frozen stdlib
+// manifest freezes this set so removing a supported opcode cannot silently turn
+// into a broad REFUSE_SHAPE_EXECUTE_SURFACE pass.
+bool isExecuteOpcodeSupported311(int opcode);
+
 // Inlining merges all of the different callee Returns (which terminate blocks,
 // leading to a bunch of distinct exit blocks) into Branches to one Return
 // block (one exit block), which the caller can transform into an Assign to the

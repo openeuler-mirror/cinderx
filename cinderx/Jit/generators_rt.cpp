@@ -308,7 +308,7 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
   // JITRT_AllocateAndLinkInterpreterFrame(), the ordinary 3.11 counting
   // point.  Count at this unique resume dispatch so canary evidence covers
   // both the initial next() and later send()/throw()/close() resumes.
-  jit::triggerStatsOnMachineCodeEntry();
+  jit::triggerStatsOnMachineCodeEntry(_PyFrame_GetCode(frame));
 #endif
   Ref<> result = Ref<>::steal(gen_footer->resumeEntry(
       gen_obj, arg, 0 /* finish_yield_from (not used in 3.12+) */, tstate));
@@ -1097,6 +1097,20 @@ bool deopt_jit_gen_with_footer(
     }
     reifyGeneratorFrame(
         frame, deopt_meta, deopt_meta.innermostFrame(), gen_footer);
+#if PY_VERSION_HEX < 0x030C0000
+    BorrowedRef<PyCodeObject> ledger_code = deopt_meta.innermostFrame().code;
+    int resume_offset = static_cast<int>(
+        (frame->prev_instr + 1 - _PyCode_CODE(ledger_code)) *
+        sizeof(_Py_CODEUNIT));
+    runtimeTransitionLedgerRecord(
+        ledger_code,
+        "generator-deopt",
+        deoptReasonName(deopt_meta.reason),
+        deopt_meta.innermostFrame().cause_instr_idx.value(),
+        resume_offset,
+        false,
+        isJitPaused());
+#endif
     // Ownership of references has been transferred from JIT to interpreter.
     releaseRefs(deopt_meta, gen_footer);
   } else {

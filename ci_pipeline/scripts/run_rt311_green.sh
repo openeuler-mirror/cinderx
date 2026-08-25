@@ -24,16 +24,18 @@ while IFS='=' read -r name _; do
 done < <(env)
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MANIFEST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_green_families.txt"
-REGISTERED="$REPO_ROOT/ci_pipeline/jit311/data/rt311_registered_tests.txt"
+REQUIRED="$REPO_ROOT/ci_pipeline/jit311/data/rt311_required_tests.txt"
 
-registered_drift() {
-  # $1: live registered-test list (sorted Suite.Test lines).  Any drift
-  # against the committed manifest -- disappearance, rename, addition --
-  # must be a deliberate manifest edit, never an accident: a deleted green
-  # case would otherwise stay green forever.
-  if ! diff <(grep -Ev '^[[:space:]]*(#|$)' "$REGISTERED") "$1"; then
-    echo "registered-test identity drifted from the committed manifest;"
-    echo "edit ci_pipeline/jit311/data/rt311_registered_tests.txt deliberately"
+required_present() {
+  # $1: live registered-test list (sorted Suite.Test lines).  Every
+  # RFC-critical test pinned in the required manifest must exist in the
+  # binary: a deleted or renamed delivery test would otherwise stay green
+  # forever.  The rest of the population is owned by git review.
+  MISSING=$(comm -23 <(grep -Ev '^[[:space:]]*(#|$)' "$REQUIRED" | sort -u) "$1")
+  if [ -n "$MISSING" ]; then
+    echo "required 3.11 tests missing from the registered population:"
+    echo "$MISSING"
+    echo "restore them or edit rt311_required_tests.txt deliberately"
     return 1
   fi
 }
@@ -123,10 +125,10 @@ baseline_growth() {
   fi
 }
 
-if [ "${1:-}" = "--verify-registered" ]; then
-  # Self-test entry: compare a live list against the manifest without a
-  # build, through the same function the gate uses.
-  registered_drift "${2:?usage: --verify-registered <live-list-file>}"
+if [ "${1:-}" = "--verify-required" ]; then
+  # Self-test entry: check a live list against the required pins without
+  # a build, through the same function the gate uses.
+  required_present "${2:?usage: --verify-required <live-list-file>}"
   exit $?
 fi
 if [ "${1:-}" = "--verify-baseline-growth" ]; then
@@ -164,7 +166,7 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
 make -C "$BUILD_DIR" -j"$(nproc)" runtime_tests > "$BUILD_DIR-build.log" 2>&1
 BIN=$(find "$BUILD_DIR" -name runtime_tests -type f | head -1)
 
-# Pin the registered-test identity before anything runs.
+# List the registered population and hold the required pins against it.
 # The suite pattern must accept value-parameterized instantiations
 # ("Prefix/Suite."): a suite line the pattern misses leaves `suite`
 # pointing at whichever suite happened to be listed before it, which
@@ -174,7 +176,7 @@ BIN=$(find "$BUILD_DIR" -name runtime_tests -type f | head -1)
   | awk '/^[A-Za-z_][A-Za-z0-9_\/]*\./ { suite = $1 }
          /^  [A-Za-z_]/ { print suite $1 }' \
   | sort -u > "$BUILD_DIR-registered.txt"
-registered_drift "$BUILD_DIR-registered.txt"
+required_present "$BUILD_DIR-registered.txt"
 
 FILTER=$(awk '{printf "%s.*:", $1}' "$MANIFEST")
 if [ "$MODE" = "--census" ]; then

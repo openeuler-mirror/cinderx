@@ -66,6 +66,121 @@ CHILD = textwrap.dedent(
     "the canary execute surface targets the vendored CPython 3.11.6",
 )
 class CanaryExecute311Test(unittest.TestCase):
+    def test_suspended_generator_pins_its_artifact(self):
+        # A suspended JIT generator is a paused invocation: its resume jumps
+        # into the artifact's machine code and its GC traversal reads the
+        # artifact's CodeRuntime.  With the reclaiming allocator, an artifact
+        # dying under the suspension would free exactly that storage, so the
+        # generator must hold the artifact for its own lifetime.
+        env = _capability_clean_env()
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONJITGENERATOR"] = "1"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            namespace = {}
+            exec(
+                "def wave(base):\\n    yield base\\n    yield base + 1\\n",
+                namespace,
+                namespace,
+            )
+            wave = namespace.pop("wave")
+            assert cinderjit.force_compile(wave) is True
+            generator = wave(10)
+            assert next(generator) == 10
+
+            def buffers():
+                return _cinderx._get_trigger_stats()["resident_code_buffers"]
+
+            held = buffers()
+            assert cinderjit.force_uncompile(wave) is True
+            del wave, namespace
+            gc.collect(); gc.collect()
+            assert buffers() == held, (buffers(), held)
+            assert generator.send(None) == 11
+            try:
+                next(generator)
+            except StopIteration:
+                pass
+            else:
+                raise AssertionError("generator did not finish")
+            del generator
+            gc.collect(); gc.collect()
+            assert buffers() == held - 1, (buffers(), held)
+            assert cinderjit._jit311_lifecycle_invariants()["ok"] is True
+            print(json.dumps({"resident_after": held - 1}))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
+        json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_lifecycle_snapshot_is_non_retaining(self):
+        env = _capability_clean_env()
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def hot(value):
+                return value + 1
+
+            assert cinderjit.force_compile(hot) is True
+            assert hot(4) == 5
+            gc.collect(); gc.collect()
+            before = cinderjit._jit311_lifecycle_snapshot()
+            assert before["schema"] == "cp311-jit-lifecycle-v1"
+            assert cinderjit._jit311_lifecycle_invariants() == {
+                "ok": True,
+                "errors": [],
+            }
+            for _index in range(100):
+                current = cinderjit._jit311_lifecycle_snapshot()
+                assert current["schema"] == before["schema"]
+                del current
+            gc.collect(); gc.collect()
+            after = cinderjit._jit311_lifecycle_snapshot()
+            for section in ("jit", "module", "runtime", "observer"):
+                assert after[section] == before[section], (
+                    section, before[section], after[section])
+            assert after["generator"] == {
+                "native_gauge_available": False,
+                "status": "GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE",
+            }
+            assert cinderjit._jit311_lifecycle_invariants()["ok"] is True
+            print(json.dumps({"before": before, "after": after}))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(report["before"], report["after"])
+
     def test_canary_child_executes_and_default_stays_zero(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
@@ -3181,23 +3296,36 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
         self.assertIn("identity guard, not invalidation", proc.stdout)
 
-    def test_instrumentation_support_config_is_refused_by_canary(self):
-        # The flag patches sys.setprofile/settrace/monitoring to pause the
-        # whole JIT while instrumentation is active.  This mode delivers
-        # tracing correctness through the guarded entry and the RFC
-        # 3.3.4.5 exemption (running frames finish natively) instead, and
-        # the toggle's disable arm has no audited 3.11 story -- so the
-        # canary refuses the configuration by name rather than running an
-        # unaudited pause-the-world path alongside the audited one.
+    def test_instrumentation_support_is_enabled_by_canary(self):
+        # The execution acceptance adopts the Meta-style policy: settrace/setprofile pause new
+        # compilation, park published entries, and re-enable them after the
+        # callback is removed.  The 3.11 canary enables this policy
+        # unconditionally; the legacy configuration flag remains accepted.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
         env["PYTHONJITSUPPORTINSTRUMENTATION"] = "1"
         probe = textwrap.dedent(
             """
+            import sys
             import _cinderx, cinderx
             cinderx.init()
-            print("init unexpectedly succeeded")
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def target(value):
+                return value + 1
+
+            assert cinderjit.force_compile(target) is True
+            before = _cinderx._get_trigger_stats()["compiled_function_creations"]
+            sys.settrace(lambda *args: None)
+            assert cinderjit.force_compile(lambda: 1) is False
+            assert not cinderjit.is_enabled()
+            sys.settrace(None)
+            assert cinderjit.is_enabled()
+            after = _cinderx._get_trigger_stats()["compiled_function_creations"]
+            assert after == before
+            print("Meta-style instrumentation policy enabled")
             """
         )
         proc = subprocess.run(
@@ -3207,16 +3335,13 @@ class CanaryExecute311Test(unittest.TestCase):
             env=env,
             timeout=120,
         )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertNotIn("init unexpectedly succeeded", proc.stdout)
-        self.assertIn("PYTHONJITSUPPORTINSTRUMENTATION", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1000:])
+        self.assertIn("Meta-style instrumentation policy enabled", proc.stdout)
 
     def test_tracing_falls_back_to_interpreter(self):
-        # MR-04 implements no instrumentation, so it fails closed: while a
-        # legacy trace or profile function is registered, the guarded entry
-        # must hand every call to the interpreter, which delivers the
-        # call/line/return events the tracer is owed.  Machine code resumes
-        # once tracing stops.
+        # Instrumentation pauses and parks the JIT.  Calls run in the stock
+        # interpreter while tracing is active and the same artifact is
+        # reattached after tracing stops.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3283,13 +3408,11 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("traced through the interpreter", proc.stdout)
         self.assertIn("machine entry restored", proc.stdout)
 
-    def test_profile_enabled_inside_binary_op_follows_the_rfc_exemption(self):
-        # RFC 3.3.4.5: a sys.setprofile from inside the running compiled
-        # frame (here: synchronously inside __add__) does NOT interrupt
-        # that frame -- it keeps running natively to its natural return
-        # and its remaining events, including PyTrace_RETURN, are not
-        # delivered.  Only new calls observe the activation: the guarded
-        # entry falls back and the interpreted run is fully profiled.
+    def test_profile_enabled_inside_binary_op_falls_back_to_interpreter(self):
+        # A profile callback installed inside __add__ parks the artifact and
+        # the next bytecode-boundary poll hands the already-running frame to
+        # the interpreter.  There is no synthetic call event for a frame that
+        # already began, but the interpreter delivers its owed return event.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3339,10 +3462,9 @@ class CanaryExecute311Test(unittest.TestCase):
                 - before
             assert entered == 1, "the probe call must start in machine code"
             assert result.n == 20, result.n
-            assert not [e for e in events if e[0] == "hot"], (
-                "the running compiled frame must not deliver events "
-                "(RFC 3.3.4.5 items 2-3): %r" % (events,)
-            )
+            assert [e for e in events if e[0] == "hot"] == [
+                ("hot", "return")
+            ], events
 
             # A new call under the active profiler: interpreted, and
             # fully profiled.
@@ -3357,7 +3479,7 @@ class CanaryExecute311Test(unittest.TestCase):
                 "the interpreted follow-up call was not profiled: %r"
                 % (events,)
             )
-            print("mid-frame profile followed the RFC exemption")
+            print("mid-frame profile fell back to the interpreter")
             """
         )
         proc = subprocess.run(
@@ -3368,16 +3490,15 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("mid-frame profile followed the RFC exemption", proc.stdout)
+        self.assertIn("mid-frame profile fell back to the interpreter", proc.stdout)
 
-    def test_profile_enabled_by_pending_call_follows_the_rfc_exemption(self):
+    def test_profile_enabled_by_pending_call_falls_back_to_interpreter(self):
         # The same transition through the other door: Py_AddPendingCall()
         # runs its callback on this thread at the compiled loop's back
         # edge (the eval-breaker service stays wired per RFC -- signals,
         # pending calls and GIL periodic tasks are delivered), and the
-        # callback enables profiling.  RFC 3.3.4.5: the running compiled
-        # frame still finishes natively with no events; only new calls
-        # observe the activation.
+        # callback enables profiling.  The loop's next boundary poll deopts
+        # it, so the interpreter owns the remainder and its return event.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3442,11 +3563,9 @@ class CanaryExecute311Test(unittest.TestCase):
             )
             assert sys.getprofile() is prof, (
                 "the pending call never ran on the loop thread")
-            assert not [e for e in events if e[0] == "hot"], (
-                "RFC 3.3.4.5 items 2-3: the running compiled frame must "
-                "keep running natively and deliver no events: %r"
-                % (events[:10],)
-            )
+            assert [e for e in events if e[0] == "hot"] == [
+                ("hot", "return")
+            ], events[:10]
 
             events.clear()
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
@@ -3459,7 +3578,7 @@ class CanaryExecute311Test(unittest.TestCase):
                 "the interpreted follow-up call was not profiled: %r"
                 % (events[:10],)
             )
-            print("pending-call profile followed the RFC exemption")
+            print("pending-call profile fell back to the interpreter")
             """
         )
         proc = subprocess.run(
@@ -3471,7 +3590,7 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn(
-            "pending-call profile followed the RFC exemption", proc.stdout)
+            "pending-call profile fell back to the interpreter", proc.stdout)
 
     def _run_transition_probe(self, body):
         env = dict(os.environ)
@@ -3501,12 +3620,11 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("transition followed the RFC exemption", proc.stdout)
+        self.assertIn("transition fell back to the interpreter", proc.stdout)
 
-    def test_profile_enabled_inside_for_iter_next_follows_the_exemption(self):
-        # Activation from inside an iterator's __next__ mid-frame: RFC
-        # 3.3.4.5 -- the running compiled frame finishes natively with no
-        # events; the follow-up call is interpreted and fully profiled.
+    def test_profile_enabled_inside_for_iter_next_falls_back(self):
+        # Activation from inside an iterator's __next__ deopts at the next
+        # stable boundary; a follow-up call stays interpreted while active.
         self._run_transition_probe(
             """
             class It:
@@ -3535,7 +3653,9 @@ class CanaryExecute311Test(unittest.TestCase):
             result = hot(It(True))
             assert entries() - before == 1, "must start in machine code"
             assert result == 42, result
-            assert not [e for e in events if e[0] == "hot"], events
+            assert [e for e in events if e[0] == "hot"] == [
+                ("hot", "return")
+            ], events
             events.clear()
             before = entries()
             follow = hot(It(False))
@@ -3544,13 +3664,13 @@ class CanaryExecute311Test(unittest.TestCase):
             assert follow == 42, follow
             assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition followed the RFC exemption")
+            print("transition fell back to the interpreter")
             """
         )
 
-    def test_profile_enabled_inside_bool_follows_the_exemption(self):
-        # Activation from inside __bool__ feeding a conditional jump:
-        # same RFC exemption oracle.
+    def test_profile_enabled_inside_bool_falls_back(self):
+        # Activation from inside __bool__ feeding a conditional jump uses the
+        # same boundary fallback policy.
         self._run_transition_probe(
             """
             class Flag:
@@ -3577,7 +3697,9 @@ class CanaryExecute311Test(unittest.TestCase):
             result = hot(Flag(True))
             assert entries() - before == 1, "must start in machine code"
             assert result == 2, result
-            assert not [e for e in events if e[0] == "hot"], events
+            assert [e for e in events if e[0] == "hot"] == [
+                ("hot", "return")
+            ], events
             events.clear()
             before = entries()
             follow = hot(Flag(False))
@@ -3586,7 +3708,7 @@ class CanaryExecute311Test(unittest.TestCase):
             assert follow == 2, follow
             assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition followed the RFC exemption")
+            print("transition fell back to the interpreter")
             """
         )
 
@@ -3923,9 +4045,9 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("mid-frame takeover stayed out of the deopt", proc.stdout)
 
-    def test_profile_enabled_inside_del_follows_the_exemption(self):
-        # Activation from a DECREF's __del__ -- the transition the
-        # bytecode never shows: same RFC exemption oracle.
+    def test_profile_enabled_inside_del_falls_back(self):
+        # Activation from a DECREF's __del__ is why every boundary, including
+        # those around refcount releases, must remain poll-covered.
         self._run_transition_probe(
             """
             class Temp:
@@ -3956,7 +4078,9 @@ class CanaryExecute311Test(unittest.TestCase):
             result = hot(Num(True), Num(True))
             assert entries() - before == 1, "must start in machine code"
             assert result == 42, result
-            assert not [e for e in events if e[0] == "hot"], events
+            assert [e for e in events if e[0] == "hot"] == [
+                ("hot", "return")
+            ], events
             events.clear()
             before = entries()
             follow = hot(Num(False), Num(False))
@@ -3965,7 +4089,7 @@ class CanaryExecute311Test(unittest.TestCase):
             assert follow == 42, follow
             assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition followed the RFC exemption")
+            print("transition fell back to the interpreter")
             """
         )
 

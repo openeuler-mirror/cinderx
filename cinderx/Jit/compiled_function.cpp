@@ -15,6 +15,7 @@
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
+#include "cinderx/Jit/context_iface.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_c_state.h"
@@ -209,7 +210,15 @@ CompiledFunction::~CompiledFunction() {
     if (mod_state != nullptr) {
       auto code_allocator = mod_state->code_allocator.get();
       if (code_allocator != nullptr) {
-        code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+        // A refused release means the allocator no longer recognizes this
+        // span: either the buffer was released twice or the accounting has
+        // already diverged from the allocator's, and every later usedBytes()
+        // reading would be fiction.
+        asmjit::Error error = code_allocator->releaseCode(
+            const_cast<std::byte*>(data_.code.data()));
+        JIT_CHECK(
+            error == asmjit::kErrorOk,
+            "Code allocator refused to release an owned code buffer");
       }
     }
   }
@@ -380,11 +389,50 @@ void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
   functions_.erase(func.get());
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Whether the runtime this artifact points at is still backed by live
+// storage.  A retired or orphaned artifact has no owner link, sits in no
+// registry, and can outlive its context inside a module cycle collected at
+// interpreter exit; the context's destructor already released the
+// runtime's owned references (its release walk covers every arena slot)
+// and freed the slab storage, so the first GC hook to run afterwards must
+// sever the pointer without touching it.  With a live owner the storage
+// lives at least as long as the artifact; without one, the module context
+// answers -- and only for slots it actually owns.
+bool CompiledFunction::runtimeStorageAlive() const {
+  if (data_.runtime == nullptr) {
+    return false;
+  }
+  // The owning context stamps every published artifact with its arena
+  // lifetime token and flips it before the storage dies; wherever the
+  // token exists it is the single source of truth.
+  if (data_.runtime_lifetime != nullptr) {
+    return data_.runtime_lifetime->alive.load(std::memory_order_acquire);
+  }
+  if (owner_ != nullptr) {
+    return true;
+  }
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    return false;
+  }
+  jit::IJitContext* ctx = mod_state->jit_context.get();
+  return ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime);
+}
+#endif
+
 int CompiledFunction::traverse(visitproc visit, void* arg) {
   // Don't traverse functions_ - these are borrowed references that we don't
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+    return 0;
+  }
+#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -398,11 +446,15 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
 void CompiledFunction::forgetFunctions() {
   functions_.clear();
 }
+
 #endif
 
 void CompiledFunction::clear(
     bool context_finalizing,
     bool release_runtime_references) {
+  // The owner is nulled below, but the runtime hand-back at the bottom
+  // still needs it: only the owner knows which slab the storage came from.
+  [[maybe_unused]] CompiledFunctionOwner* entry_owner = owner_;
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {
@@ -444,18 +496,44 @@ void CompiledFunction::clear(
     owner_ = nullptr;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // See runtimeStorageAlive(): after the owning context died, the runtime's
+  // references were already released by the context's own walk and the
+  // storage is gone -- sever without touching.
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+  }
+#endif
+
   // Clear all references held by the CodeRuntime. A retired 3.11 artifact can
   // remain executable through a suspended generator after its function-level
   // registries are gone. Keep these references until that generator converts
   // to stock state and releases the artifact's final owner.
   if (release_runtime_references && data_.runtime != nullptr) {
-    // A retired artifact can outlive the Context arena through a suspended
-    // 3.11 generator. Context releases every CodeRuntime before marking the
-    // arena dead; a later artifact destructor must not dereference that arena.
-    if (data_.runtime_lifetime == nullptr ||
-        data_.runtime_lifetime->alive.load(std::memory_order_acquire)) {
-      data_.runtime->releaseReferences();
+    data_.runtime->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+    // The release runs at artifact death, at GC collection of an
+    // unreachable artifact, or at context finalization -- registry
+    // retirement clears without releasing runtime references and never
+    // reaches here -- so no invocation and no suspended generator can
+    // still need this runtime: both hold the artifact alive.  Hand the
+    // storage back for reuse.  Finalization
+    // skips the hand-back (the slab dies wholesale with the context), and
+    // an artifact whose owner link is already severed -- retired, or
+    // orphaned by the multithread teardown -- answers to the module's
+    // context only after proving that context actually owns the slot, so
+    // a test-private context's storage is never adopted.
+    if (!context_finalizing) {
+      if (entry_owner != nullptr) {
+        entry_owner->recycleCodeRuntime(data_.runtime);
+      } else if (auto* mod_state = cinderx::getModuleState()) {
+        jit::IJitContext* ctx = mod_state->jit_context.get();
+        if (ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime)) {
+          ctx->recycleCodeRuntime(data_.runtime);
+        }
+      }
     }
+#endif
     data_.runtime = nullptr;
   }
 }

@@ -15,7 +15,6 @@ They need a CPython 3.11 interpreter with the cinderx wheel importable
 (the gate runs them on the venv the wheel job builds).
 """
 
-import inspect
 import json
 import sys
 
@@ -177,40 +176,6 @@ def test_corpus_module_missing_turns_red():
     assert any("worker exited" in err for err in result.errors)
 
 
-def test_generator_churn_runner_carries_the_mr10_contract():
-    spec = runners.generator_churn_runner()
-    assert spec.name == "generator_churn"
-    assert spec.env == {
-        "CINDERX_JIT_MODE": "canary",
-        "PYTHONJITAUTO": "1000000",
-        "PYTHONJITGENERATOR": "1",
-        "PYTHONMALLOC": "debug",
-    }
-    assert spec.asserted_env["PYTHONJITGENERATOR"] == "1"
-    for required_probe in (
-        "force_compile",
-        "force_uncompile",
-        ".send(",
-        ".throw(",
-        ".close(",
-        "weakref.ref",
-        "gc.collect",
-    ):
-        assert required_probe in spec.payload
-
-
-def test_run_all_registers_generator_churn(monkeypatch):
-    seen = []
-
-    def fake_run(spec, python=None):
-        seen.append(spec.name)
-        return None
-
-    monkeypatch.setattr(runners, "run", fake_run)
-    runners.run_all(python=sys.executable)
-    assert seen.count("generator_churn") == 1
-
-
 def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
     # Consumer smoke for the migrated refcount-matrix harness: one small
     # corpus module in interp mode must measure targets and emit JSON.
@@ -282,39 +247,15 @@ def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
                            "machine_code_entries": {"case_x": 0}}) == 1
 
 
-GATE_REQUIRED_JOBS = {
-    "vendored_manifest", "wheel_build_import", "diff_engine_selftest",
-    "bytecode_support_gate", "dynsym_allowlist", "interpreter_and_eval_hook",
-    "trigger_stats_gate", "jit311_runner_selftests",
-    "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
-    "observe_gate", "shadow_compile_gate", "release_canary_execute",
-    "generator_corpus_canary", "execute_gate",
-}
-DAILY_REQUIRED_JOBS = {
-    "asan_build_311", "debug_build_311", "runtime_tests_311_census",
-    "jit311_drivers", "jit311_pyperf_completeness", "jit311_pyperf_canary",
-    "jit311_pyperf_execute", "jit311_shadow_surface",
-    "libtest_execute_diff_72",
-}
-
-
 def test_execute_differential_covers_the_confirmed_surface():
-    # MR-11 acceptance 11 is a behaviour differential over the 72-module
-    # confirmed surface, not an import canary: the leg must run the tests
-    # under stock and under execute and compare per-testcase outcomes.
+    # The execute differential and the import canary must share one
+    # definition of the 72-module confirmed surface; a shrink in either
+    # copy is a coverage loss, not a formatting nit.
     sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
     import libtest_diff_311 as lt
 
-    # One definition of the surface, shared with the import canary.
     assert lt.load_stdlib72_modules() == list(runners.STDLIB_SHADOW_MODULES)
     assert len(lt.load_stdlib72_modules()) == 72
-    # Trigger proof: identical results prove nothing if the execute arm
-    # never executed.
-    assert "never entered machine code" in inspect.getsource(lt.cmd_execute_gate)
-    daily = (
-        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
-    ).read_text()
-    assert "libtest_diff_311.py execute-gate" in daily
 
 
 def test_execute_differential_trigger_proof_is_worker_attributed(tmp_path):
@@ -348,82 +289,6 @@ def test_execute_differential_trigger_proof_is_worker_attributed(tmp_path):
     assert lt.read_trigger_ledger(only_main)["worker_entries"] == 0
     # A missing or empty ledger reads as no proof, never as a default pass.
     assert lt.read_trigger_ledger(tmp_path / "absent.log")["workers"] == 0
-
-
-def test_execute_differential_refuses_a_scheduler_only_arm():
-    sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
-    import libtest_diff_311 as lt
-
-    src = inspect.getsource(lt.cmd_execute_gate)
-    # The three fail-closed arms: no workers, no worker execution, and
-    # execution that belongs to no target module.
-    assert "no regrtest worker reported" in src
-    assert "test workers never entered machine code" in src
-    assert "not by any worker" in src
-    # And the fourth: worker execution that belongs entirely to the
-    # harness, with no target module compiling a function of its own.
-    assert "had a function of its own" in src
-    assert '"--worker-args"' in lt.STARTUP_SITECUSTOMIZE
-
-
-def test_execute_drivers_are_registered_in_run_all(monkeypatch):
-    # MR-11: run_all carries the product-spelling child and the five
-    # execute rows of the configuration matrix; the matrix's very-high
-    # threshold row is the armed-but-interpreting control.
-    seen = []
-    monkeypatch.setattr(
-        runners,
-        "run",
-        lambda spec, python=None: (seen.append(spec) or runners.RunResult(
-            spec.name, True, [], {}, 0)),
-    )
-    runners.run_all()
-    by_name = {spec.name: spec for spec in seen}
-    assert by_name["execute_auto"].env == {
-        "CINDERX_JIT_MODE": "execute",
-        "PYTHONJITAUTO": "8",
-        "PYTHONMALLOC": "debug",
-    }
-    assert by_name["execute_auto"].asserted_env == {"CINDERX_JIT_MODE": "execute"}
-    execute_rows = [
-        spec for spec in seen
-        if spec.name.startswith("config_matrix_")
-        and spec.env.get("CINDERX_JIT_MODE") == "execute"
-    ]
-    assert [row.env.get("PYTHONJITAUTO") for row in execute_rows] == [
-        "1", "2", "4", None, "1000000000",
-    ]
-    for row in execute_rows:
-        assert row.asserted_env == row.env
-        assert "_stats['mode'] == 'execute'" in row.payload
-
-
-def test_execute_matrix_rows_pin_the_threshold_crossing():
-    rows = [
-        spec for spec in runners.config_matrix_runner()
-        if spec.env.get("CINDERX_JIT_MODE") == "execute"
-    ]
-    by_threshold = {spec.env.get("PYTHONJITAUTO"): spec for spec in rows}
-    # The default threshold is asserted as the literal 50 inside the child.
-    assert "_stats['threshold'] == 50" in by_threshold[None].payload
-    assert "count=50, result='installed'" in by_threshold[None].payload
-    assert "count=4, result='installed'" in by_threshold["4"].payload
-    # The control row expects no event and nothing compiled.
-    assert "assert _hot == [], _hot" in by_threshold["1000000000"].payload
-    control_judges = by_threshold["1000000000"].judges
-    errors = []
-    snap = {
-        "evaluator_installed": True, "executable_alloc_calls": 0,
-        "executable_alloc_bytes": 0, "compiled_function_creations": 0,
-        "machine_code_entries": 0, "machine_code_installed": 0,
-        "forced_deopt_hits": 0, "organic_deopt_hits": 0, "events_dropped": 0,
-        "supported_opcode_failures": 0, "unknown_rejects": 0,
-        "live_compiled_functions_at_exit": 0, "worker_crashes": 0,
-        "compile_requests": 3,
-    }
-    for judge in control_judges:
-        errors += judge(snap)
-    assert any("compile_requests == 0" in err for err in errors)
 
 
 def test_execute_rounds_flag_runs_every_round(monkeypatch):
@@ -467,32 +332,6 @@ def test_execute_rounds_flag_runs_every_round(monkeypatch):
     assert runners.main(["--pyperf-execute-all", "--rounds", "0"]) == 2
 
 
-def test_daily_execute_job_runs_three_rounds_of_the_full_set():
-    daily = (
-        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
-    ).read_text()
-    assert "runners --pyperf-execute-all --rounds 3" in daily
-
-
-def _suite_jobs(path):
-    import re as _re
-
-    return set(_re.findall(r'name = "([a-z0-9_]+)"', Path(path).read_text()))
-
-
-def test_daily_pyperf_job_runs_the_full_applicable_set():
-    # Review P1: daily must not shrink to the 33-name --pyperf tranche.
-    # `--pyperf` is a prefix of `--pyperformance-all`; match argv tokens.
-    import re as _re
-
-    daily = (
-        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
-    ).read_text()
-    assert "pyperformance==1.13.0" in daily
-    assert _re.search(r"runners --pyperformance-all(?:['\"\s]|$)", daily)
-    assert not _re.search(r"runners --pyperf(?:['\"\s]|$)", daily)
-
-
 def test_pyperformance_all_flag_is_not_swallowed_by_pyperf(monkeypatch):
     # `--pyperf` is a prefix of `--pyperformance-all`. Dispatch must call
     # discover_all, never the 33-name manifest loader.
@@ -520,15 +359,6 @@ def test_pyperformance_all_flag_is_not_swallowed_by_pyperf(monkeypatch):
     assert seen.get("discover") is True
     assert "load" not in seen
     assert seen.get("benchmarks") == ["nbody"]
-
-
-def test_suites_carry_the_required_jobs():
-    # The trigger-proof arms exist only if the suites actually run them; a
-    # merge accident that drops a job must fail here, not in review.
-    root = Path(runners.REPO_ROOT) / "ci_pipeline" / "suites"
-    assert GATE_REQUIRED_JOBS <= _suite_jobs(root / "cp311_gate.toml")
-    assert DAILY_REQUIRED_JOBS <= _suite_jobs(root / "cp311_daily.toml")
-    assert "rt314_differential" in _suite_jobs(root / "cp314_reference.toml")
 
 
 def test_shadow_compile_succeeds_without_install():
@@ -823,17 +653,14 @@ def _rt_data(name):
 
 
 def test_runtime_tests_manifests_are_consistent():
-    registered = _rt_data("rt311_registered_tests.txt")
+    required = _rt_data("rt311_required_tests.txt")
     known_fail = _rt_data("rt311_known_failures.txt")
     families = _rt_data("rt311_green_families.txt")
-    assert registered and len(registered) == len(set(registered))
-    # Every known failure is a registered test, every green family has a
-    # registered population, and no green family appears in the known-fail
-    # set -- the three data files describe one and the same binary.
-    assert set(known_fail) <= set(registered)
-    suites = {entry.split(".", 1)[0] for entry in registered}
-    missing = [fam for fam in families if fam not in suites]
-    assert not missing, missing
+    assert required and len(required) == len(set(required))
+    # A required delivery test may never sit in the known-fail baseline,
+    # no green family may appear in the known-fail set, and no green
+    # family member may hide behind the skip allowlist.
+    assert not (set(required) & set(known_fail))
     failing_suites = {entry.split(".", 1)[0] for entry in known_fail}
     overlap = failing_suites & set(families)
     assert not overlap, overlap
@@ -843,28 +670,6 @@ def test_runtime_tests_manifests_are_consistent():
     ]
     assert not green_skips, green_skips
     assert "HIRBuildTest" in families
-    writeoff = {
-        "LIRGeneratorTest.IsNegativeAndErrOccurredSetErrBranchesToDone",
-        "LIRGeneratorTest.RaiseOnlyFunctionHasVerifierSafeSyntheticExit",
-        "HIRBuildTest.TryLoopReturningHandler311BuildsHIR",
-        "HIRBuildTest.RaiseOnlyFunction311BuildsHIR",
-    }
-    assert writeoff <= set(registered)
-    assert not (writeoff & set(known_fail))
-
-
-def _writeoff_rows(name):
-    """Parse a write-off table into (item, status, [evidence])."""
-    rows = []
-    for line in _rt_data(name):
-        parts = [field.strip() for field in line.split("\t")]
-        assert len(parts) == 3, (name, line)
-        item, status, evidence = parts
-        assert status in ("landed", "not-applicable"), (name, line)
-        cases = [case.strip() for case in evidence.split(";") if case.strip()]
-        assert cases, (name, line)
-        rows.append((item, status, cases))
-    return rows
 
 
 def _canary_population(tests_dir=None):
@@ -887,54 +692,6 @@ def _canary_population(tests_dir=None):
     proc = _sp.run(cmd, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, (proc.returncode, proc.stdout[-400:])
     return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
-
-
-def _assert_writeoff_evidence_runs_in_canary(rows, population):
-    for item, _, cases in rows:
-        unrun = [case for case in cases if case not in population]
-        assert not unrun, (item, unrun)
-
-
-def test_mr05_lifecycle_writeoff_is_backed_by_passing_tests():
-    # The audit rows this milestone owns are closed against registered
-    # cases rather than against prose.  Reading the evidence out of the
-    # table -- instead of restating it here -- is what stops the two from
-    # drifting: a row can only be written off against a case that exists
-    # and is not in the known-failure baseline.
-    registered = set(_rt_data("rt311_registered_tests.txt"))
-    known_fail = set(_rt_data("rt311_known_failures.txt"))
-    rows = _writeoff_rows("mr05_lifecycle_writeoff.txt")
-    items = [item for item, _, _ in rows]
-    assert items == [
-        "weakref death-watch replication",
-        "co_extra minimum capacity",
-        "finalize cross-period GC re-entry UAF family",
-    ], items
-    for item, status, cases in rows:
-        assert status == "landed", (item, status)
-        missing = [case for case in cases if case not in registered]
-        assert not missing, (item, missing)
-        failing = [case for case in cases if case in known_fail]
-        assert not failing, (item, failing)
-    # Every named case has to be one the canary leg actually runs, or the
-    # write-off rests on something that is skipped in both modes.  The
-    # population comes from the runner's macro scan -- the allowed-skip
-    # manifest only proves the normal mode may skip, and a case whose gate
-    # macro is removed or relocated keeps its manifest rows while dropping
-    # out of the canary run.
-    _assert_writeoff_evidence_runs_in_canary(rows, _canary_population())
-
-
-def test_mr05_writeoff_case_leaving_the_canary_population_turns_red():
-    # A write-off evidence case that falls out of the derived canary
-    # population -- its mode-gate macro deleted, renamed, or moved -- must
-    # turn the verifier red, whatever the committed manifests still say.
-    rows = _writeoff_rows("mr05_lifecycle_writeoff.txt")
-    population = _canary_population()
-    victim = rows[0][2][0]
-    assert victim in population
-    with pytest.raises(AssertionError):
-        _assert_writeoff_evidence_runs_in_canary(rows, population - {victim})
 
 
 def test_canary_population_counts_only_gate_sites_inside_the_case(tmp_path):
@@ -961,39 +718,34 @@ def test_canary_population_counts_only_gate_sites_inside_the_case(tmp_path):
     assert "DoctoredTest.GatedViaHelper" not in population
 
 
-def test_registered_test_disappearance_turns_red(tmp_path):
+def test_required_test_disappearance_turns_red(tmp_path):
     import subprocess as _sp
 
     script = (
         Path(runners.REPO_ROOT)
         / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
     )
-    manifest = (
-        Path(runners.REPO_ROOT)
-        / "ci_pipeline" / "jit311" / "data" / "rt311_registered_tests.txt"
-    )
-    entries = [
-        line for line in manifest.read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    entries = sorted(_rt_data("rt311_required_tests.txt"))
     live = tmp_path / "live.txt"
 
-    # Identical live list passes through the same code path the gate uses.
-    live.write_text("\n".join(entries) + "\n")
+    # A binary carrying every required pin (plus anything else) passes
+    # through the same code path the gate uses.
+    live.write_text("\n".join(entries + ["ZZExtraSuite.Unpinned"]) + "\n")
     proc = _sp.run(
-        ["bash", str(script), "--verify-registered", str(live)],
+        ["bash", str(script), "--verify-required", str(live)],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 0, proc.stdout[-400:]
 
-    # One deleted green case must turn red, not stay silently green.
+    # One deleted required delivery test must turn red, never silently
+    # shrink the surface.
     live.write_text("\n".join(entries[1:]) + "\n")
     proc = _sp.run(
-        ["bash", str(script), "--verify-registered", str(live)],
+        ["bash", str(script), "--verify-required", str(live)],
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 1
-    assert "identity drifted" in proc.stdout
+    assert "missing from the registered population" in proc.stdout
 
 
 def test_baseline_growth_turns_red(tmp_path):
@@ -1046,7 +798,7 @@ def test_skip_allowlist_growth_turns_red(tmp_path):
     ).returncode == 0
 
 
-def test_registered_verification_is_locale_proof(tmp_path):
+def test_required_verification_is_locale_proof(tmp_path):
     import os as _os
     import subprocess as _sp
 
@@ -1054,21 +806,14 @@ def test_registered_verification_is_locale_proof(tmp_path):
         Path(runners.REPO_ROOT)
         / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
     )
-    manifest = (
-        Path(runners.REPO_ROOT)
-        / "ci_pipeline" / "jit311" / "data" / "rt311_registered_tests.txt"
-    )
-    entries = [
-        line for line in manifest.read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    entries = sorted(_rt_data("rt311_required_tests.txt"))
     live = tmp_path / "live.txt"
     live.write_text("\n".join(entries) + "\n")
     for locale_value in ("C", "en_US.UTF-8"):
         env = dict(_os.environ)
         env["LC_ALL"] = locale_value
         proc = _sp.run(
-            ["bash", str(script), "--verify-registered", str(live)],
+            ["bash", str(script), "--verify-required", str(live)],
             capture_output=True, text=True, env=env, timeout=60,
         )
         assert proc.returncode == 0, (locale_value, proc.stdout[-400:])

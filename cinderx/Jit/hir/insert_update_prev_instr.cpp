@@ -3,6 +3,7 @@
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 
 #include "cinderx/Common/code.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/hir/instr_effects.h"
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 
@@ -88,6 +89,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
     worklist.pop();
 
     int prev_emitted_lno_or_bc = INT_MAX;
+#if PY_VERSION_HEX < 0x030C0000
+    int prev_published_bc = INT_MAX;
+#endif
     Instr* last_emitted = nullptr;
     for (Instr& instr : *block) {
       auto update_one = [&]() {
@@ -145,6 +149,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         parent = begin;
         last_emitted = nullptr;
         prev_emitted_lno_or_bc = INT_MAX;
+#if PY_VERSION_HEX < 0x030C0000
+        prev_published_bc = INT_MAX;
+#endif
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
         inited_once = false;
 #endif
@@ -153,6 +160,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
             parents[static_cast<EndInlinedFunction&>(instr).matchingBegin()];
         last_emitted = nullptr;
         prev_emitted_lno_or_bc = INT_MAX;
+#if PY_VERSION_HEX < 0x030C0000
+        prev_published_bc = INT_MAX;
+#endif
       }
 
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
@@ -184,7 +194,41 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
 #endif
 #else
       if (hasArbitraryExecution(instr)) {
+#if PY_VERSION_HEX < 0x030C0000
+        // A materialized 3.11 frame is observable while arbitrary Python is
+        // running. Publishing only when the source line changes leaves
+        // prev_instr at the first expression on that line, which gives
+        // inspect.stack(), sys._getframe() and co_positions() a stale column.
+        //
+        // Match the stock interpreter cursor, not merely the HIR origin. Most
+        // opcodes are observable at their opcode unit. CALL is different:
+        // stock's inlined-Python-call path advances prev_instr across its four
+        // cache units before entering the callee, so a callee inspecting its
+        // caller observes the last CALL cache. CALL_FUNCTION_EX has no cache
+        // on 3.11 and therefore naturally resolves to its opcode unit.
+        auto target_code = parent == nullptr ? func.code : parent->code();
+        if (target_code != nullptr && instr.bytecodeOffset().value() >= 0) {
+          BytecodeInstruction bc_instr{target_code, instr.bytecodeOffset()};
+          BCIndex published = bc_instr.opcodeIndex();
+          if (bc_instr.opcode() == CALL) {
+            published = bc_instr.nextInstrOffset().asIndex() - 1;
+          }
+          if (published.value() != prev_published_bc) {
+            // Force an exact-position store even when this boundary shares a
+            // line with the previous one. update_one() still supplies the
+            // correct line metadata and dead-store behavior.
+            prev_emitted_lno_or_bc = INT_MAX;
+            update_one();
+            JIT_DCHECK(last_emitted != nullptr, "missing position update");
+            last_emitted->setBytecodeOffset(published);
+            prev_published_bc = published.value();
+          }
+        } else {
+          update_one();
+        }
+#else
         update_one();
+#endif
         last_emitted = nullptr;
       }
 #endif

@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "cinderx/python.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -53,11 +55,11 @@ struct TriggerStats {
 // Increment sites.  Relaxed atomics: the counters order nothing.
 void triggerStatsOnExecutableAlloc(std::size_t bytes);
 void triggerStatsOnCompiledFunctionCreate();
-void triggerStatsOnMachineCodeEntry();
+void triggerStatsOnMachineCodeEntry(PyCodeObject* code = nullptr);
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
     uint64_t specialized_opcodes);
-void triggerStatsOnCodeDestroyed();
+void triggerStatsOnCodeDestroyed(PyCodeObject* code = nullptr);
 void triggerStatsOnFunctionDestroyed();
 void triggerStatsOnCodeBufferAcquired();
 void triggerStatsOnCodeBufferReleased();
@@ -66,5 +68,28 @@ void triggerStatsOnOrganicDeopt();
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();
+
+// CPython 3.11 execution-acceptance test-only per-code entry evidence.
+// Recording is disabled by default so the product hot path pays one predictable
+// false branch and no map/string cost outside acceptance runs.  The snapshot
+// owns code objects as dictionary keys and reports any dropped first-entry
+// allocation.
+void executionEntryLedgerReset();
+void executionEntryLedgerDisable();
+PyObject* executionEntryLedgerSnapshot();
+
+// Test-only runtime-transition ledger.  Records are copied at the actual deopt
+// or suspended-generator conversion point and never retain Python objects.
+void runtimeTransitionLedgerReset();
+void runtimeTransitionLedgerDisable();
+void runtimeTransitionLedgerRecord(
+    PyCodeObject* code,
+    const char* transition,
+    const char* reason,
+    int cause_offset,
+    int resume_offset,
+    bool forced,
+    bool instrumentation);
+PyObject* runtimeTransitionLedgerSnapshot();
 
 } // namespace jit

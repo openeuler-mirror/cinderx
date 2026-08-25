@@ -108,11 +108,33 @@ ICodeAllocator* CodeAllocator::make() {
 }
 
 AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
+  // The executable-allocation trigger metric counts pool-level
+  // allocations: the Cinder allocator counts its chunk mmaps in
+  // allocPages(), so this allocator watches the underlying block pool
+  // grow rather than counting per-artifact spans -- the metric must not
+  // change meaning with the allocator choice.
+  const size_t reserved_before =
+      runtime_.allocator()->statistics().reservedSize();
   void* addr = nullptr;
   asmjit::Error error = runtime_.add(&addr, code);
 
   if (addr != nullptr && error == asmjit::kErrorOk) {
-    used_bytes_.fetch_add(code->codeSize(), std::memory_order_relaxed);
+    const size_t reserved_after =
+        runtime_.allocator()->statistics().reservedSize();
+    if (reserved_after > reserved_before) {
+      triggerStatsOnExecutableAlloc(reserved_after - reserved_before);
+    }
+    // Account the physical span rather than the logical code size: the
+    // allocator hands back aligned blocks and releaseCode() can only
+    // subtract what query() reports, so symmetric accounting is what makes
+    // used_bytes_ return to its plateau under compile/release churn --
+    // asymmetric accounting underflows the counter one alignment gap at a
+    // time.
+    asmjit::JitAllocator::Span span;
+    JIT_CHECK(
+        runtime_.allocator()->query(span, addr) == asmjit::kErrorOk,
+        "Code allocator cannot answer for a span it just allocated");
+    used_bytes_.fetch_add(span.size(), std::memory_order_relaxed);
   }
 
   return AllocateResult{addr, error};

@@ -2,7 +2,14 @@
 
 #include "cinderx/Jit/trigger_stats.h"
 
+#include "cinderx/Common/ref.h"
+
 #include <atomic>
+#include <map>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
 
 namespace jit {
 
@@ -21,6 +28,37 @@ std::atomic<uint64_t> s_resident_code_buffers{0};
 std::atomic<uint64_t> s_forced_deopt_hits{0};
 std::atomic<uint64_t> s_organic_deopt_hits{0};
 
+#if PY_VERSION_HEX < 0x030C0000
+struct EntryLedgerRow {
+  std::string filename;
+  std::string qualname;
+  int firstlineno;
+  uint64_t entries;
+};
+
+std::atomic<bool> s_entry_ledger_enabled{false};
+std::atomic<uint64_t> s_entry_ledger_dropped{0};
+std::unordered_map<PyCodeObject*, EntryLedgerRow> s_entry_ledger;
+std::map<std::tuple<std::string, int, std::string>, uint64_t>
+    s_entry_ledger_archived;
+
+struct TransitionLedgerRow {
+  std::string filename;
+  std::string qualname;
+  std::string transition;
+  std::string reason;
+  int firstlineno;
+  int cause_offset;
+  int resume_offset;
+  bool forced;
+  bool instrumentation;
+};
+
+std::atomic<bool> s_transition_ledger_enabled{false};
+std::atomic<uint64_t> s_transition_ledger_dropped{0};
+std::vector<TransitionLedgerRow> s_transition_ledger;
+#endif
+
 } // namespace
 
 void triggerStatsOnExecutableAlloc(std::size_t bytes) {
@@ -32,8 +70,34 @@ void triggerStatsOnCompiledFunctionCreate() {
   s_compiled_function_creations.fetch_add(1, std::memory_order_relaxed);
 }
 
-void triggerStatsOnMachineCodeEntry() {
+void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   s_machine_code_entries.fetch_add(1, std::memory_order_relaxed);
+#if PY_VERSION_HEX < 0x030C0000
+  if (code == nullptr ||
+      !s_entry_ledger_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  auto it = s_entry_ledger.find(code);
+  if (it != s_entry_ledger.end()) {
+    it->second.entries++;
+    return;
+  }
+  try {
+    const char* filename = PyUnicode_AsUTF8(code->co_filename);
+    const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+    if (filename == nullptr || qualname == nullptr) {
+      PyErr_Clear();
+      s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    s_entry_ledger.emplace(
+        code, EntryLedgerRow{filename, qualname, code->co_firstlineno, 1});
+  } catch (const std::bad_alloc&) {
+    s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
+  (void)code;
+#endif
 }
 
 void triggerStatsOnShadowCompile(
@@ -45,8 +109,27 @@ void triggerStatsOnShadowCompile(
   s_shadow_codegen_bytes.fetch_add(code_bytes, std::memory_order_relaxed);
 }
 
-void triggerStatsOnCodeDestroyed() {
+void triggerStatsOnCodeDestroyed(PyCodeObject* code) {
   s_code_destroyed_notifications.fetch_add(1, std::memory_order_relaxed);
+#if PY_VERSION_HEX < 0x030C0000
+  if (code == nullptr) {
+    return;
+  }
+  auto it = s_entry_ledger.find(code);
+  if (it == s_entry_ledger.end()) {
+    return;
+  }
+  try {
+    auto key = std::make_tuple(
+        it->second.filename, it->second.firstlineno, it->second.qualname);
+    s_entry_ledger_archived[key] += it->second.entries;
+  } catch (const std::bad_alloc&) {
+    s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+  s_entry_ledger.erase(it);
+#else
+  (void)code;
+#endif
 }
 
 void triggerStatsOnFunctionDestroyed() {
@@ -84,6 +167,197 @@ TriggerStats triggerStatsSnapshot() {
       s_forced_deopt_hits.load(std::memory_order_relaxed),
       s_organic_deopt_hits.load(std::memory_order_relaxed),
   };
+}
+
+void executionEntryLedgerReset() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_entry_ledger.clear();
+  s_entry_ledger_archived.clear();
+  s_entry_ledger_dropped.store(0, std::memory_order_relaxed);
+  s_entry_ledger_enabled.store(true, std::memory_order_relaxed);
+#endif
+}
+
+void executionEntryLedgerDisable() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_entry_ledger.clear();
+  s_entry_ledger_archived.clear();
+#endif
+}
+
+PyObject* executionEntryLedgerSnapshot() {
+#if PY_VERSION_HEX < 0x030C0000
+  bool was_enabled =
+      s_entry_ledger_enabled.exchange(false, std::memory_order_relaxed);
+  std::map<std::tuple<std::string, int, std::string>, uint64_t> rows;
+  try {
+    rows = s_entry_ledger_archived;
+    for (const auto& [code, row] : s_entry_ledger) {
+      (void)code;
+      rows[std::make_tuple(row.filename, row.firstlineno, row.qualname)] +=
+          row.entries;
+    }
+  } catch (const std::bad_alloc&) {
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  Ref<> entries = Ref<>::steal(PyList_New(0));
+  if (entries == nullptr) {
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  for (const auto& [key, count] : rows) {
+    const auto& [filename, firstlineno, qualname] = key;
+    Ref<> item = Ref<>::steal(Py_BuildValue(
+        "{s:s,s:s,s:i,s:K}",
+        "filename",
+        filename.c_str(),
+        "qualname",
+        qualname.c_str(),
+        "firstlineno",
+        firstlineno,
+        "entries",
+        static_cast<unsigned long long>(count)));
+    if (item == nullptr || PyList_Append(entries, item) < 0) {
+      s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+      return nullptr;
+    }
+  }
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> dropped = Ref<>::steal(PyLong_FromUnsignedLongLong(
+      s_entry_ledger_dropped.load(std::memory_order_relaxed)));
+  if (result == nullptr || dropped == nullptr ||
+      PyDict_SetItemString(result, "entries", entries) < 0 ||
+      PyDict_SetItemString(result, "dropped", dropped) < 0) {
+    s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  return result.release();
+#else
+  PyErr_SetString(
+      PyExc_NotImplementedError,
+      "the execution per-code entry ledger exists only on CPython 3.11");
+  return nullptr;
+#endif
+}
+
+void runtimeTransitionLedgerReset() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_transition_ledger.clear();
+  s_transition_ledger_dropped.store(0, std::memory_order_relaxed);
+  s_transition_ledger_enabled.store(true, std::memory_order_relaxed);
+#endif
+}
+
+void runtimeTransitionLedgerDisable() {
+#if PY_VERSION_HEX < 0x030C0000
+  s_transition_ledger_enabled.store(false, std::memory_order_relaxed);
+  s_transition_ledger.clear();
+#endif
+}
+
+void runtimeTransitionLedgerRecord(
+    PyCodeObject* code,
+    const char* transition,
+    const char* reason,
+    int cause_offset,
+    int resume_offset,
+    bool forced,
+    bool instrumentation) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (code == nullptr ||
+      !s_transition_ledger_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const char* filename = PyUnicode_AsUTF8(code->co_filename);
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  if (filename == nullptr || qualname == nullptr) {
+    PyErr_Clear();
+    s_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  try {
+    s_transition_ledger.push_back(TransitionLedgerRow{
+        filename,
+        qualname,
+        transition != nullptr ? transition : "unknown",
+        reason != nullptr ? reason : "unknown",
+        code->co_firstlineno,
+        cause_offset,
+        resume_offset,
+        forced,
+        instrumentation});
+  } catch (const std::bad_alloc&) {
+    s_transition_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+#else
+  (void)code;
+  (void)transition;
+  (void)reason;
+  (void)cause_offset;
+  (void)resume_offset;
+  (void)forced;
+  (void)instrumentation;
+#endif
+}
+
+PyObject* runtimeTransitionLedgerSnapshot() {
+#if PY_VERSION_HEX < 0x030C0000
+  bool was_enabled =
+      s_transition_ledger_enabled.exchange(false, std::memory_order_relaxed);
+  Ref<> rows = Ref<>::steal(PyList_New(0));
+  if (rows == nullptr) {
+    s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  for (const TransitionLedgerRow& row : s_transition_ledger) {
+    Ref<> item = Ref<>::steal(Py_BuildValue(
+        "{s:s,s:s,s:i,s:s,s:s,s:i,s:i,s:O,s:O}",
+        "filename",
+        row.filename.c_str(),
+        "qualname",
+        row.qualname.c_str(),
+        "firstlineno",
+        row.firstlineno,
+        "transition",
+        row.transition.c_str(),
+        "deopt_reason",
+        row.reason.c_str(),
+        "cause_offset",
+        row.cause_offset,
+        "resume_offset",
+        row.resume_offset,
+        "forced",
+        row.forced ? Py_True : Py_False,
+        "instrumentation",
+        row.instrumentation ? Py_True : Py_False));
+    if (item == nullptr || PyList_Append(rows, item) < 0) {
+      s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+      return nullptr;
+    }
+  }
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> dropped = Ref<>::steal(PyLong_FromUnsignedLongLong(
+      s_transition_ledger_dropped.load(std::memory_order_relaxed)));
+  if (result == nullptr || dropped == nullptr ||
+      PyDict_SetItemString(result, "rows", rows) < 0 ||
+      PyDict_SetItemString(result, "dropped", dropped) < 0) {
+    s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    return nullptr;
+  }
+  s_transition_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  return result.release();
+#else
+  PyErr_SetString(
+      PyExc_NotImplementedError,
+      "the runtime-transition ledger exists only on CPython 3.11");
+  return nullptr;
+#endif
 }
 
 } // namespace jit

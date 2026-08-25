@@ -3419,7 +3419,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         JIT_CHECK(op <= Py_GE, "invalid compare op {}", op);
         bbb.appendCallInstruction(
             instr->output(),
-            PyObject_RichCompare,
+            JITRT_RichCompare,
             instr->left(),
             instr->right(),
             op);

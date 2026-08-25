@@ -36,11 +36,13 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_flag_processor.h"
 #include "cinderx/Jit/jit_gdb_support.h"
 #include "cinderx/Jit/jit_list.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/mmap_file.h"
 #include "cinderx/Jit/osr.h"
@@ -76,6 +78,7 @@
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
 #include "cinderx/Interpreter/3.11/eval_hook.h"
 #include "cinderx/Interpreter/3.11/observe.h"
+extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
 #endif
 
 using namespace jit;
@@ -763,16 +766,16 @@ void configureCompileAfterNCalls(uint32_t calls, bool auto_classify) {
       auto_classify && autoJitImportProviderEnabledFromEnv();
 }
 
-void parseAutoJitOption(const std::string& value) {
+bool parseAutoJitOption(const std::string& value) {
   if (value.empty()) {
     configureCompileAfterNCalls(1, false);
-    return;
+    return true;
   }
 
   uint32_t threshold = 0;
   if (value == "auto") {
     configureCompileAfterNCalls(kAutoJitClassifyDefaultThreshold, true);
-    return;
+    return true;
   }
   constexpr std::string_view kAutoPrefix{"auto:"};
   if (value.starts_with(kAutoPrefix)) {
@@ -782,15 +785,20 @@ void parseAutoJitOption(const std::string& value) {
       configureCompileAfterNCalls(threshold, true);
     } else {
       JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+      return false;
     }
-    return;
+    return true;
   }
   if (parse_uint32_arg(value, &threshold)) {
     configureCompileAfterNCalls(threshold, false);
   } else {
     JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+    return false;
   }
+  return true;
 }
+
+bool g_auto_jit_option_valid = true;
 
 FlagProcessor initFlagProcessor() {
   FlagProcessor flag_processor;
@@ -813,7 +821,9 @@ FlagProcessor initFlagProcessor() {
   flag_processor.addOption(
       "jit-auto",
       "PYTHONJITAUTO",
-      [](const std::string& val) { parseAutoJitOption(val); },
+      [](const std::string& val) {
+        g_auto_jit_option_valid = parseAutoJitOption(val);
+      },
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
 
@@ -1364,6 +1374,24 @@ FlagProcessor initFlagProcessor() {
       "Support instrumentation (e.g. monitoring/tracing/profiling)");
 
   flag_processor.setFlags(PySys_GetXOptions());
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The CPython 3.11 surface requires retired machine code to be
+  // reclaimed, and only the asmjit-backed allocator has a real
+  // releaseCode(); CodeAllocatorCinder's is a deliberate no-op, so its
+  // huge-page pools grow by one artifact's code for every compile a
+  // churning workload retires.  Answer an explicit huge-page request
+  // here rather than rerouting it at allocator construction, so the
+  // configuration always reads the effective policy.
+  if (getConfig().use_huge_pages) {
+    if (flag_processor.hasHandled("jit-huge-pages")) {
+      JIT_LOG(
+          "Huge-page code allocation cannot reclaim retired code and is not "
+          "part of the CPython 3.11 surface; using the reclaiming allocator.");
+    }
+    getMutableConfig().use_huge_pages = false;
+  }
+#endif
 
   // Inlining relies on lightweight-frame reification support.  Keep the
   // inliner disabled for normal-frame runs so tests and explicit normal-mode
@@ -2310,8 +2338,19 @@ bool hasRegisteredMonitoringCallbacks() {
 // Check if sys.setprofile or sys.settrace have active callbacks registered.
 bool hasActiveLegacyTracing() {
 #if PY_VERSION_HEX < 0x030C0000
-  PyThreadState* tstate = PyThreadState_Get();
-  return tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr;
+  // The JIT state is interpreter-global, while sys.settrace/setprofile are
+  // per-thread.  Re-enable only after the final instrumented thread clears
+  // its callback; looking solely at the thread making this call lets thread A
+  // re-enable machine code while thread B is still traced.
+  PyInterpreterState* interp = PyInterpreterState_Get();
+  for (PyThreadState* tstate = PyInterpreterState_ThreadHead(interp);
+       tstate != nullptr;
+       tstate = PyThreadState_Next(tstate)) {
+    if (tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr) {
+      return true;
+    }
+  }
+  return false;
 #else
   auto is = PyInterpreterState_Get();
   return is->sys_profiling_threads > 0 || is->sys_tracing_threads > 0;
@@ -2503,6 +2542,530 @@ BorrowedRef<PyFunctionObject> get_func_arg(
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func =
+      get_func_arg("_jit311_compile_diagnostic", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+
+  const char* phase = "compiler";
+  const char* reason = nullptr;
+  bool eligible = true;
+  int refusal_opcode = -1;
+  int refusal_offset = -1;
+  PyThreadState* tstate = PyThreadState_Get();
+  if (tstate == nullptr) {
+    phase = "runtime";
+    reason = "JIT_PAUSED";
+  } else if (tstate->c_tracefunc != nullptr) {
+    phase = "runtime";
+    reason = "TRACING_ACTIVE";
+  } else if (tstate->c_profilefunc != nullptr) {
+    phase = "runtime";
+    reason = "PROFILING_ACTIVE";
+  } else if (!Ci_EvalHook311_IsInstalled()) {
+    phase = "runtime";
+    reason = "FOREIGN_EVALUATOR";
+  } else if (isJitPaused() || !isJitUsable()) {
+    phase = "runtime";
+    reason = "JIT_PAUSED";
+  } else if ((reason = Ci_JitShell311_ExecuteRefusal(func)) != nullptr) {
+    eligible = false;
+    phase = "preflight";
+    Ci_JitShell311_GetExecuteRefusalDetail(&refusal_opcode, &refusal_offset);
+  } else if (!isJitCompiled(func)) {
+    if (Ci_InitFrameEvalFunc() < 0) {
+      return nullptr;
+    }
+    Result compile_result;
+    try {
+      compile_result = compileFunction(func);
+    } catch (const std::exception& exn) {
+      setRuntimeError(exn);
+      return nullptr;
+    }
+    switch (compile_result) {
+      case Result::OK:
+        break;
+      case Result::PAUSED:
+        phase = "runtime";
+        reason = "JIT_PAUSED";
+        break;
+      case Result::CANNOT_SPECIALIZE:
+        reason = Ci_JitShell311_TakeExecuteRefusal();
+        if (reason == nullptr) {
+          reason = "SUPPORTED_OPCODE_FAILURE";
+        }
+        break;
+      case Result::ALREADY_SCHEDULED:
+        phase = "runtime";
+        reason = "COMPILE_ALREADY_SCHEDULED";
+        break;
+      case Result::CODE_MOVED:
+        phase = "runtime";
+        reason = "FUNCTION_CODE_MOVED";
+        break;
+      case Result::NOT_ON_JITLIST:
+        reason = "NOT_ON_JITLIST";
+        break;
+      case Result::NOT_INITIALIZED:
+        phase = "runtime";
+        reason = "JIT_NOT_INITIALIZED";
+        break;
+      case Result::NO_PRELOADER:
+        reason = "NO_PRELOADER";
+        break;
+      case Result::OVER_MAX_CODE_SIZE:
+        phase = "runtime";
+        reason = "OVER_MAX_CODE_SIZE";
+        break;
+      case Result::UNKNOWN_ERROR:
+        reason = "SUPPORTED_OPCODE_FAILURE";
+        break;
+      case Result::PYTHON_EXCEPTION:
+        if (PyErr_Occurred()) {
+          return nullptr;
+        }
+        reason = "PYTHON_EXCEPTION";
+        break;
+    }
+  }
+
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> phase_obj = Ref<>::steal(PyUnicode_FromString(phase));
+  Ref<> reason_obj = reason == nullptr
+      ? Ref<>::create(Py_None)
+      : Ref<>::steal(PyUnicode_FromString(reason));
+  Ref<> opcode_obj = refusal_opcode < 0
+      ? Ref<>::create(Py_None)
+      : Ref<>::steal(PyLong_FromLong(refusal_opcode));
+  Ref<> offset_obj = refusal_offset < 0
+      ? Ref<>::create(Py_None)
+      : Ref<>::steal(PyLong_FromLong(refusal_offset));
+  if (result == nullptr || phase_obj == nullptr || reason_obj == nullptr ||
+      opcode_obj == nullptr || offset_obj == nullptr ||
+      PyDict_SetItemString(result, "eligible", eligible ? Py_True : Py_False) <
+          0 ||
+      PyDict_SetItemString(
+          result, "compiled", isJitCompiled(func) ? Py_True : Py_False) < 0 ||
+      PyDict_SetItemString(result, "phase", phase_obj) < 0 ||
+      PyDict_SetItemString(result, "reason", reason_obj) < 0 ||
+      PyDict_SetItemString(result, "opcode", opcode_obj) < 0 ||
+      PyDict_SetItemString(result, "offset", offset_obj) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+
+PyObject* jit311_code_state(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func = get_func_arg("_jit311_code_state", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  CodeExtra* extra = codeExtraIfExists(code);
+  bool has_artifact = Ci_JitShell311_CodeHasArtifact(code);
+  bool auto_disabled =
+      extra != nullptr && Ci_code_extra_jit311_auto_disabled(extra);
+  auto* artifact = extra == nullptr
+      ? nullptr
+      : reinterpret_cast<CompiledFunction*>(
+            _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  bool artifact_member =
+      artifact != nullptr && artifact->functions().contains(func);
+  uint32_t attach_count =
+      extra != nullptr ? Ci_code_extra_jit311_attach_count(extra) : 0;
+  uint32_t attach_budget = getConfig().fresh_attach_budget;
+  uint64_t scheduler_count = 0;
+  int scheduler_dispatched = 0;
+  int scheduler_attachable = 0;
+  bool scheduler_observed = Ci_Observe311_GetCodeState(
+      code, &scheduler_count, &scheduler_dispatched, &scheduler_attachable);
+  bool installed = Ci_JitShell311_InstalledArtifact(func) != nullptr;
+  const char* policy_reason = "automatic-attempt-available";
+  if (installed) {
+    policy_reason = "installed";
+  } else if (auto_disabled) {
+    policy_reason = "code-verdict-final";
+  } else if (has_artifact && artifact_member) {
+    policy_reason = "existing-member-not-fresh-attachable";
+  } else if (has_artifact && attach_count >= attach_budget) {
+    policy_reason = "fresh-attach-budget-exhausted";
+  } else if (has_artifact) {
+    policy_reason = "artifact-awaiting-fresh-attach";
+  } else if (scheduler_dispatched) {
+    policy_reason = "automatic-attempt-spent-artifact-retired";
+  } else if (extra == nullptr) {
+    policy_reason = "code-unobserved";
+  }
+
+  return Py_BuildValue(
+      "{s:O,s:O,s:O,s:O,s:I,s:I,s:O,s:K,s:O,s:O,s:s,s:K,s:K,s:i,s:O}",
+      "installed",
+      installed ? Py_True : Py_False,
+      "code_has_artifact",
+      has_artifact ? Py_True : Py_False,
+      "auto_jit_disabled",
+      auto_disabled ? Py_True : Py_False,
+      "artifact_member",
+      artifact_member ? Py_True : Py_False,
+      "fresh_attach_count",
+      attach_count,
+      "fresh_attach_budget",
+      attach_budget,
+      "scheduler_observed",
+      scheduler_observed ? Py_True : Py_False,
+      "scheduler_count",
+      static_cast<unsigned long long>(scheduler_count),
+      "scheduler_dispatched",
+      scheduler_dispatched ? Py_True : Py_False,
+      "scheduler_attachable",
+      scheduler_attachable ? Py_True : Py_False,
+      "policy_reason",
+      policy_reason,
+      "function_id",
+      static_cast<unsigned long long>(
+          reinterpret_cast<std::uintptr_t>(func.get())),
+      "code_id",
+      static_cast<unsigned long long>(
+          reinterpret_cast<std::uintptr_t>(code.get())),
+      "code_firstlineno",
+      code->co_firstlineno,
+      "code_qualname",
+      code->co_qualname);
+}
+
+PyObject* jit311_config_state(PyObject* /* self */, PyObject* /* arg */) {
+  auto threshold = getConfig().compile_after_n_calls;
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> threshold_obj = threshold.has_value()
+      ? Ref<>::steal(PyLong_FromUnsignedLong(*threshold))
+      : Ref<>::create(Py_None);
+  if (result == nullptr || threshold_obj == nullptr ||
+      PyDict_SetItemString(result, "compile_after_n_calls", threshold_obj) <
+          0 ||
+      PyDict_SetItemString(
+          result,
+          "auto_classify",
+          getConfig().auto_classify ? Py_True : Py_False) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+
+PyObject* jit311_recursion_state(PyObject* /* self */, PyObject* /* arg */) {
+  int remaining;
+  int headroom;
+  int boundary_active;
+  int jit_entries;
+  JITRT_GetRecursionState311(
+      &remaining, &headroom, &boundary_active, &jit_entries);
+  return Py_BuildValue(
+      "{s:i,s:i,s:O,s:i}",
+      "recursion_remaining",
+      remaining,
+      "recursion_headroom",
+      headroom,
+      "boundary_active",
+      boundary_active ? Py_True : Py_False,
+      "jit_entries",
+      jit_entries);
+}
+
+static int lifecycleSetSize(PyObject* dict, const char* key, size_t value) {
+  Ref<> number = Ref<>::steal(PyLong_FromSize_t(value));
+  return number == nullptr ? -1 : PyDict_SetItemString(dict, key, number);
+}
+
+static int lifecycleSetU64(PyObject* dict, const char* key, uint64_t value) {
+  Ref<> number = Ref<>::steal(PyLong_FromUnsignedLongLong(value));
+  return number == nullptr ? -1 : PyDict_SetItemString(dict, key, number);
+}
+
+static int lifecycleSetBool(PyObject* dict, const char* key, bool value) {
+  return PyDict_SetItemString(dict, key, value ? Py_True : Py_False);
+}
+
+PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
+  cinderx::ModuleState* module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "CPython 3.11 lifecycle module state is unavailable");
+    return nullptr;
+  }
+  CompilerContext<Compiler>* ctx = jitCtx();
+  LifecycleSnapshot311 census;
+  if (ctx != nullptr) {
+    census = ctx->lifecycleSnapshot311();
+  }
+  TriggerStats trigger = triggerStatsSnapshot();
+  uint64_t observer_watched = 0;
+  uint64_t observer_keyed = 0;
+  uint64_t observer_capacity = 0;
+  uint64_t observer_events = 0;
+  uint64_t observer_post_publication = 0;
+  Ci_Observe311_GetLifecycleState(
+      &observer_watched,
+      &observer_keyed,
+      &observer_capacity,
+      &observer_events,
+      &observer_post_publication);
+
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> jit_state = Ref<>::steal(PyDict_New());
+  Ref<> module = Ref<>::steal(PyDict_New());
+  Ref<> runtime = Ref<>::steal(PyDict_New());
+  Ref<> observer = Ref<>::steal(PyDict_New());
+  Ref<> generator = Ref<>::steal(PyDict_New());
+  Ref<> schema = Ref<>::steal(PyUnicode_FromString("cp311-jit-lifecycle-v1"));
+  Ref<> unavailable = Ref<>::steal(
+      PyUnicode_FromString("GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"));
+  if (result == nullptr || jit_state == nullptr || module == nullptr ||
+      runtime == nullptr || observer == nullptr || generator == nullptr ||
+      schema == nullptr || unavailable == nullptr) {
+    return nullptr;
+  }
+  int rc = 0;
+  rc |= PyDict_SetItemString(result, "schema", schema);
+  rc |= lifecycleSetBool(result, "context_present", ctx != nullptr);
+  rc |= lifecycleSetSize(jit_state, "compiled_codes", census.compiled_codes);
+  rc |= lifecycleSetSize(
+      jit_state, "installed_functions", census.installed_functions);
+  rc |= lifecycleSetSize(
+      jit_state, "associated_functions", census.associated_functions);
+  rc |=
+      lifecycleSetSize(jit_state, "parked_functions", census.parked_functions);
+  rc |= lifecycleSetSize(
+      jit_state, "watched_functions", census.watched_functions);
+  rc |=
+      lifecycleSetSize(jit_state, "artifact_members", census.artifact_members);
+  rc |= lifecycleSetSize(
+      jit_state, "deferred_anchor_releases", census.deferred_anchor_releases);
+  rc |= lifecycleSetSize(jit_state, "active_compiles", census.active_compiles);
+  rc |= lifecycleSetSize(
+      jit_state, "completed_compiles", census.completed_compiles);
+  rc |= lifecycleSetSize(
+      jit_state, "deferred_finalizations", census.deferred_finalizations);
+  rc |= lifecycleSetSize(
+      jit_state, "orphaned_compiled_codes", census.orphaned_compiled_codes);
+  rc |= lifecycleSetSize(
+      jit_state, "code_dedup_entries", census.code_dedup_entries);
+  rc |= lifecycleSetSize(
+      jit_state, "code_outer_functions", census.code_outer_functions);
+  rc |= lifecycleSetSize(
+      jit_state, "context_references", census.context_references);
+  rc |= lifecycleSetSize(
+      jit_state, "code_runtimes_allocated", census.code_runtimes_allocated);
+  rc |= lifecycleSetSize(
+      jit_state, "code_runtimes_live", census.code_runtimes_live);
+  rc |= lifecycleSetSize(
+      module,
+      "registered_compilation_units",
+      module_state->registered_compilation_units.size());
+  rc |= lifecycleSetSize(
+      module,
+      "perf_trampoline_worklist",
+      module_state->perf_trampoline_worklist.size());
+  rc |= lifecycleSetBool(
+      module,
+      "unit_deletion_tracking_failed",
+      module_state->unit_deletion_tracking_failed);
+  rc |= lifecycleSetBool(
+      module,
+      "code_allocator_present",
+      module_state->code_allocator != nullptr);
+  rc |= lifecycleSetSize(
+      module,
+      "code_allocator_used_bytes",
+      module_state->code_allocator == nullptr
+          ? 0
+          : module_state->code_allocator->usedBytes());
+  rc |= lifecycleSetU64(
+      runtime, "resident_code_buffers", trigger.resident_code_buffers);
+  rc |= lifecycleSetU64(
+      runtime, "resident_code_extra_blocks", liveCodeExtraBlocks());
+  rc |= lifecycleSetU64(
+      runtime,
+      "compiled_function_creations",
+      trigger.compiled_function_creations);
+  rc |= lifecycleSetU64(
+      runtime,
+      "function_destroyed_notifications",
+      trigger.function_destroyed_notifications);
+  rc |= lifecycleSetU64(
+      runtime,
+      "code_destroyed_notifications",
+      trigger.code_destroyed_notifications);
+  rc |= lifecycleSetU64(
+      runtime, "executable_alloc_calls", trigger.executable_alloc_calls);
+  rc |= lifecycleSetU64(
+      runtime, "executable_alloc_bytes", trigger.executable_alloc_bytes);
+  rc |= lifecycleSetU64(
+      runtime, "machine_code_entries", trigger.machine_code_entries);
+  rc |= lifecycleSetU64(observer, "watched_codes", observer_watched);
+  rc |= lifecycleSetU64(observer, "keyed_slots", observer_keyed);
+  rc |= lifecycleSetU64(observer, "table_capacity", observer_capacity);
+  rc |= lifecycleSetU64(observer, "events", observer_events);
+  rc |= lifecycleSetU64(
+      observer,
+      "post_publication_interpreted_frames",
+      observer_post_publication);
+  rc |= lifecycleSetBool(generator, "native_gauge_available", false);
+  rc |= PyDict_SetItemString(generator, "status", unavailable);
+  rc |= PyDict_SetItemString(result, "jit", jit_state);
+  rc |= PyDict_SetItemString(result, "module", module);
+  rc |= PyDict_SetItemString(result, "runtime", runtime);
+  rc |= PyDict_SetItemString(result, "observer", observer);
+  rc |= PyDict_SetItemString(result, "generator", generator);
+  return rc < 0 ? nullptr : result.release();
+}
+
+PyObject* jit311_lifecycle_invariants(
+    PyObject* /* self */,
+    PyObject* /* arg */) {
+  cinderx::ModuleState* module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "CPython 3.11 lifecycle module state is unavailable");
+    return nullptr;
+  }
+  std::vector<std::string> errors;
+  if (CompilerContext<Compiler>* ctx = jitCtx()) {
+    errors = ctx->lifecycleInvariantErrors311();
+  }
+  if (module_state->unit_deletion_tracking_failed) {
+    errors.emplace_back("I8 unit deletion tracking is poisoned");
+  }
+  Ref<> error_list = Ref<>::steal(PyList_New(0));
+  Ref<> result = Ref<>::steal(PyDict_New());
+  if (error_list == nullptr || result == nullptr) {
+    return nullptr;
+  }
+  for (const std::string& error : errors) {
+    Ref<> text = Ref<>::steal(PyUnicode_FromString(error.c_str()));
+    if (text == nullptr || PyList_Append(error_list, text) < 0) {
+      return nullptr;
+    }
+  }
+  if (PyDict_SetItemString(result, "ok", errors.empty() ? Py_True : Py_False) <
+          0 ||
+      PyDict_SetItemString(result, "errors", error_list) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+
+PyObject* jit311_compile_with_publish_failure(
+    PyObject* /* self */,
+    PyObject* args) {
+  PyObject* func_obj;
+  int step;
+  if (!PyArg_ParseTuple(
+          args, "Oi:_jit311_compile_with_publish_failure", &func_obj, &step)) {
+    return nullptr;
+  }
+  BorrowedRef<PyFunctionObject> func =
+      get_func_arg("_jit311_compile_with_publish_failure", func_obj);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  if (step < 1 || step > 7) {
+    PyErr_SetString(PyExc_ValueError, "publish failure step must be 1..7");
+    return nullptr;
+  }
+  if (!isJitUsable() || isJitCompiled(func)) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "fault publication requires an enabled JIT and an uncompiled function");
+    return nullptr;
+  }
+
+  std::unique_ptr<hir::Preloader> preloader(
+      hir::Preloader::make(func, makeFrameReifier(func->func_code)));
+  if (preloader == nullptr) {
+    return nullptr;
+  }
+
+  Result result;
+  failJitPublishStepForTest(step);
+  try {
+    // Call the publication layer directly.  compileFunction() deliberately
+    // JIT_CHECKs on PYTHON_EXCEPTION, which is the right production contract
+    // but would turn an intentional allocation-failure probe into SIGABRT.
+    result = compilePreloader(*preloader, func);
+  } catch (const std::exception& exn) {
+    failJitPublishStepForTest(0);
+    setRuntimeError(exn);
+    return nullptr;
+  }
+  failJitPublishStepForTest(0);
+
+  bool memory_error = result == Result::PYTHON_EXCEPTION && PyErr_Occurred() &&
+      PyErr_ExceptionMatches(PyExc_MemoryError);
+  PyErr_Clear();
+  if (!memory_error) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "publish failure step %d returned result %d instead of MemoryError",
+        step,
+        static_cast<int>(result));
+    return nullptr;
+  }
+  Py_RETURN_TRUE;
+}
+
+PyObject* jit311_register_for_compile(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func =
+      get_func_arg("_jit311_register_for_compile", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  return PyBool_FromLong(registerFunction(func));
+}
+
+PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
+  Ref<> result = Ref<>::steal(PyList_New(0));
+  if (result == nullptr) {
+    return nullptr;
+  }
+  for (int opcode = 0; opcode <= std::numeric_limits<uint8_t>::max();
+       opcode++) {
+    if (!jit::hir::isExecuteOpcodeSupported311(opcode)) {
+      continue;
+    }
+    Ref<> item = Ref<>::steal(PyLong_FromLong(opcode));
+    if (item == nullptr || PyList_Append(result, item) < 0) {
+      return nullptr;
+    }
+  }
+  return result.release();
+}
+
+PyObject* jit311_reset_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  jit::executionEntryLedgerReset();
+  Py_RETURN_NONE;
+}
+
+PyObject* jit311_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  return jit::executionEntryLedgerSnapshot();
+}
+
+PyObject* jit311_reset_transition_ledger(
+    PyObject* /* self */,
+    PyObject* /* arg */) {
+  jit::runtimeTransitionLedgerReset();
+  Py_RETURN_NONE;
+}
+
+PyObject* jit311_transition_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  return jit::runtimeTransitionLedgerSnapshot();
+}
+#endif
+
 PyObject*
 precompile_all(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
   if (!isJitUsable()) {
@@ -2550,6 +3113,11 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
   }
 
 #if PY_VERSION_HEX < 0x030C0000
+  PyThreadState* tstate = PyThreadState_Get();
+  if (tstate == nullptr || tstate->c_tracefunc != nullptr ||
+      tstate->c_profilefunc != nullptr) {
+    Py_RETURN_FALSE;
+  }
   if (const char* reason = Ci_JitShell311_ExecuteRefusal(func)) {
     // MR-10 publishes stable shape reasons for the generator capability
     // boundary and for async-code refusal.  Preserve the historical generic
@@ -4484,6 +5052,73 @@ PyMethodDef jit_methods_311_canary[] = {
      force_compile,
      METH_O,
      PyDoc_STR("Force a function to be JIT compiled if it hasn't yet.")},
+    {"_jit311_compile_diagnostic",
+     jit311_compile_diagnostic,
+     METH_O,
+     PyDoc_STR("Attempt CPython 3.11 compilation and return a private, typed "
+               "compile/refusal classification for a Python function.")},
+    {"_jit311_code_state",
+     jit311_code_state,
+     METH_O,
+     PyDoc_STR("Return the private CPython 3.11 automatic-JIT policy state "
+               "for a Python function.")},
+    {"_jit311_config_state",
+     jit311_config_state,
+     METH_NOARGS,
+     PyDoc_STR("Return the private resolved CPython 3.11 JIT configuration.")},
+    {"_jit311_recursion_state",
+     jit311_recursion_state,
+     METH_NOARGS,
+     PyDoc_STR("Return private CPython 3.11 recursion accounting state.")},
+    {"_jit311_lifecycle_snapshot",
+     jit311_lifecycle_snapshot,
+     METH_NOARGS,
+     PyDoc_STR("Return the private numeric CPython 3.11 lifecycle census.")},
+    {"_jit311_lifecycle_invariants",
+     jit311_lifecycle_invariants,
+     METH_NOARGS,
+     PyDoc_STR("Check private CPython 3.11 JIT ownership invariants.")},
+    {"_jit311_compile_with_publish_failure",
+     jit311_compile_with_publish_failure,
+     METH_VARARGS,
+     PyDoc_STR("Run one private CPython 3.11 failed-publication transaction.")},
+    {"_jit311_register_for_compile",
+     jit311_register_for_compile,
+     METH_O,
+     PyDoc_STR("Register a function for private batch-compile testing.")},
+    {"_jit311_multithreaded_compile_test",
+     multithreaded_compile_test,
+     METH_NOARGS,
+     PyDoc_STR("Run the private multithreaded compile test.")},
+    {"_jit311_multithreaded_compile_test_enabled",
+     is_multithreaded_compile_test_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return whether private multithreaded compile is enabled.")},
+    {"_jit311_execute_surface",
+     jit311_execute_surface,
+     METH_NOARGS,
+     PyDoc_STR("Return the frozen-input numeric opcode whitelist used by the "
+               "private CPython 3.11 execution gate.")},
+    {"_jit311_reset_entry_ledger",
+     jit311_reset_entry_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Reset and enable the private CPython 3.11 per-code machine "
+               "entry ledger.")},
+    {"_jit311_entry_ledger",
+     jit311_entry_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Return exact code-object machine-entry counts and the dropped "
+               "evidence count for the CPython 3.11 execution acceptance.")},
+    {"_jit311_reset_transition_ledger",
+     jit311_reset_transition_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Reset and enable the private CPython 3.11 runtime-transition "
+               "ledger.")},
+    {"_jit311_transition_ledger",
+     jit311_transition_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Return CPython 3.11 deopt/generator transition rows and "
+               "the dropped evidence count.")},
     // MR-05: the inverse of force_compile, and the only published way to
     // take a function back off machine code.  A call already inside the
     // artifact keeps running it -- the guarded entry pins it for the
@@ -4548,6 +5183,16 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_NOARGS,
      PyDoc_STR("Re-enable the JIT and re-attach compiled onto previously "
                "JIT-compiled functions.")},
+    {"patched_sys_setprofile",
+     _PyCFunction_CAST(patched_sys_setprofile),
+     METH_FASTCALL,
+     PyDoc_STR("Private test wrapper that pauses or resumes the JIT after "
+               "sys.setprofile changes.")},
+    {"patched_sys_settrace",
+     _PyCFunction_CAST(patched_sys_settrace),
+     METH_FASTCALL,
+     PyDoc_STR("Private test wrapper that pauses or resumes the JIT after "
+               "sys.settrace changes.")},
     // The physical half of the lifecycle: every function the registry still
     // holds an artifact for, whether or not a call would currently enter it.
     {"_get_resident_compiled_functions",
@@ -5158,12 +5803,25 @@ int initialize() {
   }
   getMutableConfig().use_stable_pointers = use_stable_pointers;
 
+  g_auto_jit_option_valid = true;
   FlagProcessor flag_processor = initFlagProcessor();
   if (flag_processor.hasHandled("jit-help")) {
     std::cout << flag_processor.jitXOptionHelpMessage() << '\n';
     // Return rather than exit here for arg printing test doesn't end early.
     return -2;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (!g_auto_jit_option_valid) {
+    Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11");
+    return -1;
+  }
+  auto resolved_threshold = getConfig().compile_after_n_calls;
+  Ci_Observe311_SetResolvedAutoJitConfig(
+      1, resolved_threshold.value_or(50), getConfig().auto_classify, 1);
+#endif
   if (validateFrameModeConfig() < 0) {
     return -1;
   }
@@ -5243,6 +5901,13 @@ int initialize() {
   // specialized opcode consumption is on so organic type-change deopt is
   // real.  OSR, audit instrumentation and the JIT list stay off.
   getMutableConfig().specialized_opcodes = true;
+  // The tracing policy follows the upstream integration model: activating
+  // sys.settrace/sys.setprofile pauses new compilation, parks published
+  // functions and lets the interpreter own monitoring semantics.  Normal
+  // 3.11 frames still leave machine code through the existing per-bytecode
+  // instrumentation polls; the stack-IP patcher is a no-op for this frame
+  // mode/architecture.
+  getMutableConfig().support_instrumentation = true;
   // The 3.12+ behaviour classifier (PYTHONJITAUTO=auto[:N]) is not part of
   // this port: the 3.11 scheduler takes a plain threshold, and the
   // classifier's per-code state machine has no 3.11 opcode tables.  The
@@ -5268,22 +5933,6 @@ int initialize() {
         "CPython 3.11 canary: an immortal artifact anchors no function, and "
         "without function watchers the registry would keep dangling "
         "entries");
-    return -1;
-  }
-  // Same doctrine for the instrumentation toggle.  The flag patches
-  // sys.setprofile/settrace/monitoring to pause the whole JIT while any
-  // instrumentation is active and re-enable it afterwards; this mode
-  // already delivers tracing correctness through the per-boundary polls
-  // and the guarded entry's per-call check, and the toggle's disable arm
-  // (generator send patching, on-stack frame deopt) has no audited 3.11
-  // story.  Refuse the configuration instead of running an unaudited
-  // pause-the-world path alongside the audited polling one.
-  if (getConfig().support_instrumentation) {
-    PyErr_SetString(
-        PyExc_RuntimeError,
-        "PYTHONJITSUPPORTINSTRUMENTATION is not supported by the CPython "
-        "3.11 canary: tracing is handled by bytecode-boundary polls and "
-        "the guarded entry, not by pausing the JIT");
     return -1;
   }
   // The executing mode publishes its ledger through co_extra, and CPython
@@ -5327,6 +5976,7 @@ int initialize() {
       return -1;
     }
     jitCtx()->setCinderJitModule(Ref<>::steal(canary_mod));
+    patchSysSetProfileAndSetTrace(canary_mod);
   }
   // Sync generators now compile to machine code; copy stock gen/coro
   // methods onto JitGen and install the dealloc hook that pairs the 3.11
@@ -5453,6 +6103,8 @@ void finalize() {
 
   if (isJitShadow()) {
     getMutableConfig().state = State::kFinalizing;
+    jit::executionEntryLedgerDisable();
+    jit::runtimeTransitionLedgerDisable();
 
     auto mod_state = cinderx::getModuleState();
     auto* context = static_cast<Context*>(mod_state->jit_context.get());
@@ -5483,6 +6135,8 @@ void finalize() {
   getMutableConfig().state = State::kFinalizing;
   setInterpreterJitFlag(false);
   syncOSRFlags();
+  jit::executionEntryLedgerDisable();
+  jit::runtimeTransitionLedgerDisable();
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.
@@ -5924,7 +6578,7 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
 void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   FreeThreadedJITEntrypointGuard guard;
-  triggerStatsOnCodeDestroyed();
+  triggerStatsOnCodeDestroyed(code.get());
 #if PY_VERSION_HEX < 0x030C0000
   // The notification comes from the code-extra free function (no watcher)
   // and shadow populates the registries too: gate on "initialized".

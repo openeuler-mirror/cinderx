@@ -232,11 +232,105 @@ TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
-// The bytecode-boundary instrumentation polls were removed per RFC
-// 3.3.4.5: a frame already running when tracing/profiling activates keeps
-// running natively to its natural return, so no poll ordering exists to
-// assert.  Mid-flight transition coverage lives in the RFC-exemption
-// oracles in test_canary_execute_311.py.
+TEST_F(JITContextTest, ExecutionEntryLedgerAttributesExactCodeObject) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  jit::executionEntryLedgerReset();
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  Ref<> snapshot = Ref<>::steal(jit::executionEntryLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> entries = PyDict_GetItemString(snapshot, "entries");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_NE(entries, nullptr);
+  ASSERT_NE(dropped, nullptr);
+  ASSERT_TRUE(PyList_Check(entries));
+  ASSERT_EQ(PyList_GET_SIZE(entries), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(entries.get(), 0);
+  BorrowedRef<> count = PyDict_GetItemString(row, "entries");
+  ASSERT_NE(count, nullptr);
+  EXPECT_EQ(PyLong_AsLongLong(count), 2);
+  EXPECT_EQ(PyLong_AsLongLong(dropped), 0);
+  jit::executionEntryLedgerDisable();
+}
+
+TEST_F(JITContextTest, RuntimeTransitionLedgerRecordsExactResumeEvidence) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::runtimeTransitionLedgerReset();
+  jit::runtimeTransitionLedgerRecord(
+      code, "deopt", "GuardFailure", 4, 6, false, false);
+  Ref<> snapshot = Ref<>::steal(jit::runtimeTransitionLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> rows = PyDict_GetItemString(snapshot, "rows");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_TRUE(PyList_Check(rows));
+  ASSERT_EQ(PyList_GET_SIZE(rows.get()), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(rows.get(), 0);
+  EXPECT_STREQ(
+      PyUnicode_AsUTF8(PyDict_GetItemString(row, "deopt_reason")),
+      "GuardFailure");
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "cause_offset")), 4);
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "resume_offset")), 6);
+  EXPECT_EQ(PyLong_AsLong(dropped), 0);
+  jit::runtimeTransitionLedgerDisable();
+}
+
+TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(compileAndGet(
+      "def func(a, b):\n"
+      "    a + b\n"
+      "    return 42",
+      "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Function> irfunc =
+      jit::compileToFinalHIRForTest(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  int polls = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    bool decref_since_poll = false;
+    const jit::hir::Instr* offender = nullptr;
+    for (const jit::hir::Instr& instr : block) {
+      switch (instr.opcode()) {
+        case jit::hir::Opcode::kDecref:
+        case jit::hir::Opcode::kXDecref:
+        case jit::hir::Opcode::kBatchDecref:
+          decref_since_poll = true;
+          offender = &instr;
+          break;
+        case jit::hir::Opcode::kCheckInstrumentation:
+          polls++;
+          decref_since_poll = false;
+          break;
+        case jit::hir::Opcode::kReturn:
+          EXPECT_FALSE(decref_since_poll)
+              << "a Decref (last: "
+              << (offender != nullptr
+                      ? jit::hir::hirOpcodeName(offender->opcode())
+                      : "?")
+              << ") can run __del__ after the last poll and before return";
+          break;
+        default:
+          break;
+      }
+    }
+    (void)offender;
+  }
+  EXPECT_GT(polls, 0);
+}
+
 TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -2637,8 +2731,6 @@ def gen(n: int):
   EXPECT_EQ(val.get(), nullptr);
 }
 
-
-
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -2699,7 +2791,6 @@ def gen():
   EXPECT_EQ(val.get(), nullptr);
 }
 
-
 TEST_F(JITGeneratorTest, CompileCoroutine) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -2750,7 +2841,6 @@ def gen():
   EXPECT_NE(close_result, nullptr);
   Py_XDECREF(close_result);
 }
-
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
   SKIP_311_EXECUTABLE_COMPILE();
@@ -4094,6 +4184,115 @@ def with_def(a, b=1):
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
       << "a successful bind must still consume a recursion slot";
   PyErr_Clear();
+
+  runCode(R"(
+import _testinternalcapi
+import _cinderx
+import cinderjit
+import sys
+
+def recursive(depth):
+    return 0 if depth == 0 else 1 + recursive(depth - 1)
+
+def capture(function):
+    before = _testinternalcapi.get_recursion_depth()
+    try:
+        function(100_000)
+    except RecursionError as exc:
+        frames = []
+        tb = exc.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code is function.__code__:
+                code = tb.tb_frame.f_code
+                positions = list(code.co_positions())
+                position = positions[tb.tb_lasti // 2]
+                frames.append((
+                    tb.tb_lasti,
+                    tb.tb_frame.f_lasti,
+                    tb.tb_lineno - code.co_firstlineno,
+                    (
+                        position[0] - code.co_firstlineno,
+                        position[1] - code.co_firstlineno,
+                        position[2],
+                        position[3],
+                    ),
+                ))
+            tb = tb.tb_next
+        result = (type(exc).__name__, str(exc), frames)
+    else:
+        raise AssertionError("recursive call did not fail")
+    after = _testinternalcapi.get_recursion_depth()
+    assert after == before, (before, after)
+    return result
+
+old_limit = sys.getrecursionlimit()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    stock = capture(recursive)
+    cinderjit.enable()
+    assert cinderjit.force_compile(recursive) is True
+    machine = capture(recursive)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert machine == stock, (stock, machine)
+assert len(machine[2]) > 0
+assert recursive(4) == 4
+
+def native_recursive(remaining, operand):
+    if remaining:
+        return native_recursive(remaining - 1, operand)
+    return operand + 0
+
+def exercise_native(operand):
+    outer_before = _cinderx._native_recursion_state()
+    native = native_recursive(outer_before["recursion_remaining"], operand)
+    outer_after = _cinderx._native_recursion_state()
+    return outer_before, native, outer_after
+
+def native_semantics(result):
+    native = result[1]
+    return (
+        native["entered"],
+        native["return_code"],
+        native["error_occurred"],
+        native["exception_type"],
+        native["exception_message"],
+        native["before"]["recursion_remaining"],
+        native["after"]["recursion_remaining"],
+        native["before"]["recursion_headroom"],
+        native["after"]["recursion_headroom"],
+    )
+
+operand = _cinderx._native_recursion_probe_operand()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    native_stock = exercise_native(operand)
+    cinderjit.enable()
+    assert cinderjit.force_compile(native_recursive) is True
+    cinderjit._jit311_reset_entry_ledger()
+    native_machine = exercise_native(operand)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert native_semantics(native_machine) == native_semantics(native_stock)
+assert native_stock[1]["entered"] is False
+assert native_stock[1]["exception_type"] == "RecursionError"
+assert native_stock[1]["before"]["recursion_remaining"] == 0
+assert native_machine[1]["before"]["recursion_remaining"] == 0
+for result in (native_stock, native_machine):
+    assert (result[0]["recursion_remaining"]
+            == result[2]["recursion_remaining"])
+assert native_machine[2]["recursion_headroom"] == 0
+assert native_machine[2]["boundary_active"] is False
+assert native_machine[2]["jit_entries"] == 0
+ledger = cinderjit._jit311_entry_ledger()
+assert ledger["dropped"] == 0
+assert any(row["qualname"] == "native_recursive"
+           and row["entries"] > 0 for row in ledger["entries"])
+)");
 }
 
 TEST_F(JITLifecycle311Test, CallDeliversAsyncExcBeforeNextStatement) {
@@ -5703,6 +5902,229 @@ def retired_artifact(x):
   // without the lifetime token its destructor dereferences the freed arena.
   ctx.reset();
   compiled.reset();
+}
+
+TEST_F(JITLifecycle311Test, OrphanedArtifactOutlivesContextTeardown) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // clearForMultithreadedCompileTest() detaches an artifact from every
+  // registry and hands its pin to orphan storage, while a
+  // function-dictionary anchor can keep the artifact alive past the
+  // context.  The teardown contract under test: the context severs the
+  // orphan's CodeRuntime while the runtime storage is still alive, so the
+  // GC's traverse/clear and the final release no longer depend on the
+  // context.
+  const char* py_src = R"(
+def orphaned_survivor(x):
+    return x + 4
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "orphaned_survivor"));
+  ASSERT_NE(func, nullptr);
+
+  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(ctx.get(), *preloader, func), jit::Result::OK);
+
+  auto borrowed =
+      ctx->lookupCode(func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(borrowed, nullptr);
+  // The external pin stands in for the function-dictionary anchor that
+  // keeps a real orphan alive beyond the context.
+  auto survivor = Ref<jit::CompiledFunction>::create(borrowed);
+
+  ctx->clearForMultithreadedCompileTest();
+  ASSERT_EQ(survivor->owner(), nullptr);
+  ASSERT_NE(survivor->runtime(), nullptr)
+      << "orphaning already dropped the runtime; the teardown window under "
+         "test no longer exists";
+
+  ctx.reset();
+
+  EXPECT_EQ(survivor->runtime(), nullptr)
+      << "the orphaned artifact still names a CodeRuntime that died with "
+         "the context";
+
+  // What a late survivor does must now be context-independent: traverse
+  // visits nothing through the runtime, and a call answers from the
+  // interpreter.
+  visitproc visit = [](PyObject*, void*) { return 0; };
+  EXPECT_EQ(survivor->traverse(visit, nullptr), 0);
+
+  auto arg = makeLong(3);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 7);
+
+  // The last release runs ~CompiledFunction -> clear() on the severed
+  // artifact.
+  survivor.reset();
+  func.reset();
+}
+
+TEST_F(JITLifecycle311Test, PinnedRetirementKeepsTheRuntimeWhole) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A pinned generation -- an in-flight invocation or a suspended
+  // generator holds one -- keeps resuming into its machine code and
+  // reading its CodeRuntime after the registries have moved on, so
+  // retirement must leave the runtime whole; only the last pin's release
+  // guts it and hands the storage back.
+  const char* py_src = R"(
+def pinned_retiree(x):
+    return x * 3
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "pinned_retiree"));
+  ASSERT_NE(func, nullptr);
+  auto mod = importCinderJitModule();
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto borrowed = ctx->lookupFunc(func);
+  ASSERT_NE(borrowed, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(borrowed);
+  size_t live_before = ctx->lifecycleSnapshot311().code_runtimes_live;
+
+  callJitOneArg(mod, "force_uncompile", func);
+  ASSERT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(pin->owner(), nullptr) << "retirement kept the owner link";
+  ASSERT_NE(pin->runtime(), nullptr)
+      << "retirement gutted a runtime a pin may still be reading";
+  EXPECT_FALSE(pin->runtime()->isCleared());
+  EXPECT_EQ(ctx->lifecycleSnapshot311().code_runtimes_live, live_before);
+
+  // The retired generation answers from the interpreter.
+  auto arg = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 15);
+
+  // Kill the function; the external pin now stands alone, the way a
+  // suspended generator's does, and the runtime must still be whole.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "pinned_retiree"), 0);
+  func.reset();
+  ASSERT_NE(pin->runtime(), nullptr);
+  EXPECT_FALSE(pin->runtime()->isCleared());
+
+  // The last release guts the runtime and returns the slot.
+  size_t allocated = ctx->lifecycleSnapshot311().code_runtimes_allocated;
+  pin.reset();
+  auto after = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(after.code_runtimes_allocated, allocated);
+  EXPECT_EQ(after.code_runtimes_live, live_before - 1);
+}
+
+TEST_F(JITLifecycle311Test, RetiredCodeRuntimeStorageIsRecycled) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Artifact death must hand the CodeRuntime slot back: churning
+  // independent code objects through compile and death reuses storage
+  // instead of growing the slab by one slot per compile (the
+  // CODERUNTIME_STORAGE_RETENTION blocker).
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto mod = importCinderJitModule();
+
+  auto compile_one = [&](const char* src, const char* name) {
+    Ref<PyFunctionObject> func(compileAndGet(src, name));
+    if (func == nullptr) {
+      return Ref<PyFunctionObject>{};
+    }
+    callJitOneArg(mod, "force_compile", func);
+    if (!isJitCompiled(func)) {
+      return Ref<PyFunctionObject>{};
+    }
+    return func;
+  };
+
+  auto kill = [&](Ref<PyFunctionObject>& func, const char* name) {
+    ASSERT_EQ(PyDict_DelItemString(func->func_globals, name), 0);
+    func.reset();
+  };
+
+  auto first =
+      compile_one("def recycle_a(x):\n    return x + 1\n", "recycle_a");
+  ASSERT_NE(first, nullptr);
+  auto baseline = ctx->lifecycleSnapshot311();
+  kill(first, "recycle_a");
+
+  auto dead = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(dead.code_runtimes_allocated, baseline.code_runtimes_allocated)
+      << "death should recycle the slot, not shrink the slab";
+  EXPECT_EQ(dead.code_runtimes_live, baseline.code_runtimes_live - 1);
+
+  auto second =
+      compile_one("def recycle_b(x):\n    return x + 2\n", "recycle_b");
+  ASSERT_NE(second, nullptr);
+  auto reused = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(reused.code_runtimes_allocated, baseline.code_runtimes_allocated)
+      << "a fresh compile grew the slab instead of reusing the freed slot";
+  EXPECT_EQ(reused.code_runtimes_live, baseline.code_runtimes_live);
+  kill(second, "recycle_b");
+}
+
+TEST_F(JITLifecycle311Test, RecycleSurvivesFreeListAllocationFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Recycling is best effort: it runs under GC hooks and destructors, so
+  // a failure to grow the free list must cost one reuse opportunity, not
+  // a C++ exception across the C API.  The husk stays cleared in the
+  // arena and later deaths recycle normally.
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto mod = importCinderJitModule();
+
+  auto compile_one = [&](const char* src, const char* name) {
+    Ref<PyFunctionObject> func(compileAndGet(src, name));
+    if (func == nullptr) {
+      return Ref<PyFunctionObject>{};
+    }
+    callJitOneArg(mod, "force_compile", func);
+    if (!isJitCompiled(func)) {
+      return Ref<PyFunctionObject>{};
+    }
+    return func;
+  };
+  auto kill = [&](Ref<PyFunctionObject>& func, const char* name) {
+    ASSERT_EQ(PyDict_DelItemString(func->func_globals, name), 0);
+    func.reset();
+  };
+
+  auto first = compile_one("def refuse_a(x):\n    return x + 1\n", "refuse_a");
+  ASSERT_NE(first, nullptr);
+  auto baseline = ctx->lifecycleSnapshot311();
+
+  jit::failJitPublishStepForTest(jit::kSlabFreeListFailpointStep);
+  kill(first, "refuse_a");
+  jit::failJitPublishStepForTest(0);
+
+  auto refused = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(refused.code_runtimes_live, baseline.code_runtimes_live - 1)
+      << "the artifact still died and cleared its runtime";
+  EXPECT_EQ(refused.code_runtimes_allocated, baseline.code_runtimes_allocated);
+
+  auto second = compile_one("def refuse_b(x):\n    return x + 2\n", "refuse_b");
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(
+      ctx->lifecycleSnapshot311().code_runtimes_allocated,
+      baseline.code_runtimes_allocated + 1)
+      << "a slot whose banking was refused must not be reused";
+
+  kill(second, "refuse_b");
+  auto third = compile_one("def refuse_c(x):\n    return x + 3\n", "refuse_c");
+  ASSERT_NE(third, nullptr);
+  EXPECT_EQ(
+      ctx->lifecycleSnapshot311().code_runtimes_allocated,
+      baseline.code_runtimes_allocated + 1)
+      << "recycling did not recover after the injected failure";
+  kill(third, "refuse_c");
 }
 
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheInstalledRegistry) {

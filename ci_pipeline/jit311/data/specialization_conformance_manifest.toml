@@ -1,0 +1,108 @@
+[meta]
+version = 1
+python = "3.11.6"
+classification = "family"
+
+[[family]]
+name = "BINARY_OP"
+witness = "binary-op-int"
+expected_specialized_opcodes = ["BINARY_OP_ADD_INT"]
+expected_outcome = "jit"
+
+[[family]]
+name = "BINARY_SUBSCR"
+witness = "binary-subscr-list"
+expected_specialized_opcodes = ["BINARY_SUBSCR_LIST_INT"]
+expected_outcome = "safe-refuse"
+expected_reason = "REFUSE_SHAPE_EXECUTE_SURFACE"
+
+[[family]]
+name = "CALL"
+witness = "call-python-exact"
+expected_specialized_opcodes = ["CALL_PY_EXACT_ARGS"]
+expected_outcome = "jit"
+
+[[family]]
+name = "COMPARE_OP"
+witness = "compare-int-jump"
+expected_specialized_opcodes = ["COMPARE_OP_INT_JUMP"]
+expected_outcome = "jit"
+
+[[family]]
+name = "EXTENDED_ARG"
+witness = "extended-arg-quick"
+expected_specialized_opcodes = ["EXTENDED_ARG_QUICK"]
+expected_outcome = "jit"
+
+[[family]]
+name = "JUMP_BACKWARD"
+witness = "jump-backward-quick"
+expected_specialized_opcodes = ["JUMP_BACKWARD_QUICK"]
+expected_outcome = "jit"
+
+[[family]]
+name = "LOAD_ATTR"
+witness = "load-attr-instance"
+expected_specialized_opcodes = ["LOAD_ATTR_INSTANCE_VALUE"]
+expected_outcome = "jit"
+
+[[family]]
+name = "LOAD_CONST"
+witness = "load-const-fast"
+expected_specialized_opcodes = ["LOAD_CONST__LOAD_FAST"]
+expected_outcome = "jit"
+
+[[family]]
+name = "LOAD_FAST"
+witness = "binary-op-int"
+expected_specialized_opcodes = ["LOAD_FAST__LOAD_FAST"]
+expected_outcome = "jit"
+
+[[family]]
+name = "LOAD_GLOBAL"
+witness = "load-global-module"
+expected_specialized_opcodes = ["LOAD_GLOBAL_MODULE"]
+expected_outcome = "jit"
+
+[[family]]
+name = "LOAD_METHOD"
+witness = "load-method-values"
+expected_specialized_opcodes = ["LOAD_METHOD_WITH_VALUES"]
+expected_outcome = "jit"
+
+[[family]]
+name = "PRECALL"
+witness = "call-python-exact"
+expected_specialized_opcodes = ["PRECALL_PYFUNC"]
+expected_outcome = "jit"
+
+[[family]]
+name = "RESUME"
+witness = "binary-op-int"
+expected_specialized_opcodes = ["RESUME_QUICK"]
+expected_outcome = "jit"
+
+[[family]]
+name = "STORE_ATTR"
+witness = "store-attr-instance"
+expected_specialized_opcodes = ["STORE_ATTR_INSTANCE_VALUE"]
+expected_outcome = "jit"
+
+[[family]]
+name = "STORE_FAST"
+witness = "unpack-two-tuple"
+expected_specialized_opcodes = ["STORE_FAST__STORE_FAST"]
+expected_outcome = "jit"
+
+[[family]]
+name = "STORE_SUBSCR"
+witness = "store-subscr-list"
+expected_specialized_opcodes = ["STORE_SUBSCR_LIST_INT"]
+expected_outcome = "safe-refuse"
+expected_reason = "REFUSE_SHAPE_EXECUTE_SURFACE"
+
+[[family]]
+name = "UNPACK_SEQUENCE"
+witness = "unpack-two-tuple"
+expected_specialized_opcodes = ["UNPACK_SEQUENCE_TWO_TUPLE"]
+expected_outcome = "jit"

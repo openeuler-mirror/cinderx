@@ -23,6 +23,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/global_cache.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
@@ -937,12 +938,155 @@ static PyObject* get_trigger_stats(PyObject*, PyObject*) {
       static_cast<unsigned long long>(stats.organic_deopt_hits));
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+static void get_recursion_state_for_test(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries) {
+  JITRT_GetRecursionState311(remaining, headroom, boundary_active, jit_entries);
+}
+
+static PyObject* native_recursion_state_for_test(PyObject*, PyObject*) {
+  int remaining;
+  int headroom;
+  int boundary_active;
+  int jit_entries;
+  get_recursion_state_for_test(
+      &remaining, &headroom, &boundary_active, &jit_entries);
+  return Py_BuildValue(
+      "{s:i,s:i,s:O,s:i}",
+      "recursion_remaining",
+      remaining,
+      "recursion_headroom",
+      headroom,
+      "boundary_active",
+      boundary_active ? Py_True : Py_False,
+      "jit_entries",
+      jit_entries);
+}
+
+// Test-only native recursion probe.  It deliberately calls the public C API
+// directly, without going through Ci_EvalFrame, so the runtime-transition
+// freeze validation can compare Stock and JIT behavior at the last admitted
+// Python frame.
+static PyObject* native_enter_recursive_call_for_test(PyObject*, PyObject*) {
+  int before_remaining;
+  int before_headroom;
+  int before_boundary;
+  int before_jit_entries;
+  get_recursion_state_for_test(
+      &before_remaining,
+      &before_headroom,
+      &before_boundary,
+      &before_jit_entries);
+
+  int rc = Py_EnterRecursiveCall("");
+  int error_occurred = PyErr_Occurred() != nullptr;
+  const char* exception_type = nullptr;
+  Ref<> exception_message;
+  if (error_occurred) {
+    PyObject* type = nullptr;
+    PyObject* value = nullptr;
+    PyObject* traceback = nullptr;
+    PyErr_Fetch(&type, &value, &traceback);
+    if (type != nullptr && PyType_Check(type)) {
+      exception_type = reinterpret_cast<PyTypeObject*>(type)->tp_name;
+    }
+    if (value != nullptr) {
+      exception_message = Ref<>::steal(PyObject_Str(value));
+      if (exception_message == nullptr) {
+        PyErr_Clear();
+      }
+    }
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+  } else if (rc == 0) {
+    Py_LeaveRecursiveCall();
+  }
+
+  int after_remaining;
+  int after_headroom;
+  int after_boundary;
+  int after_jit_entries;
+  get_recursion_state_for_test(
+      &after_remaining, &after_headroom, &after_boundary, &after_jit_entries);
+  return Py_BuildValue(
+      "{s:O,s:i,s:O,s:z,s:O,s:{s:i,s:i,s:O,s:i},s:{s:i,s:i,s:O,s:i}}",
+      "entered",
+      rc == 0 ? Py_True : Py_False,
+      "return_code",
+      rc,
+      "error_occurred",
+      error_occurred ? Py_True : Py_False,
+      "exception_type",
+      exception_type,
+      "exception_message",
+      exception_message != nullptr ? exception_message.get() : Py_None,
+      "before",
+      "recursion_remaining",
+      before_remaining,
+      "recursion_headroom",
+      before_headroom,
+      "boundary_active",
+      before_boundary ? Py_True : Py_False,
+      "jit_entries",
+      before_jit_entries,
+      "after",
+      "recursion_remaining",
+      after_remaining,
+      "recursion_headroom",
+      after_headroom,
+      "boundary_active",
+      after_boundary ? Py_True : Py_False,
+      "jit_entries",
+      after_jit_entries);
+}
+
+static PyObject* native_recursion_probe_add(PyObject*, PyObject*) {
+  return native_enter_recursive_call_for_test(nullptr, nullptr);
+}
+
+static PyObject* native_recursion_probe_operand_for_test(PyObject*, PyObject*) {
+  static PyType_Slot slots[] = {
+      {Py_nb_add, reinterpret_cast<void*>(native_recursion_probe_add)},
+      {Py_tp_new, reinterpret_cast<void*>(PyType_GenericNew)},
+      {0, nullptr},
+  };
+  static PyType_Spec spec = {
+      "_cinderx._NativeRecursionProbeOperand",
+      sizeof(PyObject),
+      0,
+      Py_TPFLAGS_DEFAULT,
+      slots,
+  };
+  Ref<> type = Ref<>::steal(PyType_FromSpec(&spec));
+  if (type == nullptr) {
+    return nullptr;
+  }
+  return PyObject_CallNoArgs(type);
+}
+#endif
+
 PyMethodDef _cinderx_methods[] = {
 #if PY_VERSION_HEX < 0x030C0000
     {"_get_observe_stats",
      get_observe_stats,
      METH_NOARGS,
      PyDoc_STR("Snapshot of observe-mode counters and scheduling events.")},
+    {"_native_enter_recursive_call",
+     native_enter_recursive_call_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only direct Py_EnterRecursiveCall probe.")},
+    {"_native_recursion_state",
+     native_recursion_state_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only CPython 3.11 recursion accounting snapshot.")},
+    {"_native_recursion_probe_operand",
+     native_recursion_probe_operand_for_test,
+     METH_NOARGS,
+     PyDoc_STR("Test-only number operand whose add slot probes recursion.")},
 #endif
     {"_get_trigger_stats",
      get_trigger_stats,
