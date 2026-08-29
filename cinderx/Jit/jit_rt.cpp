@@ -296,12 +296,12 @@ static PyThreadState* allocate_and_link_interpreter_frame(
 thread_local _PyInterpreterFrame* t_prelinked_recursion_frame = nullptr;
 thread_local int t_jit_recursion_entries = 0;
 
-// CPython 3.11 binds in initialize_locals, then consumes a recursion
-// slot only after the attempted frame is linked at start_frame. Binding stays
-// in the generated prologue. This scope then prelinks the real JIT frame,
-// consumes the recursion slot, and lets LoadFrame consume that prelinked frame
-// instead of allocating a second one. A failed Enter unlinks the attempted
-// frame exactly once and returns RecursionError to the caller.
+// CPython 3.11 binds in initialize_locals, then consumes a recursion slot only
+// after the attempted frame is linked at start_frame. Binding stays in the
+// generated prologue. Normal frames are prelinked here and consumed by
+// LoadFrame. Lightweight frames are linked inline by LoadFrame, so they only
+// consume the recursion slot here; prelinking would create a duplicate Python
+// frame and leave the TLS handoff occupied across recursive calls.
 class RecursiveCallAfterBind {
  public:
   explicit RecursiveCallAfterBind(PyFunctionObject* func)
@@ -309,15 +309,16 @@ class RecursiveCallAfterBind {
     JIT_CHECK(
         t_prelinked_recursion_frame == nullptr,
         "nested prelinked CPython 3.11 recursion frame");
-    PyThreadState* tstate = allocate_and_link_interpreter_frame(
-        func, reinterpret_cast<PyCodeObject*>(func->func_code));
-    t_prelinked_recursion_frame = currentFrame(tstate);
+    PyThreadState* tstate = PyThreadState_GET();
+    JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
+    if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
+      tstate = allocate_and_link_interpreter_frame(
+          func, reinterpret_cast<PyCodeObject*>(func->func_code));
+      t_prelinked_recursion_frame = currentFrame(tstate);
+    }
     if (Ci_JitRecursionBoundary311_IsActive()) {
       Ci_JitRecursionBoundary311_Refuse(tstate);
-      t_prelinked_recursion_frame = nullptr;
-      tstate->recursion_remaining--;
-      JITRT_UnlinkFrame(tstate);
-      tstate->recursion_remaining++;
+      unlinkPrelinkedFrame(tstate);
       return;
     }
     if (_Py_EnterRecursiveCallTstate(tstate, "") == 0) {
@@ -333,10 +334,7 @@ class RecursiveCallAfterBind {
     // _Py_CheckRecursiveCall restored recursion_remaining after setting the
     // exception. Stock temporarily consumes one slot while clearing the
     // failed entry frame (_PyEvalFrameClearAndPop); mirror that headroom.
-    t_prelinked_recursion_frame = nullptr;
-    tstate->recursion_remaining--;
-    JITRT_UnlinkFrame(tstate);
-    tstate->recursion_remaining++;
+    unlinkPrelinkedFrame(tstate);
   }
   ~RecursiveCallAfterBind() {
     if (t_prelinked_recursion_frame != nullptr) {
@@ -367,6 +365,16 @@ class RecursiveCallAfterBind {
   }
 
  private:
+  static void unlinkPrelinkedFrame(PyThreadState* tstate) {
+    if (t_prelinked_recursion_frame == nullptr) {
+      return;
+    }
+    t_prelinked_recursion_frame = nullptr;
+    tstate->recursion_remaining--;
+    JITRT_UnlinkFrame(tstate);
+    tstate->recursion_remaining++;
+  }
+
   bool entered_{false};
   bool boundary_active_{false};
   int entries_before_;

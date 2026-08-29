@@ -530,11 +530,19 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   }
 #endif
   int free_offset = code->co_nlocalsplus - numFreevars(code);
+#if PY_VERSION_HEX >= 0x030C0000
   Ci_STACK_TYPE* localsplus = &frame->localsplus[0];
   for (std::size_t i = 0; i < free_offset; i++) {
     *localsplus = Ci_STACK_NULL;
     localsplus++;
   }
+#else
+  // CPython 3.11 executing mode keeps an owned observer copy of fast locals
+  // in localsplus.  Frame initialization has already cleared every slot, and
+  // subsequent stores keep them current, so preserve them for deopt reification
+  // to replace (and release) rather than dropping the references here.
+  (void)free_offset;
+#endif
 
   jitFrameGetHeader(frame)->frame_status |= JIT_FRAME_INITIALIZED;
 #endif
@@ -547,6 +555,9 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 // is going to be transferred there.
 void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  if (getConfig().frame_mode != FrameMode::kLightweight) {
+    return;
+  }
 #if PY_VERSION_HEX >= 0x030F0000
   PyObject* code = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   if (PyUnstable_JITExecutable_Check(code)) {
@@ -640,22 +651,24 @@ void jitFrameSetFunction(_PyInterpreterFrame* frame, PyFunctionObject* func) {
 
 BorrowedRef<PyFunctionObject> jitFrameGetFunction(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
-  if constexpr (PY_VERSION_HEX >= 0x030E0000) {
-    return frameFunction(frame);
+  if (getConfig().frame_mode == FrameMode::kLightweight) {
+    if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+      return frameFunction(frame);
+    }
+    return reinterpret_cast<PyFunctionObject*>(
+        jitFrameGetHeader(frame)->frame_status & ~JIT_FRAME_MASK);
   }
-  return reinterpret_cast<PyFunctionObject*>(
-      jitFrameGetHeader(frame)->frame_status & ~JIT_FRAME_MASK);
-#else
-  return frameFunction(frame);
 #endif
+  return frameFunction(frame);
 }
 
 bool isInlinedFrame(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
-  return jitFrameGetHeader(frame)->frame_status & JIT_FRAME_INLINED;
-#else
-  return false;
+  if (getConfig().frame_mode == FrameMode::kLightweight) {
+    return jitFrameGetHeader(frame)->frame_status & JIT_FRAME_INLINED;
+  }
 #endif
+  return false;
 }
 
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
@@ -703,12 +716,16 @@ void jitFrameInitLightweight(
 #endif
 #else
   frame->stacktop = 0;
+  for (int i = 0; i < code->co_nlocalsplus; i++) {
+    frame->localsplus[i] = nullptr;
+  }
   setFrameInstruction(frame, _PyCode_CODE(code) - 1);
   frame->prev_instr = _PyCode_CODE(code) - 1;
   setFrameCode(frame, (PyObject*)code);
-  JIT_DCHECK(
-      _Py_IsImmortal(cinderx::getModuleState()->frame_reifier),
-      "frame helper must be immortal");
+  JIT_CHECK(
+      cinderx::getModuleState()->frame_reifier != nullptr &&
+          _Py_IsImmortal(cinderx::getModuleState()->frame_reifier),
+      "frame helper must exist and be immortal");
   setFrameFunction(frame, cinderx::getModuleState()->frame_reifier);
   jitFrameSetFunction(frame, (PyFunctionObject*)Py_NewRef(func));
 #endif
@@ -805,7 +822,13 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
 
   // Otherwise only clear things that we've initialized.
   BorrowedRef<PyCodeObject> code = frameCode(frame);
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 mirrors arguments and fast locals into localsplus for frame
+  // observability, taking an independent owned reference for each slot.
+  int free_offset = 0;
+#else
   int free_offset = code->co_nlocalsplus - numFreevars(code);
+#endif
   for (int i = free_offset; i < code->co_nlocalsplus; i++) {
     Ci_STACK_CLEAR(frame->localsplus[i]);
   }

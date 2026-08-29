@@ -760,6 +760,13 @@ TEST_F(CmdLineTest, LightweightFrameFlagRequiresCompileSupport) {
   jit::shutdown_jit_genobject_type();
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+TEST_F(CmdLineTest, Python311DefaultsToNormalFramesWhenSupportIsCompiledIn) {
+  Config config;
+  EXPECT_EQ(config.frame_mode, FrameMode::kNormal);
+}
+#endif
+
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
 TEST_F(CmdLineTest, LightweightFrameRejectsOSRConflict) {
   ScopedEnvVar lightweight_env{"PYTHONJITLIGHTWEIGHTFRAME"};

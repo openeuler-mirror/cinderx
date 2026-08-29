@@ -133,7 +133,7 @@ struct Config {
   // to be initialized or uninitialized.  Intended for testing.
   std::optional<bool> force_init;
   FrameMode frame_mode{
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000
       FrameMode::kLightweight
 #else
       FrameMode::kNormal

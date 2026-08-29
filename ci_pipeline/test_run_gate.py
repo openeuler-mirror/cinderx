@@ -499,7 +499,7 @@ def test_configure_toolchain_keeps_explicit_compilers(monkeypatch):
     assert env["CXX"] == "/custom/g++"
 
 
-def test_runtime_tests_disable_lightweight_frames_on_cpython311(
+def test_runtime_tests_enable_runtime_selectable_frames_on_cpython311(
     monkeypatch,
     tmp_path,
 ):
@@ -518,15 +518,18 @@ def test_runtime_tests_disable_lightweight_frames_on_cpython311(
     )
 
     options = run_gate.runtime_tests_cmake_options(
-        {
-            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
-            "ENABLE_LIGHTWEIGHT_FRAMES": "1",
-            "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
-        }
+        {"CINDERX_TEST_PYTHON": "/usr/bin/python3.11"}
     )
 
-    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in options
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=1" in options
     assert "-DENABLE_INTERPRETER_LOOP=1" in options
+    disabled = run_gate.runtime_tests_cmake_options(
+        {
+            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
+            "ENABLE_LIGHTWEIGHT_FRAMES": "0",
+        }
+    )
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in disabled
 
     command = run_gate.runtime_tests_command(
         {"name": "runtime_tests_311"},
@@ -537,7 +540,7 @@ def test_runtime_tests_disable_lightweight_frames_on_cpython311(
             "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
         },
     )
-    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in command
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=1" in command
     assert "PYTHONJITLIGHTWEIGHTFRAME=1" not in command
     assert "env -u PYTHONJITLIGHTWEIGHTFRAME" in command
 

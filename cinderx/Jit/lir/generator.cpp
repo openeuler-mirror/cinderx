@@ -47,6 +47,7 @@ extern "C" {
 #include "cinderx/Jit/lir/block_builder.h"
 #include "cinderx/Jit/lir/interpframe.h"
 #include "cinderx/Jit/threaded_compile.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
@@ -417,7 +418,7 @@ class FrameInitPlan {
       plan.groups_[plan.num_groups_++] = {
           static_cast<uint8_t>(start), static_cast<uint8_t>(i - start)};
     }
-#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+#if !defined(ENABLE_LIGHTWEIGHT_FRAMES) || PY_VERSION_HEX < 0x030C0000
     if (nlocalsplus > 0) {
       plan.localsplus_zero_offset_ =
           static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
@@ -464,8 +465,9 @@ class FrameInitPlan {
       }
     }
 
-    // Zero localsplus slots (non-LW frames need this so the GC doesn't
-    // see garbage pointers).
+    // Zero localsplus slots before argument binding can replace and decref
+    // their old values. CPython 3.11 LWF stores live on uninitialized native
+    // stack space, so they need the same initialization as normal frames.
     if (localsplus_zero_count_ > 0) {
       Instruction* zero =
           bbb.appendInstr(OutVReg{}, Instruction::kMove, Imm{0});
@@ -5978,6 +5980,14 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
   }
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   else if (func_->frameMode == FrameMode::kLightweight) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Normal frames count at JITRT_AllocateAndLinkInterpreterFrame and
+    // generators count at their resume dispatch.  The 3.11 lightweight
+    // prologue inlines frame setup, so this is its unique entry-counting site.
+    bbb.annotateNext("Record machine-code entry");
+    bbb.appendInvokeInstruction(
+        triggerStatsOnMachineCodeEntry, func_->code.get());
+#endif
 #if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     // Compute the address of the deopt_idx field once
     // TranslateOneBasicBlock reuses this for all deopt index stores.
@@ -6048,9 +6058,11 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
                     executable_or_reifier_obj.get());
                 return executable_or_reifier;
               } else {
-                JIT_DCHECK(
-                    _Py_IsImmortal(cinderx::getModuleState()->frame_reifier),
-                    "Reifier must be immortal");
+                JIT_CHECK(
+                    cinderx::getModuleState()->frame_reifier != nullptr &&
+                        _Py_IsImmortal(
+                            cinderx::getModuleState()->frame_reifier),
+                    "frame reifier must exist and be immortal");
                 return bbb.appendInstr(
                     OutVReg{},
                     Instruction::kMove,
@@ -6212,6 +6224,14 @@ void LIRGenerator::emitUnlinkFrame(
     PyObject* executable,
     std::optional<destructor> exec_dtor,
     Instruction* callee_frame) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Executing-mode CPython 3.11 frames own observer copies of fast locals.
+  // The inline unlink paths do not clear localsplus, so use the helper which
+  // unlinks the frame before releasing those references (finalizers may
+  // re-enter Python and inspect the frame chain).
+  bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+  return;
+#endif
   if (has_freevars) {
     bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
   } else if (!env_->can_deopt) {

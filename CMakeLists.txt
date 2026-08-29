@@ -57,12 +57,9 @@ if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11)
   # There is no 3.11 product without the interpreter loop: the runtime paths
   # call into it unconditionally, so the option cannot be turned off here.
   set(ENABLE_INTERPRETER_LOOP ON)
-  # The materialized _PyInterpreterFrame is the only frame mode in the 3.11
-  # delivery; a lightweight-frames build would silently change frame
-  # ownership semantics, so it fails here instead of at runtime.
-  if (DEFINED ENABLE_LIGHTWEIGHT_FRAMES AND ${ENABLE_LIGHTWEIGHT_FRAMES})
-    message(FATAL_ERROR "ENABLE_LIGHTWEIGHT_FRAMES is not supported on CPython 3.11")
-  endif()
+  # Compile lightweight-frame support into the 3.11 delivery when requested.
+  # Config keeps normal frames as the default, so the optimized ownership path
+  # remains an explicit runtime opt-in with a rollback switch.
 endif()
 
 set_flag(ENABLE_ADAPTIVE_STATIC_PYTHON)
