@@ -3902,13 +3902,61 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         size_t flags = 0;
 #if PY_VERSION_HEX < 0x030C0000
-        // _PyObject_VectorcallTstate is a static inline on 3.11 and cannot
-        // be materialized as a call target; the jit_rt helper wraps it.
-        uint64_t func =
-            reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
+        Instruction* callable = bbb.getDefInstr(hir_instr.func());
+        Instruction* target = nullptr;
+        constexpr int32_t kVectorcallOffset =
+            static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+        if (hir_instr.func()->type() <= TFunc) {
+          target = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, kVectorcallOffset});
+        } else {
+          // Select an address before loading the target. This avoids reading
+          // PyFunctionObject::vectorcall from a non-function object.
+          Instruction* type = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, static_cast<int32_t>(offsetof(PyObject, ob_type))});
+          Instruction* function_type = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+          Instruction* is_function = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              type,
+              function_type);
+          Instruction* fast_address = bbb.appendInstr(
+              Instruction::kLea,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, kVectorcallOffset});
+          Instruction* slow_address = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)});
+          Instruction* selected_address = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              is_function,
+              fast_address,
+              slow_address);
+          target = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{selected_address, 0});
+        }
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(), Instruction::kVectorCall, target, Imm{flags});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+        break;
 #else
         uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
-#endif
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
@@ -3930,6 +3978,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           instr->addOperands(Imm{0});
         }
         break;
+#endif
       }
       case Opcode::kCallCFunc: {
         const auto kFuncPtrMap = std::to_array({
@@ -4037,6 +4086,101 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCallMethod: {
         auto& hir_instr = static_cast<const CallMethod&>(i);
         size_t flags = 0;
+#if PY_VERSION_HEX < 0x030C0000
+        Instruction* callable = bbb.getDefInstr(hir_instr.func());
+        constexpr int32_t kVectorcallOffset =
+            static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+        Instruction* sentinel = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(Py_True)});
+        Instruction* zero = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{0});
+        Instruction* is_null = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            callable,
+            zero);
+        Instruction* non_null = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_null,
+            sentinel,
+            callable);
+        Instruction* none = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(Py_None)});
+        Instruction* is_none = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            non_null,
+            none);
+        Instruction* safe_callable = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_none,
+            sentinel,
+            non_null);
+        Instruction* type = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Ind{safe_callable,
+                static_cast<int32_t>(offsetof(PyObject, ob_type))});
+        Instruction* function_type = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+        Instruction* is_function = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            type,
+            function_type);
+        Instruction* fast_address = bbb.appendInstr(
+            Instruction::kLea,
+            OutVReg{OperandBase::k64bit},
+            Ind{safe_callable, kVectorcallOffset});
+        Instruction* slow_address = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot)});
+        Instruction* address_by_type = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_function,
+            fast_address,
+            slow_address);
+        // JITRT_Call must shift its argument window when LOAD_METHOD
+        // supplies a null receiver. Keep that shape on the helper arm.
+        Instruction* receiver = bbb.getDefInstr(hir_instr.self());
+        Instruction* receiver_is_null = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            receiver,
+            zero);
+        Instruction* selected_address = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            receiver_is_null,
+            slow_address,
+            address_by_type);
+        Instruction* target = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Ind{selected_address, 0});
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(),
+            Instruction::kVectorCall,
+            target,
+            Imm{flags});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+        break;
+#else
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
             Instruction::kVectorCallTstate,
@@ -4052,6 +4196,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           instr->addOperands(Imm{0});
         }
         break;
+#endif
       }
 
       case Opcode::kCallStatic: {

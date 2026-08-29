@@ -1593,6 +1593,33 @@ PyObject* JITRT_VectorcallTstate(
   return res;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+PyObject* JITRT_Vectorcall311(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  return JITRT_VectorcallTstate(
+      PyThreadState_GET(), callable, args, nargsf, kwnames);
+}
+
+PyObject* JITRT_Call311(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  return JITRT_Call(PyThreadState_GET(), callable, args, nargsf, kwnames);
+}
+} // namespace
+
+extern "C" {
+void* g_JITRT_Vectorcall311_slot =
+    reinterpret_cast<void*>(JITRT_Vectorcall311);
+void* g_JITRT_Call311_slot = reinterpret_cast<void*>(JITRT_Call311);
+}
+#endif
+
 PyObject* JITRT_VectorcallPythonFunction(
     PyThreadState*,
     PyObject* callable,

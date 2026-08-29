@@ -256,6 +256,14 @@ PyObject* JITRT_VectorcallTstate(
     size_t nargsf,
     PyObject* kwnames);
 
+#if PY_VERSION_HEX < 0x030C0000
+// Slow-arm slots for CPython 3.11 generated-call target selection. The
+// selected target has the ordinary four-argument vectorcall ABI whether it
+// comes from a Python function or one of these adapters.
+extern "C" void* g_JITRT_Vectorcall311_slot;
+extern "C" void* g_JITRT_Call311_slot;
+#endif
+
 /*
  * Performs a vectorcall to an exact Python function. This has the same calling
  * convention as JITRT_VectorcallTstate but skips the generic callable dispatch.

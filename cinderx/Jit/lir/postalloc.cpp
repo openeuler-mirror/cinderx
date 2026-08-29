@@ -1043,9 +1043,11 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kNop:
     case Instruction::kUnreachable:
     case Instruction::kCall:
+    case Instruction::kLoadAttrCachedFastPath:
     case Instruction::kLoadMethodCachedFastPath:
     case Instruction::kStoreAttrCachedFastPath:
     case Instruction::kBinaryOpExactLongAddSubFastPath:
+    case Instruction::kVectorCall:
     case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:
