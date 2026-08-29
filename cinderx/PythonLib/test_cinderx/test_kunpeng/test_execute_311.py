@@ -324,6 +324,22 @@ class Execute311Test(unittest.TestCase):
         self.assertEqual(payload["exception"], [9])
         self.assertGreater(payload["entry_delta"], 0)
 
+    def test_artifact_entry_pins_reentrant_unpublish_and_rechecks_guards(self):
+        payload = self.run_ok(
+            "artifact_entry",
+            threshold="1000000",
+        )
+        self.assertEqual(payload["first"], 42)
+        self.assertEqual(payload["reentrant"], 42)
+        self.assertFalse(payload["compiled_after_reentrant"])
+        self.assertEqual(payload["interpreted_after_reentrant"], 42)
+        self.assertEqual(payload["swapped"], 99)
+        self.assertFalse(payload["compiled_after_swap"])
+        self.assertEqual(payload["traced_value"], 5)
+        self.assertIn("call", payload["trace_events"])
+        self.assertEqual(payload["trace_entry_delta"], 0)
+        self.assertGreater(payload["entry_delta"], 0)
+
     def test_frame_local_inline_preserves_materialized_frame_semantics(self):
         payload = self.run_ok("frame_local_inline", threshold="2")
         self.assertTrue(all(payload["compiled"].values()))

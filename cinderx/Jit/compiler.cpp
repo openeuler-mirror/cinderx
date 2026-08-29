@@ -490,6 +490,10 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   CompiledFunctionData compiled_data;
   compiled_data.code = code;
   compiled_data.vectorcall_entry = entry;
+#if PY_VERSION_HEX < 0x030C0000
+  compiled_data.artifact_guarded_entry =
+      reinterpret_cast<vectorcallfunc>(ngen->getArtifactGuardedEntry311());
+#endif
   compiled_data.stack_size = stack_size;
   compiled_data.spill_stack_size = spill_stack_size;
   compiled_data.inline_function_stats = std::move(inline_stats);

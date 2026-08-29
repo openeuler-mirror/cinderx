@@ -5,6 +5,7 @@
 #include <structmember.h>
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
 #endif
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
@@ -2510,6 +2511,20 @@ void NativeGenerator::generateCode(
   env_.correct_arg_count = as_->newLabel();
 
   Label static_jmp_location = as_->newLabel();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  Label artifact_guarded_entry_label = as_->newLabel();
+  auto artifact_entry_cursor = as_->cursor();
+  as_->bind(artifact_guarded_entry_label);
+  // vectorcall occupies x0-x3. Carry the compilation's stable runtime in x4
+  // and tail-branch into static C text. The C entry acquires the owning
+  // CompiledFunction pin before calling vectorcall_entry_, so unpublishing
+  // from inside the body cannot free the stub or body while either executes.
+  as_->mov(a64::x4, reinterpret_cast<uint64_t>(env_.code_rt));
+  as_->mov(
+      a64::x16, reinterpret_cast<uint64_t>(&Ci_JitShell311_ArtifactEntry));
+  as_->br(a64::x16);
+  env_.addAnnotation("Artifact-specific guarded entry", artifact_entry_cursor);
+#endif
   bool has_static_entry = hasStaticEntry();
   if (has_static_entry) {
     generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
@@ -2717,6 +2732,10 @@ void NativeGenerator::generateCode(
 
   vectorcall_entry_ = static_cast<char*>(code_start_) +
       codeholder.labelOffsetFromBase(vectorcall_entry_label);
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  artifact_guarded_entry_311_ = static_cast<char*>(code_start_) +
+      codeholder.labelOffsetFromBase(artifact_guarded_entry_label);
+#endif
 
   for (auto& entry : env_.unresolved_gen_entry_labels) {
     entry.first->setResumeTarget(

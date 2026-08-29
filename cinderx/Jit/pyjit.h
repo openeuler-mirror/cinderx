@@ -9,6 +9,8 @@
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/pyjit_result.h"
 
+#include <optional>
+
 namespace jit {
 
 /*

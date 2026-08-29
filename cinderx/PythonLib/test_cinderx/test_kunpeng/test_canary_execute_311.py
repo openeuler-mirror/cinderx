@@ -1686,6 +1686,7 @@ class CanaryExecute311Test(unittest.TestCase):
                 loop(3, 5, 1)
             assert cinderjit.force_compile(loop) is True
 
+            gc.collect()
             finalized = []
 
             class Killer:
@@ -1699,7 +1700,8 @@ class CanaryExecute311Test(unittest.TestCase):
             killer = Killer()
             del killer
             old_threshold = gc.get_threshold()
-            gc.set_threshold(1, 1, 1)
+            next_allocation = gc.get_count()[0] + 1
+            gc.set_threshold(next_allocation, 1, 1)
             try:
                 sites = cinderjit.deopt_sites(loop)
             finally:

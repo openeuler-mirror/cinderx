@@ -872,7 +872,13 @@ bool Context::finalizeFunc(
   // Route 3.11 calls through the guarded entry, which re-checks the code
   // identity and the call form that compilation assumed before entering
   // machine code (see Jit/pyjit_311_gate.cpp).
-  setVectorcall(func, Ci_JitShell311_GuardedEntry);
+  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
+#if defined(CINDER_AARCH64)
+  if (compiled->artifactGuardedEntry311() != nullptr) {
+    entry = compiled->artifactGuardedEntry311();
+  }
+#endif
+  setVectorcall(func, entry);
   if (hasFunctionEntryCache(func)) {
     void** indirect = findFunctionEntryCache(func);
     *indirect = compiled->staticEntry();

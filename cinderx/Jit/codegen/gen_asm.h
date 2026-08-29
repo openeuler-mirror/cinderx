@@ -55,6 +55,14 @@ class NativeGenerator {
   // time this method is called.
   void* getVectorcallEntry();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Artifact-specific guarded entry emitted beside the normal vectorcall
+  // entry, or null when unsupported.
+  void* getArtifactGuardedEntry311() const {
+    return artifact_guarded_entry_311_;
+  }
+#endif
+
   // Run the complete native-code generation pipeline without publishing any
   // executable code or retaining runtime metadata. Returns the relocated code
   // size.
@@ -85,6 +93,9 @@ class NativeGenerator {
   const hir::Function* func_;
   void* code_start_{nullptr};
   void* vectorcall_entry_{nullptr};
+#if PY_VERSION_HEX < 0x030C0000
+  void* artifact_guarded_entry_311_{nullptr};
+#endif
   arch::Builder* as_{nullptr};
   CodeHolderMetadata metadata_{CodeSection::kHot};
 
