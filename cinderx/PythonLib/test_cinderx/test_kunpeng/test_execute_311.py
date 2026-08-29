@@ -324,6 +324,15 @@ class Execute311Test(unittest.TestCase):
         self.assertEqual(payload["exception"], [9])
         self.assertGreater(payload["entry_delta"], 0)
 
+    def test_frame_local_inline_preserves_materialized_frame_semantics(self):
+        payload = self.run_ok("frame_local_inline", threshold="2")
+        self.assertTrue(all(payload["compiled"].values()))
+        self.assertEqual(payload["stored"], 17)
+        self.assertFalse(payload["deleted"])
+        self.assertEqual(payload["replaced"], "new")
+        self.assertEqual(payload["events"], ["new"])
+        self.assertGreater(payload["entry_delta"], 0)
+
     def test_third_party_evaluator_degrades_the_jit_safely(self):
         payload = self.run_ok("third_party_evaluator")
         self.assertEqual(payload["entered_ours"], 1)

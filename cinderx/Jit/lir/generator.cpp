@@ -4201,6 +4201,46 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
       case Opcode::kCallStatic: {
         auto& hir_instr = static_cast<const CallStatic&>(i);
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+        if (hir_instr.addr() ==
+                reinterpret_cast<void*>(JITRT_StoreFrameLocal311)) {
+          // Match JITRT_StoreFrameLocal311 and stock SETLOCAL exactly:
+          // take the frame-owned reference first, publish the new slot, then
+          // release the old value.  The cold zero-refcount arm may invoke
+          // arbitrary __del__ code, which must observe the new slot already.
+          Instruction* idx =
+              bbb.getDefInstr(hir_instr.GetOperand(0));
+          Instruction* value =
+              bbb.getDefInstr(hir_instr.GetOperand(1));
+          Instruction* frame = makeCurrentFrameAccessor(bbb).load();
+          constexpr int32_t kLocalsplusOffset =
+              offsetof(_PyInterpreterFrame, localsplus);
+          Instruction* old = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Ind{frame, idx, sizeof(PyObject*), kLocalsplusOffset});
+          makeIncref(bbb, value, /* xincref= */ true, /* immortal= */ true);
+          bbb.appendInstr(
+              OutInd{
+                  frame,
+                  idx,
+                  sizeof(PyObject*),
+                  kLocalsplusOffset,
+                  DataType::kObject},
+              Instruction::kMove,
+              value);
+          makeDecref(
+              bbb,
+              old,
+              std::nullopt,
+              /* xdecref= */ true,
+              /* possible_immortal= */ true);
+          bbb.appendInstr(
+              hir_instr.output(), Instruction::kMove, Imm{0});
+          break;
+        }
+#endif
         std::vector<Instruction*> args;
         // Generate the argument conversions before the call.
         for (hir::Register* reg_arg : hir_instr.GetOperands()) {
