@@ -670,6 +670,7 @@ def test_runtime_tests_manifests_are_consistent():
     ]
     assert not green_skips, green_skips
     assert "HIRBuildTest" in families
+    assert "HIRPipelineGolden" in families
 
 
 def _canary_population(tests_dir=None):

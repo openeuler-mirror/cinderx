@@ -16,6 +16,7 @@ DataFlowTest
 DeoptSiteIdTest
 FuncTypeCheckTest
 HIRBuildTest
+HIRPipelineGolden
 InstrusiveListTest
 IntrusiveListTest
 JITConfigTest

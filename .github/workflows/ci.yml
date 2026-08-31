@@ -51,42 +51,59 @@ jobs:
       run: uv run pytest cinderx/PythonLib/test_cinderx/test*.py
 
   # INFRA-2: no-behavior-drift gate for Compiler::runPasses.  Anchored to
-  # the supported platform and a single line per the version policy
-  # (Linux aarch64 per README_CN, Python 3.14 — matching the committed
-  # goldens); x86_64 and other Python versions keep extension capability
-  # only and are deliberately not gated here.
+  # Linux aarch64 and the supported CPython 3.11/3.14 lines, matching the
+  # committed Golden Samples.  Other versions and x86_64 keep extension
+  # capability only and are deliberately not gated here.
   hir_pipeline_golden:
-    name: HIR pipeline golden gate (3.14)
+    name: HIR pipeline Golden Sample gate (${{ matrix.python-minor }})
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: '3.11.6'
+            python-minor: '3.11'
+            enable-xxclassloader: '0'
+          - python-version: '3.14.3'
+            python-minor: '3.14'
+            enable-xxclassloader: '1'
 
     steps:
       - name: Checkout CinderX
         uses: actions/checkout@v6
 
-      - name: Set up Python 3.14.3
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
         with:
-          python-version: '3.14.3'
+          python-version: ${{ matrix.python-version }}
 
       - name: Configure runtime_tests
-        run: >
-          cmake -S . -B build/rt -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DENABLE_RUNTIME_TESTS=ON -DPY_VERSION=3.14
-          -DPython_ROOT_DIR=$(python -c "import sys; print(sys.prefix)")
-          -DPython_EXECUTABLE=$(which python)
-          -DMETA_PYTHON=0 -DENABLE_ADAPTIVE_STATIC_PYTHON=0
-          -DENABLE_DISASSEMBLER=1 -DENABLE_ELF_READER=1
-          -DENABLE_INTERPRETER_LOOP=1 -DENABLE_LIGHTWEIGHT_FRAMES=1
-          -DENABLE_PEP523_HOOK=1 -DENABLE_SYMBOLIZER=1 -DENABLE_USDT=1
-          -DENABLE_XXCLASSLOADER=1 -DENABLE_ZLIB=1
+        shell: bash
+        env:
+          ENABLE_XXCLASSLOADER: ${{ matrix.enable-xxclassloader }}
+        run: |
+          mapfile -t cmake_options < <(
+            python -c 'import sys; sys.path.insert(0, "ci_pipeline"); from cmake_options import cmake_feature_options; print(*(f"-D{k}={v}" for k, v in sorted(cmake_feature_options(py_version="${{ matrix.python-minor }}", python_root=sys.prefix).items())), sep="\n")'
+          )
+          cmake -S . -B build/rt -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_RUNTIME_TESTS=ON \
+            -DPython_EXECUTABLE="$(command -v python)" \
+            "${cmake_options[@]}"
 
       - name: Build runtime_tests
         run: cmake --build build/rt --target runtime_tests --parallel "$(nproc)"
 
-      - name: Run HIR pipeline golden suite
-        run: >
-          ./build/rt/cinderx/RuntimeTests/runtime_tests
-          --gtest_filter=HIRPipelineGolden.*
+      - name: Run HIR pipeline Golden Sample suite
+        shell: bash
+        run: |
+          set -o pipefail
+          ./build/rt/cinderx/RuntimeTests/runtime_tests \
+            --gtest_filter=HIRPipelineGolden.* \
+            | tee build/rt/hir-pipeline-golden.log
+          ! grep -q '^\[  SKIPPED \]' build/rt/hir-pipeline-golden.log
+          grep -q '^\[  PASSED  \] 36 tests\.$' \
+            build/rt/hir-pipeline-golden.log
 
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
