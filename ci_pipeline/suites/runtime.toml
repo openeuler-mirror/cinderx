@@ -1,5 +1,13 @@
 fail_fast = true
 
+# This suite runs the full runtime_tests binary, which includes the
+# HIRPipelineGolden suite (RuntimeTests/hir_pipeline_test.cpp): the
+# no-behavior-drift gate for Compiler::runPasses.  Goldens are anchored
+# per (python, arch); on a target with no committed goldens the suite
+# skips loudly instead of failing (see
+# RuntimeTests/hir_pipeline_golden/README.md for the version policy:
+# gates anchor 3.14 only, other versions keep extension capability).
+
 [target]
 python = "3.14"
 arch = "arm64"

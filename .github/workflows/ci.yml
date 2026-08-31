@@ -50,6 +50,44 @@ jobs:
       if: runner.os != 'Windows'
       run: uv run pytest cinderx/PythonLib/test_cinderx/test*.py
 
+  # INFRA-2: no-behavior-drift gate for Compiler::runPasses.  Anchored to
+  # the supported platform and a single line per the version policy
+  # (Linux aarch64 per README_CN, Python 3.14 — matching the committed
+  # goldens); x86_64 and other Python versions keep extension capability
+  # only and are deliberately not gated here.
+  hir_pipeline_golden:
+    name: HIR pipeline golden gate (3.14)
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout CinderX
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.14.3
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14.3'
+
+      - name: Configure runtime_tests
+        run: >
+          cmake -S . -B build/rt -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DENABLE_RUNTIME_TESTS=ON -DPY_VERSION=3.14
+          -DPython_ROOT_DIR=$(python -c "import sys; print(sys.prefix)")
+          -DPython_EXECUTABLE=$(which python)
+          -DMETA_PYTHON=0 -DENABLE_ADAPTIVE_STATIC_PYTHON=0
+          -DENABLE_DISASSEMBLER=1 -DENABLE_ELF_READER=1
+          -DENABLE_INTERPRETER_LOOP=1 -DENABLE_LIGHTWEIGHT_FRAMES=1
+          -DENABLE_PEP523_HOOK=1 -DENABLE_SYMBOLIZER=1 -DENABLE_USDT=1
+          -DENABLE_XXCLASSLOADER=1 -DENABLE_ZLIB=1
+
+      - name: Build runtime_tests
+        run: cmake --build build/rt --target runtime_tests --parallel "$(nproc)"
+
+      - name: Run HIR pipeline golden suite
+        run: >
+          ./build/rt/cinderx/RuntimeTests/runtime_tests
+          --gtest_filter=HIRPipelineGolden.*
+
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
