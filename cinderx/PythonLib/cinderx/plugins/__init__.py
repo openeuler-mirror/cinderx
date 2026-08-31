@@ -19,9 +19,21 @@ from .manifest import (
     parse_manifest,
     validate_manifest,
 )
+from .registry import (
+    AdmissionInputs,
+    NamespaceSnapshot,
+    PluginRegistry,
+    RegistrationResult,
+    RegistryEntry,
+    RegistryEntryFamily,
+    RegistryRejection,
+    RegistryRejectionReason,
+    RegistrySnapshot,
+)
 
 __all__ = [
     "CURRENT_SPI_VERSION",
+    "AdmissionInputs",
     "MAX_ENTRIES_PER_SECTION",
     "MAX_IDENTIFIER_BYTES",
     "MAX_MANIFEST_BYTES",
@@ -32,7 +44,15 @@ __all__ = [
     "ManifestValidationResult",
     "PluginAdapter",
     "PluginManifest",
+    "PluginRegistry",
     "PluginProvides",
+    "NamespaceSnapshot",
+    "RegistrationResult",
+    "RegistryEntry",
+    "RegistryEntryFamily",
+    "RegistryRejection",
+    "RegistryRejectionReason",
+    "RegistrySnapshot",
     "RuntimeABI",
     "parse_manifest",
     "validate_manifest",
