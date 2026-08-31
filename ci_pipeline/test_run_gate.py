@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 import subprocess
+import tomllib
 
 import ci_pipeline.run_gate as run_gate
 
@@ -14,6 +16,21 @@ def test_pr_pipeline_keeps_python314_gate():
 
 def test_explicit_pipeline_name_is_not_rewritten():
     assert run_gate.resolve_pipeline_name("pr311", (3, 11)) == "pr311"
+
+
+def test_cp311_wheel_jobs_honor_declared_build_backend():
+    suite_path = Path(__file__).parent / "suites" / "cp311_gate.toml"
+    with suite_path.open("rb") as suite_file:
+        suite = tomllib.load(suite_file)
+
+    wheel_jobs = {
+        job["name"]: job["command"]
+        for job in suite["jobs"]
+        if job["name"] in {"wheel_build_import", "release_canary_execute"}
+    }
+
+    assert set(wheel_jobs) == {"wheel_build_import", "release_canary_execute"}
+    assert all("--no-build-isolation" not in command for command in wheel_jobs.values())
 
 
 def test_configure_toolchain_prefers_target_python_compilers(monkeypatch):
