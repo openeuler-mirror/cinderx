@@ -18,8 +18,9 @@
 // Goldens live in RuntimeTests/hir_pipeline_golden/<py>.<minor>/<arch>/
 // and are regenerated with UPDATE_HIR_PIPELINE_GOLDEN=1 (see
 // TestScripts/update_hir_pipeline_golden.py).  Per the version policy the
-// gated line is Python 3.14; other versions/architectures only get goldens
-// once generated on such a host, and the test skips (loudly) until then.
+// gated lines are Python 3.11 and 3.14; other versions/architectures only
+// get goldens once generated on such a host, and the test skips (loudly)
+// until then.
 
 #include "cinderx/RuntimeTests/fixtures.h"
 
