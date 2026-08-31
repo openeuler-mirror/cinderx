@@ -24,13 +24,65 @@ def test_cp311_wheel_jobs_honor_declared_build_backend():
         suite = tomllib.load(suite_file)
 
     wheel_jobs = {
-        job["name"]: job["command"]
+        job["name"]: job
         for job in suite["jobs"]
         if job["name"] in {"wheel_build_import", "release_canary_execute"}
     }
 
     assert set(wheel_jobs) == {"wheel_build_import", "release_canary_execute"}
-    assert all("--no-build-isolation" not in command for command in wheel_jobs.values())
+    assert all(
+        "--no-build-isolation" not in job["command"]
+        for job in wheel_jobs.values()
+    )
+    assert all(
+        job.get("env", {}).get("CINDERX_TEST_PREFER_MODERN_COMPILER") == "1"
+        for job in wheel_jobs.values()
+    )
+
+
+def test_configure_toolchain_uses_requested_modern_compilers(monkeypatch):
+    env = {
+        "CINDERX_TEST_PYTHON": "/usr/local/cpython-3.11.6/bin/python3.11",
+        "CINDERX_TEST_PREFER_MODERN_COMPILER": "1",
+    }
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[0] == env["CINDERX_TEST_PYTHON"]
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"CC": "gcc", "CXX": "g++"}),
+            stderr="",
+        )
+
+    def fake_first_executable(candidates, extra_globs):
+        if candidates[0] == "gcc-14":
+            return "/opt/gcc-14.2/bin/gcc"
+        if candidates[0] == "g++-14":
+            return "/opt/gcc-14.2/bin/g++"
+        return None
+
+    monkeypatch.setattr(run_gate.subprocess, "run", fake_run)
+    monkeypatch.setattr(run_gate, "first_executable", fake_first_executable)
+
+    run_gate.configure_toolchain(env)
+
+    assert env["CC"] == "/opt/gcc-14.2/bin/gcc"
+    assert env["CXX"] == "/opt/gcc-14.2/bin/g++"
+
+
+def test_merged_env_applies_job_overrides_before_toolchain(monkeypatch):
+    def fake_configure_toolchain(env):
+        assert env["CINDERX_TEST_PREFER_MODERN_COMPILER"] == "1"
+        env["CC"] = "/opt/gcc-14.2/bin/gcc"
+
+    monkeypatch.setattr(run_gate, "configure_toolchain", fake_configure_toolchain)
+
+    env = run_gate.merged_env(
+        {"env": {"CINDERX_TEST_PREFER_MODERN_COMPILER": "1"}}
+    )
+
+    assert env["CC"] == "/opt/gcc-14.2/bin/gcc"
 
 
 def test_configure_toolchain_prefers_target_python_compilers(monkeypatch):
