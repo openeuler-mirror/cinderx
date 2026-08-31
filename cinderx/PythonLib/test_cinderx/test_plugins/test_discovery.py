@@ -115,6 +115,23 @@ class PluginDiscoveryTests(unittest.TestCase):
             ["Demo.Plugin", "demo_plugin"],
         )
 
+    def test_structurally_v1_alternate_spi_survives_discovery(self) -> None:
+        payload = json.loads(valid_manifest("alternate-spi"))
+        payload["spi_version"] = "2"
+
+        results = discover(
+            distributions=(
+                FakeDistribution(
+                    "alternate-spi",
+                    json.dumps(payload, separators=(",", ":")),
+                ),
+            )
+        )
+
+        self.assertTrue(results[0].available)
+        assert results[0].manifest is not None
+        self.assertEqual(results[0].manifest.spi_version, "2")
+
     def test_equal_distribution_identities_sort_by_manifest_content(self) -> None:
         first_payload = json.loads(valid_manifest("duplicate"))
         first_payload["provides"] = {"contracts": [{"variant": "first"}]}

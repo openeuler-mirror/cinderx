@@ -18,6 +18,7 @@ from cinderx.plugins.manifest import (
     MAX_PROVIDE_ENTRIES,
     MAX_TARGET_CAPABILITIES,
     ManifestIssueCode,
+    parse_manifest,
     validate_manifest,
 )
 
@@ -300,6 +301,28 @@ class PluginManifestFailureTests(unittest.TestCase):
                     encode(payload),
                     ManifestIssueCode.SCHEMA_INVALID,
                     "$.spi_version",
+                )
+
+    def test_unsupported_spi_mode_is_bounded_and_defaults_stay_strict(self) -> None:
+        payload = valid_manifest()
+        payload["spi_version"] = "2"
+        encoded = encode(payload)
+
+        self.assertFalse(validate_manifest(encoded).accepted)
+        self.assertFalse(parse_manifest(encoded).accepted)
+        allowed = validate_manifest(encoded, allow_unsupported_spi=True)
+        self.assertTrue(allowed.accepted)
+        assert allowed.manifest is not None
+        self.assertEqual(allowed.manifest.spi_version, "2")
+
+        for invalid in (1, "", "x" * (MAX_IDENTIFIER_BYTES + 1)):
+            with self.subTest(invalid=invalid):
+                payload["spi_version"] = invalid
+                self.assertFalse(
+                    validate_manifest(
+                        encode(payload),
+                        allow_unsupported_spi=True,
+                    ).accepted
                 )
 
     def test_runtime_abi_has_an_exact_schema(self) -> None:
