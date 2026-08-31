@@ -132,6 +132,7 @@ class ArtifactVerificationResult:
     issue: ArtifactIssue | None
     closure: tuple[str, ...]
     inspected_file_records: int
+    root_distribution_version: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +246,8 @@ def _rejected(
     issue: ArtifactIssue,
     closure: Iterable[str],
     inspected: int = 0,
+    *,
+    root_version: str = "",
 ) -> ArtifactVerificationResult:
     return ArtifactVerificationResult(
         root_distribution_name=root_name,
@@ -252,6 +255,7 @@ def _rejected(
         issue=issue,
         closure=tuple(sorted(closure)),
         inspected_file_records=inspected,
+        root_distribution_version=root_version,
     )
 
 
@@ -259,6 +263,8 @@ def _accepted(
     root_name: str,
     closure: Iterable[str],
     inspected: int,
+    *,
+    root_version: str = "",
 ) -> ArtifactVerificationResult:
     return ArtifactVerificationResult(
         root_distribution_name=root_name,
@@ -266,6 +272,7 @@ def _accepted(
         issue=None,
         closure=tuple(sorted(closure)),
         inspected_file_records=inspected,
+        root_distribution_version=root_version,
     )
 
 
@@ -1142,6 +1149,7 @@ def _verify(
     root_identity_ambiguous: bool = False,
 ) -> ArtifactVerificationResult:
     root_name = _distribution_name(root)
+    root_version = _distribution_version(root)
     if budgets.max_edges < 0:
         return _rejected(
             root_name,
@@ -1151,6 +1159,7 @@ def _verify(
                 "declared closure exceeded the dependency-edge budget",
             ),
             (root_name,),
+            root_version=root_version,
         )
     if budgets.max_file_records < 0:
         return _rejected(
@@ -1161,6 +1170,7 @@ def _verify(
                 "declared closure exceeded the installed-file-record budget",
             ),
             (root_name,),
+            root_version=root_version,
         )
     if budgets.max_requirement_bytes < 0:
         return _rejected(
@@ -1171,6 +1181,7 @@ def _verify(
                 "a Requires-Dist entry exceeded the byte budget",
             ),
             (root_name,),
+            root_version=root_version,
         )
     if budgets.max_record_bytes < 0:
         return _rejected(
@@ -1181,6 +1192,7 @@ def _verify(
                 "the installed RECORD exceeded the byte budget",
             ),
             (root_name,),
+            root_version=root_version,
         )
     if not enumeration_complete:
         return _rejected(
@@ -1191,6 +1203,7 @@ def _verify(
                 "installed distributions could not be enumerated completely",
             ),
             (root_name,),
+            root_version=root_version,
         )
     resolution = _resolve_closure(
         root,
@@ -1203,7 +1216,12 @@ def _verify(
     )
     closure = tuple(name for name, _ in resolution.distributions)
     if resolution.issue is not None:
-        return _rejected(root_name, resolution.issue, closure or (root_name,))
+        return _rejected(
+            root_name,
+            resolution.issue,
+            closure or (root_name,),
+            root_version=root_version,
+        )
 
     inspected = 0
     for distribution_name, distribution in resolution.distributions:
@@ -1221,14 +1239,32 @@ def _verify(
                 ),
                 closure,
                 inspected,
+                root_version=root_version,
             )
         if not inspection.records_complete:
             assert inspection.issue is not None
-            return _rejected(root_name, inspection.issue, closure, inspected)
+            return _rejected(
+                root_name,
+                inspection.issue,
+                closure,
+                inspected,
+                root_version=root_version,
+            )
         inspected += inspection.inspected_file_records
         if inspection.issue is not None:
-            return _rejected(root_name, inspection.issue, closure, inspected)
-    return _accepted(root_name, closure, inspected)
+            return _rejected(
+                root_name,
+                inspection.issue,
+                closure,
+                inspected,
+                root_version=root_version,
+            )
+    return _accepted(
+        root_name,
+        closure,
+        inspected,
+        root_version=root_version,
+    )
 
 
 def verify_distribution_closure(
@@ -1250,6 +1286,7 @@ def verify_distribution_closure(
     """
 
     root_name = _distribution_name(root)
+    root_version = _distribution_version(root)
     candidates, complete = _materialize_installed(distributions)
     cache = _VerificationCache(
         requirement_parser,
@@ -1274,6 +1311,7 @@ def verify_distribution_closure(
                 "the installed distribution closure could not be verified",
             ),
             (root_name,),
+            root_version=root_version,
         )
 
 
@@ -1319,6 +1357,7 @@ def verify_distribution_closures(
     )
     for root in ordered_roots:
         root_name = _distribution_name(root)
+        root_version = _distribution_version(root)
         if not extras_complete:
             result = _rejected(
                 root_name,
@@ -1328,6 +1367,7 @@ def verify_distribution_closures(
                     "the installed distribution closure could not be verified",
                 ),
                 (root_name,),
+                root_version=root_version,
             )
         else:
             try:
@@ -1352,6 +1392,7 @@ def verify_distribution_closures(
                         "the installed distribution closure could not be verified",
                     ),
                     (root_name,),
+                    root_version=root_version,
                 )
         results.append(result)
 

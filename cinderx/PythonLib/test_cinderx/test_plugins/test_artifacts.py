@@ -16,6 +16,7 @@ from unittest.mock import patch
 from cinderx.plugins import (
     ArtifactBudgets,
     ArtifactIssueCode,
+    ArtifactVerificationResult,
     verify_distribution_closure,
     verify_distribution_closures,
 )
@@ -181,10 +182,22 @@ class ArtifactClosureTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertIsNone(result.issue)
         self.assertEqual(result.root_distribution_name, "pure-plugin")
+        self.assertEqual(result.root_distribution_version, "1.0")
         self.assertEqual(result.closure, ("pure-plugin",))
         self.assertEqual(result.inspected_file_records, 1)
         with self.assertRaises(FrozenInstanceError):
             result.accepted = False  # type: ignore[misc]
+
+    def test_result_version_field_has_backward_compatible_default(self) -> None:
+        result = ArtifactVerificationResult(
+            "legacy-plugin",
+            True,
+            None,
+            ("legacy-plugin",),
+            1,
+        )
+
+        self.assertEqual(result.root_distribution_version, "")
 
     def test_transitive_native_names_exact_distribution_and_path(self) -> None:
         parser = RequirementParser(
