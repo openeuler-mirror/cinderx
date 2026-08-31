@@ -37,11 +37,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "gtest_args",
-        nargs="*",
-        default=["--gtest_filter=HIRPipelineGolden.*"],
+        nargs=argparse.REMAINDER,
         help="Extra gtest arguments (default: only the golden suite)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.gtest_args:
+        args.gtest_args = ["--gtest_filter=HIRPipelineGolden.*"]
+    return args
 
 
 def main() -> int:
