@@ -1,4 +1,4 @@
-# HIR pipeline goldens (INFRA-1)
+# HIR pipeline Golden Samples (INFRA-1)
 
 This directory holds the no-behavior-drift baseline for
 `Compiler::runPasses` (`cinderx/Jit/compiler.cpp`).  Each file is the
@@ -10,7 +10,7 @@ call points, and an FNV-1a-64 hash of the normalized post-pass HIR
 
 The `HIRPipelineGolden` suite (`cinderx/RuntimeTests/hir_pipeline_test.cpp`)
 rebuilds each trace, asserts that two consecutive runs are identical
-(determinism gate), and compares against the committed golden.  Any
+(determinism gate), and compares against the committed Golden Sample.  Any
 reordering, duplication, omission or gating change of a pass — or a
 content change at any intermediate stage, including ones the final HIR
 converges away — fails the suite.  This is the acceptance gate for the
@@ -40,17 +40,19 @@ more scheduling units than an x86_64 build would.
 ## Version & platform policy
 
 Per the project README the supported platform is **Linux aarch64**
-(README_CN.md: 运行环境 Linux aarch64, 仅提供 aarch64 预编译 whl), and
-per the scenario-extension batch plan **CI and gates anchor Python 3.14
-only**.  Accordingly:
+(README_CN.md: 运行环境 Linux aarch64, 仅提供 aarch64 预编译 whl).
+The CPython 3.11 functional adaptation is complete, so the pipeline gate
+anchors both supported runtime lines.  Accordingly:
 
+- `3.11/aarch64` — anchored, gated.  Baseline generated on
+  openEuler 24.03 aarch64 with CPython 3.11.6.
 - `3.14/aarch64` — anchored, gated.  Baseline generated on
   openEuler 24.03 aarch64 with CPython 3.14.3.
-- x86_64 — not a supported product platform; no goldens committed and
+- x86_64 — not a supported product platform; no Golden Samples committed and
   no CI line.  The suite itself is arch-neutral and would skip loudly
-  if ever run there without goldens.
-- 3.11/3.12/3.15 — extension capability only (SPI/runtime_abi
-  negotiation stays version-aware); no goldens, not gated, not in CI.
+  if ever run there without Golden Samples.
+- 3.12/3.15 — extension capability only (SPI/runtime_abi negotiation
+  stays version-aware); no Golden Samples, not gated, not in CI.
 
 ## Regenerating
 
