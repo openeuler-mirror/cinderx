@@ -3,5 +3,5 @@
 # Diagnose a fingerprint diff: rerun with HIR_PIPELINE_FULL_DUMP=1 to print per-pass HIR.
 # Regenerate: TestScripts/update_hir_pipeline_golden.py <runtime_tests binary>
 # python: 3.11  arch: aarch64  config: kMinimal  case: CallChain
-step  1: SSAify#1                         0473d562d6148560 len=2573
-step  2: RefcountInsertion#1              277fb0ba340f0bee len=2825
+step  1: SSAify#1                         64eeeb6dd75d177c len=2609
+step  2: RefcountInsertion#1              fbe187cf78434816 len=2861
