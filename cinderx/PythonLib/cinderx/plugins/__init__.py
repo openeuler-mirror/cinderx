@@ -2,6 +2,21 @@
 # pyre-strict
 """Static declarations for the CinderX plugin framework."""
 
+from .artifacts import (
+    ArtifactBudgets,
+    ArtifactIssue,
+    ArtifactIssueCode,
+    ArtifactVerificationResult,
+    MAX_CLOSURE_EDGES,
+    MAX_CLOSURE_NODES,
+    MAX_DIAGNOSTIC_BYTES,
+    MAX_EVIDENCE_PATH_BYTES,
+    MAX_INSPECTED_FILE_RECORDS,
+    MAX_RECORD_BYTES,
+    MAX_REQUIREMENT_BYTES,
+    verify_distribution_closure,
+    verify_distribution_closures,
+)
 from .discovery import (
     DiscoveryIssue,
     DiscoveryIssueCode,
@@ -38,12 +53,23 @@ from .negotiation import (
 )
 
 __all__ = [
+    "ArtifactBudgets",
+    "ArtifactIssue",
+    "ArtifactIssueCode",
+    "ArtifactVerificationResult",
     "CURRENT_SPI_VERSION",
     "DiscoveryIssue",
     "DiscoveryIssueCode",
     "MANIFEST_FILENAME",
+    "MAX_CLOSURE_EDGES",
+    "MAX_CLOSURE_NODES",
+    "MAX_DIAGNOSTIC_BYTES",
     "MAX_ENTRIES_PER_SECTION",
+    "MAX_EVIDENCE_PATH_BYTES",
     "MAX_IDENTIFIER_BYTES",
+    "MAX_INSPECTED_FILE_RECORDS",
+    "MAX_RECORD_BYTES",
+    "MAX_REQUIREMENT_BYTES",
     "MAX_MANIFEST_BYTES",
     "MAX_NEGOTIATION_DETAIL_CHARS",
     "MAX_NEGOTIATION_DETAIL_VALUES",
@@ -66,4 +92,6 @@ __all__ = [
     "normalize_distribution_name",
     "parse_manifest",
     "validate_manifest",
+    "verify_distribution_closure",
+    "verify_distribution_closures",
 ]
