@@ -50,6 +50,9 @@ def test_cp311_wheel_jobs_honor_declared_build_backend():
         job["command"].count("$CINDERX_TEST_PYTHON") >= 2
         for job in wheel_jobs.values()
     )
+    wheel_command = wheel_jobs["wheel_build_import"]["command"]
+    assert "pytest==9.0.3" in wheel_command
+    assert "pytest==8.3.4" not in wheel_command
 
 
 def test_failure_log_tail_is_line_and_size_bounded(tmp_path):
