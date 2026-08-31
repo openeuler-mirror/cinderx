@@ -47,10 +47,30 @@ namespace {
 // Same normalization as HIRTest applies to expected/actual HIR: some
 // toolchains suffix private symbols with ".lto_priv.<n>", which would make
 // goldens toolchain-dependent.
-std::string normalizeToolchainPrivateSymbols(std::string hir) {
+std::string normalizePipelineHIR(std::string hir) {
   static const std::regex lto_priv_suffix{
       R"(([A-Za-z_][A-Za-z0-9_]*)\.lto_priv\.[0-9]+(@0x[0-9a-fA-F]+))"};
-  return std::regex_replace(hir, lto_priv_suffix, "$1$2");
+  hir = std::regex_replace(hir, lto_priv_suffix, "$1$2");
+
+  // Stable global loads embed the globals dict's keys version as the third
+  // operand of JITRT_LoadGlobalModuleValue.  That version is a process-global
+  // monotonic counter, so it depends on which tests initialized dictionaries
+  // first even when the HIR and pass behavior are otherwise identical.
+  // Normalize only registers used in that precise four-argument CallStatic
+  // position; unrelated CUInt32 constants remain part of the fingerprint.
+  static const std::regex global_load_call{
+      R"(CallStatic<[^>\n]*,\s*4>\s+\S+\s+\S+\s+(v[0-9]+)\s+\S+)"};
+  for (std::sregex_iterator it{hir.begin(), hir.end(), global_load_call}, end;
+       it != end;
+       ++it) {
+    const std::string version_reg = (*it)[1].str();
+    const std::regex version_const{fmt::format(
+        R"(({}\s*:CUInt32\[)[0-9]+(\]\s*=\s*LoadConst<CUInt32\[)[0-9]+(\]>))",
+        version_reg)};
+    hir = std::regex_replace(
+        hir, version_const, "$1<dict-keys-version>$2<dict-keys-version>$3");
+  }
+  return hir;
 }
 
 struct PipelineCase {
@@ -212,6 +232,24 @@ TEST(HIRPipelineGoldenPolicyTest, RequiredGoldenSamplesFailClosed) {
       MissingGoldenSamplePolicy::kSkip);
 }
 
+TEST(HIRPipelineGoldenPolicyTest, NormalizesGlobalDictKeysVersion) {
+  const std::string first = normalizePipelineHIR(
+      "v2:CUInt32[2147483648] = LoadConst<CUInt32[2147483648]>\n"
+      "v3:CUInt32[42] = LoadConst<CUInt32[42]>\n"
+      "v4:CUInt32[2147483999] = LoadConst<CUInt32[2147483999]>\n"
+      "v5:OptObject = CallStatic<0xdeadbeef, 4> v0 v1 v2 v3\n");
+  const std::string second = normalizePipelineHIR(
+      "v2:CUInt32[2147483658] = LoadConst<CUInt32[2147483658]>\n"
+      "v3:CUInt32[42] = LoadConst<CUInt32[42]>\n"
+      "v4:CUInt32[2147483999] = LoadConst<CUInt32[2147483999]>\n"
+      "v5:OptObject = CallStatic<0xdeadbeef, 4> v0 v1 v2 v3\n");
+
+  EXPECT_EQ(first, second);
+  EXPECT_NE(first.find("CUInt32[42]"), std::string::npos);
+  EXPECT_NE(first.find("CUInt32[2147483999]"), std::string::npos);
+  EXPECT_EQ(first.find("2147483648"), std::string::npos);
+}
+
 // Fixed 64-bit FNV-1a.  std::hash<std::string> is implementation-defined
 // and would make goldens non-portable across libstdc++ versions.
 uint64_t fnv1a64(std::string_view s) {
@@ -248,7 +286,7 @@ std::vector<PipelineStep> capturePipelineSteps(
         steps.push_back(PipelineStep{
             static_cast<int>(steps.size()) + 1,
             fmt::format("{}#{}", pass_name, occurrence),
-            normalizeToolchainPrivateSymbols(printer.ToString(func))});
+            normalizePipelineHIR(printer.ToString(func))});
       });
   return steps;
 }
