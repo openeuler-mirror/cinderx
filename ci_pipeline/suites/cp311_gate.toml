@@ -27,7 +27,7 @@ command = "bash -lc 'cd cinderx/Interpreter/3.11/upstream && sha256sum --check -
 name = "wheel_build_import"
 env = { CINDERX_TEST_PREFER_MODERN_COMPILER = "1" }
 failure_log_tail_lines = 80
-command = "bash -lc '\"$CINDERX_TEST_PYTHON\" -m pip wheel . -w \"{run_dir}/wheels\" --no-deps && \"$CINDERX_TEST_PYTHON\" -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\" && \"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pytest==8.3.4 && \"{run_dir}/venv/bin/python\" -m pytest --version'"
+command = "bash -lc '\"$CINDERX_TEST_PYTHON\" -m pip wheel . -w \"{run_dir}/wheels\" --no-deps && \"$CINDERX_TEST_PYTHON\" -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\" && \"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pytest==9.0.3 && \"{run_dir}/venv/bin/python\" -m pytest --version'"
 
 # Scenario 1b: the same thing at CMAKE_BUILD_TYPE=Release, running the
 # canary suite against it.  The default wheel is RelWithDebInfo, so without
