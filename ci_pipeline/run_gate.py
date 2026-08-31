@@ -34,6 +34,7 @@ ARTIFACT_ROOT = REPO_ROOT / "build" / "testgate"
 PYTHON_COMPAT_MATRIX = TESTGATE_DIR / "python_compat_matrix.toml"
 ALLOW_TARGET_MISMATCH_ENV = "CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH"
 AUTO_IMPORT_ENABLE_ENV = "CINDERX_PLUGIN_ENABLE"
+PREFER_MODERN_COMPILER_ENV = "CINDERX_TEST_PREFER_MODERN_COMPILER"
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
 COUNT_KEY_ALIASES = {
     "errors": "error",
@@ -331,6 +332,23 @@ def target_python_build_toolchain(env: dict[str, str]) -> dict[str, str]:
     return toolchain
 
 
+def modern_build_toolchain() -> dict[str, str]:
+    pairs = (
+        (
+            first_executable(["gcc-14"], ["opt/gcc-*/bin/gcc"]),
+            first_executable(["g++-14"], ["opt/gcc-*/bin/g++"]),
+        ),
+        (
+            first_executable(["clang-19"], ["opt/clang-*/bin/clang"]),
+            first_executable(["clang++-19"], ["opt/clang-*/bin/clang++"]),
+        ),
+    )
+    for cc, cxx in pairs:
+        if cc and cxx:
+            return {"CC": cc, "CXX": cxx}
+    return {}
+
+
 def configure_toolchain(env: dict[str, str]) -> None:
     env.setdefault("CINDERX_TEST_PYTHON", sys.executable)
     configure_pip_dependencies(env)
@@ -340,25 +358,36 @@ def configure_toolchain(env: dict[str, str]) -> None:
     target_toolchain = {}
     if need_cc or need_cxx:
         target_toolchain = target_python_build_toolchain(env)
+    preferred_toolchain = {}
+    if env_truthy(env.get(PREFER_MODERN_COMPILER_ENV)):
+        preferred_toolchain = modern_build_toolchain()
 
     if "CC" not in env:
-        cc = target_toolchain.get("CC") or first_executable(
-            ["gcc-14", "gcc", "clang-19", "clang"],
-            [
-                "opt/gcc-*/bin/gcc",
-                "opt/clang-*/bin/clang",
-            ],
+        cc = (
+            preferred_toolchain.get("CC")
+            or target_toolchain.get("CC")
+            or first_executable(
+                ["gcc-14", "gcc", "clang-19", "clang"],
+                [
+                    "opt/gcc-*/bin/gcc",
+                    "opt/clang-*/bin/clang",
+                ],
+            )
         )
         if cc:
             env["CC"] = cc
 
     if "CXX" not in env:
-        cxx = target_toolchain.get("CXX") or first_executable(
-            ["g++-14", "g++", "clang++-19", "clang++"],
-            [
-                "opt/gcc-*/bin/g++",
-                "opt/clang-*/bin/clang++",
-            ],
+        cxx = (
+            preferred_toolchain.get("CXX")
+            or target_toolchain.get("CXX")
+            or first_executable(
+                ["g++-14", "g++", "clang++-19", "clang++"],
+                [
+                    "opt/gcc-*/bin/g++",
+                    "opt/clang-*/bin/clang++",
+                ],
+            )
         )
         if cxx:
             env["CXX"] = cxx
@@ -366,12 +395,12 @@ def configure_toolchain(env: dict[str, str]) -> None:
 
 def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
     env = os.environ.copy()
+    for key, value in job.get("env", {}).items():
+        env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
     configure_toolchain(env)
     if coverage:
         env["CINDERX_ENABLE_COVERAGE"] = "1"
         env[AUTO_IMPORT_ENABLE_ENV] = "1"
-    for key, value in job.get("env", {}).items():
-        env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
     return env
 
 
