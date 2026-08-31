@@ -35,6 +35,7 @@ PYTHON_COMPAT_MATRIX = TESTGATE_DIR / "python_compat_matrix.toml"
 ALLOW_TARGET_MISMATCH_ENV = "CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH"
 AUTO_IMPORT_ENABLE_ENV = "CINDERX_PLUGIN_ENABLE"
 PREFER_MODERN_COMPILER_ENV = "CINDERX_TEST_PREFER_MODERN_COMPILER"
+FAILURE_LOG_TAIL_MAX_CHARS = 12_000
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
 COUNT_KEY_ALIASES = {
     "errors": "error",
@@ -780,6 +781,16 @@ def parse_pytest_summary(log_path: Path) -> dict[str, int] | None:
     return counts if found else None
 
 
+def failure_log_tail(log_path: Path, line_limit: int) -> str:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    bounded_text = text[-FAILURE_LOG_TAIL_MAX_CHARS:]
+    bounded_lines = max(1, min(line_limit, 200))
+    return "\n".join(bounded_text.splitlines()[-bounded_lines:])
+
+
 def run_job(
     job: dict[str, Any],
     run_dir: Path,
@@ -838,6 +849,15 @@ def run_job(
         print(f"[{marker} ] {name} [{counts_str}] ({log_path})", flush=True)
     else:
         print(f"[{marker} ] {name} ({log_path})", flush=True)
+
+    if completed.returncode != 0:
+        tail_lines = int(job.get("failure_log_tail_lines", 0))
+        if tail_lines > 0:
+            tail = failure_log_tail(log_path, tail_lines)
+            if tail:
+                print(f"--- {name} failure log tail ---", flush=True)
+                print(tail, flush=True)
+                print(f"--- end {name} failure log tail ---", flush=True)
 
     return {
         "name": name,
