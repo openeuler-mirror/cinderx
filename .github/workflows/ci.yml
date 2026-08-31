@@ -102,11 +102,20 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          test_filter='HIRPipelineGolden.*:HIRPipelineGoldenPolicyTest.*'
+          expected_tests="$(
+            ./build/rt/cinderx/RuntimeTests/runtime_tests \
+              --gtest_filter="$test_filter" --gtest_list_tests \
+              | awk '/^[A-Za-z_][A-Za-z0-9_\/]*\./ { suite = $1 }
+                     /^  [A-Za-z_]/ { count++ }
+                     END { print count + 0 }'
+          )"
+          test "$expected_tests" -gt 0
           ./build/rt/cinderx/RuntimeTests/runtime_tests \
-            --gtest_filter=HIRPipelineGolden.*:HIRPipelineGoldenPolicyTest.* \
+            --gtest_filter="$test_filter" \
             | tee build/rt/hir-pipeline-golden.log
           ! grep -q '^\[  SKIPPED \]' build/rt/hir-pipeline-golden.log
-          grep -q '^\[  PASSED  \] 37 tests\.$' \
+          grep -q "^\[  PASSED  \] $expected_tests tests\.$" \
             build/rt/hir-pipeline-golden.log
 
   build_wheels:
