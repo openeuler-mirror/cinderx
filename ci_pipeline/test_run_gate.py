@@ -41,6 +41,15 @@ def test_cp311_wheel_jobs_honor_declared_build_backend():
     assert all(
         job.get("failure_log_tail_lines") == 80 for job in wheel_jobs.values()
     )
+    assert all(
+        "python3.11 -m pip" not in job["command"]
+        and "python3.11 -m venv" not in job["command"]
+        for job in wheel_jobs.values()
+    )
+    assert all(
+        job["command"].count("$CINDERX_TEST_PYTHON") >= 2
+        for job in wheel_jobs.values()
+    )
 
 
 def test_failure_log_tail_is_line_and_size_bounded(tmp_path):
