@@ -4,6 +4,18 @@ import subprocess
 import ci_pipeline.run_gate as run_gate
 
 
+def test_pr_pipeline_routes_python311_to_pr311_gate():
+    assert run_gate.resolve_pipeline_name("pr", (3, 11)) == "pr311"
+
+
+def test_pr_pipeline_keeps_python314_gate():
+    assert run_gate.resolve_pipeline_name("pr", (3, 14)) == "pr"
+
+
+def test_explicit_pipeline_name_is_not_rewritten():
+    assert run_gate.resolve_pipeline_name("pr311", (3, 11)) == "pr311"
+
+
 def test_configure_toolchain_prefers_target_python_compilers(monkeypatch):
     env = {"CINDERX_TEST_PYTHON": "/usr/local/cpython-3.14.3/bin/python3.14"}
 
