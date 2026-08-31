@@ -169,6 +169,49 @@ bool updateGoldenRequested() {
   return env != nullptr && env[0] != '\0' && env != std::string_view("0");
 }
 
+enum class MissingGoldenSamplePolicy { kFail, kSkip };
+
+MissingGoldenSamplePolicy missingGoldenSamplePolicy(
+    int python_major,
+    int python_minor,
+    std::string_view arch,
+    bool is_linux) {
+  const bool required_runtime =
+      python_major == 3 && (python_minor == 11 || python_minor == 14);
+  return is_linux && arch == "aarch64" && required_runtime
+      ? MissingGoldenSamplePolicy::kFail
+      : MissingGoldenSamplePolicy::kSkip;
+}
+
+MissingGoldenSamplePolicy missingGoldenSamplePolicy() {
+#if defined(__linux__)
+  constexpr bool kIsLinux = true;
+#else
+  constexpr bool kIsLinux = false;
+#endif
+  return missingGoldenSamplePolicy(
+      PY_MAJOR_VERSION, PY_MINOR_VERSION, archName(), kIsLinux);
+}
+
+TEST(HIRPipelineGoldenPolicyTest, RequiredGoldenSamplesFailClosed) {
+  EXPECT_EQ(
+      missingGoldenSamplePolicy(3, 11, "aarch64", true),
+      MissingGoldenSamplePolicy::kFail);
+  EXPECT_EQ(
+      missingGoldenSamplePolicy(3, 14, "aarch64", true),
+      MissingGoldenSamplePolicy::kFail);
+
+  EXPECT_EQ(
+      missingGoldenSamplePolicy(3, 12, "aarch64", true),
+      MissingGoldenSamplePolicy::kSkip);
+  EXPECT_EQ(
+      missingGoldenSamplePolicy(3, 14, "x86_64", true),
+      MissingGoldenSamplePolicy::kSkip);
+  EXPECT_EQ(
+      missingGoldenSamplePolicy(3, 14, "aarch64", false),
+      MissingGoldenSamplePolicy::kSkip);
+}
+
 // Fixed 64-bit FNV-1a.  std::hash<std::string> is implementation-defined
 // and would make goldens non-portable across libstdc++ versions.
 uint64_t fnv1a64(std::string_view s) {
@@ -295,9 +338,16 @@ class HIRPipelineGoldenTest : public RuntimeTest {
     }
 
     if (!std::filesystem::exists(path)) {
-      GTEST_SKIP() << "no golden for python "
-                   << PY_MAJOR_VERSION << "." << PY_MINOR_VERSION << " / "
-                   << archName() << " (" << case_.name << "__" << config_.name
+      if (missingGoldenSamplePolicy() == MissingGoldenSamplePolicy::kFail) {
+        FAIL() << "missing required Golden Sample for python "
+               << PY_MAJOR_VERSION << "." << PY_MINOR_VERSION << " / "
+               << archName() << " (" << case_.name << "__" << config_.name
+               << "); regenerate it intentionally with"
+               << " cinderx/TestScripts/update_hir_pipeline_golden.py";
+      }
+      GTEST_SKIP() << "no Golden Sample for python " << PY_MAJOR_VERSION << "."
+                   << PY_MINOR_VERSION << " / " << archName() << " ("
+                   << case_.name << "__" << config_.name
                    << "); generate one on this platform with"
                    << " UPDATE_HIR_PIPELINE_GOLDEN=1";
     }
@@ -306,7 +356,7 @@ class HIRPipelineGoldenTest : public RuntimeTest {
         (std::istreambuf_iterator<char>(in)),
         std::istreambuf_iterator<char>());
     EXPECT_EQ(actual, expected)
-        << "HIR pipeline trace drifted from golden " << path.string()
+        << "HIR pipeline trace drifted from Golden Sample " << path.string()
         << " (case " << case_.name << ", config " << config_.name
         << "). If the change is intentional, regenerate with"
         << " UPDATE_HIR_PIPELINE_GOLDEN=1 and review the fingerprint diff;"
