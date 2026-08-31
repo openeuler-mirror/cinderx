@@ -79,6 +79,18 @@ DAILY_COMPAT_GROUPS = (
 )
 
 
+def resolve_pipeline_name(
+    pipeline_name: str,
+    python_version: tuple[int, int] | None = None,
+) -> str:
+    """Route the generic PR entry point to the active Python line."""
+    if python_version is None:
+        python_version = (sys.version_info.major, sys.version_info.minor)
+    if pipeline_name == "pr" and python_version == (3, 11):
+        return "pr311"
+    return pipeline_name
+
+
 def load_suite(name: str) -> dict[str, Any]:
     suite_path = SUITES_DIR / f"{name}.toml"
     if not suite_path.exists():
@@ -1654,7 +1666,14 @@ def main(argv: list[str]) -> int:
             if args.suite == "daily":
                 parser.error("daily is pipeline-only; use `ci_pipeline/run_gate.py daily`")
             return run_suite_command(args.suite, args)
-        return run_pipeline_command(args.pipeline, args)
+        pipeline_name = resolve_pipeline_name(args.pipeline)
+        if pipeline_name != args.pipeline:
+            print(
+                f"pipeline: {args.pipeline} routed to {pipeline_name} for "
+                f"Python {sys.version_info.major}.{sys.version_info.minor}",
+                flush=True,
+            )
+        return run_pipeline_command(pipeline_name, args)
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
