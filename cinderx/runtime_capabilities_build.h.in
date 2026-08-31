@@ -1,0 +1,5 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#pragma once
+
+#define CINDERX_CORE_BUILD_ID "@_cinderx_core_build_id@"
