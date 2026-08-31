@@ -38,6 +38,23 @@ def test_cp311_wheel_jobs_honor_declared_build_backend():
         job.get("env", {}).get("CINDERX_TEST_PREFER_MODERN_COMPILER") == "1"
         for job in wheel_jobs.values()
     )
+    assert all(
+        job.get("failure_log_tail_lines") == 80 for job in wheel_jobs.values()
+    )
+
+
+def test_failure_log_tail_is_line_and_size_bounded(tmp_path):
+    log_path = tmp_path / "failed.log"
+    log_path.write_text(
+        "first\nsecond\n" + ("x" * 12_500) + "\nlast\n",
+        encoding="utf-8",
+    )
+
+    tail = run_gate.failure_log_tail(log_path, line_limit=2)
+
+    assert tail.endswith("\nlast")
+    assert "first" not in tail
+    assert len(tail) <= run_gate.FAILURE_LOG_TAIL_MAX_CHARS
 
 
 def test_configure_toolchain_uses_requested_modern_compilers(monkeypatch):
