@@ -50,6 +50,11 @@ CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
+The generic `pr` entry point is version-aware: when it is invoked by Python
+3.11, it routes to `pr311`.  This keeps multi-version CI wrappers from
+accidentally applying the Python 3.14 `runtime` target to the 3.11 worker.
+Calling `pr311` explicitly remains supported.
+
 The `pr` pipeline runs in this order:
 
 1. `runtime`: build and run native `RuntimeTests` through CMake. `--coverage`

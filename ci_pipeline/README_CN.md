@@ -47,6 +47,10 @@ CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
+通用 `pr` 入口会识别解释器版本：由 Python 3.11 调用时自动路由到
+`pr311`，避免多版本 CI 包装脚本把面向 Python 3.14 的 `runtime` 目标错误地
+施加到 3.11 worker；仍然支持显式调用 `pr311`。
+
 `pr` pipeline 的顺序是：
 
 1. `runtime`：CMake 构建并运行 native `RuntimeTests`，`--coverage` 只作用于这个 suite。
