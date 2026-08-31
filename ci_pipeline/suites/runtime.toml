@@ -18,6 +18,9 @@ name = "runtime_tests"
 kind = "runtime_tests"
 coverage = true
 [jobs.env]
+# Runtime gates compare committed Golden Samples; only the dedicated update
+# script may inject update mode intentionally.
+UPDATE_HIR_PIPELINE_GOLDEN = "0"
 CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX = "CmdLineTest.LightweightFrame|ReifyFrameTest|Deopt"
 CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR = "1"
 ENABLE_LIGHTWEIGHT_FRAMES = "1"

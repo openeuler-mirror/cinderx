@@ -899,6 +899,32 @@ def test_green_gate_refuses_skips(tmp_path):
     ).returncode == 0
 
 
+def test_runtime_gates_drop_inherited_golden_sample_update_mode():
+    import os as _os
+    import subprocess as _sp
+
+    env = dict(_os.environ)
+    env["UPDATE_HIR_PIPELINE_GOLDEN"] = "1"
+    for name in (
+        "run_rt311_green.sh",
+        "run_asan_build_311.sh",
+        "rt314_differential.sh",
+    ):
+        script = (
+            Path(runners.REPO_ROOT) / "ci_pipeline" / "scripts" / name
+        )
+        proc = _sp.run(
+            ["bash", str(script), "--verify-golden-update-env"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+        assert proc.returncode == 0, (name, proc.stderr)
+        assert proc.stdout.strip() == "0", name
+
+
 def _rt314_fixture_logs(tmp_path):
     base = tmp_path / "base.log"
     base.write_text(

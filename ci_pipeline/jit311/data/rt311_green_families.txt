@@ -17,6 +17,7 @@ DeoptSiteIdTest
 FuncTypeCheckTest
 HIRBuildTest
 HIRPipelineGolden
+HIRPipelineGoldenPolicyTest
 InstrusiveListTest
 IntrusiveListTest
 JITConfigTest

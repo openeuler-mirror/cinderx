@@ -16,6 +16,9 @@ set -euo pipefail
 # the committed files are byte-ordered, and a UTF-8 runner locale would
 # order the live lists differently and fake an identity drift.
 export LC_ALL=C
+# This is a compare-only gate. Updating Golden Samples is an intentional,
+# separate operation owned by update_hir_pipeline_golden.py.
+export UPDATE_HIR_PIPELINE_GOLDEN=0
 # Inherited GTEST_*/TESTBRIDGE_* could filter or shard what executes; the
 # gate owns its execution surface (the PASSED==manifest check would catch
 # the shrink, but a clean environment fails faster and clearer).
@@ -149,6 +152,12 @@ fi
 if [ "${1:-}" = "--verify-green-log" ]; then
   green_log_verdict "${2:?log}" "${3:?expected count}"
   exit $?
+fi
+if [ "${1:-}" = "--verify-golden-update-env" ]; then
+  # Self-test entry: prove a dirty parent environment cannot put the gate in
+  # Golden Sample update mode, without configuring or building RuntimeTests.
+  printf '%s\n' "$UPDATE_HIR_PIPELINE_GOLDEN"
+  exit 0
 fi
 
 BUILD_DIR=${1:?usage: run_rt311_green.sh <build_dir> [--census]}
