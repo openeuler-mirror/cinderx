@@ -1,5 +1,7 @@
 include CMakeLists.txt
+include cmake/CinderXBuildId.cmake
 include ci_pipeline/cmake_options.py
+include cinderx/runtime_capabilities_build.h.in
 recursive-include cinderx *.cpp *.c *.h CMakeLists.txt
 recursive-include cinderx/UpstreamBorrow *.template *.md *.txt *.html
 
