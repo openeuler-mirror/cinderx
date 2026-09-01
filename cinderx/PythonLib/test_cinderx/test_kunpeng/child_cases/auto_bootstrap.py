@@ -4,8 +4,10 @@ import sys
 
 def lightweight_bootstrap() -> None:
     import _cinderx_auto  # noqa: F401
+    import _cinderx_plugins_bootstrap
 
     assert "_cinderx_plugins_bootstrap" in sys.modules
+    assert _cinderx_plugins_bootstrap.bootstrapped
     assert "cinderx" not in sys.modules
     assert "_cinderx" in sys.modules
     if sys.version_info[:2] == (3, 11):
