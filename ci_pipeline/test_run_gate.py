@@ -403,14 +403,11 @@ def test_cp311_release_builder_and_smoke_keep_exact_platform_anchor():
     assert "python3-devel-${PYTHON3_NVR}" in smoke
 
 
-def test_autojit_zero_threshold_is_only_rejected_on_cp311():
+def test_autojit_zero_threshold_is_not_version_gated():
     source = (Path(run_gate.REPO_ROOT) / "cinderx" / "Jit" / "pyjit.cpp").read_text()
 
-    helper = source[source.index("bool validAutoJitThreshold") :]
-    helper = helper[: helper.index("bool parseAutoJitOption")]
-    assert "#if PY_VERSION_HEX < 0x030C0000" in helper
-    assert "return threshold > 0;" in helper
-    assert "#else\n  return true;" in helper
+    assert "bool validAutoJitThreshold" not in source
+    assert "expected a non-negative integer" in source
 
 
 def test_configure_toolchain_prefers_target_python_compilers(monkeypatch):

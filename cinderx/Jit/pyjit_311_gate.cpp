@@ -460,7 +460,8 @@ extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
 // RuntimeTests uses this to enter synthetic artifacts which are not installed
 // on a function.  Keep the regular installed-artifact path in
 // Ci_JitShell311_GuardedEntry: moving that path behind this helper changes its
-// Py_DEBUG refcount lifetime.
+// Py_DEBUG refcount lifetime.  The soft-limit check, pin, invocation scope,
+// and vectorcall sequence below must stay synchronized with that path.
 extern "C" PyObject* Ci_JitShell311_InvokeArtifact(
     void* artifact,
     PyObject* func_obj,
@@ -506,6 +507,8 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // Keyword names and a mismatched positional count are the generated
   // prologue's job (JITRT_CallWithKeywordArgs /
   // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
+  // Keep the sequence below synchronized with Ci_JitShell311_InvokeArtifact;
+  // it remains inline here to preserve the installed path's Py_DEBUG lifetime.
   // C-stack first so a soft-limit hit does not mutate recursion_remaining.
   // Py_EnterRecursiveCall waits until bind succeeds (body reentry), matching
   // CPython 3.11 initialize_locals then start_frame.  A bind TypeError at

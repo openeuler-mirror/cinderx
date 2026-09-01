@@ -306,8 +306,8 @@ if [ "$MODE" = "--census" ]; then
   # Skip allowlist may only shrink silently, never grow: adding GTEST_SKIP
   # and its allowlist row in the same change would keep census green.
   SKIP_ALLOWLIST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_allowed_skips.txt"
-  SKIP_BOOTSTRAP_COUNT=130
-  SKIP_BOOTSTRAP_SHA256=80aae121d290fc73a5bb73c05df8411c8b83368b5377ab977009e36330d32001
+  SKIP_BOOTSTRAP_COUNT=202
+  SKIP_BOOTSTRAP_SHA256=af3d1176bec84c230dfd155dd418da23cf75032d04d95a6034dd255271a8e53e
   if [ -z "${RT311_BASELINE_BASE:-}" ]; then
     echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
     echo "(the skip-allowlist self-extension guard refuses to run open)"
@@ -385,8 +385,8 @@ if [ "$MODE" = "--census" ]; then
   # byte-match the audited pin below -- extending it moves the digest and
   # turns red; once the file lands at the base, the git comparison takes
   # over and the pin becomes inert.
-  BOOTSTRAP_COUNT=1139
-  BOOTSTRAP_SHA256=04ce056c841c3a2bc84a2ac8f9be9bedfb46ddf93c4ddc612e66fbf965a9f10a
+  BOOTSTRAP_COUNT=453
+  BOOTSTRAP_SHA256=bc5f29f6d7e14aefad6a33a79548819bb2a9a4e433c23d9155f9926a5569a5f5
   if [ -z "${RT311_BASELINE_BASE:-}" ]; then
     echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
     echo "(the baseline self-extension guard refuses to run open)"

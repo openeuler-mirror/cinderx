@@ -349,7 +349,9 @@ JUNIT_MODULE_ALIASES = (
 )
 
 
-def make_module_resolver(requested: list[str]):
+def make_module_resolver(
+    requested: list[str], available: list[str] | None = None
+):
     """Map a junit classname to the requested test name it belongs to.
 
     ``--list-tests`` mixes top-level names (test_grammar) with package paths
@@ -364,6 +366,7 @@ def make_module_resolver(requested: list[str]):
     """
     normalized = sorted((_normalize(r), r) for r in requested)
     by_length = sorted(normalized, key=lambda nr: len(nr[0]), reverse=True)
+    alias_targets = set(available if available is not None else requested)
     cache: dict[str, str] = {}
 
     def resolve(classname: str) -> str:
@@ -375,7 +378,7 @@ def make_module_resolver(requested: list[str]):
                 cache[cls] = req
                 return req
         for prefix, req in JUNIT_MODULE_ALIASES:
-            if req in requested and (
+            if req in alias_targets and (
                 cls == prefix or cls.startswith(prefix + ".")
             ):
                 cache[cls] = req
@@ -956,7 +959,7 @@ def reuse_stock_result(
             f"({attest_count} records, clean={attest_clean}): {attest_path}"
         )
 
-    resolve = make_module_resolver(list(result["modules"]))
+    resolve = make_module_resolver(modules, list(result["modules"]))
     wanted = set(modules)
     subset = {
         "meta": {

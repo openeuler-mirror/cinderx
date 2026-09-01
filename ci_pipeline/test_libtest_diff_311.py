@@ -115,6 +115,7 @@ def test_reuse_stock_result_resolves_cpython_junit_aliases(tmp_path, monkeypatch
         "test_ctypes": "pass",
         "test_datetime": "pass",
         "test_enum": "pass",
+        "test_profile": "pass",
         "test_unittest": "pass",
     }
     cases = {
@@ -169,6 +170,17 @@ def test_module_resolver_uses_profile_alias_when_only_cprofile_requested():
     assert (
         resolve("test.test_profile.ProfileTest.test_cprofile")
         == "test_cprofile"
+    )
+
+
+def test_module_resolver_keeps_unrequested_cross_module_aliases():
+    resolve = libtest_diff.make_module_resolver(
+        ["test_bytes"], ["test_bytes", "test_ctypes"]
+    )
+
+    assert (
+        resolve("ctypes.test.test_bytes.BytesTest.test_c_char")
+        == "test_ctypes"
     )
 
 

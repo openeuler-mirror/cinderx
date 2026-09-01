@@ -211,13 +211,13 @@ void* Ci_JitShell311_InvocationArtifact(void);
 // Run one call through an artifact the caller has already chosen: pin the
 // artifact for the duration of the call, publish it as the invocation
 // snapshot consulted by JITRT_ReenterAfterBind, and enter its vectorcall
-// entry.  This is the single path into machine code:
-// Ci_JitShell311_GuardedEntry routes here after its per-call re-checks, and
-// a test that drives generated code directly must route here too -- the
-// generated prologue resolves its bound-arguments reentry through the
-// snapshot, and entering the code without one silently runs the
-// interpreter instead of the machine-code body.  `artifact` is a
-// jit::CompiledFunction*.
+// entry.  RuntimeTests use this path for synthetic artifacts that are not
+// installed on a function.  Ci_JitShell311_GuardedEntry keeps the equivalent
+// soft-limit check, pin, invocation scope, and vectorcall sequence inline to
+// preserve its Py_DEBUG refcount lifetime.  Keep those two sequences in sync:
+// the generated prologue resolves its bound-arguments reentry through the
+// snapshot, and entering the code without one silently runs the interpreter
+// instead of the machine-code body.  `artifact` is a jit::CompiledFunction*.
 PyObject* Ci_JitShell311_InvokeArtifact(
     void* artifact,
     PyObject* func,

@@ -766,14 +766,6 @@ void configureCompileAfterNCalls(uint32_t calls, bool auto_classify) {
       auto_classify && autoJitImportProviderEnabledFromEnv();
 }
 
-bool validAutoJitThreshold(uint32_t threshold) {
-#if PY_VERSION_HEX < 0x030C0000
-  return threshold > 0;
-#else
-  return true;
-#endif
-}
-
 bool parseAutoJitOption(const std::string& value) {
   if (value.empty()) {
     configureCompileAfterNCalls(1, false);
@@ -789,8 +781,7 @@ bool parseAutoJitOption(const std::string& value) {
   if (value.starts_with(kAutoPrefix)) {
     std::string_view threshold_text{
         value.data() + kAutoPrefix.size(), value.size() - kAutoPrefix.size()};
-    if (parse_uint32_arg(threshold_text, &threshold) &&
-        validAutoJitThreshold(threshold)) {
+    if (parse_uint32_arg(threshold_text, &threshold)) {
       configureCompileAfterNCalls(threshold, true);
     } else {
       JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
@@ -798,7 +789,7 @@ bool parseAutoJitOption(const std::string& value) {
     }
     return true;
   }
-  if (parse_uint32_arg(value, &threshold) && validAutoJitThreshold(threshold)) {
+  if (parse_uint32_arg(value, &threshold)) {
     configureCompileAfterNCalls(threshold, false);
   } else {
     JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
@@ -5825,7 +5816,7 @@ int initialize() {
     PyErr_Format(
         PyExc_RuntimeError,
         "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11: "
-        "expected a positive integer");
+        "expected a non-negative integer");
     return -1;
   }
   auto resolved_threshold = getConfig().compile_after_n_calls;
