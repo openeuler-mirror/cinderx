@@ -85,6 +85,11 @@ python3.11 ci_pipeline/run_gate.py daily
 统一报告；不会重复 stock 72 或 evaluator-off 440，且该阶段不包含 shadow
 Lib/test arm。
 
+`test_release_daily_311` 还会运行有界的 72 模块 stdlib execute canary，
+包括精确的 organic-deopt 漂移守卫。pyperformance completion 命令保留为
+显式手工诊断入口，不属于 PR 或 Daily；因此自动功能门禁不声明覆盖完整的
+pyperformance worker crash、reject ledger 或 benchmark completion。
+
 `daily` pipeline 的顺序是：
 
 1. `runtime`

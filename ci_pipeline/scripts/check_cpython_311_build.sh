@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builder preflight for the cp311 release wheel. Refuses to build unless the
-# selected CPython 3.11.6 and compiler toolchain are actually present.
+# Builder preflight for the cp311 release wheel.  This script is intentionally
+# stricter than PR/dev builds: the deliverable is anchored to the distro
+# CPython NVR and the GCC 14 toolset in the openEuler 24.03-LTS-SP3 image.
 set -Eeuo pipefail
 
 resolve_executable() {
@@ -16,17 +17,33 @@ resolve_executable() {
   fi
 }
 
-PYTHON=$(resolve_executable "${CINDERX_CP311_PYTHON:-python3.11}")
-CC=$(resolve_executable "${CC:-gcc}")
-CXX=$(resolve_executable "${CXX:-g++}")
+PYTHON3_NVR=3.11.6-34.oe2403sp3
+test "$(rpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}' python3)" = \
+  "python3-${PYTHON3_NVR}"
+test "$(rpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}' python3-devel)" = \
+  "python3-devel-${PYTHON3_NVR}"
+
+PYTHON=$(resolve_executable python3.11)
+CC=$(resolve_executable gcc)
+CXX=$(resolve_executable g++)
 export PYTHON CC CXX
 "$PYTHON" -c "import sys; assert sys.version_info[:3] == (3, 11, 6), sys.version"
 
-gcc_version=$("$CXX" -dumpfullversion)
-case "$gcc_version" in
-  12.*|14.*) echo "g++ ${gcc_version}" ;;
-  *) echo "expected GCC 12.x or 14.x, got ${gcc_version}" >&2; exit 1 ;;
+cc_version=$("$CC" -dumpfullversion)
+cxx_version=$("$CXX" -dumpfullversion)
+case "$cc_version" in
+  14.*) ;;
+  *) echo "expected GCC 14.x, got ${cc_version}" >&2; exit 1 ;;
 esac
+case "$cxx_version" in
+  14.*) ;;
+  *) echo "expected G++ 14.x, got ${cxx_version}" >&2; exit 1 ;;
+esac
+test "${cc_version%%.*}" = "${cxx_version%%.*}" || {
+  echo "CC/CXX major mismatch: gcc ${cc_version}, g++ ${cxx_version}" >&2
+  exit 1
+}
+echo "gcc ${cc_version}; g++ ${cxx_version}"
 
 cmake --version | head -n 1
 

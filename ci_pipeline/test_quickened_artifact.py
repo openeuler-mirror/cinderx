@@ -146,6 +146,16 @@ class OriginalFailureShapeTests(unittest.TestCase):
         )
         self.assertTrue(artifact, why)
 
+    def test_pure_block_artifact_with_regrtest_duration_is_accepted(self):
+        text = block_failure_log().replace(
+            "test_listcomps failed (reference leak)",
+            "test_listcomps failed (reference leak) in 2 min 3 sec",
+        )
+        artifact, why = only_block_artifact_failure(
+            "test_listcomps", text, 2
+        )
+        self.assertTrue(artifact, why)
+
     def test_block_artifact_plus_ordinary_failure_is_rejected(self):
         artifact, why = only_block_artifact_failure(
             "test_listcomps",

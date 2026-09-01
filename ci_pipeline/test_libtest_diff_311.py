@@ -152,6 +152,26 @@ def test_reuse_stock_result_resolves_cpython_junit_aliases(tmp_path, monkeypatch
     }
 
 
+def test_module_resolver_prefers_requested_profile_over_cprofile_alias():
+    resolve = libtest_diff.make_module_resolver(
+        ["test_profile", "test_cprofile"]
+    )
+
+    assert (
+        resolve("test.test_profile.ProfileTest.test_bad_counter")
+        == "test_profile"
+    )
+
+
+def test_module_resolver_uses_profile_alias_when_only_cprofile_requested():
+    resolve = libtest_diff.make_module_resolver(["test_cprofile"])
+
+    assert (
+        resolve("test.test_profile.ProfileTest.test_cprofile")
+        == "test_cprofile"
+    )
+
+
 def test_reuse_stock_result_rejects_unattested_control(tmp_path, monkeypatch):
     stock_dir = tmp_path / "stock"
     stock_dir.mkdir()

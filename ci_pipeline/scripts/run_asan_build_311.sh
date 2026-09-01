@@ -182,3 +182,51 @@ fi
 bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
   --verify-green-log "$EXEC_DIR-canary.log" "$CANARY_EXPECTED"
 echo "asan canary-mode RuntimeTests ok ($CANARY_EXPECTED tests)"
+
+# RuntimeTests exercise the native compiler and execute-mode cases, but they
+# do not prove that the Python extension itself is instrumented and safe to
+# initialize, enter, deopt and tear down in a real interpreter.  Build only
+# the extension target from this existing ASAN tree, attest its instrumentation
+# and run the bounded canary.  This restores the Python/native boundary proof
+# without bringing back the removed duplicate full Debug+ASAN build.
+make -C "$EXEC_DIR" -j"$BUILD_JOBS" _cinderx \
+  > "$EXEC_DIR-extension-build.log" 2>&1 || {
+    echo "asan extension build FAILED"
+    tail -20 "$EXEC_DIR-extension-build.log"
+    exit 1
+  }
+ASAN_EXT=$(find "$EXEC_DIR" -name '_cinderx*.so' -type f | head -1)
+[ -n "$ASAN_EXT" ] || { echo "asan extension missing after build"; exit 1; }
+
+ASAN_SYMS=$(nm -D "$ASAN_EXT" 2>/dev/null | grep -c __asan || true)
+ASAN_NEEDED=$(readelf -d "$ASAN_EXT" 2>/dev/null | grep -c libasan || true)
+if [ "$ASAN_SYMS" -lt 1 ] || [ "$ASAN_NEEDED" -lt 1 ]; then
+  echo "asan extension is not instrumented (__asan symbols: $ASAN_SYMS,"
+  echo "libasan NEEDED: $ASAN_NEEDED); the canary would sanitize nothing"
+  exit 1
+fi
+echo "asan extension instrumented ($ASAN_SYMS __asan symbols): $ASAN_EXT"
+
+ASAN_RUNTIME=$("$ASAN_CC" -print-file-name=libasan.so)
+CANARY_PYTHONPATH="$(dirname "$ASAN_EXT"):$REPO_ROOT/cinderx/PythonLib"
+if [ -n "$PYTHON_EXTENSIONS_DIR" ]; then
+  CANARY_PYTHONPATH="$CANARY_PYTHONPATH:$PYTHON_EXTENSIONS_DIR"
+fi
+(cd "$REPO_ROOT" && \
+  env LD_PRELOAD="$ASAN_RUNTIME" \
+    ASAN_OPTIONS=detect_leaks=0:alloc_dealloc_mismatch=0 \
+    CINDERX_JIT_MODE=canary PYTHONJITAUTO=1 \
+    PYTHONPATH="$CANARY_PYTHONPATH" \
+    "$TEST_PYTHON" "$REPO_ROOT/ci_pipeline/scripts/asan_canary_smoke.py") \
+  > "$EXEC_DIR-extension-canary.log" 2>&1 || {
+    echo "asan extension canary FAILED"
+    tail -30 "$EXEC_DIR-extension-canary.log"
+    exit 1
+  }
+grep -q 'asan canary entries=' "$EXEC_DIR-extension-canary.log" || {
+  echo "asan extension canary produced no machine-code entry proof"
+  tail -20 "$EXEC_DIR-extension-canary.log"
+  exit 1
+}
+grep 'asan canary ' "$EXEC_DIR-extension-canary.log"
+echo "asan extension canary ok"

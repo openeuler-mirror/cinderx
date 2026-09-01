@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+import textwrap
 
 import ci_pipeline.run_gate as run_gate
 
@@ -55,6 +56,20 @@ def test_legacy_daily311_pipeline_remains_available():
         ("cp311_gate", False),
         ("cp311_daily", False),
     )
+
+
+def test_cp311_pipeline_mode_is_explicit():
+    assert run_gate.cp311_pipeline_env_overrides("pr", "cp311_gate") == {
+        "CINDERX_CP311_PIPELINE_MODE": "pr"
+    }
+    for suite_name in ("cp311_gate", "cp311_daily"):
+        assert run_gate.cp311_pipeline_env_overrides(
+            "daily", suite_name
+        ) == {"CINDERX_CP311_PIPELINE_MODE": "daily"}
+        assert run_gate.cp311_pipeline_env_overrides(
+            "daily311", suite_name
+        ) == {"CINDERX_CP311_PIPELINE_MODE": "daily"}
+    assert run_gate.cp311_pipeline_env_overrides("pr", "runtime") == {}
 
 
 def test_daily_compatibility_fanout_is_python314_only():
@@ -126,6 +141,18 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
     ).read_text()
 
     assert "CINDERX_TEST_WHEEL" in script
+    assert "CINDERX_CP311_PIPELINE_MODE" in script
+    assert "PR mode rejects CINDERX_TEST_WHEEL" in script
+    assert "Daily mode requires CINDERX_TEST_WHEEL" in script
+    assert 'archive.read("cinderx/_native/build_info_311.json")' in script
+    assert "require_matching_source_sha" in script
+    assert "run_step_continue asan_runtime_tests" in script
+    assert "run_step_continue debug_build" in script
+    assert "run_step_continue stdlib_execute_canary_72" in script
+    assert "--stdlib-canary" in script
+    assert "run_step_continue stock_evaluator_off_440" in script
+    assert "run_step_continue pydebug_refleak_10" in script
+    assert script.count("finish_daily_stage") == 3
     assert script.count("-m pip wheel") == 1
     build_requirements = (
         '"$TEST_PYTHON" -m pip install "${PIP_ARGS[@]}" --upgrade'
@@ -150,12 +177,81 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
     assert "libtest-tri" not in script
     assert "evaluator-off-vs-shadow" not in script
     assert "cinderx-test-support.pth" not in script
-    assert "import test.test_threading" in script
+    assert "import test, test.test_threading" in script
+    assert "print(test.__file__)" in script
+    assert '"$PYTHON" -I -c' not in script
     assert script.count('--jobs "$BUILD_JOBS"') == 2
     assert "stock_to_evaluator_off" not in script
     assert "evaluator_off_to_shadow" not in script
     assert "--skip-test-cinderx" not in script
     assert "--skip-libtest" in script
+
+
+def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
+    harness = textwrap.dedent(
+        r"""
+        set -euo pipefail
+        LOG_DIR=$(mktemp -d)
+        trap 'rm -rf -- "$LOG_DIR"' EXIT
+        source <(awk '
+          /^run_step\(\)/ { emit = 1 }
+          /^require_candidate\(\)/ { emit = 0 }
+          /^pip_args\(\)/ { emit = 1 }
+          /^import_dynsym_smoke\(\)/ { emit = 0 }
+          emit { print }
+        ' ci_pipeline/scripts/run_cp311_stage.sh)
+
+        bad_step() { false; echo SHOULD_NOT_RUN; }
+        good_step() { echo SECOND_STEP_RAN; }
+
+        set +e
+        run_step fail_fast_probe bad_step
+        first_rc=$?
+        set -e
+        test "$first_rc" -ne 0
+        ! grep -q SHOULD_NOT_RUN "$LOG_DIR/fail_fast_probe.log"
+
+        DAILY_FAILURES=()
+        run_step_continue first_daily_probe bad_step
+        run_step_continue second_daily_probe good_step
+        set +e
+        finish_daily_stage
+        daily_rc=$?
+        set -e
+        test "$daily_rc" -ne 0
+        grep -q SECOND_STEP_RAN "$LOG_DIR/second_daily_probe.log"
+
+        RUN_DIR=$LOG_DIR
+        VENV=$RUN_DIR/venv
+        PIP=$VENV/bin/pip
+        BUILD_JOBS=1
+        PIPELINE_MODE=pr
+        CINDERX_TEST_WHEEL=/unexpected/candidate.whl
+        set +e
+        setup_release
+        pr_rc=$?
+        set -e
+        test "$pr_rc" -eq 2
+
+        PIPELINE_MODE=daily
+        CINDERX_TEST_WHEEL=
+        set +e
+        setup_release
+        daily_wheel_rc=$?
+        set -e
+        test "$daily_wheel_rc" -eq 2
+        """
+    )
+
+    completed = subprocess.run(
+        ["bash"],
+        cwd=run_gate.REPO_ROOT,
+        input=harness,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_python_test_support_is_scoped_to_release_test_jobs():
@@ -235,7 +331,12 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert 'BUILD_DIR-exec' not in asan_script
     assert asan_script.count("cmake -S") == 1
     assert 'make -C "$EXEC_DIR"' in asan_script
-    assert "asan_canary_smoke.py" not in asan_script
+    assert "asan_canary_smoke.py" in asan_script
+    assert 'make -C "$EXEC_DIR" -j"$BUILD_JOBS" _cinderx' in asan_script
+    assert 'nm -D "$ASAN_EXT"' in asan_script
+    assert 'readelf -d "$ASAN_EXT"' in asan_script
+    assert 'LD_PRELOAD="$ASAN_RUNTIME"' in asan_script
+    assert '"$TEST_PYTHON" "$REPO_ROOT/ci_pipeline/scripts/asan_canary_smoke.py"' in asan_script
 
     assert "CINDERX_TEST_JOBS" in refleak_script
     assert "CINDERX_REFLEAK_PYTHON_SOURCE" in refleak_script
@@ -265,8 +366,41 @@ def test_cp311_container_scripts_resolve_bare_executable_names():
         assert '[[ "$candidate" == */* ]]' in script
 
     builder = scripts[0]
-    assert 'CC=$(resolve_executable "${CC:-gcc}")' in builder
-    assert 'CXX=$(resolve_executable "${CXX:-g++}")' in builder
+    assert "PYTHON=$(resolve_executable python3.11)" in builder
+    assert "CC=$(resolve_executable gcc)" in builder
+    assert "CXX=$(resolve_executable g++)" in builder
+
+
+def test_cp311_release_builder_and_smoke_keep_exact_platform_anchor():
+    pipeline_dir = Path(run_gate.REPO_ROOT) / "ci_pipeline"
+    driver = (pipeline_dir / "build_cp311_wheel.py").read_text()
+    scripts_dir = pipeline_dir / "scripts"
+    builder = (scripts_dir / "build_cp311_wheel_in_container.sh").read_text()
+    preflight = (scripts_dir / "check_cpython_311_build.sh").read_text()
+    smoke = (scripts_dir / "smoke_cp311_wheel_in_runtime.sh").read_text()
+
+    for inherited in (
+        '"CINDERX_SKIP_BUILDER_CHECK"',
+        '"CINDERX_CP311_PYTHON"',
+        '"CC"',
+        '"CXX"',
+        '"CMAKE_BUILD_TYPE"',
+    ):
+        assert f'"-e", {inherited}' not in driver
+    assert "CINDERX_SKIP_BUILDER_CHECK" not in builder
+    assert "export CMAKE_BUILD_TYPE=Release" in builder
+    assert "toolchain-311.txt" in builder
+
+    for script in (preflight, smoke):
+        assert "PYTHON3_NVR=3.11.6-34.oe2403sp3" in script
+    assert "python3-devel-${PYTHON3_NVR}" in preflight
+    assert 'case "$cc_version"' in preflight
+    assert 'case "$cxx_version"' in preflight
+    assert "expected GCC 14.x" in preflight
+    assert "expected G++ 14.x" in preflight
+    assert "CC/CXX major mismatch" in preflight
+    assert 'for module in ("_testcapi", "_testinternalcapi")' in smoke
+    assert "python3-devel-${PYTHON3_NVR}" in smoke
 
 
 def test_autojit_zero_threshold_is_only_rejected_on_cp311():
@@ -325,8 +459,9 @@ def test_configure_toolchain_keeps_explicit_compilers(monkeypatch):
     assert env["CXX"] == "/custom/g++"
 
 
-def test_runtime_tests_enable_runtime_selectable_frames_on_cpython311(
+def test_runtime_tests_disable_lightweight_frames_on_cpython311(
     monkeypatch,
+    tmp_path,
 ):
     monkeypatch.setattr(
         run_gate,
@@ -343,7 +478,25 @@ def test_runtime_tests_enable_runtime_selectable_frames_on_cpython311(
     )
 
     options = run_gate.runtime_tests_cmake_options(
-        {"CINDERX_TEST_PYTHON": "/usr/bin/python3.11"}
+        {
+            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
+            "ENABLE_LIGHTWEIGHT_FRAMES": "1",
+            "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
+        }
     )
 
-    assert "-DENABLE_LIGHTWEIGHT_FRAMES=1" in options
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in options
+    assert "-DENABLE_INTERPRETER_LOOP=1" in options
+
+    command = run_gate.runtime_tests_command(
+        {"name": "runtime_tests_311"},
+        tmp_path,
+        {
+            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
+            "ENABLE_LIGHTWEIGHT_FRAMES": "1",
+            "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
+        },
+    )
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in command
+    assert "PYTHONJITLIGHTWEIGHTFRAME=1" not in command
+    assert "env -u PYTHONJITLIGHTWEIGHTFRAME" in command

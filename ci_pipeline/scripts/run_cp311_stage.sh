@@ -8,6 +8,7 @@ RUN_DIR=${2:?usage: run_cp311_stage.sh <stage> <run_dir>}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
 BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
+PIPELINE_MODE=${CINDERX_CP311_PIPELINE_MODE:-}
 VENV="$RUN_DIR/venv"
 PYTHON="$VENV/bin/python"
 PIP="$VENV/bin/pip"
@@ -35,13 +36,21 @@ PY
 run_step() {
   local name=$1
   shift
-  local started ended rc
+  local started ended rc had_errexit=0
   started=$(date +%s)
   echo "[ CP311 STEP ] $name"
+  [[ $- == *e* ]] && had_errexit=1
   set +e
-  "$@" > >(tee "$LOG_DIR/$name.log") 2>&1
+  (
+    set -e
+    "$@"
+  ) > >(tee "$LOG_DIR/$name.log") 2>&1
   rc=$?
-  set -e
+  if [ "$had_errexit" -eq 1 ]; then
+    set -e
+  else
+    set +e
+  fi
   ended=$(date +%s)
   printf '%s\n' "$((ended - started))" > "$LOG_DIR/$name.seconds"
   if [ "$rc" -ne 0 ]; then
@@ -49,6 +58,29 @@ run_step() {
     return "$rc"
   fi
   echo "[ CP311 PASS ] $name ($((ended - started))s)"
+}
+
+DAILY_FAILURES=()
+
+run_step_continue() {
+  local name=$1
+  local rc
+  set +e
+  run_step "$@"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    DAILY_FAILURES+=("$name:$rc")
+  fi
+  return 0
+}
+
+finish_daily_stage() {
+  if [ "${#DAILY_FAILURES[@]}" -eq 0 ]; then
+    return 0
+  fi
+  printf '[ CP311 DAILY FAILURES ] %s\n' "${DAILY_FAILURES[*]}"
+  return 1
 }
 
 require_candidate() {
@@ -68,15 +100,72 @@ pip_args() {
   fi
 }
 
+verify_daily_wheel_source() {
+  local wheel=$1
+  "$TEST_PYTHON" - "$wheel" "$REPO_ROOT" <<'PY'
+import json
+import subprocess
+import sys
+import zipfile
+
+from ci_pipeline.jit311.execution_acceptance import require_matching_source_sha
+
+wheel, source = sys.argv[1:]
+try:
+    with zipfile.ZipFile(wheel) as archive:
+        provenance = json.loads(
+            archive.read("cinderx/_native/build_info_311.json").decode("utf-8")
+        )
+except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+    raise SystemExit(f"daily wheel provenance is missing or invalid: {exc}")
+
+if provenance.get("format") != "cinderx-cp311-wheel-v1":
+    raise SystemExit(
+        f"unexpected daily wheel provenance format: {provenance.get('format')!r}"
+    )
+source_sha = subprocess.run(
+    ["git", "rev-parse", "HEAD"],
+    cwd=source,
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+try:
+    require_matching_source_sha(provenance.get("git_sha"), source_sha)
+except RuntimeError as exc:
+    raise SystemExit(str(exc))
+print(f"setup_release_311: wheel provenance matches HEAD {source_sha}")
+PY
+}
+
 setup_release() {
   local wheel=${CINDERX_TEST_WHEEL:-}
   local wheel_dir="$RUN_DIR/release-wheels"
-  pip_args
-  if [ -n "$wheel" ]; then
-    [ -f "$wheel" ] || {
-      echo "CINDERX_TEST_WHEEL does not exist: $wheel"
+  case "$PIPELINE_MODE" in
+    pr)
+      if [ -n "$wheel" ]; then
+        echo "PR mode rejects CINDERX_TEST_WHEEL; the candidate must be built from HEAD"
+        return 2
+      fi
+      ;;
+    daily)
+      if [ -z "$wheel" ]; then
+        echo "Daily mode requires CINDERX_TEST_WHEEL"
+        return 2
+      fi
+      [ -f "$wheel" ] || {
+        echo "CINDERX_TEST_WHEEL does not exist: $wheel"
+        return 2
+      }
+      verify_daily_wheel_source "$wheel"
+      ;;
+    *)
+      echo "CINDERX_CP311_PIPELINE_MODE must be pr or daily, got: ${PIPELINE_MODE:-<unset>}"
       return 2
-    }
+      ;;
+  esac
+  pip_args
+  if [ "$PIPELINE_MODE" = "daily" ]; then
     echo "setup_release_311: using CINDERX_TEST_WHEEL=$wheel"
   else
     rm -rf "$wheel_dir"
@@ -185,34 +274,40 @@ driver_selftests() {
     ci_pipeline/test_quickened_artifact.py \
     ci_pipeline/test_runtime_transition_report.py \
     ci_pipeline/test_semantic_naming.py \
-    ci_pipeline/test_shutdown_stability.py
+    ci_pipeline/test_shutdown_stability.py \
+    ci_pipeline/test_libtest_diff_311.py \
+    ci_pipeline/test_run_gate.py
 }
 
 test_release_daily() {
-  run_step asan_runtime_tests ci_pipeline/scripts/run_asan_build_311.sh \
+  run_step_continue asan_runtime_tests ci_pipeline/scripts/run_asan_build_311.sh \
     "$RUN_DIR/asan-build"
-  run_step debug_build ci_pipeline/scripts/run_debug_build_311.sh \
+  run_step_continue debug_build ci_pipeline/scripts/run_debug_build_311.sh \
     "$RUN_DIR/debug-build"
-  run_step test_cinderx_off_to_shadow "$PYTHON" \
+  run_step_continue stdlib_execute_canary_72 "$PYTHON" \
+    -m ci_pipeline.jit311.runners --stdlib-canary
+  run_step_continue test_cinderx_off_to_shadow "$PYTHON" \
     -m ci_pipeline.jit311.runners --shadow-surface --skip-libtest \
     --out "$RUN_DIR/test-cinderx-shadow"
+  finish_daily_stage
 }
 
 libtest_daily() {
-  "$PYTHON" -I -c 'import test.test_threading' || {
-    echo "candidate Python cannot import test.test_threading under -I: $PYTHON"
+  "$PYTHON" -c 'import test, test.test_threading; print(test.__file__)' || {
+    echo "candidate Python cannot import the configured Lib/test tree: $PYTHON"
     return 2
   }
-  run_step stock_evaluator_off_440 "$PYTHON" \
+  run_step_continue stock_evaluator_off_440 "$PYTHON" \
     ci_pipeline/libtest_diff_311.py off-gate --jobs "$BUILD_JOBS" \
     --out "$RUN_DIR/libtest-off"
-  run_step execute_72 "$PYTHON" ci_pipeline/libtest_diff_311.py \
+  run_step_continue execute_72 "$PYTHON" ci_pipeline/libtest_diff_311.py \
     execute-gate --jobs "$BUILD_JOBS" \
     --stock-dir "$RUN_DIR/libtest-off/stock" \
     --out "$RUN_DIR/libtest-execute"
-  run_step pydebug_refleak_10 ci_pipeline/scripts/run_refleak_311.sh \
+  run_step_continue pydebug_refleak_10 ci_pipeline/scripts/run_refleak_311.sh \
     "$RUN_DIR/refleak"
-  run_step unified_report unified_libtest_report
+  run_step_continue unified_report unified_libtest_report
+  finish_daily_stage
 }
 
 unified_libtest_report() {

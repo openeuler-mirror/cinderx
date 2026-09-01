@@ -75,7 +75,10 @@ def only_block_artifact_failure(
         return False, f"{module}: non-block leak is never an artifact"
 
     failure_lines = re.findall(
-        rf"^{re.escape(module)} failed(?: \(([^)]*)\))?$", text, re.M
+        rf"^{re.escape(module)} failed(?: \(([^)]*)\))?"
+        r"(?: in [^\r\n]+)?$",
+        text,
+        re.M,
     )
     if failure_lines != ["reference leak"]:
         return False, (

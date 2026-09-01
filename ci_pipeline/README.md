@@ -95,6 +95,12 @@ execute 72, the ten-module Py_DEBUG refleak check, and one unified report. It
 repeats neither stock 72 nor evaluator-off 440; the shadow Lib/test arm is not
 part of this stage.
 
+`test_release_daily_311` also runs the bounded 72-module stdlib execute canary,
+including its exact organic-deopt drift guard. The pyperformance completion
+commands remain explicit manual diagnostics and are not part of PR or Daily;
+therefore the automatic functional gates do not claim full pyperformance
+worker-crash, reject-ledger, or benchmark-completion coverage.
+
 The `daily` pipeline runs in this order:
 
 1. `runtime`

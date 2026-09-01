@@ -18,6 +18,11 @@ import sys
 import tomllib
 from typing import Any
 
+if __package__:
+    from .cmake_options import cmake_feature_options
+else:
+    from cmake_options import cmake_feature_options
+
 
 def find_repo_root() -> Path:
     path = Path(__file__).resolve()
@@ -84,6 +89,8 @@ DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),
     ("unsupported", "wheel_compat_negative"),
 )
+CP311_PIPELINE_MODE_ENV = "CINDERX_CP311_PIPELINE_MODE"
+CP311_SUITES = {"cp311_gate", "cp311_daily"}
 
 
 def load_suite(name: str) -> dict[str, Any]:
@@ -476,16 +483,6 @@ def lcov_ignore_errors_args(
     return ["--ignore-errors", ",".join(errors)]
 
 
-def cmake_value(value: object) -> str:
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        return value
-    raise ValueError(f"unsupported CMake option value: {value!r}")
-
-
 def cinderx_test_python_info(env: dict[str, str]) -> dict[str, Any]:
     code = (
         "import json, os, sys, sysconfig; "
@@ -517,42 +514,19 @@ def cinderx_test_python_info(env: dict[str, str]) -> dict[str, Any]:
 def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
     info = cinderx_test_python_info(env)
     py_version = str(info["py_version"])
-    meta_python = bool(info["meta_python"])
-    linux = bool(info["linux"])
-    mac = bool(info["mac"])
-    meta_312 = meta_python and py_version == "3.12"
-    is_stock_311 = py_version == "3.11" and not meta_python
-    is_314plus = py_version in {"3.14", "3.15"}
-
-    options: dict[str, str] = {
-        "PY_VERSION": py_version,
-        "Python_ROOT_DIR": str(info["python_root"]),
-        "Python_EXECUTABLE": str(info["executable"]),
-    }
+    feature_env = dict(env)
+    if py_version == "3.11":
+        # CPython 3.11 only supports materialized interpreter frames.  Do not
+        # forward a 3.14 suite's inherited LWF build option into a 3.11 build.
+        feature_env.pop("ENABLE_LIGHTWEIGHT_FRAMES", None)
+    options = cmake_feature_options(
+        py_version=py_version,
+        python_root=str(info["python_root"]),
+        env=feature_env,
+    )
+    options["Python_EXECUTABLE"] = str(info["executable"])
     if info.get("python_library"):
         options["Python_LIBRARY"] = str(info["python_library"])
-
-    def set_option(var: str, default: object) -> None:
-        options[var] = env.get(var, cmake_value(default))
-
-    set_option("META_PYTHON", meta_python)
-    set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
-    set_option("ENABLE_DISASSEMBLER", True)
-    set_option("ENABLE_ELF_READER", linux)
-    set_option("ENABLE_EVAL_HOOK", meta_312)
-    set_option("ENABLE_FUNC_EVENT_MODIFY_QUALNAME", meta_312)
-    set_option("ENABLE_GENERATOR_AWAITER", meta_312)
-    set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
-    set_option("ENABLE_LAZY_IMPORTS", meta_312)
-    set_option("ENABLE_LIGHTWEIGHT_FRAMES", is_stock_311 or meta_312)
-    set_option("ENABLE_PARALLEL_GC", meta_312)
-    set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
-    set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
-    set_option("ENABLE_SYMBOLIZER", linux)
-    set_option("ENABLE_USDT", linux)
-    set_option("ENABLE_XXCLASSLOADER", False)
-    set_option("ENABLE_ZLIB", linux or mac)
-
     return [f"-D{name}={value}" for name, value in options.items()]
 
 
@@ -617,6 +591,8 @@ def runtime_tests_command(
     build_type = env.get("CMAKE_BUILD_TYPE", "RelWithDebInfo")
     verbose_makefile = env.get("CMAKE_VERBOSE_MAKEFILE", "OFF")
     parallelism = env.get("CINDERX_TEST_JOBS", str(os.cpu_count() or 2))
+    feature_options = runtime_tests_cmake_options(env)
+    is_cp311 = "-DPY_VERSION=3.11" in feature_options
 
     cmake_args = [
         "cmake",
@@ -632,7 +608,7 @@ def runtime_tests_command(
             if env.get("CINDERX_ENABLE_LTO") is not None
             else "-DENABLE_LTO=OFF"
         ),
-        *runtime_tests_cmake_options(env),
+        *feature_options,
     ]
     if env.get("CINDERX_ENABLE_COVERAGE") == "1":
         cmake_args.append("-DENABLE_COVERAGE=ON")
@@ -655,7 +631,10 @@ def runtime_tests_command(
         parallelism,
     ]
     ctest_args = ["ctest", "--output-on-failure", "-C", build_type]
-    if truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR")):
+    if (
+        not is_cp311
+        and truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR"))
+    ):
         osr_regex = env.get("CINDERX_RUNTIME_TEST_OSR_REGEX", "OSR|Osr|osr")
         lightweight_regex = env.get(
             "CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX",
@@ -698,9 +677,14 @@ def runtime_tests_command(
             f"{osr_ctest_command}"
         )
     else:
+        ctest_prefix = (
+            ["env", "-u", "PYTHONJITLIGHTWEIGHTFRAME"]
+            if is_cp311
+            else []
+        )
         ctest_command = (
             f"cd {shlex.quote(str(build_dir))} && "
-            f"{shell_join(ctest_args)}"
+            f"{shell_join([*ctest_prefix, *ctest_args])}"
         )
 
     return " && ".join(
@@ -1338,6 +1322,22 @@ def clone_suite_with_env_overrides(
     return cloned_suite
 
 
+def cp311_pipeline_env_overrides(
+    pipeline_name: str,
+    suite_name: str,
+) -> dict[str, str]:
+    if suite_name not in CP311_SUITES:
+        return {}
+    if pipeline_name == "pr":
+        return {CP311_PIPELINE_MODE_ENV: "pr"}
+    if pipeline_name in {"daily", "daily311"}:
+        return {CP311_PIPELINE_MODE_ENV: "daily"}
+    raise ValueError(
+        f"CPython 3.11 suite {suite_name} has no mode for pipeline "
+        f"{pipeline_name}"
+    )
+
+
 def run_suite_jobs(
     suite: dict[str, Any],
     run_dir: Path,
@@ -1610,7 +1610,12 @@ def run_pipeline_command(
     for suite_invocation in pipeline:
         suite_name = suite_invocation[0]
         pass_coverage = bool(suite_invocation[1])
-        env_overrides = suite_invocation[2] if len(suite_invocation) > 2 else {}
+        env_overrides = dict(
+            suite_invocation[2] if len(suite_invocation) > 2 else {}
+        )
+        env_overrides.update(
+            cp311_pipeline_env_overrides(pipeline_name, suite_name)
+        )
         suite = load_suite(suite_name)
         target_status = check_suite_target(suite_name, suite, args)
         if target_status != 0:

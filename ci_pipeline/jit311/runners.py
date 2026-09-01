@@ -1579,7 +1579,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1 if failed else 0
     # `--pyperf` is a prefix of `--pyperformance-all`; dispatch on exact
-    # tokens, and handle the full applicable set first so the daily job
+    # tokens, and handle the full applicable set first so a manual full run
     # cannot silently shrink to the 33-name tranche.
     if "--pyperformance-all" in argv:
         spec = pyperformance_completeness_runner(
@@ -1587,8 +1587,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if spec is None:
             print(
-                "jit311-runners: pyperformance is required for the daily "
-                "shadow gate",
+                "jit311-runners: pyperformance is required for the manual "
+                "full shadow run",
                 file=sys.stderr,
             )
             return 2
@@ -1667,10 +1667,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.ok else 1
     if "--pyperf-canary" in argv:
         # The canary leg runs the committed tranche, not the full applicable
-        # set the shadow daily covers: every benchmark here compiles and
+        # set the separate manual shadow command covers: every benchmark
+        # here compiles and
         # executes machine code, which the nightly budget cannot absorb for
         # the whole set.  Say so out loud -- a bounded run that reads as
-        # full coverage is how a gate starts lying.
+        # full coverage is how validation starts lying.
         canary_names = load_pyperf_benchmarks()
         # The cap is deliberate, so it is stated as a fact the leg checks
         # rather than a line it prints.  Swallowing a discovery failure
@@ -1694,7 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"jit311-runners: canary completion leg covers "
             f"{len(canary_names)} of {discoverable} applicable benchmark(s); "
-            f"the remainder is covered by the shadow completeness leg"
+            f"run --pyperformance-all separately for the full shadow set"
         )
         spec = pyperformance_completeness_runner(
             mode="canary", benchmarks=list(canary_names)

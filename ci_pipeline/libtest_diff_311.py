@@ -355,10 +355,12 @@ def make_module_resolver(requested: list[str]):
     ``--list-tests`` mixes top-level names (test_grammar) with package paths
     (test.test_asyncio.test_events); junit classnames are full dotted paths.
     Longest-prefix match on dot boundaries after stripping the "test." prefix
-    keys ordinary cases back to their requested name.  CPython also reuses
-    test classes from alias modules (for example test_cprofile runs classes
-    defined in test_profile), so those aliases must win before the generic
-    fallback sees method names such as ``test_call`` or ``test_bytes``.
+    keys ordinary cases back to their requested name.  That match must run
+    before the alias table: both test_profile and test_cprofile are frozen
+    targets, so an unconditional alias would steal test_profile's own cases.
+    CPython also reuses test classes from alias modules (for example
+    test_cprofile runs classes defined in test_profile), so aliases remain a
+    fallback when the source module was not requested independently.
     """
     normalized = sorted((_normalize(r), r) for r in requested)
     by_length = sorted(normalized, key=lambda nr: len(nr[0]), reverse=True)
@@ -368,12 +370,14 @@ def make_module_resolver(requested: list[str]):
         cls = _normalize(classname)
         if cls in cache:
             return cache[cls]
-        for prefix, req in JUNIT_MODULE_ALIASES:
-            if cls == prefix or cls.startswith(prefix + "."):
-                cache[cls] = req
-                return req
         for norm, req in by_length:
             if cls == norm or cls.startswith(norm + "."):
+                cache[cls] = req
+                return req
+        for prefix, req in JUNIT_MODULE_ALIASES:
+            if req in requested and (
+                cls == prefix or cls.startswith(prefix + ".")
+            ):
                 cache[cls] = req
                 return req
         for part in cls.split("."):

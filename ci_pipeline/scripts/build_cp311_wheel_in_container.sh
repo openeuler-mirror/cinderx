@@ -17,7 +17,7 @@ set -x
 
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 export PYTHONUNBUFFERED=1
-export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+export CMAKE_BUILD_TYPE=Release
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 export CINDERX_VERSION_PATCH="${CINDERX_VERSION_PATCH:-0}"
 
@@ -34,11 +34,10 @@ resolve_executable() {
   fi
 }
 
-PYTHON=$(resolve_executable "${CINDERX_CP311_PYTHON:-python3.11}")
-CC=$(resolve_executable "${CC:-gcc}")
-CXX=$(resolve_executable "${CXX:-g++}")
+PYTHON=$(resolve_executable python3.11)
+CC=$(resolve_executable gcc)
+CXX=$(resolve_executable g++)
 export PYTHON CC CXX
-export CINDERX_CP311_PYTHON="$PYTHON"
 
 # Static C++ runtime.  The stock openEuler image carries the GCC 12 system
 # libstdc++ (GLIBCXX up to 3.4.30) while this GCC 14 build references
@@ -64,9 +63,16 @@ mkdir -p /out /out/logs /work
 
 # The checked-out tree's preflight is authoritative -- the copy baked into
 # the image only guards image builds and goes stale as the tree evolves.
-if [ "${CINDERX_SKIP_BUILDER_CHECK:-0}" != "1" ]; then
-  bash /src/ci_pipeline/scripts/check_cpython_311_build.sh
-fi
+bash /src/ci_pipeline/scripts/check_cpython_311_build.sh
+
+{
+  printf 'python=%s\n' "$PYTHON"
+  "$PYTHON" -VV
+  printf 'cc=%s\n' "$CC"
+  "$CC" --version | sed -n '1p'
+  printf 'cxx=%s\n' "$CXX"
+  "$CXX" --version | sed -n '1p'
+} > /out/logs/toolchain-311.txt
 
 # Interpreter build-config snapshot, mirroring the cp314 flow's evidence.
 "$PYTHON" - <<'PY' > /out/logs/cpython-311-build.jsonl
