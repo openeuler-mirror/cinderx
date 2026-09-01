@@ -22,10 +22,9 @@
 // get goldens once generated on such a host, and the test skips (loudly)
 // until then.
 
-#include "cinderx/RuntimeTests/fixtures.h"
-
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/RuntimeTests/fixtures.h"
 
 #include <fmt/format.h>
 
@@ -173,15 +172,15 @@ const char* archName() {
 }
 
 std::filesystem::path goldenRoot() {
-  return std::filesystem::path(__FILE__).parent_path() /
-      "hir_pipeline_golden";
+  return std::filesystem::path(__FILE__).parent_path() / "hir_pipeline_golden";
 }
 
 std::filesystem::path goldenPath(
     const PipelineCase& c,
     const PipelineConfig& cfg) {
-  return goldenRoot() / fmt::format("{}.{}", PY_MAJOR_VERSION, PY_MINOR_VERSION) /
-      archName() / fmt::format("{}__{}.txt", c.name, cfg.name);
+  return goldenRoot() /
+      fmt::format("{}.{}", PY_MAJOR_VERSION, PY_MINOR_VERSION) / archName() /
+      fmt::format("{}__{}.txt", c.name, cfg.name);
 }
 
 bool updateGoldenRequested() {
@@ -350,9 +349,12 @@ class HIRPipelineGoldenTest : public RuntimeTest {
 
     std::string actual = fmt::format(
         "# CinderX HIR pipeline golden - generated, do not hand-edit.\n"
-        "# Format: step <n>: <Pass>#<occurrence> <fnv1a64 of normalized post-pass HIR> len=<bytes>\n"
-        "# Diagnose a fingerprint diff: rerun with HIR_PIPELINE_FULL_DUMP=1 to print per-pass HIR.\n"
-        "# Regenerate: TestScripts/update_hir_pipeline_golden.py <runtime_tests binary>\n"
+        "# Format: step <n>: <Pass>#<occurrence> <fnv1a64 of normalized "
+        "post-pass HIR> len=<bytes>\n"
+        "# Diagnose a fingerprint diff: rerun with HIR_PIPELINE_FULL_DUMP=1 to "
+        "print per-pass HIR.\n"
+        "# Regenerate: TestScripts/update_hir_pipeline_golden.py "
+        "<runtime_tests binary>\n"
         "# python: {}.{}  arch: {}  config: {}  case: {}\n",
         PY_MAJOR_VERSION,
         PY_MINOR_VERSION,
@@ -391,8 +393,7 @@ class HIRPipelineGoldenTest : public RuntimeTest {
     }
     std::ifstream in(path, std::ios::binary);
     std::string expected(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
+        (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     EXPECT_EQ(actual, expected)
         << "HIR pipeline trace drifted from Golden Sample " << path.string()
         << " (case " << case_.name << ", config " << config_.name
