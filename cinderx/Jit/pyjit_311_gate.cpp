@@ -457,12 +457,10 @@ extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
   return t_invocation_artifact;
 }
 
-// The single path that enters an artifact's machine code once the caller
-// has committed to it.  The generated vectorcall prologue does not jump
-// into its own body: it resolves the bound-arguments reentry through
-// JITRT_ReenterAfterBind, which consults the invocation snapshot published
-// here.  Entering a generated entry without this scope resolves that
-// reentry to the interpreter and the machine-code body never runs.
+// RuntimeTests uses this to enter synthetic artifacts which are not installed
+// on a function.  Keep the regular installed-artifact path in
+// Ci_JitShell311_GuardedEntry: moving that path behind this helper changes its
+// Py_DEBUG refcount lifetime.
 extern "C" PyObject* Ci_JitShell311_InvokeArtifact(
     void* artifact,
     PyObject* func_obj,
@@ -508,8 +506,17 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // Keyword names and a mismatched positional count are the generated
   // prologue's job (JITRT_CallWithKeywordArgs /
   // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
-  return Ci_JitShell311_InvokeArtifact(
-      compiled, func_obj, args, nargsf, kwnames);
+  // C-stack first so a soft-limit hit does not mutate recursion_remaining.
+  // Py_EnterRecursiveCall waits until bind succeeds (body reentry), matching
+  // CPython 3.11 initialize_locals then start_frame.  A bind TypeError at
+  // recursion_remaining == 0 must stay TypeError, not RecursionError.
+  if (cStackSoftLimitReached311()) {
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+    return nullptr;
+  }
+  Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  InvocationArtifactScope invocation(compiled);
+  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }
 
 namespace {
