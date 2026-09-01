@@ -80,9 +80,10 @@ CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
 python3.11 ci_pipeline/run_gate.py daily
 ```
 
-`libtest_daily_311` 只执行一次 stock 440、evaluator-off 440 和 shadow 440，
-随后从 stock 440 结果中抽取 72 模块基线，只运行 execute 72、Py_DEBUG
-refleak 10，并写统一报告；不会重复 stock 72 或 evaluator-off 440。
+`libtest_daily_311` 只执行一次 stock 440 和 evaluator-off 440，随后从 stock
+440 结果中抽取 72 模块基线，只运行 execute 72、Py_DEBUG refleak 10，并写
+统一报告；不会重复 stock 72 或 evaluator-off 440，且该阶段不包含 shadow
+Lib/test arm。
 
 `daily` pipeline 的顺序是：
 

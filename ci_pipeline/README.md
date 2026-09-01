@@ -89,10 +89,11 @@ CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
 python3.11 ci_pipeline/run_gate.py daily
 ```
 
-`libtest_daily_311` runs stock 440, evaluator-off 440, and shadow 440 once
-each, extracts the 72-module control baseline from that stock result, and then
-runs only execute 72, the ten-module Py_DEBUG refleak check, and one unified
-report. It repeats neither stock 72 nor evaluator-off 440.
+`libtest_daily_311` runs stock 440 and evaluator-off 440 once each, extracts
+the 72-module control baseline from that stock result, and then runs only
+execute 72, the ten-module Py_DEBUG refleak check, and one unified report. It
+repeats neither stock 72 nor evaluator-off 440; the shadow Lib/test arm is not
+part of this stage.
 
 The `daily` pipeline runs in this order:
 
