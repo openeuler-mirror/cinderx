@@ -7,7 +7,24 @@ leak, so the cases below pin both directions.
 
 import unittest
 
-from ci_pipeline.jit311.quickened_artifact import classify, decide
+from ci_pipeline.jit311.quickened_artifact import (
+    classify,
+    decide,
+    only_block_artifact_failure,
+)
+
+
+def block_failure_log(module="test_listcomps", extra=""):
+    return (
+        f"{module} leaked [8, 8, 8] memory blocks, sum=24\n"
+        f"{module} failed (reference leak)\n"
+        f"{extra}"
+        "\n== Tests result: FAILURE ==\n\n"
+        "1 test failed:\n"
+        f"    {module}\n\n"
+        "Total test files: success=0 failed=1\n"
+        "Result: FAILURE\n"
+    )
 
 
 class DecideTests(unittest.TestCase):
@@ -84,9 +101,7 @@ class ClassifyFailClosedTests(unittest.TestCase):
         self.assertIn("never reached a regrtest result", why)
 
     def test_hook_producing_no_counts_is_not_an_artifact(self):
-        artifact, why = self._classify(
-            self.BLOCK_LINE + self.RESULT_FAIL, 2, None
-        )
+        artifact, why = self._classify(block_failure_log(), 2, None)
         self.assertFalse(artifact, why)
         self.assertIn("no counts", why)
 
@@ -118,7 +133,38 @@ class ClassifyFailClosedTests(unittest.TestCase):
     def test_a_healthy_run_with_matching_arithmetic_is_an_artifact(self):
         # The one path that may pass, so the tests above are not vacuous.
         artifact, why = self._classify(
-            self.BLOCK_LINE + self.RESULT_FAIL, 2, self.GOOD_COUNTS
+            block_failure_log(), 2, self.GOOD_COUNTS
         )
         self.assertTrue(artifact, why)
         self.assertIn("artifact", why)
+
+
+class OriginalFailureShapeTests(unittest.TestCase):
+    def test_pure_block_artifact_failure_is_accepted(self):
+        artifact, why = only_block_artifact_failure(
+            "test_listcomps", block_failure_log(), 2
+        )
+        self.assertTrue(artifact, why)
+
+    def test_block_artifact_plus_ordinary_failure_is_rejected(self):
+        artifact, why = only_block_artifact_failure(
+            "test_listcomps",
+            block_failure_log(
+                extra=(
+                    "FAIL: test_real_failure (test_listcomps.Tests.test_real_failure)\n"
+                    "Traceback (most recent call last):\n"
+                    "AssertionError: real failure\n"
+                )
+            ),
+            2,
+        )
+        self.assertFalse(artifact, why)
+        self.assertIn("ordinary failure", why)
+
+    def test_block_artifact_with_ambiguous_failure_reason_is_rejected(self):
+        text = block_failure_log().replace(
+            "test_listcomps failed (reference leak)", "test_listcomps failed"
+        )
+        artifact, why = only_block_artifact_failure("test_listcomps", text, 2)
+        self.assertFalse(artifact, why)
+        self.assertIn("failure reasons", why)

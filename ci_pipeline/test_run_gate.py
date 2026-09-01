@@ -246,7 +246,8 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert 'for MODULE in "${MODULES[@]}"' in refleak_script
     assert '"$VENV_PY" -m test -R "$ROUNDS" "$MODULE"' in refleak_script
     assert 'FAILED_MODULES+=("$MODULE")' in refleak_script
-    assert "comm -23" in refleak_script
+    assert "comm -3" in refleak_script
+    assert '--original-log-dir "$MODULE_LOG_DIR"' in refleak_script
     assert "any global SUCCESS epilogue" in refleak_script
 
 

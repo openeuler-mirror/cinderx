@@ -44,6 +44,69 @@ _REFS = re.compile(r"^(\S+) leaked \[([-0-9, ]+)\] references", re.M)
 
 _FDS = re.compile(r"^(\S+) leaked \[([-0-9, ]+)\] file descriptors", re.M)
 _RESULT = re.compile(r"^== Tests result: (\w+)", re.M)
+_FINAL_RESULT = re.compile(r"^Result: (\w+)$", re.M)
+_TOTAL_FILES = re.compile(
+    r"^Total test files: success=(\d+) failed=(\d+)$", re.M
+)
+_ORDINARY_FAILURE = re.compile(
+    r"^(?:FAIL|ERROR): |^Traceback \(most recent call last\):|"
+    r"^test .* failed --|timed out|crashed|worker thread failed",
+    re.M | re.I,
+)
+
+
+def only_block_artifact_failure(
+    module: str, text: str, returncode: int
+) -> tuple[bool, str]:
+    """Prove that a single-module regrtest failed only on its block line.
+
+    A verified block figure cannot excuse another failure from the same
+    module.  Accept only the complete CPython 3.11 single-module epilogue
+    emitted for a refleak finding, and reject every additional ordinary
+    failure signal.
+    """
+    if returncode != 2:
+        return False, f"{module}: expected refleak exit 2, got {returncode}"
+
+    blocks = _BLOCKS.findall(text)
+    if not blocks or {name for name, _ in blocks} != {module}:
+        return False, f"{module}: missing or foreign memory-block finding"
+    if _REFS.search(text) or _FDS.search(text):
+        return False, f"{module}: non-block leak is never an artifact"
+
+    failure_lines = re.findall(
+        rf"^{re.escape(module)} failed(?: \(([^)]*)\))?$", text, re.M
+    )
+    if failure_lines != ["reference leak"]:
+        return False, (
+            f"{module}: failure reasons were {failure_lines!r}, not only "
+            "the refleak block finding"
+        )
+
+    result = _RESULT.findall(text)
+    final_result = _FINAL_RESULT.findall(text)
+    totals = _TOTAL_FILES.findall(text)
+    if result != ["FAILURE"] or final_result != ["FAILURE"]:
+        return False, f"{module}: incomplete or ambiguous FAILURE epilogue"
+    if totals != [("0", "1")]:
+        return False, f"{module}: unexpected test-file totals {totals!r}"
+
+    failed_section = re.search(
+        r"^1 test failed:\s*\n((?:[ \t]+\S+\s*\n)+)", text, re.M
+    )
+    if failed_section is None:
+        return False, f"{module}: missing single-test failure summary"
+    failed_names = re.findall(r"^\s+(\S+)\s*$", failed_section.group(1), re.M)
+    if failed_names != [module]:
+        return False, f"{module}: unexpected failed tests {failed_names!r}"
+
+    ordinary = _ORDINARY_FAILURE.search(text)
+    if ordinary is not None:
+        return False, (
+            f"{module}: ordinary failure signal {ordinary.group(0)!r} "
+            "was present alongside the block artifact"
+        )
+    return True, f"{module}: only the memory-block refleak finding failed"
 
 
 def _run_verification(
@@ -138,6 +201,10 @@ def classify_run(
             f"unverified rather than excused"
         )
 
+    shape_ok, shape_why = only_block_artifact_failure(module, text, returncode)
+    if not shape_ok:
+        return False, shape_why
+
     if counts is None or "blocks" not in counts or "quick" not in counts:
         return False, f"{module}: verification hook produced no counts"
 
@@ -209,10 +276,30 @@ def main() -> int:
     ap.add_argument("modules", nargs="+")
     ap.add_argument("--warmups", type=int, default=20)
     ap.add_argument("--reps", type=int, default=6)
+    ap.add_argument(
+        "--original-log-dir",
+        type=Path,
+        help="require each original single-module log to contain only the block failure",
+    )
     args = ap.parse_args()
 
     ok = True
     for module in args.modules:
+        if args.original_log_dir is not None:
+            original_log = args.original_log_dir / f"{module}.log"
+            try:
+                original_text = original_log.read_text(errors="replace")
+            except OSError as exc:
+                print(f"REAL LEAK: {module}: cannot read {original_log}: {exc}")
+                ok = False
+                continue
+            shape_ok, shape_why = only_block_artifact_failure(
+                module, original_text, 2
+            )
+            print(("failure shape: " if shape_ok else "REAL LEAK: ") + shape_why)
+            if not shape_ok:
+                ok = False
+                continue
         artifact, why = classify(args.python, module, args.warmups, args.reps)
         print(("artifact: " if artifact else "REAL LEAK: ") + why)
         ok = ok and artifact

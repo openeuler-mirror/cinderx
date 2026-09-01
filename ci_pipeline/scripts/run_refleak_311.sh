@@ -194,7 +194,8 @@ if [ -n "$BLK_MODULES" ]; then
   if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
        CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
        "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
-       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8; then
+       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8 \
+       --original-log-dir "$MODULE_LOG_DIR"; then
     echo "refleak: a reported block figure is not the quickened-counter"
     echo "artifact -- treating it as a real leak"
     exit 1
@@ -208,7 +209,7 @@ fi
 # later successful module hide an earlier real failure.
 if ((${#FAILED_MODULES[@]})); then
   FAILED=$(printf '%s\n' "${FAILED_MODULES[@]}" | sort -u)
-  UNEXPLAINED=$(comm -23 <(printf '%s\n' "$FAILED") \
+  UNEXPLAINED=$(comm -3 <(printf '%s\n' "$FAILED") \
     <(printf '%s\n' "$BLK_MODULES" | sort -u) || true)
   if [ -n "$UNEXPLAINED" ]; then
     echo "refleak: regrtest failed on tests beyond the verified block"
