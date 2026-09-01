@@ -457,22 +457,19 @@ extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
   return t_invocation_artifact;
 }
 
-extern "C" PyObject* Ci_JitShell311_GuardedEntry(
+// The single path that enters an artifact's machine code once the caller
+// has committed to it.  The generated vectorcall prologue does not jump
+// into its own body: it resolves the bound-arguments reentry through
+// JITRT_ReenterAfterBind, which consults the invocation snapshot published
+// here.  Entering a generated entry without this scope resolves that
+// reentry to the interpreter and the machine-code body never runs.
+extern "C" PyObject* Ci_JitShell311_InvokeArtifact(
+    void* artifact,
     PyObject* func_obj,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  auto func = reinterpret_cast<PyFunctionObject*>(func_obj);
-  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
-      Ci_JitShell311_InstalledArtifact(func));
-  PyThreadState* tstate = PyThreadState_GET();
-  if (compiled == nullptr || tstate->c_tracefunc != nullptr ||
-      tstate->c_profilefunc != nullptr) {
-    return getInterpretedVectorcall(func)(func_obj, args, nargsf, kwnames);
-  }
-  // Keyword names and a mismatched positional count are the generated
-  // prologue's job (JITRT_CallWithKeywordArgs /
-  // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(artifact);
   // C-stack first so a soft-limit hit does not mutate recursion_remaining.
   // Py_EnterRecursiveCall waits until bind succeeds (body reentry), matching
   // CPython 3.11 initialize_locals then start_frame.  A bind TypeError at
@@ -493,6 +490,26 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
   InvocationArtifactScope invocation(compiled);
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+}
+
+extern "C" PyObject* Ci_JitShell311_GuardedEntry(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  auto func = reinterpret_cast<PyFunctionObject*>(func_obj);
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  PyThreadState* tstate = PyThreadState_GET();
+  if (compiled == nullptr || tstate->c_tracefunc != nullptr ||
+      tstate->c_profilefunc != nullptr) {
+    return getInterpretedVectorcall(func)(func_obj, args, nargsf, kwnames);
+  }
+  // Keyword names and a mismatched positional count are the generated
+  // prologue's job (JITRT_CallWithKeywordArgs /
+  // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
+  return Ci_JitShell311_InvokeArtifact(
+      compiled, func_obj, args, nargsf, kwnames);
 }
 
 namespace {
