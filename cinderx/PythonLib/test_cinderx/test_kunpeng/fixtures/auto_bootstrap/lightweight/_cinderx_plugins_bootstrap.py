@@ -1,14 +1,15 @@
-# Simulates discovery scheduling and requires it to precede JIT initialization.
+# Simulates discovery scheduling and requires an AutoJIT hold while enabled.
 import sys
 
-
-assert "_cinderx" not in sys.modules
-assert "cinderjit" not in sys.modules
 
 bootstrapped = False
 
 
 def bootstrap():
     global bootstrapped
+    assert "_cinderx" in sys.modules
+    import _cinderx
+
+    assert _cinderx._autojit_setup_depth() == 1
     bootstrapped = True
     return ()

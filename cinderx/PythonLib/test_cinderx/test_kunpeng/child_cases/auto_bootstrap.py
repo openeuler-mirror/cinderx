@@ -14,6 +14,9 @@ def lightweight_bootstrap() -> None:
         assert "cinderjit" not in sys.modules
     else:
         assert "cinderjit" in sys.modules
+    import _cinderx
+
+    assert _cinderx._autojit_setup_depth() == 0
 
 
 def jit_disabled() -> None:
