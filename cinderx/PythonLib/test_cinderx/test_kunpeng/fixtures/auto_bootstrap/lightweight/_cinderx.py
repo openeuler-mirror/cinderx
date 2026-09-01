@@ -1,4 +1,7 @@
 # Simulates the native _cinderx APIs required by lightweight bootstrap.
+_setup_depth = 0
+
+
 def install_frame_evaluator():
     pass
 
@@ -20,12 +23,15 @@ def _autojit_import_scope_depth():
 
 
 def _autojit_setup_enter():
-    pass
+    global _setup_depth
+    _setup_depth += 1
 
 
 def _autojit_setup_leave():
-    pass
+    global _setup_depth
+    assert _setup_depth > 0
+    _setup_depth -= 1
 
 
 def _autojit_setup_depth():
-    return 0
+    return _setup_depth
