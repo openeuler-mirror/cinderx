@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -94,6 +95,47 @@ def test_installed_cinderx_auto_setup_provider_tracks_depth(tmp_path):
         tmp_path,
         env,
         "installed cinderx setup provider subprocess failed",
+    )
+
+
+def test_installed_plugin_candidate_keeps_autojit_held(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    dist_info = tmp_path / "candidate-1.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: candidate\nVersion: 1.0\n",
+        encoding="utf-8",
+    )
+    (dist_info / "cinderx_plugin.json").write_text(
+        json.dumps(
+            {
+                "id": "candidate",
+                "spi_version": "1",
+                "runtime_abi": {
+                    "python_version": "3.14",
+                    "soabi": "test",
+                    "core_build_id": "test",
+                    "cpu_caps": [],
+                },
+                "target_capabilities": [],
+                "provides": {},
+                "adapter": {
+                    "entry": "never_imported.adapter",
+                    "target": "never_imported_target",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    env = _startup_provider_env("find_and_load")
+    env["EXPECT_CINDERX_EAGER_BOOTSTRAP"] = "1"
+    env["PYTHONPATH"] = str(tmp_path)
+
+    _run_startup_auto_jit_helper(
+        tmp_path,
+        env,
+        "installed plugin candidate released the AutoJIT hold",
     )
 
 
