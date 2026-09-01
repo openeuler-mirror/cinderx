@@ -63,15 +63,22 @@ PIPELINES = {
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     ),
-    # CPython 3.11 runners invoke these; the suite's [target] check keeps a
-    # mis-provisioned runner loud instead of silently green.
-    "pr311": (("cp311_gate", False),),
     "daily311": (
         ("cp311_gate", False),
         ("cp311_daily", False),
     ),
     # Runs on the 3.14 runner; RT314_BASE_REF must carry the merge-base SHA.
     "ref314": (("cp314_reference", False),),
+}
+PIPELINES_BY_PYTHON = {
+    "pr": {
+        "3.11": (("cp311_gate", False),),
+        "3.14": PIPELINES["pr"],
+    },
+    "daily": {
+        "3.11": PIPELINES["daily311"],
+        "3.14": PIPELINES["daily"],
+    },
 }
 DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),
@@ -89,6 +96,38 @@ def load_suite(name: str) -> dict[str, Any]:
     if not isinstance(jobs, list) or not jobs:
         raise ValueError(f"suite {suite_path} must define at least one [[jobs]] entry")
     return data
+
+
+def pipeline_for_python(
+    pipeline_name: str,
+    python_version: tuple[int, int] | None = None,
+) -> tuple[tuple[Any, ...], ...]:
+    versioned_pipelines = PIPELINES_BY_PYTHON.get(pipeline_name)
+    if versioned_pipelines is None:
+        return PIPELINES[pipeline_name]
+
+    if python_version is None:
+        python_version = (sys.version_info.major, sys.version_info.minor)
+    version = ".".join(map(str, python_version))
+    try:
+        return versioned_pipelines[version]
+    except KeyError as exc:
+        supported = ", ".join(sorted(versioned_pipelines))
+        raise ValueError(
+            f"pipeline {pipeline_name} does not support Python {version}; "
+            f"supported versions: {supported}"
+        ) from exc
+
+
+def daily_compat_enabled(
+    pipeline_name: str,
+    python_version: tuple[int, int] | None = None,
+) -> bool:
+    if pipeline_name != "daily":
+        return False
+    if python_version is None:
+        python_version = (sys.version_info.major, sys.version_info.minor)
+    return python_version == (3, 14)
 
 
 def check_target(expected: dict[str, Any]) -> list[str]:
@@ -360,7 +399,26 @@ def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
         env[AUTO_IMPORT_ENABLE_ENV] = "1"
     for key, value in job.get("env", {}).items():
         env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
+    configure_python_test_support(env, job)
     return env
+
+
+def configure_python_test_support(
+    env: dict[str, str], job: dict[str, Any]
+) -> None:
+    if str(job.get("phase", "")) not in {"test_release", "libtest"}:
+        return
+
+    support_paths = [
+        env.get("CINDERX_TEST_PYTHON_STDLIB_DIR", "").strip(),
+        env.get("CINDERX_TEST_PYTHON_EXTENSIONS_DIR", "").strip(),
+    ]
+    existing = env.get("PYTHONPATH", "").strip()
+    if existing:
+        support_paths.append(existing)
+    configured = os.pathsep.join(path for path in support_paths if path)
+    if configured:
+        env["PYTHONPATH"] = configured
 
 
 def coverage_tool_paths() -> dict[str, str]:
@@ -463,6 +521,7 @@ def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
     linux = bool(info["linux"])
     mac = bool(info["mac"])
     meta_312 = meta_python and py_version == "3.12"
+    is_stock_311 = py_version == "3.11" and not meta_python
     is_314plus = py_version in {"3.14", "3.15"}
 
     options: dict[str, str] = {
@@ -485,7 +544,7 @@ def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
     set_option("ENABLE_GENERATOR_AWAITER", meta_312)
     set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
     set_option("ENABLE_LAZY_IMPORTS", meta_312)
-    set_option("ENABLE_LIGHTWEIGHT_FRAMES", meta_312)
+    set_option("ENABLE_LIGHTWEIGHT_FRAMES", is_stock_311 or meta_312)
     set_option("ENABLE_PARALLEL_GC", meta_312)
     set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
     set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
@@ -746,6 +805,7 @@ def run_job(
     coverage: bool = False,
 ) -> dict[str, Any]:
     name = str(job["name"])
+    phase = str(job.get("phase", name))
     log_path = run_dir / "logs" / f"{name}.log"
 
     started = _datetime.datetime.now().isoformat(timespec="seconds")
@@ -760,6 +820,7 @@ def run_job(
         print(f"[  FAILED ] {name} ({log_path})", flush=True)
         return {
             "name": name,
+            "phase": phase,
             "status": "failed",
             "returncode": 1,
             "command": None,
@@ -800,6 +861,7 @@ def run_job(
 
     return {
         "name": name,
+        "phase": phase,
         "status": status,
         "returncode": completed.returncode,
         "command": command,
@@ -1169,11 +1231,32 @@ def write_summary(
         "repo": str(REPO_ROOT),
         "head": git_head(),
         "results": results,
+        "phases": summarize_phases(results),
         "coverage": coverage or {"enabled": False},
     }
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary_path
+
+
+def summarize_phases(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    phases: list[dict[str, Any]] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for result in results:
+        phase_name = str(result.get("phase", result["name"]))
+        phase = by_name.get(phase_name)
+        if phase is None:
+            phase = {
+                "name": phase_name,
+                "status": "passed",
+                "jobs": [],
+            }
+            by_name[phase_name] = phase
+            phases.append(phase)
+        phase["jobs"].append(result["name"])
+        if result["returncode"] != 0:
+            phase["status"] = "failed"
+    return phases
 
 
 def git_head() -> str | None:
@@ -1264,7 +1347,12 @@ def run_suite_jobs(
     results = []
     prelude = suite_prelude(suite, args)
     fail_fast = bool(suite.get("fail_fast", True))
+    current_phase = None
     for job in suite_enabled_jobs(suite):
+        phase = str(job.get("phase", job["name"]))
+        if phase != current_phase:
+            print(f"[ PHASE    ] {phase}", flush=True)
+            current_phase = phase
         result = run_job(job, run_dir, prelude, job_uses_coverage(job, coverage))
         results.append(result)
         if fail_fast and result["returncode"] != 0:
@@ -1516,7 +1604,8 @@ def run_pipeline_command(
     pipeline_name: str,
     args: argparse.Namespace,
 ) -> int:
-    pipeline = PIPELINES[pipeline_name]
+    pipeline = pipeline_for_python(pipeline_name)
+    run_daily_compat = daily_compat_enabled(pipeline_name)
     loaded_suites: list[tuple[str, bool, dict[str, Any]]] = []
     for suite_invocation in pipeline:
         suite_name = suite_invocation[0]
@@ -1535,7 +1624,7 @@ def run_pipeline_command(
         for _, _, suite in loaded_suites
         for job in suite_enabled_jobs(suite)
     ]
-    if pipeline_name == "daily":
+    if run_daily_compat:
         jobs.extend(daily_compat_jobs())
     if args.list:
         for job in jobs:
@@ -1576,7 +1665,7 @@ def run_pipeline_command(
                 break
 
     if (
-        pipeline_name == "daily"
+        run_daily_compat
         and not any(result["returncode"] != 0 for result in results)
         and coverage_result.get("status") != "failed"
     ):

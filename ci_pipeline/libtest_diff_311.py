@@ -339,13 +339,26 @@ def _normalize(name: str) -> str:
     return name[5:] if name.startswith("test.") else name
 
 
+JUNIT_MODULE_ALIASES = (
+    ("unittest.test.testmock", "test_unittest"),
+    ("ctypes.test", "test_ctypes"),
+    ("datetimetester", "test_datetime"),
+    ("test_profile", "test_cprofile"),
+    ("builtins", "test_builtin"),
+    ("enum", "test_enum"),
+)
+
+
 def make_module_resolver(requested: list[str]):
     """Map a junit classname to the requested test name it belongs to.
 
     ``--list-tests`` mixes top-level names (test_grammar) with package paths
     (test.test_asyncio.test_events); junit classnames are full dotted paths.
     Longest-prefix match on dot boundaries after stripping the "test." prefix
-    keys every case back to its requested name.
+    keys ordinary cases back to their requested name.  CPython also reuses
+    test classes from alias modules (for example test_cprofile runs classes
+    defined in test_profile), so those aliases must win before the generic
+    fallback sees method names such as ``test_call`` or ``test_bytes``.
     """
     normalized = sorted((_normalize(r), r) for r in requested)
     by_length = sorted(normalized, key=lambda nr: len(nr[0]), reverse=True)
@@ -355,6 +368,10 @@ def make_module_resolver(requested: list[str]):
         cls = _normalize(classname)
         if cls in cache:
             return cache[cls]
+        for prefix, req in JUNIT_MODULE_ALIASES:
+            if cls == prefix or cls.startswith(prefix + "."):
+                cache[cls] = req
+                return req
         for norm, req in by_length:
             if cls == norm or cls.startswith(norm + "."):
                 cache[cls] = req
@@ -415,6 +432,17 @@ def arm_environment(base: dict) -> dict:
     # Unconditional: an inherited PYTHONHASHSEED=random would make the two
     # arms diverge for reasons that have nothing to do with the evaluator.
     env["PYTHONHASHSEED"] = "0"
+    # Some minimal CPython installations omit Lib/test while the matching
+    # test support tree lives beside the explicitly selected interpreter.
+    # These two scheduler-owned paths are control-plane inputs, not CinderX
+    # activation knobs, and both differential arms must see the same tree.
+    test_support = [
+        base.get("CINDERX_TEST_PYTHON_STDLIB_DIR", "").strip(),
+        base.get("CINDERX_TEST_PYTHON_EXTENSIONS_DIR", "").strip(),
+    ]
+    configured = os.pathsep.join(path for path in test_support if path)
+    if configured:
+        env["PYTHONPATH"] = configured
     return env
 
 
@@ -889,6 +917,75 @@ def load_stdlib72_modules() -> list[str]:
     return modules
 
 
+def reuse_stock_result(
+    stock_dir: Path, out: Path, modules: list[str], python: str
+) -> dict:
+    """Extract the execute surface from a completed frozen stock arm."""
+    result_path = stock_dir / "result.json"
+    attest_path = stock_dir / "attest-stock.log"
+    try:
+        result = load(str(result_path))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot load reusable stock result {result_path}: {exc}")
+
+    expected = set(load_target_manifest())
+    actual = set(result.get("modules", {}))
+    if actual != expected:
+        raise ValueError(
+            "reusable stock result is not the frozen surface: "
+            f"expected {len(expected)} modules, got {len(actual)}"
+        )
+    missing = set(modules) - actual
+    if missing:
+        raise ValueError(
+            f"reusable stock result is missing execute modules: {sorted(missing)}"
+        )
+    recorded_python = result.get("meta", {}).get("python")
+    if recorded_python != python:
+        raise ValueError(
+            f"reusable stock result used {recorded_python!r}, expected {python!r}"
+        )
+    attest_count, attest_clean = read_stock_attest(attest_path)
+    if attest_count < 2 or not attest_clean:
+        raise ValueError(
+            "reusable stock arm purity not attested "
+            f"({attest_count} records, clean={attest_clean}): {attest_path}"
+        )
+
+    resolve = make_module_resolver(list(result["modules"]))
+    wanted = set(modules)
+    subset = {
+        "meta": {
+            **result["meta"],
+            "original_argv_tests": result["meta"].get("argv_tests"),
+            "argv_tests": len(modules),
+            "reused_from": str(result_path),
+            "stock_attest_processes": attest_count,
+        },
+        "modules": {name: result["modules"][name] for name in modules},
+        "cases": {
+            key: state
+            for key, state in result.get("cases", {}).items()
+            if resolve(key) in wanted
+        },
+        "diagnostics": {
+            key: diagnostic
+            for key, diagnostic in result.get("diagnostics", {}).items()
+            if resolve(key) in wanted
+        },
+    }
+    target = out / "stock"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "result.json").write_text(
+        json.dumps(subset, indent=1, sort_keys=True) + "\n"
+    )
+    print(
+        f"EXECUTE-GATE: reused {len(modules)}-module stock baseline from "
+        f"{result_path}; no second stock arm was run"
+    )
+    return subset
+
+
 def read_trigger_ledger(path: Path) -> dict:
     """Per-role trigger evidence for one arm.
 
@@ -932,6 +1029,72 @@ def read_trigger_ledger(path: Path) -> dict:
     }
 
 
+def cmd_off_gate(args: argparse.Namespace) -> int:
+    """Run stock and evaluator-off once each over the frozen 440."""
+    out = Path(args.out)
+    if not args.tests and args.exclude:
+        print(
+            "OFF-GATE: --exclude is not allowed on the frozen surface; "
+            "edit the target-module manifest deliberately"
+        )
+        return 2
+    out.mkdir(parents=True, exist_ok=True)
+
+    rc, _ = provision_dual_arms(
+        args,
+        out,
+        label="OFF-GATE evaluator-off",
+        arm_dir="evaluator-off",
+        shared=vars(args),
+        cinderx_env=[
+            "CINDERX_PLUGIN_ENABLE=1",
+            "CINDERX_EVAL_MODE=cinder",
+            "CINDERX_JIT_MODE=off",
+        ],
+    )
+    if rc:
+        return rc
+
+    stock = load(str(out / "stock" / "result.json"))
+    evaluator_off = load(str(out / "evaluator-off" / "result.json"))
+    stock_off_diff = diff_results(stock, evaluator_off)
+    (out / "stock-vs-evaluator-off.json").write_text(
+        json.dumps(stock_off_diff, indent=1, sort_keys=True) + "\n"
+    )
+
+    expected = set(args.tests or load_target_manifest())
+    diff_errors = bool(
+        stock_off_diff["module_regressions"]
+        or stock_off_diff["case_regressions"]
+    )
+    report = {
+        "arms": {
+            "stock": stock["meta"],
+            "evaluator_off": evaluator_off["meta"],
+        },
+        "frozen_module_count": len(expected),
+        "worker_crashes": 0,
+        "diffs": {
+            "stock_vs_evaluator_off": "stock-vs-evaluator-off.json",
+        },
+    }
+    (out / "off-gate-report.json").write_text(
+        json.dumps(report, indent=1, sort_keys=True) + "\n"
+    )
+    (out / "trigger_report_fields.json").write_text(
+        json.dumps(
+            {
+                "target_modules_attempted": len(expected),
+                "worker_crashes": 0,
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    print("OFF-GATE: stock/evaluator-off each ran once")
+    return 1 if diff_errors else 0
+
+
 def cmd_execute_gate(args: argparse.Namespace) -> int:
     """Run the 72-module confirmed surface under stock and under
     CINDERX_JIT_MODE=execute, and require the per-testcase results to be
@@ -949,21 +1112,53 @@ def cmd_execute_gate(args: argparse.Namespace) -> int:
     modules = load_stdlib72_modules()
     ledger = out / "execute" / "trigger.log"
 
-    rc, attest = provision_dual_arms(
-        args,
-        out,
-        label="EXECUTE-GATE",
-        arm_dir="execute",
-        shared={**vars(args), "tests": modules, "exclude": []},
-        cinderx_env=[
-            "CINDERX_JIT_MODE=execute",
-            f"PYTHONJITAUTO={args.threshold}",
-            f"CINDERX_EXECUTE_TRIGGER_LEDGER={ledger}",
-        ],
-        precreate=[out / "execute" / "attest.log", ledger],
-    )
-    if rc:
-        return rc
+    execute_env = [
+        "CINDERX_JIT_MODE=execute",
+        f"PYTHONJITAUTO={args.threshold}",
+        f"CINDERX_EXECUTE_TRIGGER_LEDGER={ledger}",
+    ]
+    stock_dir = getattr(args, "stock_dir", None)
+    if stock_dir:
+        try:
+            reuse_stock_result(Path(stock_dir), out, modules, args.python)
+        except ValueError as exc:
+            print(f"EXECUTE-GATE: {exc}")
+            return 3
+        startup = out / "startup"
+        startup.mkdir(parents=True, exist_ok=True)
+        (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
+        attest = out / "execute" / "attest.log"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        for path in (attest, ledger):
+            path.unlink(missing_ok=True)
+            path.touch()
+            os.chmod(path, 0o666)
+        execute = argparse.Namespace(
+            **{
+                **vars(args),
+                "out": str(out / "execute"),
+                "tests": modules,
+                "exclude": [],
+                "env": execute_env,
+                "pythonpath_prepend": [str(startup)]
+                + list(args.pythonpath_prepend or []),
+                "attest_file": str(attest),
+            }
+        )
+        if run_arm(execute):
+            return 2
+    else:
+        rc, attest = provision_dual_arms(
+            args,
+            out,
+            label="EXECUTE-GATE",
+            arm_dir="execute",
+            shared={**vars(args), "tests": modules, "exclude": []},
+            cinderx_env=execute_env,
+            precreate=[out / "execute" / "attest.log", ledger],
+        )
+        if rc:
+            return rc
     attest_count, attest_clean = read_attest(attest)
     if attest_count < 2 or not attest_clean:
         print(
@@ -1055,6 +1250,15 @@ def cmd_execute_gate(args: argparse.Namespace) -> int:
         load(str(out / "execute" / "result.json")),
         load_execute_baseline(baseline_path),
     )
+    report["trigger_proof"] = {
+        "workers": proof["workers"],
+        "worker_modules": len(proof["worker_tests"] & set(modules)),
+        "executing_modules": len(executing),
+        "target_attributed_compile_modules": len(compiling),
+        "unattributed_modules": len(unattributed),
+        "worker_machine_code_entries": proof["worker_entries"],
+        "worker_compiled_function_creations": proof["worker_creations"],
+    }
     text = json.dumps(report, indent=1, sort_keys=True)
     (out / "diff.json").write_text(text)
     if args.write_baseline:
@@ -1128,6 +1332,11 @@ def main(argv: list[str] | None = None) -> int:
     common(p_exec)
     p_exec.add_argument("--out", required=True)
     p_exec.add_argument(
+        "--stock-dir",
+        help="reuse a completed frozen stock arm (result.json plus "
+             "attest-stock.log) instead of running stock again",
+    )
+    p_exec.add_argument(
         "--threshold",
         default="50",
         help="PYTHONJITAUTO for the execute arm (default: 50)",
@@ -1149,6 +1358,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_exec.set_defaults(func=cmd_execute_gate)
     p_gate.set_defaults(func=cmd_gate)
+
+    p_off = sub.add_parser(
+        "off-gate",
+        help="440-module stock/evaluator-off differential",
+    )
+    common(p_off)
+    p_off.add_argument("--out", required=True)
+    p_off.set_defaults(func=cmd_off_gate)
 
     args = parser.parse_args(argv)
     return args.func(args)

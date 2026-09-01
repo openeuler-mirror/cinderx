@@ -21,6 +21,25 @@ export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 export CINDERX_VERSION_PATCH="${CINDERX_VERSION_PATCH:-0}"
 
+resolve_executable() {
+  local candidate=$1
+  if [[ "$candidate" == */* ]]; then
+    test -x "$candidate" || {
+      echo "executable not found in builder container: $candidate" >&2
+      return 1
+    }
+    printf '%s\n' "$candidate"
+  else
+    command -v "$candidate"
+  fi
+}
+
+PYTHON=$(resolve_executable "${CINDERX_CP311_PYTHON:-python3.11}")
+CC=$(resolve_executable "${CC:-gcc}")
+CXX=$(resolve_executable "${CXX:-g++}")
+export PYTHON CC CXX
+export CINDERX_CP311_PYTHON="$PYTHON"
+
 # Static C++ runtime.  The stock openEuler image carries the GCC 12 system
 # libstdc++ (GLIBCXX up to 3.4.30) while this GCC 14 build references
 # GLIBCXX_3.4.31, so a dynamic link would strand the wheel; linking
@@ -50,7 +69,7 @@ if [ "${CINDERX_SKIP_BUILDER_CHECK:-0}" != "1" ]; then
 fi
 
 # Interpreter build-config snapshot, mirroring the cp314 flow's evidence.
-python3.11 - <<'PY' > /out/logs/cpython-311-build.jsonl
+"$PYTHON" - <<'PY' > /out/logs/cpython-311-build.jsonl
 import json
 import sys
 import sysconfig
@@ -71,7 +90,7 @@ cp -a /src/. /work/src/
 cd /work/src
 rm -rf scratch build dist wheelhouse ./*.egg-info
 
-python3.11 -m pip wheel --no-build-isolation --no-deps --no-cache-dir -w /out .
+"$PYTHON" -m pip wheel --no-build-isolation --no-deps --no-cache-dir -w /out .
 
 # Scoped to the cp311 tag: /out is the shared release wheelhouse and may
 # already hold the cp314 fat wheel.
@@ -80,7 +99,7 @@ test -n "$wheel"
 echo "[cp311-wheel] BUILT ${wheel}"
 sha256sum "$wheel" | tee /out/logs/ordinary.sha256
 
-python3.11 /src/ci_pipeline/scripts/normalize_cp311_wheel.py \
+"$PYTHON" /src/ci_pipeline/scripts/normalize_cp311_wheel.py \
   --wheel "$wheel" \
   --git-sha "${CINDERX_GIT_SHA:-unknown}" \
   --builder-image "${CINDERX_BUILDER_IMAGE:-unknown}"

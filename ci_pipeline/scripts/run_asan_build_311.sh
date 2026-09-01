@@ -1,10 +1,7 @@
 #!/bin/bash
-# AddressSanitizer leg for the CPython 3.11 build (dev plan MR-02
-# acceptance item 9, extended by MR-04): builds the full source set with
-# ASAN instrumentation and then RUNS the minimal execution set -- the
-# green-family RuntimeTests population -- under the instrumented binary,
-# so heap misuse in the compile pipeline and the execution scaffolding
-# fails loudly instead of compiling quietly.
+# AddressSanitizer RuntimeTests leg for CPython 3.11.  The independent Debug
+# job owns the full compile-only matrix; this runner builds one instrumented
+# RuntimeTests binary and runs both its Green and Canary populations.
 set -euo pipefail
 # ASAN frames are several times larger than unsanitized ones.  The 3.11
 # C-stack hard limit is derived from the thread's mapped stack; keep the
@@ -20,6 +17,24 @@ while IFS='=' read -r name _; do
 done < <(env)
 BUILD_DIR=${1:?usage: run_asan_build_311.sh <build_dir>}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+if [ -n "${CINDERX_RUNTIME_TEST_PYTHON:-}" ]; then
+  TEST_PYTHON=$CINDERX_RUNTIME_TEST_PYTHON
+  PYTHON_INCLUDE_DIR=${CINDERX_RUNTIME_TEST_PYTHON_INCLUDE_DIR:-}
+  PYTHON_LIBRARY=${CINDERX_RUNTIME_TEST_PYTHON_LIBRARY:-}
+  PYTHON_EXTENSIONS_DIR=${CINDERX_RUNTIME_TEST_PYTHON_EXTENSIONS_DIR:-}
+else
+  TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
+  PYTHON_INCLUDE_DIR=${CINDERX_TEST_PYTHON_INCLUDE_DIR:-}
+  PYTHON_LIBRARY=${CINDERX_TEST_PYTHON_LIBRARY:-}
+  PYTHON_EXTENSIONS_DIR=${CINDERX_TEST_PYTHON_EXTENSIONS_DIR:-}
+fi
+PYTHON_ROOT=$("$TEST_PYTHON" -c 'import sys; print(sys.base_prefix)')
+BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
+case "$BUILD_JOBS" in
+  ''|*[!0-9]*) echo "CINDERX_TEST_JOBS must be a positive integer"; exit 2 ;;
+esac
+[ "$BUILD_JOBS" -gt 0 ] \
+  || { echo "CINDERX_TEST_JOBS must be greater than zero"; exit 2; }
 
 # CMake's default probe picks /usr/bin/cc, which on the build image is an
 # older toolchain that ships no sanitizer runtime; the wheel and the green
@@ -52,7 +67,7 @@ if [ -d "$ASAN_LIBDIR" ]; then
   ASAN_RPATH="-Wl,-rpath,$ASAN_LIBDIR"
 fi
 
-FLAGS=$(python3.11 -c '
+FLAGS=$("$TEST_PYTHON" -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 from cmake_options import cmake_feature_options
@@ -62,26 +77,28 @@ print(" ".join(f"-D{k}={v}" for k, v in sorted(opts.items())))
 if [ -n "${CINDERX_LOCAL_DEPS_DIR:-}${CINDERX_LOCAL_DEPS:-}" ]; then
   FLAGS="$FLAGS -DCINDERX_LOCAL_DEPS_DIR=${CINDERX_LOCAL_DEPS_DIR:-$CINDERX_LOCAL_DEPS}"
 fi
-cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_C_COMPILER="$ASAN_CC" -DCMAKE_CXX_COMPILER="$ASAN_CXX" \
-  -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address $ASAN_RPATH" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address $ASAN_RPATH" \
-  $FLAGS > "$BUILD_DIR-configure.log" 2>&1
-make -C "$BUILD_DIR" -j"$(nproc)" > "$BUILD_DIR-build.log" 2>&1
-echo "asan build ok: $BUILD_DIR"
-
+PYTHON_CMAKE_ARGS=(
+  -DPython_ROOT_DIR="$PYTHON_ROOT"
+  -DPython_EXECUTABLE="$TEST_PYTHON"
+)
+if [ -n "$PYTHON_INCLUDE_DIR" ]; then
+  PYTHON_CMAKE_ARGS+=(
+    -DPython_INCLUDE_DIR="$PYTHON_INCLUDE_DIR"
+  )
+fi
+if [ -n "$PYTHON_LIBRARY" ]; then
+  PYTHON_CMAKE_ARGS+=(
+    -DPython_LIBRARY="$PYTHON_LIBRARY"
+  )
+fi
 # Minimal execution set: the green-family population must run clean under
 # the sanitizer.  Leak detection stays off -- CPython's own finalization
 # leaks are upstream noise; addressability errors are the contract here.
 #
-# The executed arm configures separately, at RelWithDebInfo rather than the
-# Debug used above.  With assertions live, the vendored 3.11 interpreter
+# Configure at RelWithDebInfo.  With assertions live, the vendored 3.11 interpreter
 # compiles in CPython's own assert helpers (_PyThreadState_CheckConsistency,
 # _Py_CheckSlotResult), which a release libpython does not export, so no
-# executable can link.  The compile-only arm above keeps that assertion
-# coverage; this arm keeps the sanitizer coverage of code that actually runs.
+# executable can link.  The separate Debug job keeps assertion coverage.
 #
 # Leak detection stays off for the whole executed arm, not just the later
 # gtest invocations.  CMake's gtest_discover_tests POST_BUILD runs the
@@ -89,20 +106,27 @@ echo "asan build ok: $BUILD_DIR"
 # LeakSanitizer; LSAN then fatals after listing tests and make deletes
 # the binary.  detect_leaks=0 is the same contract as the run below.
 export ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}detect_leaks=0"
-EXEC_DIR="$BUILD_DIR-exec"
+EXEC_DIR="$BUILD_DIR"
 cmake -S "$REPO_ROOT" -B "$EXEC_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER="$ASAN_CC" -DCMAKE_CXX_COMPILER="$ASAN_CXX" \
+  "${PYTHON_CMAKE_ARGS[@]}" \
   -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
   -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address $ASAN_RPATH" \
   -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address $ASAN_RPATH" \
   -DENABLE_RUNTIME_TESTS=ON \
   $FLAGS > "$EXEC_DIR-configure.log" 2>&1
-make -C "$EXEC_DIR" -j"$(nproc)" runtime_tests > "$EXEC_DIR-build.log" 2>&1
+make -C "$EXEC_DIR" -j"$BUILD_JOBS" runtime_tests > "$EXEC_DIR-build.log" 2>&1
 BIN=$(find "$EXEC_DIR" -name runtime_tests -type f | head -1)
 [ -n "$BIN" ] || { echo "asan runtime_tests binary missing"; exit 1; }
+RUNTIME_TEST_ENV=()
+if [ -n "$PYTHON_EXTENSIONS_DIR" ]; then
+  RUNTIME_TEST_ENV+=(
+    "PYTHONPATH=$PYTHON_EXTENSIONS_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  )
+fi
 MANIFEST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_green_families.txt"
-"$BIN" --gtest_list_tests 2>/dev/null \
+env "${RUNTIME_TEST_ENV[@]}" "$BIN" --gtest_list_tests 2>/dev/null \
   | awk '/^[A-Za-z_][A-Za-z0-9_\/]*\./ { suite = $1 }
          /^  [A-Za-z_]/ { print suite $1 }' \
   | sort -u > "$EXEC_DIR-registered.txt"
@@ -111,7 +135,8 @@ EXPECTED=$(awk -F. 'NR == FNR { fam[$1] = 1; next } ($1 in fam)' \
 FILTER=$(awk '{printf "%s.*:", $1}' "$MANIFEST")
 set +e
 (cd "$REPO_ROOT/cinderx" && \
-  ASAN_OPTIONS=detect_leaks=0 "$BIN" --gtest_filter="${FILTER%:}") \
+  env ASAN_OPTIONS=detect_leaks=0 "${RUNTIME_TEST_ENV[@]}" \
+    "$BIN" --gtest_filter="${FILTER%:}") \
   > "$EXEC_DIR-run.log" 2>&1
 EXEC_CODE=$?
 set -e
@@ -143,7 +168,8 @@ CANARY_EXPECTED=$(printf '%s\n' "$CANARY_CASES" | grep -c .)
 }
 set +e
 (cd "$REPO_ROOT/cinderx" && \
-  ASAN_OPTIONS=detect_leaks=0 CINDERX_JIT_MODE=canary "$BIN" \
+  env ASAN_OPTIONS=detect_leaks=0 CINDERX_JIT_MODE=canary \
+    "${RUNTIME_TEST_ENV[@]}" "$BIN" \
     --gtest_filter="$(printf '%s\n' "$CANARY_CASES" | paste -sd: -)") \
   > "$EXEC_DIR-canary.log" 2>&1
 CANARY_CODE=$?
@@ -156,50 +182,3 @@ fi
 bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
   --verify-green-log "$EXEC_DIR-canary.log" "$CANARY_EXPECTED"
 echo "asan canary-mode RuntimeTests ok ($CANARY_EXPECTED tests)"
-
-# The RuntimeTests population above instruments the compiler; it never
-# enters machine code.  The prologue, the materialized frame, the epilogue,
-# the deopt return and the shutdown teardown only run when compiled code
-# actually executes, so the leg also runs a canary child against the
-# instrumented extension.
-#
-# The extension comes from this CMake build, not from `pip wheel`: setup.py
-# never forwards CFLAGS/CXXFLAGS into its CMake invocation and reuses a
-# cached build tree under scratch/, so an environment-flag wheel build can
-# silently produce an uninstrumented extension and pair it with a
-# preloaded runtime -- a green leg that sanitized nothing.  It is built
-# here at RelWithDebInfo for the same reason the executed RuntimeTests are:
-# an assertion-enabled extension references CPython debug helpers a release
-# libpython does not export, so it cannot even be imported.
-make -C "$EXEC_DIR" -j"$(nproc)" _cinderx > "$EXEC_DIR-ext.log" 2>&1 \
-  || { echo "asan extension build FAILED"; tail -20 "$EXEC_DIR-ext.log"; exit 1; }
-ASAN_EXT=$(find "$EXEC_DIR" -name "_cinderx*.so" -type f | head -1)
-[ -n "$ASAN_EXT" ] || { echo "asan extension missing after build"; exit 1; }
-# Prove the thing under test is instrumented before trusting what it says.
-ASAN_SYMS=$(nm -D "$ASAN_EXT" 2>/dev/null | grep -c __asan || true)
-ASAN_NEEDED=$(readelf -d "$ASAN_EXT" 2>/dev/null | grep -c libasan || true)
-if [ "$ASAN_SYMS" -lt 1 ] || [ "$ASAN_NEEDED" -lt 1 ]; then
-  echo "asan extension is not instrumented (__asan symbols: $ASAN_SYMS,"
-  echo "libasan NEEDED: $ASAN_NEEDED); the canary run would sanitize nothing"
-  exit 1
-fi
-echo "asan extension instrumented ($ASAN_SYMS __asan symbols): $ASAN_EXT"
-
-ASAN_RUNTIME=$("$ASAN_CC" -print-file-name=libasan.so)
-# detect_leaks stays off (CPython finalization leaks are upstream noise);
-# addressability and use-after-free are the contract.  alloc_dealloc
-# mismatch is disabled because CPython legitimately pairs its own
-# allocators across the boundary.  The interpreter itself is not
-# instrumented, so the runtime is preloaded.
-(cd "$REPO_ROOT" && \
-  LD_PRELOAD="$ASAN_RUNTIME" \
-  ASAN_OPTIONS=detect_leaks=0:alloc_dealloc_mismatch=0 \
-  CINDERX_JIT_MODE=canary PYTHONJITAUTO=1 \
-  PYTHONPATH="$(dirname "$ASAN_EXT"):$REPO_ROOT/cinderx/PythonLib" \
-  python3.11 "$REPO_ROOT/ci_pipeline/scripts/asan_canary_smoke.py") \
-  > "$BUILD_DIR-canary.log" 2>&1 \
-  || { echo "asan canary execution FAILED"; tail -30 "$BUILD_DIR-canary.log"; exit 1; }
-grep -q "asan canary entries=" "$BUILD_DIR-canary.log" \
-  || { echo "asan canary produced no entry report"; tail -20 "$BUILD_DIR-canary.log"; exit 1; }
-grep "asan canary " "$BUILD_DIR-canary.log"
-echo "asan canary execution ok"

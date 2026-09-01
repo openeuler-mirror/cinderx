@@ -12,12 +12,170 @@ a frozen baseline.
 
 import inspect
 import json
+from types import SimpleNamespace
 
 import ci_pipeline.libtest_diff_311 as libtest_diff
 
 
+def test_off_gate_runs_each_440_arm_once_and_publishes_report(
+    tmp_path, monkeypatch
+):
+    modules = ["test_a", "test_b"]
+    result = {
+        "meta": {"duration_s": 1.0},
+        "modules": {name: "pass" for name in modules},
+        "cases": {f"test.{name}.T.test_ok": "pass" for name in modules},
+        "diagnostics": {},
+    }
+    calls = []
+
+    def fake_provision(args, out, **kwargs):
+        calls.extend(["stock", "evaluator-off"])
+        (out / "startup").mkdir(parents=True)
+        for arm in ("stock", "evaluator-off"):
+            arm_dir = out / arm
+            arm_dir.mkdir()
+            (arm_dir / "result.json").write_text(json.dumps(result))
+        return 0, out / "evaluator-off" / "attest.log"
+
+    monkeypatch.setattr(libtest_diff, "load_target_manifest", lambda: modules)
+    monkeypatch.setattr(libtest_diff, "provision_dual_arms", fake_provision)
+    args = SimpleNamespace(
+        out=str(tmp_path),
+        tests=None,
+        exclude=[],
+        python="python3.11",
+        jobs=4,
+        timeout=30,
+        env=None,
+        pythonpath_prepend=[],
+    )
+
+    assert libtest_diff.cmd_off_gate(args) == 0
+    assert calls == ["stock", "evaluator-off"]
+    report = json.loads((tmp_path / "off-gate-report.json").read_text())
+    assert report["frozen_module_count"] == 2
+    assert set(report["arms"]) == {"stock", "evaluator_off"}
+    assert report["diffs"] == {
+        "stock_vs_evaluator_off": "stock-vs-evaluator-off.json"
+    }
+    fields = json.loads((tmp_path / "trigger_report_fields.json").read_text())
+    assert fields == {"target_modules_attempted": 2, "worker_crashes": 0}
+
+
 def _arm(modules, cases):
     return {"modules": modules, "cases": cases}
+
+
+def test_reuse_stock_result_extracts_execute_surface_and_requires_purity(
+    tmp_path, monkeypatch
+):
+    stock_dir = tmp_path / "tri" / "stock"
+    stock_dir.mkdir(parents=True)
+    result = {
+        "meta": {"python": "/venv/bin/python", "argv_tests": 3},
+        "modules": {"test_a": "pass", "test_b": "fail", "test_c": "skip"},
+        "cases": {
+            "test.test_a.T.test_ok": "pass",
+            "test.test_b.T.test_bad": "failure",
+            "test.test_c.T.test_skip": "skipped",
+        },
+        "diagnostics": {
+            "test.test_b.T.test_bad": "AssertionError: bad",
+            "test.test_c.T.test_skip": "skipped: unavailable",
+        },
+    }
+    (stock_dir / "result.json").write_text(json.dumps(result))
+    (stock_dir / "attest-stock.log").write_text("clean\nclean\n")
+    monkeypatch.setattr(
+        libtest_diff, "load_target_manifest", lambda: ["test_a", "test_b", "test_c"]
+    )
+
+    subset = libtest_diff.reuse_stock_result(
+        stock_dir, tmp_path / "execute", ["test_a", "test_c"], "/venv/bin/python"
+    )
+
+    assert subset["modules"] == {"test_a": "pass", "test_c": "skip"}
+    assert set(subset["cases"]) == {
+        "test.test_a.T.test_ok",
+        "test.test_c.T.test_skip",
+    }
+    assert set(subset["diagnostics"]) == {"test.test_c.T.test_skip"}
+    assert subset["meta"]["argv_tests"] == 2
+    assert subset["meta"]["original_argv_tests"] == 3
+
+
+def test_reuse_stock_result_resolves_cpython_junit_aliases(tmp_path, monkeypatch):
+    stock_dir = tmp_path / "stock"
+    stock_dir.mkdir()
+    modules = {
+        "test_builtin": "pass",
+        "test_bytes": "pass",
+        "test_cprofile": "pass",
+        "test_ctypes": "pass",
+        "test_datetime": "pass",
+        "test_enum": "pass",
+        "test_unittest": "pass",
+    }
+    cases = {
+        "builtins.bin": "pass",
+        "enum.Enum": "pass",
+        "test.test_profile.ProfileTest.test_cprofile": "pass",
+        "ctypes.test.test_bytes.BytesTest.test_c_char": "pass",
+        "test.datetimetester.TestDateTime_Fast.test_bool": "pass",
+        "unittest.test.testmock.testmock.MockTest.test_call": "pass",
+    }
+    (stock_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "meta": {"python": "/venv/bin/python", "argv_tests": 7},
+                "modules": modules,
+                "cases": cases,
+                "diagnostics": {},
+            }
+        )
+    )
+    (stock_dir / "attest-stock.log").write_text("clean\nclean\n")
+    monkeypatch.setattr(libtest_diff, "load_target_manifest", lambda: list(modules))
+
+    subset = libtest_diff.reuse_stock_result(
+        stock_dir,
+        tmp_path / "execute",
+        ["test_builtin", "test_bytes", "test_cprofile", "test_enum"],
+        "/venv/bin/python",
+    )
+
+    assert set(subset["cases"]) == {
+        "builtins.bin",
+        "enum.Enum",
+        "test.test_profile.ProfileTest.test_cprofile",
+    }
+
+
+def test_reuse_stock_result_rejects_unattested_control(tmp_path, monkeypatch):
+    stock_dir = tmp_path / "stock"
+    stock_dir.mkdir()
+    (stock_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "meta": {"python": "python3.11", "argv_tests": 1},
+                "modules": {"test_a": "pass"},
+                "cases": {},
+                "diagnostics": {},
+            }
+        )
+    )
+    (stock_dir / "attest-stock.log").write_text("clean\nPOLLUTED:cinderx\n")
+    monkeypatch.setattr(libtest_diff, "load_target_manifest", lambda: ["test_a"])
+
+    try:
+        libtest_diff.reuse_stock_result(
+            stock_dir, tmp_path / "out", ["test_a"], "python3.11"
+        )
+    except ValueError as exc:
+        assert "purity not attested" in str(exc)
+    else:
+        raise AssertionError("unattested stock result was accepted")
 
 
 def test_case_failure_is_a_regression():
@@ -205,6 +363,26 @@ def test_arm_environment_is_sanitized():
     env = libtest_diff.arm_environment(dirty)
     # The inherited random hash seed is REPLACED, not merely defaulted.
     assert env == {"PATH": "/bin", "PYTHONHASHSEED": "0"}, env
+
+
+def test_arm_environment_preserves_scheduler_test_support_paths():
+    env = libtest_diff.arm_environment(
+        {
+            "PATH": "/bin",
+            "PYTHONPATH": "/somewhere/evil",
+            "CINDERX_TEST_PYTHON_STDLIB_DIR": "/opt/python/lib/python3.11",
+            "CINDERX_TEST_PYTHON_EXTENSIONS_DIR": (
+                "/opt/python/lib/python3.11/lib-dynload"
+            ),
+        }
+    )
+
+    assert env["PYTHONPATH"].split(libtest_diff.os.pathsep) == [
+        "/opt/python/lib/python3.11",
+        "/opt/python/lib/python3.11/lib-dynload",
+    ]
+    assert "CINDERX_TEST_PYTHON_STDLIB_DIR" not in env
+    assert "CINDERX_TEST_PYTHON_EXTENSIONS_DIR" not in env
 
 
 def test_stock_startup_attests_purity(tmp_path):

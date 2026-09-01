@@ -106,6 +106,9 @@ def build(image: str, out_dir: Path, git_sha: str, deps_cache: Path | None) -> P
         "-e", "CINDERX_BUILDER_IMAGE",
         "-e", "CINDERX_PYTHON3_NVR",
         "-e", "CINDERX_GIT_INSECURE",
+        "-e", "CINDERX_CP311_PYTHON",
+        "-e", "CC",
+        "-e", "CXX",
     ]
     # Opt-in local FetchContent cache, the repo's documented offline
     # mechanism (README: CINDERX_LOCAL_DEPS).
@@ -171,6 +174,7 @@ def smoke(runtime_image: str, out_dir: Path) -> None:
             "-v", f"{scripts / 'smoke_cp311_wheel_in_runtime.sh'}:/smoke/run.sh:ro",
             "-v", f"{tests}:/smoke/test_cinderx:ro",
             "-e", "CINDERX_PYTHON3_NVR",
+            "-e", "CINDERX_CP311_PYTHON",
             "-w", "/smoke",
             runtime_image,
             "bash", "/smoke/run.sh",
