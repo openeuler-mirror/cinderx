@@ -338,6 +338,16 @@ class LightweightFramesTests(unittest.TestCase):
         )
         self.assertIn("CASE_RESULT generator_argument_lifetime OK mode=1", output)
 
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_generator_close_releases_owned_argument_once(self) -> None:
+        output = _run_lightweight_case(
+            "generator_close_gc", enable_generators=True
+        )
+        self.assertIn("CASE_RESULT generator_close_gc OK mode=1", output)
+
 
 if __name__ == "__main__":
     unittest.main()

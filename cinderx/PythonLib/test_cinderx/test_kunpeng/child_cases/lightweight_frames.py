@@ -259,6 +259,40 @@ def run_generator_argument_lifetime_case() -> None:
     print("CASE_RESULT generator_argument_lifetime OK mode=1")
 
 
+def run_generator_close_gc_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        def __del__(self) -> None:
+            events.append("finalized")
+
+    def gen(obj):
+        try:
+            yield obj
+        finally:
+            events.append("closed")
+
+    assert cinderx.jit.force_compile(gen)
+    obj = Marker()
+    ref = weakref.ref(obj)
+    suspended = gen(obj)
+    yielded = next(suspended)
+    assert yielded is obj
+    del yielded
+    del obj
+    assert ref() is not None
+
+    suspended.close()
+    gc.collect()
+    assert ref() is None
+    assert events == ["closed", "finalized"], events
+    del suspended
+    gc.collect()
+    assert events.count("finalized") == 1, events
+    print("CASE_RESULT generator_close_gc OK mode=1")
+
+
 def main() -> int:
     cases = {
         "fallback",
@@ -270,6 +304,7 @@ def main() -> int:
         "materialize_traceback",
         "generator_return_cleanup",
         "generator_argument_lifetime",
+        "generator_close_gc",
         "normal_generator",
         "recursion",
     }
@@ -278,7 +313,8 @@ def main() -> int:
             f"usage: {sys.argv[0]} "
             "<fallback|inline|execute|localsplus_reuse|mode|materialize_getframe|"
             "materialize_traceback|generator_return_cleanup|"
-            "generator_argument_lifetime|normal_generator|recursion>"
+            "generator_argument_lifetime|generator_close_gc|normal_generator|"
+            "recursion>"
         )
     if sys.argv[1] == "mode":
         run_mode_case()
@@ -296,6 +332,8 @@ def main() -> int:
         run_generator_return_cleanup_case()
     elif sys.argv[1] == "generator_argument_lifetime":
         run_generator_argument_lifetime_case()
+    elif sys.argv[1] == "generator_close_gc":
+        run_generator_close_gc_case()
     elif sys.argv[1] == "execute":
         run_case(dump_assembly=False)
     else:
