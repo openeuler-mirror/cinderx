@@ -156,6 +156,47 @@ For 3.11 this adds the stock/execute 72 differential; for 3.14 it enables the
 existing local Lib/test jobs. Jenkins PR jobs leave the variable unset and
 therefore keep the default fast gate.
 
+### Dual-version developer gate container
+
+`ci_pipeline/docker/dev-gate/Dockerfile` is a thin layer over the pinned
+openEuler 24.03-LTS-SP3 multi-version image used by Jenkins. It contains
+CPython 3.11.6, CPython 3.14.3, GCC 12/14, the CMake dependency cache, and the
+pip wheelhouse. Only that directory is needed as the build context:
+
+```bash
+docker build -t cinderx-dev-gate:oe2403sp3 \
+  ci_pipeline/docker/dev-gate
+docker run --rm -it --cpus 4 --memory 12g \
+  -v cinderx-dev-work:/workspace \
+  cinderx-dev-gate:oe2403sp3
+```
+
+Clone the source in the container and run both L2 gates:
+
+```bash
+git clone https://gitcode.com/openeuler/cinderx.git
+cd cinderx
+git checkout <branch-or-commit-under-test>
+
+export CINDERX_LOCAL_RUN_LIBTEST=1
+python3.11 ci_pipeline/run_gate.py pr
+python3.14 ci_pipeline/run_gate.py pr
+```
+
+The launchers select the matching static CPython and compiler automatically.
+The 3.11 launcher derives `RT311_BASELINE_BASE` from `upstream/dev` or
+`origin/dev`. For a single-branch fork clone, fetch the upstream target first:
+
+```bash
+git remote add upstream https://gitcode.com/openeuler/cinderx.git
+git fetch upstream dev
+```
+
+Artifacts remain under `build/testgate/` in the source tree. The named volume
+therefore preserves the checkout, logs, and `summary.json` after the container
+exits. The image defaults to four test jobs; override it with
+`-e CINDERX_TEST_JOBS=<N>`.
+
 ## Pipelines And Suites
 
 ### Pipelines

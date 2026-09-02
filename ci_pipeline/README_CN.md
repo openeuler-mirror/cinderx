@@ -141,6 +141,45 @@ python3.14 ci_pipeline/run_gate.py pr
 其中 3.11 增加 stock/execute 72 differential，3.14 增加现有的本地 Lib/test job；
 Jenkins PR 不设置该变量，因此仍保持默认快速门禁。
 
+### 双版本开发门禁容器
+
+`ci_pipeline/docker/dev-gate/Dockerfile` 基于 Jenkins 使用的固定 openEuler
+24.03-LTS-SP3 多版本镜像，内置 CPython 3.11.6、CPython 3.14.3、GCC 12/14、
+CMake 依赖缓存和 pip wheelhouse。构建上下文只需要该目录：
+
+```bash
+docker build -t cinderx-dev-gate:oe2403sp3 \
+  ci_pipeline/docker/dev-gate
+docker run --rm -it --cpus 4 --memory 12g \
+  -v cinderx-dev-work:/workspace \
+  cinderx-dev-gate:oe2403sp3
+```
+
+进入容器后拉取代码并运行双版本 L2：
+
+```bash
+git clone https://gitcode.com/openeuler/cinderx.git
+cd cinderx
+git checkout <待测分支或提交>
+
+export CINDERX_LOCAL_RUN_LIBTEST=1
+python3.11 ci_pipeline/run_gate.py pr
+python3.14 ci_pipeline/run_gate.py pr
+```
+
+两个 launcher 会自动选择对应的 static CPython 和编译器；3.11 会从
+`upstream/dev` 或 `origin/dev` 计算 `RT311_BASELINE_BASE`。如使用 fork 的
+single-branch clone，先获取主仓 `dev`：
+
+```bash
+git remote add upstream https://gitcode.com/openeuler/cinderx.git
+git fetch upstream dev
+```
+
+运行产物保存在源码树的 `build/testgate/`；使用命名 volume 可在容器退出后保留源码、
+日志和 `summary.json`。镜像默认使用 4 个测试 job，可通过
+`-e CINDERX_TEST_JOBS=<N>` 调整。
+
 ## Pipeline 与 Suite 组成
 
 ### Pipeline

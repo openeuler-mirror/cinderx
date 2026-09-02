@@ -6,6 +6,16 @@ import textwrap
 import ci_pipeline.run_gate as run_gate
 
 
+def test_runtime_tests_disable_lto_for_gcc_builds():
+    cmake = (
+        Path(__file__).parents[1] / "cinderx" / "RuntimeTests" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    assert 'CMAKE_CXX_COMPILER_ID STREQUAL "GNU"' in cmake
+    assert "target_compile_options(runtime_tests PRIVATE -fno-lto)" in cmake
+    assert "target_link_options(runtime_tests PRIVATE -fno-lto)" in cmake
+
+
 def test_pr_pipeline_selects_cp311_gate_for_python311():
     assert run_gate.pipeline_for_python("pr", (3, 11)) == (
         ("cp311_gate", False),
