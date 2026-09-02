@@ -50,10 +50,12 @@ CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-Python 3.11 运行 3-job 的 `cp311_gate` 验收 suite：
+Python 3.11 默认运行 3-job 的 `cp311_gate` 快速验收 suite：
 `runtime_tests_311`、`setup_release_311`、`test_release_311`。PR 只构建一个
-Release wheel；完整 Lib/test differential 只在 Daily 运行。Python 3.14 保持现有
-流程，顺序是：
+Release wheel。开发者设置 `CINDERX_LOCAL_RUN_LIBTEST=1` 时会额外运行
+`libtest_execute_72_311`；该 job 自行运行 stock 72 与 execute 72 differential，
+不依赖 Daily 产物。完整 Lib/test differential 仍只在 Daily 运行。Python 3.14
+保持现有流程，顺序是：
 
 1. `runtime`：CMake 构建并运行 native `RuntimeTests`，`--coverage` 只作用于这个 suite。
 2. 覆盖率后处理：运行 `gcov`、`lcov`、`genhtml`，并检查覆盖率阈值。
@@ -128,6 +130,17 @@ CINDERX_LOCAL_RUN_LIBTEST=1 \
 python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 ```
 
+合入前可用同一开关进行双版本 L2 自验证：
+
+```bash
+export CINDERX_LOCAL_RUN_LIBTEST=1
+python3.11 ci_pipeline/run_gate.py pr
+python3.14 ci_pipeline/run_gate.py pr
+```
+
+其中 3.11 增加 stock/execute 72 differential，3.14 增加现有的本地 Lib/test job；
+Jenkins PR 不设置该变量，因此仍保持默认快速门禁。
+
 ## Pipeline 与 Suite 组成
 
 ### Pipeline
@@ -173,7 +186,7 @@ package data 只进入本地测试 wheel，不影响普通发布 wheel。
 | `CINDERX_TEST_PYTHON` | 门禁使用的 Python 解释器；未设置时默认为当前运行 `run_gate.py` 的解释器 |
 | `CINDERX_TEST_WHEEL` | `daily` compat fan-out 和 `wheel_compat` / `wheel_compat_negative` 待测的外部 wheel |
 | `CINDERX_UNSUPPORTED_TEST_PYTHON` | `wheel_compat_negative` 使用的不支持 Python 解释器 |
-| `CINDERX_LOCAL_RUN_LIBTEST=1` | 让 `cinderx_local` 额外运行本地 wheel 的 Lib/test |
+| `CINDERX_LOCAL_RUN_LIBTEST=1` | 让 3.11 PR 增加 stock/execute 72 differential，并让 3.14 `cinderx_local` 增加本地 wheel Lib/test |
 | `CINDERX_LOCAL_DEPS` | CMake FetchContent 依赖的本地缓存目录 |
 | `CINDERX_PIP_WHEELHOUSE` | suite venv 引导使用的本地 Python wheelhouse |
 | `CINDERX_PIP_OFFLINE=1` | 要求 pip 只从 `CINDERX_PIP_WHEELHOUSE` 安装 |

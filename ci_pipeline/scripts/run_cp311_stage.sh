@@ -3,7 +3,7 @@
 # for every sub-step.
 set -euo pipefail
 
-STAGE=${1:?usage: run_cp311_stage.sh <setup_release|test_release|test_release_daily|libtest_daily> <run_dir>}
+STAGE=${1:?usage: run_cp311_stage.sh <setup_release|test_release|libtest_execute_72|test_release_daily|libtest_daily> <run_dir>}
 RUN_DIR=${2:?usage: run_cp311_stage.sh <stage> <run_dir>}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
@@ -292,11 +292,22 @@ test_release_daily() {
   finish_daily_stage
 }
 
-libtest_daily() {
+require_libtest() {
   "$PYTHON" -c 'import test, test.test_threading; print(test.__file__)' || {
     echo "candidate Python cannot import the configured Lib/test tree: $PYTHON"
     return 2
   }
+}
+
+libtest_execute_72() {
+  require_libtest
+  run_step execute_72 "$PYTHON" ci_pipeline/libtest_diff_311.py \
+    execute-gate --jobs "$BUILD_JOBS" \
+    --out "$RUN_DIR/libtest-execute-local"
+}
+
+libtest_daily() {
+  require_libtest
   run_step_continue stock_evaluator_off_440 "$PYTHON" \
     ci_pipeline/libtest_diff_311.py off-gate --jobs "$BUILD_JOBS" \
     --out "$RUN_DIR/libtest-off"
@@ -363,6 +374,10 @@ case "$STAGE" in
     run_step lifecycle_census lifecycle_census
     run_step driver_selftests driver_selftests
     run_step non_libtest_drivers non_libtest_drivers
+    ;;
+  libtest_execute_72)
+    require_candidate
+    libtest_execute_72
     ;;
   test_release_daily)
     require_candidate

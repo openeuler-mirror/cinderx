@@ -85,11 +85,11 @@ def test_non_versioned_pipeline_is_not_version_dispatched():
     )
 
 
-def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase():
+def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
     jobs = run_gate.load_suite("cp311_gate")["jobs"]
     jobs_by_name = {job["name"]: job for job in jobs}
 
-    assert len(jobs) == 3
+    assert len(jobs) == 4
     runtime_job = jobs_by_name["runtime_tests_311"]
     assert "run_rt311_green.sh" in runtime_job["command"]
     assert '"{run_dir}/rt311-build" --census' in runtime_job["command"]
@@ -98,10 +98,28 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase():
         "runtime_tests_311",
         "setup_release_311",
         "test_release_311",
+        "libtest_execute_72_311",
     }
     assert "sha256sum --check" in runtime_job["command"]
     assert "setup_release" in jobs_by_name["setup_release_311"]["command"]
     assert "test_release" in jobs_by_name["test_release_311"]["command"]
+    libtest_job = jobs_by_name["libtest_execute_72_311"]
+    assert libtest_job["enabled_by_env"] == "CINDERX_LOCAL_RUN_LIBTEST"
+    assert "libtest_execute_72" in libtest_job["command"]
+
+    monkeypatch.delenv("CINDERX_LOCAL_RUN_LIBTEST", raising=False)
+    assert [
+        job["name"] for job in run_gate.suite_enabled_jobs({"jobs": jobs})
+    ] == ["runtime_tests_311", "setup_release_311", "test_release_311"]
+    monkeypatch.setenv("CINDERX_LOCAL_RUN_LIBTEST", "1")
+    assert [
+        job["name"] for job in run_gate.suite_enabled_jobs({"jobs": jobs})
+    ] == [
+        "runtime_tests_311",
+        "setup_release_311",
+        "test_release_311",
+        "libtest_execute_72_311",
+    ]
 
     assert [
         phase["name"]
@@ -115,7 +133,7 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase():
                 for job in jobs
             ]
         )
-    ] == ["runtime_tests", "setup_release", "test_release"]
+    ] == ["runtime_tests", "setup_release", "test_release", "libtest"]
 
 
 def test_cp311_daily_has_two_incremental_jobs():
@@ -123,7 +141,7 @@ def test_cp311_daily_has_two_incremental_jobs():
     daily_jobs = run_gate.load_suite("cp311_daily")["jobs"]
     daily_names = [job["name"] for job in daily_jobs]
 
-    assert len(pr_jobs) + len(daily_jobs) == 5
+    assert len(pr_jobs) + len(daily_jobs) == 6
     assert daily_names == ["test_release_daily_311", "libtest_daily_311"]
     assert all("phase" in job for job in daily_jobs)
     assert {job["phase"] for job in daily_jobs} == {
@@ -173,14 +191,16 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         assert script.count(module) == 1
     assert "--non-libtest" in script
     assert script.count("libtest_diff_311.py off-gate") == 1
+    assert script.count("execute-gate --jobs") == 2
     assert script.count('--stock-dir "$RUN_DIR/libtest-off/stock"') == 1
+    assert '"$RUN_DIR/libtest-execute-local"' in script
     assert "libtest-tri" not in script
     assert "evaluator-off-vs-shadow" not in script
     assert "cinderx-test-support.pth" not in script
     assert "import test, test.test_threading" in script
     assert "print(test.__file__)" in script
     assert '"$PYTHON" -I -c' not in script
-    assert script.count('--jobs "$BUILD_JOBS"') == 2
+    assert script.count('--jobs "$BUILD_JOBS"') == 3
     assert "stock_to_evaluator_off" not in script
     assert "evaluator_off_to_shadow" not in script
     assert "--skip-test-cinderx" not in script
