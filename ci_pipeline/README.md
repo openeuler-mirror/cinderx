@@ -2,8 +2,8 @@
 
 Chinese documentation: [README_CN.md](README_CN.md)
 
-This directory maintains the local gate flow for ARM64 Linux CPython 3.14
-CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
+This directory maintains the local gate flow for ARM64 Linux CPython 3.11 and
+3.14 CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
 configuration lives in `ci_pipeline/suites/*.toml`.
 
 ## Software Dependencies
@@ -43,14 +43,20 @@ coverage builds.
 
 ### PR Gate
 
-Before submitting changes, run the PR gate with native C/C++ coverage enabled:
+The `pr` entry point selects its suites from the interpreter running it:
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
+python3.11 ci_pipeline/run_gate.py pr
+
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-The `pr` pipeline runs in this order:
+Python 3.11 runs three `cp311_gate` jobs: `runtime_tests_311`,
+`setup_release_311`, and `test_release_311`. PR builds exactly one Release
+wheel, while the full Lib/test differential remains Daily-only. Python 3.14
+keeps the existing pipeline and runs in this order:
 
 1. `runtime`: build and run native `RuntimeTests` through CMake. `--coverage`
    applies only to this suite.
@@ -73,6 +79,28 @@ CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
 
+Python 3.11 Daily requires the fat wheel. `setup_release_311` installs it
+instead of building a second wheel, then Daily appends
+`test_release_daily_311` and `libtest_daily_311`:
+
+```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
+CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
+python3.11 ci_pipeline/run_gate.py daily
+```
+
+`libtest_daily_311` runs stock 440 and evaluator-off 440 once each, extracts
+the 72-module control baseline from that stock result, and then runs only
+execute 72, the ten-module Py_DEBUG refleak check, and one unified report. It
+repeats neither stock 72 nor evaluator-off 440; the shadow Lib/test arm is not
+part of this stage.
+
+`test_release_daily_311` also runs the bounded 72-module stdlib execute canary,
+including its exact organic-deopt drift guard. The pyperformance completion
+commands remain explicit manual diagnostics and are not part of PR or Daily;
+therefore the automatic functional gates do not claim full pyperformance
+worker-crash, reject-ledger, or benchmark-completion coverage.
+
 The `daily` pipeline runs in this order:
 
 1. `runtime`
@@ -90,6 +118,7 @@ Available suites correspond to `ci_pipeline/suites/*.toml`. Use `--list` to
 print the jobs for a pipeline or suite without running them:
 
 ```bash
+python3.11 ci_pipeline/run_gate.py pr --list
 python3.14 ci_pipeline/run_gate.py pr --list
 python3.14 ci_pipeline/run_gate.py --suite runtime --list
 ```
