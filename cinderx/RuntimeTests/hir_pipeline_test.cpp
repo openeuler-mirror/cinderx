@@ -59,10 +59,13 @@ std::string normalizePipelineHIR(std::string hir) {
   // position; unrelated CUInt32 constants remain part of the fingerprint.
   static const std::regex global_load_call{
       R"(CallStatic<[^>\n]*,\s*4>\s+\S+\s+\S+\s+(v[0-9]+)\s+\S+)"};
+  std::vector<std::string> version_regs;
   for (std::sregex_iterator it{hir.begin(), hir.end(), global_load_call}, end;
        it != end;
        ++it) {
-    const std::string version_reg = (*it)[1].str();
+    version_regs.push_back((*it)[1].str());
+  }
+  for (const std::string& version_reg : version_regs) {
     const std::regex version_const{fmt::format(
         R"(({}\s*:CUInt32\[)[0-9]+(\]\s*=\s*LoadConst<CUInt32\[)[0-9]+(\]>))",
         version_reg)};
@@ -247,6 +250,23 @@ TEST(HIRPipelineGoldenPolicyTest, NormalizesGlobalDictKeysVersion) {
   EXPECT_NE(first.find("CUInt32[42]"), std::string::npos);
   EXPECT_NE(first.find("CUInt32[2147483999]"), std::string::npos);
   EXPECT_EQ(first.find("2147483648"), std::string::npos);
+}
+
+TEST(HIRPipelineGoldenPolicyTest, NormalizesMultipleGlobalDictKeysVersions) {
+  const std::string actual = normalizePipelineHIR(
+      "v2:CUInt32[2147483648] = LoadConst<CUInt32[2147483648]>\n"
+      "v4:CUInt32[2147483999] = LoadConst<CUInt32[2147483999]>\n"
+      "v5:OptObject = CallStatic<0xdeadbeef, 4> v0 v1 v2 v3\n"
+      "v6:OptObject = CallStatic<0xcafebabe, 4> v0 v1 v4 v3\n");
+
+  EXPECT_EQ(
+      actual,
+      "v2:CUInt32[<dict-keys-version>] = "
+      "LoadConst<CUInt32[<dict-keys-version>]>\n"
+      "v4:CUInt32[<dict-keys-version>] = "
+      "LoadConst<CUInt32[<dict-keys-version>]>\n"
+      "v5:OptObject = CallStatic<0xdeadbeef, 4> v0 v1 v2 v3\n"
+      "v6:OptObject = CallStatic<0xcafebabe, 4> v0 v1 v4 v3\n");
 }
 
 // Fixed 64-bit FNV-1a.  std::hash<std::string> is implementation-defined
