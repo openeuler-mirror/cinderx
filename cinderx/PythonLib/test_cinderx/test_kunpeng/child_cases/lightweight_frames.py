@@ -1,3 +1,4 @@
+import dis
 import gc
 import sys
 import weakref
@@ -293,6 +294,104 @@ def run_generator_close_gc_case() -> None:
     print("CASE_RESULT generator_close_gc OK mode=1")
 
 
+def run_forced_deopt_restore_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        __slots__ = ("__weakref__",)
+
+        def __del__(self) -> None:
+            events.append("forced")
+
+    def hot(obj, a, b, one):
+        total = a - a
+        i = total
+        while i < b:
+            total = total + a
+            i = i + one
+        if obj is None:
+            return -1
+        return total
+
+    warm = Marker()
+    for _ in range(200):
+        assert hot(warm, 3, 5, 1) == 15
+    assert cinderx.jit.force_compile(hot)
+    instructions = {instr.offset: instr.opname for instr in dis.get_instructions(hot)}
+    forceable = [
+        site
+        for site in cinderjit.deopt_sites(hot)
+        if site["kind"] == "GuardFailure"
+        and site["forceable"]
+        and instructions.get(site["bc_offset"]) == "BINARY_OP"
+    ]
+    assert forceable, cinderjit.deopt_sites(hot)
+    site = max(forceable, key=lambda item: item["bc_offset"])
+
+    obj = Marker()
+    ref = weakref.ref(obj)
+    before = _cinderx._get_trigger_stats()
+    assert cinderjit.force_deopt(hot, site["id"], n=1)
+    assert hot(obj, 3, 5, 1) == 15
+    after = _cinderx._get_trigger_stats()
+    assert after["forced_deopt_hits"] == before["forced_deopt_hits"] + 1
+    assert cinderjit.is_jit_compiled(hot)
+
+    del obj
+    gc.collect()
+    assert ref() is None
+    assert events == ["forced"], events
+    print("CASE_RESULT forced_deopt_restore OK mode=1")
+
+
+def run_exit_ownership_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        __slots__ = ("name", "__weakref__")
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __del__(self) -> None:
+            events.append(self.name)
+
+    def target(obj, should_raise):
+        local = obj
+        if should_raise:
+            raise ValueError("boom")
+        return local is obj
+
+    warm = Marker("warm")
+    for _ in range(200):
+        assert target(warm, False)
+    assert cinderx.jit.force_compile(target)
+
+    normal = Marker("normal")
+    normal_ref = weakref.ref(normal)
+    assert target(normal, False)
+    del normal
+    gc.collect()
+    assert normal_ref() is None
+    assert events == ["normal"], events
+
+    exceptional = Marker("exception")
+    exceptional_ref = weakref.ref(exceptional)
+    try:
+        target(exceptional, True)
+    except ValueError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("ValueError was not raised")
+    del exceptional
+    gc.collect()
+    assert exceptional_ref() is None
+    assert events == ["normal", "exception"], events
+    print("CASE_RESULT exit_ownership OK mode=1")
+
+
 def main() -> int:
     cases = {
         "fallback",
@@ -305,6 +404,8 @@ def main() -> int:
         "generator_return_cleanup",
         "generator_argument_lifetime",
         "generator_close_gc",
+        "forced_deopt_restore",
+        "exit_ownership",
         "normal_generator",
         "recursion",
     }
@@ -313,8 +414,8 @@ def main() -> int:
             f"usage: {sys.argv[0]} "
             "<fallback|inline|execute|localsplus_reuse|mode|materialize_getframe|"
             "materialize_traceback|generator_return_cleanup|"
-            "generator_argument_lifetime|generator_close_gc|normal_generator|"
-            "recursion>"
+            "generator_argument_lifetime|generator_close_gc|"
+            "forced_deopt_restore|exit_ownership|normal_generator|recursion>"
         )
     if sys.argv[1] == "mode":
         run_mode_case()
@@ -334,6 +435,10 @@ def main() -> int:
         run_generator_argument_lifetime_case()
     elif sys.argv[1] == "generator_close_gc":
         run_generator_close_gc_case()
+    elif sys.argv[1] == "forced_deopt_restore":
+        run_forced_deopt_restore_case()
+    elif sys.argv[1] == "exit_ownership":
+        run_exit_ownership_case()
     elif sys.argv[1] == "execute":
         run_case(dump_assembly=False)
     else:

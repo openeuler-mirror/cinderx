@@ -67,12 +67,14 @@ def _run_tls_case(case: str) -> str:
     return output
 
 
-def _run_lightweight_case(case: str, *, enable_generators: bool = False) -> str:
+def _run_lightweight_case(
+    case: str, *, enable_generators: bool = False, jit_mode: str = "execute"
+) -> str:
     env = _clean_env()
     env.update(
         {
             "CINDERX_EVAL_MODE": "cinder",
-            "CINDERX_JIT_MODE": "execute",
+            "CINDERX_JIT_MODE": jit_mode,
             "CINDERX_PLUGIN_ENABLE": "1",
             "PYTHONJITLIGHTWEIGHTFRAME": "1",
             "PYTHONUNBUFFERED": "1",
@@ -80,6 +82,8 @@ def _run_lightweight_case(case: str, *, enable_generators: bool = False) -> str:
     )
     if enable_generators:
         env["PYTHONJITGENERATOR"] = "1"
+    if jit_mode == "canary":
+        env["PYTHONJITAUTO"] = "1000000"
     completed = run_python_child(HELPER, case, env=env, timeout=120)
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, (
@@ -347,6 +351,24 @@ class LightweightFramesTests(unittest.TestCase):
             "generator_close_gc", enable_generators=True
         )
         self.assertIn("CASE_RESULT generator_close_gc OK mode=1", output)
+
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_forced_deopt_rebuilds_locals_and_value_stack(self) -> None:
+        output = _run_lightweight_case(
+            "forced_deopt_restore", jit_mode="canary"
+        )
+        self.assertIn("CASE_RESULT forced_deopt_restore OK mode=1", output)
+
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_normal_and_exceptional_exits_release_owned_argument_once(self) -> None:
+        output = _run_lightweight_case("exit_ownership", jit_mode="canary")
+        self.assertIn("CASE_RESULT exit_ownership OK mode=1", output)
 
 
 if __name__ == "__main__":
