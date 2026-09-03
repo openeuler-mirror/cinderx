@@ -6,8 +6,9 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 ## 环境要求
 
-- Python 3.14
-- Linux (aarch64)，推荐 openEuler 24.03 (LTS-SP3)
+- Python 3.11/3.14
+- Linux (aarch64)
+- CPython 3.11.6 目前仅支持 openEuler 24.03 (LTS-SP3)；CPython 3.14 推荐 openEuler 24.03 (LTS-SP3)
 
 ## 兼容性
 
@@ -15,6 +16,7 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 | CPython 版本 | aarch64 (ARM64) | x86_64 |
 |---|---|---|
+| 3.11.6 | 支持 | — |
 | 3.14.0 | 支持 | — |
 | 3.14.1 | 支持 | — |
 | 3.14.2 | 支持 | — |
@@ -22,7 +24,7 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 > **注意**：
 > - 当前仅提供 aarch64 (ARM64) 架构的预编译 whl 包，x86_64 暂未提供预编译包。
-> - 不支持 Python 3.13 及更早版本，不支持 Python 3.15 及以上版本。
+> - 仅支持 CPython 3.11.6 和 3.14.0–3.14.3，不支持其他 Python 版本。
 
 ## 安装
 
@@ -30,9 +32,8 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 安装预编译 whl 前，请确认运行环境满足以下要求：
 
-- 操作系统：Linux aarch64/ARM64，推荐 openEuler 24.03 (LTS-SP3)。
-- Python：CPython 3.14.0 - 3.14.3，推荐 3.14.3；`pip` 必须来自同一个 `python3.14`。
-- 架构：当前发布包仅提供 aarch64 wheel，x86_64 暂无预编译包。
+- 操作系统：Linux aarch64/ARM64。CPython 3.11.6 目前仅支持 openEuler 24.03 (LTS-SP3)；CPython 3.14 推荐 openEuler 24.03 (LTS-SP3)。
+- Python：CPython 3.11.6 或 3.14.0 - 3.14.3，推荐 3.14.3；`pip` 必须来自对应的 `python3.11` 或 `python3.14`。
 - 权限：安装到系统 `site-packages` 需要 root 权限；普通用户建议先创建虚拟环境，或使用 `--user` 安装。
 
 建议先确认解释器和平台：
@@ -51,7 +52,7 @@ PY
 ### 安装命令
 
 在 [openeuler releases](https://gitcode.com/openeuler/cinderx/releases) 获取最新
-cinderx whl 包后安装：
+cinderx whl 包后安装（以 `python3.14` 为例）：
 
 ```bash
 python3.14 -m pip install --no-index cinderx-*_aarch64.whl
@@ -64,8 +65,9 @@ python3.14 -m pip install --no-index cinderx-*_aarch64.whl
 | 文件/目录 | 说明 |
 |---|---|
 | `cinderx/` | CinderX Python 包，包含 `cinderx.jit`、缓存属性、Strict/Static 辅助接口、compiler 子包、`cinderx/opcode.py` 等 |
-| `cinderx/_native/` | fat wheel 的 native 扩展目录，包含 `fat_wheel.json` 和 `py314_0` 至 `py314_3` 对应的 `_cinderx_314*.so` |
-| `_cinderx.py` | 顶层 native loader；按当前 CPython 3.14 micro 版本加载 `cinderx/_native/` 下对应的 native 扩展 |
+| `cinderx/_native/` | CPython 3.11.6 wheel 在该目录包含构建溯源信息 `build_info_311.json`；CPython 3.14 fat wheel 包含 `fat_wheel.json` 和 `py314_0` 至 `py314_3` 对应的 `_cinderx_314*.so` |
+| `_cinderx*.so` | 仅 CPython 3.11.6 wheel 提供的顶层 native 扩展；CPython 3.14 fat wheel 使用下述 `_cinderx.py` loader |
+| `_cinderx.py` | CPython 3.14 fat wheel 的顶层 native loader；按当前 micro 版本加载 `cinderx/_native/` 下对应的 native 扩展 |
 | `__static__/`、`__strict__/` | Static Python 和 Strict Modules 的兼容包入口 | 
 | `opcodes/` | CinderX opcode 生成/维护辅助包，包含 `3.12/`、`3.14/`、`3.15/` 版本化 `opcode.py` 和生成脚本 |
 | `_cinderx_auto.py` | 自动导入入口；由 `cinderx.pth` 在 Python 启动时触发 |
@@ -79,6 +81,7 @@ python3.14 -m pip install --no-index cinderx-*_aarch64.whl
 先验证包和 native 扩展可以导入：
 
 ```bash
+# 以 python3.14 为例
 python3.14 - <<'PY'
 import _cinderx
 import cinderx
@@ -110,6 +113,13 @@ PY
 `_cinderx_auto loaded: True`，说明 whl 已安装到当前 `python3.14` 的搜索路径中。
 
 ## 特性概览
+
+| 特性 | CPython 3.11 | CPython 3.14 |
+|---|---|---|
+| 自动导入 | 支持 | 支持 |
+| OSR | 不支持 | 支持 |
+| 轻量级帧 | 不支持 | 支持 |
+| AutoJIT | 不支持 | 支持 |
 
 ### 自动导入
 

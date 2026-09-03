@@ -208,6 +208,23 @@ void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func);
 // that this call already committed to.
 void* Ci_JitShell311_InvocationArtifact(void);
 
+// Run one call through an artifact the caller has already chosen: pin the
+// artifact for the duration of the call, publish it as the invocation
+// snapshot consulted by JITRT_ReenterAfterBind, and enter its vectorcall
+// entry.  RuntimeTests use this path for synthetic artifacts that are not
+// installed on a function.  Ci_JitShell311_GuardedEntry keeps the equivalent
+// soft-limit check, pin, invocation scope, and vectorcall sequence inline to
+// preserve its Py_DEBUG refcount lifetime.  Keep those two sequences in sync:
+// the generated prologue resolves its bound-arguments reentry through the
+// snapshot, and entering the code without one silently runs the interpreter
+// instead of the machine-code body.  `artifact` is a jit::CompiledFunction*.
+PyObject* Ci_JitShell311_InvokeArtifact(
+    void* artifact,
+    PyObject* func,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
 // The vectorcall entry installed on a function whose artifact may execute.
 // It re-checks the predicate above on every call and falls back to the
 // interpreter entry when anything has moved, so a function that leaves the
