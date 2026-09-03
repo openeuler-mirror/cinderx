@@ -498,7 +498,7 @@ print(json.dumps({
             PYTHONJITAUTO="auto",
         )
         self.assertFalse(payload["installed"])
-        self.assertIn("positive integer", payload["message"])
+        self.assertIn("non-negative integer", payload["message"])
 
     def test_observe_file_records_the_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
