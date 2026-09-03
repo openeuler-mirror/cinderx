@@ -380,6 +380,8 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert "comm -3" in refleak_script
     assert '--original-log-dir "$MODULE_LOG_DIR"' in refleak_script
     assert "any global SUCCESS epilogue" in refleak_script
+    assert 'PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}"' not in refleak_script
+    assert refleak_script.count('PYTHONPATH="$START"') == 2
 
 
 def test_cp311_container_scripts_resolve_bare_executable_names():
