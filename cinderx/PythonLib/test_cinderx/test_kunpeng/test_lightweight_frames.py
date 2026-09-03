@@ -356,6 +356,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 canary control plane")
     def test_forced_deopt_rebuilds_locals_and_value_stack(self) -> None:
         output = _run_lightweight_case(
             "forced_deopt_restore", jit_mode="canary"
