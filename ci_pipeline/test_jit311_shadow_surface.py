@@ -454,6 +454,32 @@ def test_empty_pass_with_stdlib_compiles_is_green_against_matching_baseline():
     assert surface.judge_completeness(_report(modules)) == []
 
 
+def test_dtrace_platform_skip_is_green_against_matching_baseline():
+    # CPython 3.11 reports a successful module with run=0/skipped=5 when
+    # the Linux host has no usable SystemTap/DTrace backend.  Keep this
+    # audited empty surface dual-run instead of treating its empty junit as
+    # a disappeared test module.
+    assert "test_dtrace" in surface.libtest_empty_ok()
+    rec = _module(
+        "test_dtrace",
+        verdict="pass",
+        returncode=0,
+        cases={},
+        snap=_snap(
+            "test_dtrace",
+            compiled_functions=[
+                {
+                    "filename": "/usr/bin/dtrace",
+                    "qualname": "usage",
+                }
+            ],
+        ),
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    assert surface.judge_completeness(_report(modules)) == []
+
+
 def test_codecencodings_matches_multibytecodec_support_not_argparse():
     rec = _module(
         "test_codecencodings_cn",

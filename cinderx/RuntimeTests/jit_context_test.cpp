@@ -3764,6 +3764,93 @@ def forget_me():
   EXPECT_FALSE(ctx->didCompile(func));
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
+class JITDefaultOwnershipTest : public RuntimeTest {};
+
+TEST_F(JITDefaultOwnershipTest, PositionalDefaultsSurviveTupleRebind) {
+  const char* py_src = R"(
+class Boom:
+    pass
+
+def rebind():
+    victim.__defaults__ = ()
+
+def victim(first=Boom(), second=Boom()):
+    rebind()
+    return first, second
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  ASSERT_NE(got, nullptr);
+  ASSERT_TRUE(PyTuple_CheckExact(got));
+  ASSERT_EQ(PyTuple_GET_SIZE(got), 2);
+  EXPECT_STREQ(Py_TYPE(PyTuple_GET_ITEM(got.get(), 0))->tp_name, "Boom");
+  EXPECT_STREQ(Py_TYPE(PyTuple_GET_ITEM(got.get(), 1))->tp_name, "Boom");
+}
+
+TEST_F(JITDefaultOwnershipTest, PositionalDefaultSurvivesKeywordBinding) {
+  // Passing the first positional parameter by keyword keeps kwnames non-null
+  // and routes this small function through JITRT_CallWithKeywordArgsSimple.
+  // The binder must pin the defaults tuple before borrowing the second value.
+  const char* py_src = R"(
+class Boom:
+    pass
+
+explicit = Boom()
+
+def rebind():
+    victim.__defaults__ = ()
+
+def victim(first, second=Boom()):
+    rebind()
+    return first, second
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto kwargs = Ref<>::steal(PyDict_New());
+  ASSERT_NE(kwargs, nullptr);
+  ASSERT_EQ(PyDict_SetItemString(kwargs, "first", getGlobal("explicit")), 0);
+  auto got = Ref<>::steal(PyObject_Call(func, no_args, kwargs));
+  ASSERT_NE(got, nullptr);
+  ASSERT_TRUE(PyTuple_CheckExact(got));
+  ASSERT_EQ(PyTuple_GET_SIZE(got), 2);
+  EXPECT_EQ(PyTuple_GET_ITEM(got.get(), 0), getGlobal("explicit"));
+  EXPECT_STREQ(Py_TYPE(PyTuple_GET_ITEM(got.get(), 1))->tp_name, "Boom");
+}
+
+TEST_F(JITDefaultOwnershipTest, KeywordDefaultsSurviveDictClear) {
+  const char* py_src = R"(
+class Boom:
+    pass
+
+def clear_kw():
+    victim.__kwdefaults__.clear()
+
+def victim(*, first=Boom(), second=Boom()):
+    clear_kw()
+    return first, second
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  ASSERT_NE(got, nullptr);
+  ASSERT_TRUE(PyTuple_CheckExact(got));
+  ASSERT_EQ(PyTuple_GET_SIZE(got), 2);
+  EXPECT_STREQ(Py_TYPE(PyTuple_GET_ITEM(got.get(), 0))->tp_name, "Boom");
+  EXPECT_STREQ(Py_TYPE(PyTuple_GET_ITEM(got.get(), 1))->tp_name, "Boom");
+}
+#endif
+
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 lifecycle contracts, asserted natively rather than only from
 // Python.  Each of these was reported against a build where the Python-level

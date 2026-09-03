@@ -98,13 +98,10 @@ def build(image: str, out_dir: Path, git_sha: str, deps_cache: Path | None) -> P
         "-v", f"{out_dir}:/out",
         # Pass-through knobs; docker omits any that are unset here.
         "-e", "CINDERX_VERSION_PATCH",
-        "-e", "CINDERX_SKIP_BUILDER_CHECK",
-        "-e", "CMAKE_BUILD_TYPE",
         "-e", "CMAKE_BUILD_PARALLEL_LEVEL",
         "-e", "SOURCE_DATE_EPOCH",
         "-e", "CINDERX_GIT_SHA",
         "-e", "CINDERX_BUILDER_IMAGE",
-        "-e", "CINDERX_PYTHON3_NVR",
         "-e", "CINDERX_GIT_INSECURE",
     ]
     # Opt-in local FetchContent cache, the repo's documented offline
@@ -170,7 +167,6 @@ def smoke(runtime_image: str, out_dir: Path) -> None:
             "-v", f"{out_dir}:/wheels:ro",
             "-v", f"{scripts / 'smoke_cp311_wheel_in_runtime.sh'}:/smoke/run.sh:ro",
             "-v", f"{tests}:/smoke/test_cinderx:ro",
-            "-e", "CINDERX_PYTHON3_NVR",
             "-w", "/smoke",
             runtime_image,
             "bash", "/smoke/run.sh",
