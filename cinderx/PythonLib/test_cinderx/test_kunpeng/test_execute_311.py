@@ -286,11 +286,11 @@ class Execute311Test(unittest.TestCase):
     def test_threshold_rejects_negative_and_overflowing_values(self):
         # strtoull() accepts a sign: an unchecked "-1" becomes a threshold
         # no program reaches.  Bad values must be refused outright.
-        for value in ("-1", "99999999999999999999999999", "0", "1.5", " 5"):
+        for value in ("-1", "99999999999999999999999999", "1.5", " 5"):
             with self.subTest(value=value):
                 proc = run_program("init_only", threshold=value, timeout=60)
                 self.assertNotEqual(proc.returncode, 0, value)
-                self.assertIn("positive integer", proc.stderr)
+                self.assertIn("non-negative integer", proc.stderr)
 
     def test_attach_budget_above_the_counter_width_is_clamped(self):
         # The 16-bit attach counter saturates; an unreachable budget would
@@ -334,7 +334,14 @@ class Execute311Test(unittest.TestCase):
     def test_threshold_matrix(self):
         # (PYTHONJITAUTO, effective threshold); None = the default of 50,
         # and the very high value is the armed-but-interpreted control arm.
-        cases = [("1", 1), ("2", 2), ("4", 4), (None, 50), ("1000000000", None)]
+        cases = [
+            ("0", 0),
+            ("1", 1),
+            ("2", 2),
+            ("4", 4),
+            (None, 50),
+            ("1000000000", None),
+        ]
         for raw, effective in cases:
             with self.subTest(threshold=raw):
                 payload = self.run_ok("threshold_matrix", threshold=raw)
@@ -349,11 +356,30 @@ class Execute311Test(unittest.TestCase):
                     continue
                 self.assertEqual(payload["threshold"], effective)
                 self.assertEqual(len(payload["events"]), 1)
-                self.assertEqual(payload["events"][0]["count"], effective)
+                # Threshold zero schedules on the first observable call;
+                # there is no call-count event before that frame exists.
+                self.assertEqual(payload["events"][0]["count"], max(effective, 1))
                 self.assertEqual(payload["events"][0]["result"], "installed")
                 # hot's own calls after the crossing; the driving
                 # comprehension itself never enters machine code.
-                self.assertEqual(payload["entries"], 200 - effective)
+                # The threshold-crossing frame is already executing in the
+                # interpreter; only later calls enter the published artifact.
+                self.assertEqual(payload["entries"], 200 - max(effective, 1))
+                self.assertTrue(payload["compiled"])
+
+    def test_zero_threshold_startup_sources_are_consistent(self):
+        cases = (
+            {"threshold": "0"},
+            {"threshold": None, "PYTHONJITALL": "1"},
+        )
+        for env in cases:
+            with self.subTest(env=env):
+                payload = self.run_ok("threshold_matrix", **env)
+                self.assertEqual(payload["threshold"], 0)
+                self.assertEqual(len(payload["events"]), 1)
+                self.assertEqual(payload["events"][0]["count"], 1)
+                self.assertEqual(payload["events"][0]["result"], "installed")
+                self.assertEqual(payload["entries"], 199)
                 self.assertTrue(payload["compiled"])
 
     def test_shutdown_repeats_clean_with_live_state(self):

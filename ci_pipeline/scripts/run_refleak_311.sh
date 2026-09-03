@@ -28,8 +28,21 @@ REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PY_VERSION=3.11.6
 THRESHOLD=${PYTHONJITAUTO:-20}
 # -R <warmups>:<repetitions>.  regrtest reports a leak only when the
-# totals move in every repetition, so the repetitions are the judge.
-ROUNDS=${CINDERX_REFLEAK_ROUNDS:-3:3}
+# totals move in every repetition, so the repetitions are the judge.  Ten
+# warmups let threshold-triggered compilation settle before those measured
+# repetitions; otherwise compilation itself lands inside the measurement.
+ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}
+BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
+case "$BUILD_JOBS" in
+  ''|*[!0-9]*) echo "CINDERX_TEST_JOBS must be a positive integer"; exit 2 ;;
+esac
+[ "$BUILD_JOBS" -gt 0 ] \
+  || { echo "CINDERX_TEST_JOBS must be greater than zero"; exit 2; }
+PYTHON_SOURCE_ARCHIVE=${CINDERX_REFLEAK_PYTHON_SOURCE:-}
+PIP_ARGS=(--disable-pip-version-check --no-cache-dir)
+if [ -n "${CINDERX_PIP_WHEELHOUSE:-}" ]; then
+  PIP_ARGS+=(--no-index --find-links="$CINDERX_PIP_WHEELHOUSE")
+fi
 
 MODULES=("$@")
 if [ ${#MODULES[@]} -eq 0 ]; then
@@ -47,12 +60,20 @@ if [ ! -x "$PYD" ]; then
   mkdir -p "$SRC"
   ( cd "$SRC"
     if [ ! -f "Python-$PY_VERSION.tgz" ]; then
-      curl -sSLO "https://www.python.org/ftp/python/$PY_VERSION/Python-$PY_VERSION.tgz"
+      if [ -n "$PYTHON_SOURCE_ARCHIVE" ]; then
+        test -f "$PYTHON_SOURCE_ARCHIVE" || {
+          echo "refleak Python source archive missing: $PYTHON_SOURCE_ARCHIVE"
+          exit 1
+        }
+        cp "$PYTHON_SOURCE_ARCHIVE" "Python-$PY_VERSION.tgz"
+      else
+        curl -sSLO "https://www.python.org/ftp/python/$PY_VERSION/Python-$PY_VERSION.tgz"
+      fi
     fi
     rm -rf "Python-$PY_VERSION" && tar xf "Python-$PY_VERSION.tgz"
     cd "Python-$PY_VERSION"
     ./configure --with-pydebug --prefix="$PREFIX" --with-ensurepip=install
-    make -j"$(nproc)"
+    make -j"$BUILD_JOBS"
     make install
   ) > "$WORK/cpython-build.log" 2>&1
 fi
@@ -64,9 +85,11 @@ fi
 
 # CinderX against that interpreter.  The wheel carries the cp311d ABI tag,
 # so it can never be confused with the release one.
-"$PYD" -m pip install -q --upgrade "setuptools>=77" wheel > "$WORK/pip.log" 2>&1
+"$PYD" -m pip install -q "${PIP_ARGS[@]}" \
+  setuptools==82.0.1 wheel==0.47.0 > "$WORK/pip.log" 2>&1
 rm -rf "$WORK/wheels"
-( cd "$REPO_ROOT" && CMAKE_BUILD_TYPE=Release "$PYD" -m pip wheel . \
+( cd "$REPO_ROOT" && CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" \
+    CMAKE_BUILD_TYPE=Release "$PYD" -m pip wheel . \
     -w "$WORK/wheels" --no-deps --no-build-isolation ) > "$WORK/cinderx-build.log" 2>&1
 WHEEL=$(ls "$WORK"/wheels/cinderx-*.whl)
 case "$WHEEL" in
@@ -96,15 +119,48 @@ mkdir -p "$START"
 cp "$REPO_ROOT/ci_pipeline/scripts/refleak_attest_sitecustomize.py" \
   "$START/sitecustomize.py"
 
-echo "running: python -m test -R $ROUNDS ${MODULES[*]}"
-set +e
-env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
-    CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
-    CINDERX_REFLEAK_LEDGER="$LEDGER" \
-    PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}" \
-  "$VENV_PY" -m test -R "$ROUNDS" "${MODULES[@]}" > "$WORK/regrtest.log" 2>&1
-RC=$?
-set -e
+echo "running: one python -m test -R $ROUNDS process per module: ${MODULES[*]}"
+MODULE_LOG_DIR="$WORK/regrtest-modules"
+rm -rf "$MODULE_LOG_DIR"
+mkdir -p "$MODULE_LOG_DIR"
+: > "$WORK/regrtest.log"
+RC=0
+FAILED_MODULES=()
+for MODULE in "${MODULES[@]}"; do
+  MODULE_LOG="$MODULE_LOG_DIR/$MODULE.log"
+  set +e
+  env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+      CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+      CINDERX_REFLEAK_LEDGER="$LEDGER" \
+      PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}" \
+    "$VENV_PY" -m test -R "$ROUNDS" "$MODULE" > "$MODULE_LOG" 2>&1
+  MODULE_RC=$?
+  set -e
+  if [ "$MODULE_RC" != 0 ] && [ "$MODULE_RC" != 2 ]; then
+    echo "refleak: $MODULE exited abnormally ($MODULE_RC)"
+    tail -30 "$MODULE_LOG"
+    exit 1
+  fi
+  grep -qE '^Result: |^== Tests result: ' "$MODULE_LOG" || {
+    echo "refleak: $MODULE produced no completion epilogue"
+    tail -30 "$MODULE_LOG"
+    exit 1
+  }
+  {
+    echo "===== $MODULE (exit $MODULE_RC) ====="
+    cat "$MODULE_LOG"
+  } >> "$WORK/regrtest.log"
+  if [ "$MODULE_RC" = 0 ]; then
+    grep -qE '^Result: SUCCESS|^== Tests result: SUCCESS' "$MODULE_LOG" || {
+      echo "refleak: $MODULE exited zero without a success epilogue"
+      tail -30 "$MODULE_LOG"
+      exit 1
+    }
+  else
+    RC=2
+    FAILED_MODULES+=("$MODULE")
+  fi
+done
 tail -20 "$WORK/regrtest.log"
 
 # Reference leaks are the acceptance item's subject and are never excused.
@@ -138,7 +194,8 @@ if [ -n "$BLK_MODULES" ]; then
   if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
        CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
        "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
-       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8; then
+       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8 \
+       --original-log-dir "$MODULE_LOG_DIR"; then
     echo "refleak: a reported block figure is not the quickened-counter"
     echo "artifact -- treating it as a real leak"
     exit 1
@@ -147,13 +204,13 @@ elif [ "$RC" != 0 ]; then
   echo "refleak: regrtest -R reported failures (exit $RC) with no leak lines"
   exit 1
 fi
-# A run that executed nothing would also print no leaks.
-if ! grep -qE "^Result: SUCCESS|== Tests result: SUCCESS" "$WORK/regrtest.log"; then
-  # A FAILURE line is acceptable only when every failing test is one whose
-  # block figure was verified above; anything else is a real failure.
-  FAILED=$(sed -n '/tests* failed:/,/^$/p' "$WORK/regrtest.log" \
-    | grep -oE '^ +[a-z_0-9]+' | tr -d ' ' | sort -u || true)
-  UNEXPLAINED=$(comm -23 <(echo "$FAILED") <(echo "$BLK_MODULES" | sort -u) || true)
+# A non-zero module is acceptable only when that same module's block figure
+# was verified above.  Looking for any global SUCCESS epilogue would let a
+# later successful module hide an earlier real failure.
+if ((${#FAILED_MODULES[@]})); then
+  FAILED=$(printf '%s\n' "${FAILED_MODULES[@]}" | sort -u)
+  UNEXPLAINED=$(comm -3 <(printf '%s\n' "$FAILED") \
+    <(printf '%s\n' "$BLK_MODULES" | sort -u) || true)
   if [ -n "$UNEXPLAINED" ]; then
     echo "refleak: regrtest failed on tests beyond the verified block"
     echo "artifact: $(echo "$UNEXPLAINED" | tr '\n' ' ')"
@@ -183,4 +240,9 @@ if [ "$ENTRIES" -le 0 ]; then
   echo "machine code; a leak in compiled-code lifetime could not have shown"
   exit 1
 fi
+printf '{"modules":%d,"rounds":"%s","attesting_processes":%d,' \
+  "${#MODULES[@]}" "$ROUNDS" "$ROWS" > "$WORK/refleak-summary.json"
+printf '"evaluator_installed_processes":%d,"machine_code_entries":%d,' \
+  "$INSTALLED" "$ENTRIES" >> "$WORK/refleak-summary.json"
+printf '"reference_leaks":0}\n' >> "$WORK/refleak-summary.json"
 echo "refleak: -R $ROUNDS over ${#MODULES[@]} module(s), no leaks"

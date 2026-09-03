@@ -14,14 +14,19 @@
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/gen_asm.h"
-#include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/deopt.h"
 // NOLINTNEXTLINE(facebook-unused-include-check)
 #include "internal/pycore_frame.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/builder.h"
@@ -438,14 +443,47 @@ class DeoptStressTest : public RuntimeTest {
     };
     Context* ngen_ctx = getContext();
     auto pyfunc = reinterpret_cast<PyFunctionObject*>(funcobj.get());
+#if PY_VERSION_HEX < 0x030C0000
+    // The shadow-mode fixture deliberately omits CompiledFunction/cinderjit
+    // initialization, so the artifact type used by the wrappers below has
+    // not been readied.  PyType_Ready is idempotent, so this is also safe
+    // under the canary fixture, where module init already readied it.
+    ASSERT_EQ(PyType_Ready(getCompiledFunctionType()), 0);
+#endif
     while (!guards.empty()) {
+      std::size_t guards_before = guards.size();
       NativeGeneratorFactory factory;
       NativeGenerator gen(irfunc.get(), factory);
       auto jitfunc = reinterpret_cast<vectorcallfunc>(gen.getVectorcallEntry());
       ASSERT_NE(jitfunc, nullptr);
       ngen_ctx->setGuardFailureCallback(delete_one_deopt);
+#if PY_VERSION_HEX < 0x030C0000
+      // On 3.11 the generated prologue does not jump into its own body: it
+      // resolves the bound-arguments reentry through JITRT_ReenterAfterBind,
+      // which consults the invocation snapshot and the published-artifact
+      // registry and falls back to the interpreter when neither resolves.
+      // Entering the generated code directly would therefore run the
+      // interpreter, return the right answer, and consume no guards.  Wrap
+      // each generation as an artifact and enter it through the shared
+      // invocation path, exactly as Ci_JitShell311_GuardedEntry does.  The
+      // wrapper also owns the code buffer, so each round's machine code is
+      // released with the wrapper instead of accumulating across rounds.
+      CompiledFunctionData wrapper_data;
+      wrapper_data.code = gen.getCodeBuffer();
+      wrapper_data.vectorcall_entry = jitfunc;
+      Ref<CompiledFunction> compiled =
+          CompiledFunction::create(std::move(wrapper_data), /*immortal=*/false);
+      ASSERT_NE(compiled, nullptr);
+      auto res = Ci_JitShell311_InvokeArtifact(
+          compiled.get(),
+          reinterpret_cast<PyObject*>(pyfunc),
+          args,
+          nargs,
+          nullptr);
+#else
       auto res =
           jitfunc(reinterpret_cast<PyObject*>(pyfunc), args, nargs, nullptr);
+#endif
       ngen_ctx->clearGuardFailureCallback();
       if ((res == nullptr) ||
           (PyObject_RichCompareBool(res, expected, Py_EQ) < 1)) {
@@ -453,6 +491,9 @@ class DeoptStressTest : public RuntimeTest {
         FAIL();
       }
       Py_XDECREF(res);
+      ASSERT_LT(guards.size(), guards_before)
+          << "JIT body did not execute: the call consumed no guard, so the "
+             "stress loop cannot make progress";
     }
   }
 
