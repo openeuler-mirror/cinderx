@@ -66,15 +66,36 @@ std::unique_ptr<T[]> allocateBindArray(size_t n) {
   }
 }
 
-// Caller-provided args stay borrowed.  Defaults / kwdefaults are owned
-// until reentry returns: __defaults__ and __kwdefaults__ can be rebound
-// while the compiled body is running.
-static void bindOwnedDefault(
-    std::vector<Ref<PyObject>>& owned_defaults,
+// Caller-provided args stay borrowed.  Defaults / kwdefaults must stay alive
+// until reentry returns: either attribute can be rebound while the compiled
+// body is running, and the kwdefaults dict can also be mutated in place.
+//
+// A defaults tuple is immutable, so one reference to the tuple pins every
+// positional default without allocating per-value ownership storage.  A
+// kwdefaults dict is mutable, so each selected value still needs its own
+// reference.
+struct BoundDefaultRefs {
+  Ref<> positional_tuple;
+  std::vector<Ref<>> keyword_values;
+};
+
+static void bindPositionalDefault(
+    BoundDefaultRefs& owned_defaults,
+    PyObject* defaults,
     PyObject** slot,
     PyObject* def) {
-  owned_defaults.emplace_back(Ref<>::create(def));
-  *slot = owned_defaults.back().get();
+  if (owned_defaults.positional_tuple == nullptr) {
+    owned_defaults.positional_tuple = Ref<>::create(defaults);
+  }
+  *slot = def;
+}
+
+static void bindKeywordDefault(
+    BoundDefaultRefs& owned_defaults,
+    PyObject** slot,
+    PyObject* def) {
+  owned_defaults.keyword_values.emplace_back(Ref<>::create(def));
+  *slot = owned_defaults.keyword_values.back().get();
 }
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
@@ -89,7 +110,7 @@ static BindKwStatus JITRT_BindKeywordArgs(
     Py_ssize_t total_args,
     Ref<PyObject>& kwdict,
     Ref<PyObject>& varargs,
-    std::vector<Ref<PyObject>>& owned_defaults) {
+    BoundDefaultRefs& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   const Py_ssize_t named_args = co->co_argcount + co->co_kwonlyargcount;
@@ -209,8 +230,8 @@ static BindKwStatus JITRT_BindKeywordArgs(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          bindOwnedDefault(
-              owned_defaults, &arg_space[arg_index], defs[def_index]);
+          bindPositionalDefault(
+              owned_defaults, defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
@@ -229,7 +250,7 @@ static BindKwStatus JITRT_BindKeywordArgs(
       if (kwdefs != nullptr) {
         PyObject* def = PyDict_GetItemWithError(kwdefs, name);
         if (def) {
-          bindOwnedDefault(owned_defaults, &arg_space[i], def);
+          bindKeywordDefault(owned_defaults, &arg_space[i], def);
           continue;
         } else if (_PyErr_Occurred(_PyThreadState_GET())) {
           return BindKwStatus::Error;
@@ -430,7 +451,7 @@ PyObject* JITRT_CallWithKeywordArgs(
     return nullptr;
   }
   Ref<PyObject> kwdict, varargs;
-  std::vector<Ref<PyObject>> owned_defaults;
+  BoundDefaultRefs owned_defaults;
 
   switch (JITRT_BindKeywordArgs(
       func,
@@ -511,11 +532,11 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     arg_space[i] = *args++;
   }
 
-  std::vector<Ref<PyObject>> owned_defaults;
-  PyObject** def_items =
-      &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
+  Ref<> owned_defaults = Ref<>::create(defaults);
+  PyObject** def_items = &((PyTupleObject*)owned_defaults.get())
+                              ->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
+    arg_space[i] = *def_items++;
   }
 
   size_t new_nargsf = argcount;
@@ -585,11 +606,11 @@ JITRT_CallWithIncorrectArgcount(
     arg_space[i] = *args++;
   }
 
-  std::vector<Ref<PyObject>> owned_defaults;
-  PyObject** def_items =
-      &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
+  Ref<> owned_defaults = Ref<>::create(defaults);
+  PyObject** def_items = &((PyTupleObject*)owned_defaults.get())
+                              ->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
+    arg_space[i] = *def_items++;
   }
 
   size_t new_nargsf = argcount;
@@ -736,7 +757,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
       return TRetType();
     }
     Ref<PyObject> kwdict, varargs;
-    std::vector<Ref<PyObject>> owned_defaults;
+    BoundDefaultRefs owned_defaults;
 
     switch (JITRT_BindKeywordArgs(
         func,
@@ -3281,7 +3302,7 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
     PyObject* kwnames,
     PyObject** arg_space,
     Py_ssize_t total_args,
-    std::vector<Ref<PyObject>>& owned_defaults) {
+    BoundDefaultRefs& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   if (argcount > co->co_argcount) {
@@ -3362,8 +3383,8 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          bindOwnedDefault(
-              owned_defaults, &arg_space[arg_index], defs[def_index]);
+          bindPositionalDefault(
+              owned_defaults, defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
@@ -3389,7 +3410,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
 
   // stack allocate
   auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
-  std::vector<Ref<PyObject>> owned_defaults;
+  BoundDefaultRefs owned_defaults;
 
   switch (JITRT_BindKeywordArgsSimple(
       func, args, nargsf, kwnames, arg_space, total_args, owned_defaults)) {
