@@ -12,3 +12,9 @@ repos:
         entry: python ci_pipeline/scripts/check_clean_code_incremental.py --tidy
         language: system
         pass_filenames: false
+
+      - id: markdown-tables
+        name: Markdown table structure check
+        entry: python ci_pipeline/scripts/check_markdown_tables.py
+        language: system
+        pass_filenames: false
