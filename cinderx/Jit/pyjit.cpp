@@ -5815,7 +5815,8 @@ int initialize() {
     Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
     PyErr_Format(
         PyExc_RuntimeError,
-        "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11");
+        "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11: "
+        "expected a non-negative integer");
     return -1;
   }
   auto resolved_threshold = getConfig().compile_after_n_calls;
