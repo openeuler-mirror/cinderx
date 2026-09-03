@@ -680,6 +680,18 @@ def test_runtime_tests_manifests_are_consistent():
     }
     assert golden_required <= set(required)
 
+    runner = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline"
+        / "scripts"
+        / "run_rt311_green.sh"
+    ).read_text()
+    assert "DeoptStressTest\\." not in runner
+    assert runner.count(
+        "InsertUpdatePrevInstrTest\\.RedundantStoresEliminated"
+    ) == 1
+    assert "https://gitcode.com/openeuler/cinderx/issues/20" not in runner
+
 
 def _canary_population(tests_dir=None):
     """The canary population by the runner's own derivation.
@@ -862,15 +874,14 @@ def test_unexpected_organic_deopt_turns_red():
 
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
-    # Each milestone re-pins the leg (MR-09's guarded attribute sites put
-    # it at 333, MR-10's generator round at 336, which the MR-11 base
-    # keeps); any drift off the pinned constant must still turn red.
+    # The shared-3.11 gate and its matching CPython test support path pin
+    # the current invocation at 330; any drift must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 337})
+        for error in judge({"organic_deopt_hits": 331})
     ]
-    assert any("organic_deopt_hits == 336" in error for error in errors)
+    assert any("organic_deopt_hits == 330" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):
@@ -931,6 +942,29 @@ def test_runtime_gates_drop_inherited_golden_sample_update_mode():
 
         assert proc.returncode == 0, (name, proc.stderr)
         assert proc.stdout.strip() == "0", name
+
+
+def test_rt311_census_parses_gtest_timing_suffix(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline"
+        / "scripts"
+        / "run_rt311_green.sh"
+    )
+    log = tmp_path / "census-shard.log"
+    log.write_text(
+        "[==========] 200 tests from 13 test suites ran. (1716 ms total)\n"
+    )
+    proc = _sp.run(
+        ["bash", str(script), "--verify-gtest-ran-count", str(log)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "200"
 
 
 def _rt314_fixture_logs(tmp_path):

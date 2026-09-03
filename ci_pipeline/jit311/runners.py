@@ -576,14 +576,14 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # one more when MR-08 opened the exception family, 333 once MR-09's
     # pull-validated attribute caches guard attribute sites across 72
     # importing modules (import-time class mutation retires
-    # receiver-version guards by design), and 336 at the MR-11 base after
-    # MR-10's generator round.  MR-11 itself leaves the count unchanged:
-    # the base build and this branch measure alike in the gate's
-    # invocation context.  The count is sensitive to sys.path (an extra
-    # repository root on PYTHONPATH changes the compiled slice); the gate
-    # runs with the venv only.  Verified deterministic across reruns; the
-    # exact pin keeps the fail-closed drift guard.
-    default = execute_holds(expected_organic_deopts=336) + [
+    # receiver-version guards by design), and 330 in the shared-3.11 gate
+    # after the CPython test support path is added.  The base build and this
+    # branch measure alike in that invocation context.  The count is
+    # sensitive to sys.path; the gate runs with its system-3.11 venv plus
+    # the matching CPython 3.11.6 test support paths.  Verified deterministic
+    # across base and candidate reruns; the exact pin keeps the fail-closed
+    # drift guard.
+    default = execute_holds(expected_organic_deopts=330) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -1540,6 +1540,24 @@ def run_all(python: str | None = None) -> list[RunResult]:
     return results
 
 
+def run_non_libtest(python: str | None = None) -> list[RunResult]:
+    """Run the PR driver battery without either 72-module Lib/test arm."""
+    specs: list[RunnerSpec] = [
+        cold_compile_runner(),
+        warm_compile_runner(),
+        auto_like_runner(),
+        shadow_compile_runner(),
+        corpus_shadow_runner(),
+        dynamic_shapes_runner(),
+        canary_force_cold_runner(),
+        canary_force_warm_runner(),
+        canary_execute_runner(),
+        execute_auto_runner(),
+        exception_semantics_runner(),
+    ]
+    return [run(spec, python=python) for spec in specs]
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--unify" in argv:
@@ -1550,8 +1568,18 @@ def main(argv: list[str] | None = None) -> int:
             print("usage: runners --unify <fields.json> -o <out.json>")
             return 2
         return unify(fields_path, out_path)
+    if "--non-libtest" in argv:
+        results = run_non_libtest()
+        failed = [result for result in results if not result.ok]
+        for result in results:
+            print(result.summary())
+        print(
+            f"jit311-runners: non-Lib/test "
+            f"{len(results) - len(failed)}/{len(results)} passed"
+        )
+        return 1 if failed else 0
     # `--pyperf` is a prefix of `--pyperformance-all`; dispatch on exact
-    # tokens, and handle the full applicable set first so the daily job
+    # tokens, and handle the full applicable set first so a manual full run
     # cannot silently shrink to the 33-name tranche.
     if "--pyperformance-all" in argv:
         spec = pyperformance_completeness_runner(
@@ -1559,8 +1587,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if spec is None:
             print(
-                "jit311-runners: pyperformance is required for the daily "
-                "shadow gate",
+                "jit311-runners: pyperformance is required for the manual "
+                "full shadow run",
                 file=sys.stderr,
             )
             return 2
@@ -1639,10 +1667,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.ok else 1
     if "--pyperf-canary" in argv:
         # The canary leg runs the committed tranche, not the full applicable
-        # set the shadow daily covers: every benchmark here compiles and
+        # set the separate manual shadow command covers: every benchmark
+        # here compiles and
         # executes machine code, which the nightly budget cannot absorb for
         # the whole set.  Say so out loud -- a bounded run that reads as
-        # full coverage is how a gate starts lying.
+        # full coverage is how validation starts lying.
         canary_names = load_pyperf_benchmarks()
         # The cap is deliberate, so it is stated as a fact the leg checks
         # rather than a line it prints.  Swallowing a discovery failure
@@ -1666,7 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"jit311-runners: canary completion leg covers "
             f"{len(canary_names)} of {discoverable} applicable benchmark(s); "
-            f"the remainder is covered by the shadow completeness leg"
+            f"run --pyperformance-all separately for the full shadow set"
         )
         spec = pyperformance_completeness_runner(
             mode="canary", benchmarks=list(canary_names)

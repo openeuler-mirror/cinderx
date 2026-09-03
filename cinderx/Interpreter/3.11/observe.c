@@ -150,7 +150,7 @@ static int parse_autojit_threshold(const char* raw, uint64_t* threshold) {
     PyErr_Format(
         PyExc_RuntimeError,
         "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
-        "positive integer threshold (or 0 for immediate scheduling); "
+        "non-negative integer threshold; "
         "classification is not supported",
         raw);
     return -1;
