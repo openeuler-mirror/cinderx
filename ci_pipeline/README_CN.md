@@ -2,7 +2,7 @@
 
 英文文档：[README.md](README.md)
 
-这里维护 ARM64 Linux CPython 3.14 CinderX JIT 的本地门禁流程。入口脚本是
+这里维护 ARM64 Linux CPython 3.11 和 3.14 CinderX JIT 的本地门禁流程。入口脚本是
 `ci_pipeline/run_gate.py`，suite 配置位于 `ci_pipeline/suites/*.toml`。
 
 ## 软件依赖
@@ -40,14 +40,20 @@ native suite 时，还需要：
 
 ### PR 门禁
 
-提交前推荐运行 PR 门禁，并打开 native C/C++ 覆盖率：
+`pr` 入口根据运行它的解释器版本选择 suite：
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
+python3.11 ci_pipeline/run_gate.py pr
+
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-`pr` pipeline 的顺序是：
+Python 3.11 运行 3-job 的 `cp311_gate` 验收 suite：
+`runtime_tests_311`、`setup_release_311`、`test_release_311`。PR 只构建一个
+Release wheel；完整 Lib/test differential 只在 Daily 运行。Python 3.14 保持现有
+流程，顺序是：
 
 1. `runtime`：CMake 构建并运行 native `RuntimeTests`，`--coverage` 只作用于这个 suite。
 2. 覆盖率后处理：运行 `gcov`、`lcov`、`genhtml`，并检查覆盖率阈值。
@@ -65,6 +71,25 @@ CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
 
+Python 3.11 Daily 必须传入 fat wheel；`setup_release_311` 直接安装它，不再构建
+第二个 wheel，然后追加 `test_release_daily_311` 和 `libtest_daily_311`：
+
+```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
+CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
+python3.11 ci_pipeline/run_gate.py daily
+```
+
+`libtest_daily_311` 只执行一次 stock 440 和 evaluator-off 440，随后从 stock
+440 结果中抽取 72 模块基线，只运行 execute 72、Py_DEBUG refleak 10，并写
+统一报告；不会重复 stock 72 或 evaluator-off 440，且该阶段不包含 shadow
+Lib/test arm。
+
+`test_release_daily_311` 还会运行有界的 72 模块 stdlib execute canary，
+包括精确的 organic-deopt 漂移守卫。pyperformance completion 命令保留为
+显式手工诊断入口，不属于 PR 或 Daily；因此自动功能门禁不声明覆盖完整的
+pyperformance worker crash、reject ledger 或 benchmark completion。
+
 `daily` pipeline 的顺序是：
 
 1. `runtime`
@@ -80,6 +105,7 @@ python3.14 ci_pipeline/run_gate.py daily
 将要运行的 job，不会真正执行：
 
 ```bash
+python3.11 ci_pipeline/run_gate.py pr --list
 python3.14 ci_pipeline/run_gate.py pr --list
 python3.14 ci_pipeline/run_gate.py --suite runtime --list
 ```
