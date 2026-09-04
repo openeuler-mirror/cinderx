@@ -1028,14 +1028,15 @@ def _hashless_record_allowed(
     if path.name != "RECORD" or not path.parent.name.endswith(".dist-info"):
         return False
     if not isinstance(distribution, metadata.PathDistribution):
-        return True
+        return False
     metadata_path = getattr(distribution, "_path", None)
     if metadata_path is None:
         return False
     try:
-        return path.parent.name == Path(metadata_path).name
+        expected = PurePosixPath(Path(metadata_path).name) / "RECORD"
     except (TypeError, ValueError):
         return False
+    return path == expected
 
 
 def _inspect_file(

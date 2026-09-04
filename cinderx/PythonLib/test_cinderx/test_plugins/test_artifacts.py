@@ -737,16 +737,11 @@ class ArtifactClosureTests(unittest.TestCase):
             "hashless/unverified.py",
         )
 
-    def test_installer_generated_hashless_entries_are_allowed(self) -> None:
+    def test_installer_generated_hashless_bytecode_is_allowed(self) -> None:
         distribution = self.distribution("generated")
         distribution.add_file(
             "generated/__pycache__/module.cpython-311.pyc",
             b"python bytecode",
-            hash_spec="",
-        )
-        distribution.add_file(
-            "generated-1.0.dist-info/RECORD",
-            b"",
             hash_spec="",
         )
 
@@ -757,6 +752,82 @@ class ArtifactClosureTests(unittest.TestCase):
 
         self.assertTrue(result.accepted)
         self.assertIsNone(result.issue)
+
+    def test_only_exact_path_distribution_self_record_may_be_hashless(
+        self,
+    ) -> None:
+        dist_info = self.root_path / "self_record-1.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: Self.Record\n"
+            "Version: 1.0\n",
+            encoding="utf-8",
+        )
+        package_file = self.root_path / "self_record" / "__init__.py"
+        package_file.parent.mkdir()
+        payload = b"pass\n"
+        package_file.write_bytes(payload)
+        (dist_info / "RECORD").write_text(
+            "self_record/__init__.py,"
+            f"{_record_hash(payload)},{len(payload)}\n"
+            "self_record-1.0.dist-info/RECORD,,\n",
+            encoding="utf-8",
+        )
+        distribution = metadata.PathDistribution(dist_info)
+
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertIsNone(result.issue)
+
+    def test_nested_record_lookalike_cannot_use_hashless_exception(
+        self,
+    ) -> None:
+        dist_info = self.root_path / "lookalike-1.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: Lookalike\n"
+            "Version: 1.0\n",
+            encoding="utf-8",
+        )
+        package_file = self.root_path / "lookalike" / "__init__.py"
+        package_file.parent.mkdir()
+        payload = b"pass\n"
+        package_file.write_bytes(payload)
+        lookalike = (
+            self.root_path
+            / "nested"
+            / "lookalike-1.0.dist-info"
+            / "RECORD"
+        )
+        lookalike.parent.mkdir(parents=True)
+        lookalike.write_bytes(b"not the installation RECORD")
+        (dist_info / "RECORD").write_text(
+            "lookalike/__init__.py,"
+            f"{_record_hash(payload)},{len(payload)}\n"
+            "nested/lookalike-1.0.dist-info/RECORD,,\n",
+            encoding="utf-8",
+        )
+        distribution = metadata.PathDistribution(dist_info)
+
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertEqual(
+            result.issue.code,  # type: ignore[union-attr]
+            ArtifactIssueCode.HASH_UNVERIFIABLE,
+        )
+        self.assertEqual(
+            result.issue.path,  # type: ignore[union-attr]
+            "nested/lookalike-1.0.dist-info/RECORD",
+        )
 
     def test_path_distribution_record_is_bounded_before_text_read(self) -> None:
         class GuardedPathDistribution(metadata.PathDistribution):
