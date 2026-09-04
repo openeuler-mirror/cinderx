@@ -378,26 +378,21 @@ def _bounded_inputs(values: object) -> tuple[object, ...]:
 
 def _bounded_stage_inputs(
     values: object,
-) -> tuple[tuple[object, ...], bool]:
+) -> tuple[tuple[object, ...], str | None]:
     try:
         iterator = iter(values)  # type: ignore[arg-type]
     except Exception:
-        return (), False
+        return (), "status_input_incomplete"
     results: list[object] = []
-    consecutive_errors = 0
     while len(results) <= _MAX_STATUS_INPUT_RESULTS:
         try:
             value = next(iterator)
         except StopIteration:
-            return tuple(results), False
+            return tuple(results), None
         except Exception:
-            consecutive_errors += 1
-            if consecutive_errors > 1:
-                return tuple(results), False
-            continue
-        consecutive_errors = 0
+            return (), "status_input_incomplete"
         results.append(value)
-    return (), True
+    return (), "status_input_budget_exceeded"
 
 
 def _normalized_name(value: object) -> str | None:
@@ -478,7 +473,13 @@ def _malformed_status() -> PluginStatus:
     )
 
 
-def _input_budget_exceeded_status() -> PluginStatus:
+def _input_failure_status(codes: Iterable[str]) -> PluginStatus:
+    messages = {
+        "status_input_budget_exceeded": (
+            "status inputs exceeded the materialization budget"
+        ),
+        "status_input_incomplete": "a status input could not be read completely",
+    }
     return PluginStatus(
         distribution_name=_INVALID_DISTRIBUTION_NAME,
         normalized_distribution_name=_INVALID_DISTRIBUTION_NAME,
@@ -486,11 +487,9 @@ def _input_budget_exceeded_status() -> PluginStatus:
         plugin_id=None,
         state=PluginState.UNAVAILABLE,
         reasons=(PluginStatusReason.SCHEMA_INVALID,),
-        diagnostics=(
-            _schema_diagnostic(
-                "status_input_budget_exceeded",
-                "status inputs exceeded the materialization budget",
-            ),
+        diagnostics=tuple(
+            _schema_diagnostic(code, messages[code])
+            for code in sorted(set(codes))
         ),
     )
 
@@ -740,17 +739,26 @@ def build_status_snapshot(
 ) -> StatusSnapshot:
     """Correlate already-computed stage results into one bounded snapshot."""
 
-    negotiation_values, negotiation_overflow = _bounded_stage_inputs(
+    negotiation_values, negotiation_failure = _bounded_stage_inputs(
         negotiation_results
     )
-    artifact_values, artifact_overflow = _bounded_stage_inputs(
+    artifact_values, artifact_failure = _bounded_stage_inputs(
         artifact_results
     )
-    discovery_values, discovery_overflow = _bounded_stage_inputs(
+    discovery_values, discovery_failure = _bounded_stage_inputs(
         discovery_results
     )
-    if discovery_overflow or negotiation_overflow or artifact_overflow:
-        return StatusSnapshot((_input_budget_exceeded_status(),))
+    input_failures = {
+        failure
+        for failure in (
+            discovery_failure,
+            negotiation_failure,
+            artifact_failure,
+        )
+        if failure is not None
+    }
+    if input_failures:
+        return StatusSnapshot((_input_failure_status(input_failures),))
 
     negotiations = _group_by_identity(
         negotiation_values,

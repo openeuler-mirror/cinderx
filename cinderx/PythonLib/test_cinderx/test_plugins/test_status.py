@@ -604,6 +604,48 @@ class PluginStatusTests(unittest.TestCase):
                     ("status_input_budget_exceeded",),
                 )
 
+    def test_incomplete_stage_iterators_fail_closed(self) -> None:
+        discovery = discovered_plugin("target")
+        negotiated = negotiation(discovery)
+        accepted_artifact = artifact("target")
+
+        def incomplete(value):
+            yield value
+            raise OSError("private iterator failure")
+
+        cases = {
+            "discovery": lambda: build_status_snapshot(
+                incomplete(discovery),
+                negotiation_results=(negotiated,),
+                artifact_results=(accepted_artifact,),
+            ),
+            "negotiation": lambda: build_status_snapshot(
+                (discovery,),
+                negotiation_results=incomplete(negotiated),
+                artifact_results=(accepted_artifact,),
+            ),
+            "artifact": lambda: build_status_snapshot(
+                (discovery,),
+                negotiation_results=(negotiated,),
+                artifact_results=incomplete(accepted_artifact),
+            ),
+        }
+        for name, build in cases.items():
+            with self.subTest(stage=name):
+                snapshot = build()
+
+                self.assertEqual(len(snapshot.plugins), 1)
+                plugin = snapshot.plugins[0]
+                self.assertEqual(plugin.state, PluginState.UNAVAILABLE)
+                self.assertEqual(
+                    plugin.reasons,
+                    (PluginStatusReason.SCHEMA_INVALID,),
+                )
+                self.assertEqual(
+                    tuple(item.code for item in plugin.diagnostics),
+                    ("status_input_incomplete",),
+                )
+
     def test_plugins_diagnostics_details_and_strings_are_bounded(self) -> None:
         oversized = "\N{SNOWMAN}" * (MAX_STATUS_STRING_BYTES + 1)
         diagnostic = StageDiagnostic(
