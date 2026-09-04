@@ -1021,11 +1021,18 @@ def _native_suffix(relative_path: str) -> bool:
 def _hashless_record_allowed(
     distribution: metadata.Distribution,
     relative_path: str,
+    actual_path: Path,
 ) -> bool:
-    path = PurePosixPath(relative_path)
-    if path.suffix.casefold() == ".pyc" and "__pycache__" in path.parts:
+    record_path = PurePosixPath(relative_path)
+    if (
+        record_path.suffix.casefold() == ".pyc"
+        and "__pycache__" in record_path.parts
+    ):
         return True
-    if path.name != "RECORD" or not path.parent.name.endswith(".dist-info"):
+    if (
+        record_path.name != "RECORD"
+        or not record_path.parent.name.endswith(".dist-info")
+    ):
         return False
     if not isinstance(distribution, metadata.PathDistribution):
         return False
@@ -1033,10 +1040,15 @@ def _hashless_record_allowed(
     if metadata_path is None:
         return False
     try:
-        expected = PurePosixPath(Path(metadata_path).name) / "RECORD"
-    except (TypeError, ValueError):
+        metadata_record = Path(metadata_path).joinpath("RECORD")
+        expected_relative = PurePosixPath(Path(metadata_path).name) / "RECORD"
+        expected_actual = metadata_record.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError):
         return False
-    return path == expected
+    return (
+        record_path == expected_relative
+        and actual_path == expected_actual
+    )
 
 
 def _inspect_file(
@@ -1050,7 +1062,7 @@ def _inspect_file(
     hasher = None
     expected_digest = None
     if not hash_spec and not _hashless_record_allowed(
-        distribution, relative_path
+        distribution, relative_path, path
     ):
         return _issue(
             ArtifactIssueCode.HASH_UNVERIFIABLE,

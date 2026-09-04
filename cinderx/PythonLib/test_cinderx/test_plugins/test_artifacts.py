@@ -829,6 +829,78 @@ class ArtifactClosureTests(unittest.TestCase):
             "nested/lookalike-1.0.dist-info/RECORD",
         )
 
+    def test_redirected_self_record_cannot_use_hashless_exception(
+        self,
+    ) -> None:
+        dist_info = self.root_path / "redirected-1.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: Redirected\n"
+            "Version: 1.0\n",
+            encoding="utf-8",
+        )
+        package_file = self.root_path / "redirected" / "__init__.py"
+        package_file.parent.mkdir()
+        payload = b"pass\n"
+        package_file.write_bytes(payload)
+        redirected_file = self.root_path / "ordinary-record-shaped-file"
+        redirected_file.write_bytes(b"not the installation RECORD")
+        (dist_info / "RECORD").write_text(
+            "redirected/__init__.py,"
+            f"{_record_hash(payload)},{len(payload)}\n"
+            "redirected-1.0.dist-info/RECORD,,\n",
+            encoding="utf-8",
+        )
+
+        class RedirectedPathDistribution(metadata.PathDistribution):
+            def locate_file(self, path):
+                if (
+                    os.fspath(path).replace("\\", "/")
+                    == "redirected-1.0.dist-info/RECORD"
+                ):
+                    return redirected_file
+                return super().locate_file(path)
+
+        distribution = RedirectedPathDistribution(dist_info)
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertEqual(
+            result.issue.code,  # type: ignore[union-attr]
+            ArtifactIssueCode.HASH_UNVERIFIABLE,
+        )
+        self.assertEqual(
+            result.issue.path,  # type: ignore[union-attr]
+            "redirected-1.0.dist-info/RECORD",
+        )
+
+    def test_non_path_distribution_cannot_prove_hashless_self_record(
+        self,
+    ) -> None:
+        distribution = self.distribution("provider")
+        distribution.add_file(
+            "provider-1.0.dist-info/RECORD",
+            b"record shaped payload",
+            hash_spec="",
+        )
+
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertEqual(
+            result.issue.code,  # type: ignore[union-attr]
+            ArtifactIssueCode.HASH_UNVERIFIABLE,
+        )
+        self.assertEqual(
+            result.issue.path,  # type: ignore[union-attr]
+            "provider-1.0.dist-info/RECORD",
+        )
+
     def test_path_distribution_record_is_bounded_before_text_read(self) -> None:
         class GuardedPathDistribution(metadata.PathDistribution):
             def read_text(self, filename: str) -> str | None:
