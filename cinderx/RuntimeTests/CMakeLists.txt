@@ -40,6 +40,16 @@ endif()
 
 add_executable(runtime_tests ${RUNTIME_TEST_SOURCES} ${CINDERX_LIB_SOURCES})
 
+# RuntimeTests embeds CPython through Python::Python.  The release interpreters
+# may carry fat LTO objects produced by a different GCC build, so always use
+# their native-code payload instead of asking the active linker plugin to
+# consume toolchain-specific LTO bytecode.  Coverage builds already add this
+# globally; keep the non-coverage PR and local paths equivalent.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(runtime_tests PRIVATE -fno-lto)
+  target_link_options(runtime_tests PRIVATE -fno-lto)
+endif()
+
 target_link_libraries(
   runtime_tests
   PRIVATE

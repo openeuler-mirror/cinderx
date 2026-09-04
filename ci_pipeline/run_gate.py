@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from typing import Any
 
@@ -85,6 +86,99 @@ PIPELINES_BY_PYTHON = {
         "3.14": PIPELINES["daily"],
     },
 }
+STRICT_FORMAT_ROOT_ENV = "CINDERX_FORMAT_ROOT"
+STRICT_FORMAT_ROOT = Path("/opt/cinderx-format/x86")
+STRICT_FORMATTER_SHA256 = "eddd299e8f26bfeece3bae5a5bdc3663c7385f8d1cff03b51a796661f8aa7360"
+STRICT_STYLE_SHA256 = "92f45c59710cc556cb1bfed7cf50657bfdbecf127e57a50c7a5f41955075b50f"
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def strict_format_deployment_guide(root: Path) -> str:
+    root_text = str(root).replace("\\", "/")
+    return f"""严格 Jenkins format 环境缺失或校验失败。
+请在 openEuler aarch64 主机执行以下命令部署（不在 run_gate 中自动联网安装）：
+
+set -euo pipefail
+ROOT={root_text}
+mkdir -p \"$ROOT/downloads\" \"$ROOT/sysroot\"
+curl -fL --retry 3 -o \"$ROOT/downloads/qemu-user-static_arm64.deb\" \\
+  https://mirrors.huaweicloud.com/debian/pool/main/q/qemu/qemu-user-static_7.2+dfsg-7+deb12u18+b3_arm64.deb
+mkdir -p \"$ROOT/qemu-extract\"
+ar p \"$ROOT/downloads/qemu-user-static_arm64.deb\" data.tar.xz | tar -xJ -C \"$ROOT/qemu-extract\"
+install -m 0755 \"$ROOT/qemu-extract/usr/bin/qemu-x86_64-static\" \"$ROOT/qemu-x86_64-static\"
+BASE=https://repo.openeuler.org/openEuler-22.03-LTS
+for item in \\
+  \"everything/x86_64/Packages/clang-12.0.1-1.oe2203.x86_64.rpm\" \\
+  \"update/x86_64/Packages/llvm-libs-12.0.1-4.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/libstdc++-10.3.1-10.oe2203.x86_64.rpm\" \\
+  \"update/x86_64/Packages/glibc-2.34-149.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/libgcc-10.3.1-10.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/libffi-3.4.2-2.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/libedit-3.1-28.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/libxml2-2.9.12-5.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/ncurses-libs-6.3-2.oe2203.x86_64.rpm\" \\
+  \"everything/x86_64/Packages/zlib-1.2.11-19.oe2203.x86_64.rpm\"; do
+  curl -fL --retry 3 -o \"$ROOT/downloads/$(basename \"$item\")\" \"$BASE/$item\"
+  rpm2cpio \"$ROOT/downloads/$(basename \"$item\")\" | (cd \"$ROOT/sysroot\" && cpio -idm --quiet)
+done
+test \"$($ROOT/qemu-x86_64-static -L $ROOT/sysroot $ROOT/sysroot/usr/bin/clang-format --version)\" = \\
+  \"clang-format version 12.0.1 (openEuler 12.0.1-1.oe2203 4fd5fb384b180c854df9bde29afbda6d40e8836f)\"
+sha256sum \"$ROOT/sysroot/usr/bin/clang-format\"
+"""
+
+
+def run_strict_format() -> int:
+    root = Path(os.environ.get(STRICT_FORMAT_ROOT_ENV, str(STRICT_FORMAT_ROOT)))
+    qemu = root / "qemu-x86_64-static"
+    sysroot = root / "sysroot"
+    formatter = sysroot / "usr" / "bin" / "clang-format"
+    style = REPO_ROOT / ".clang-format"
+    missing = [str(path) for path in (qemu, formatter, style) if not path.is_file()]
+    if missing:
+        print(strict_format_deployment_guide(root), file=sys.stderr)
+        print("missing: " + ", ".join(missing), file=sys.stderr)
+        return 2
+    actual_formatter_sha = _sha256_file(formatter)
+    actual_style_sha = _sha256_file(style)
+    if actual_formatter_sha != STRICT_FORMATTER_SHA256 or actual_style_sha != STRICT_STYLE_SHA256:
+        print(strict_format_deployment_guide(root), file=sys.stderr)
+        print(f"formatter_sha256={actual_formatter_sha}", file=sys.stderr)
+        print(f"style_sha256={actual_style_sha}", file=sys.stderr)
+        return 2
+    version = subprocess.run(
+        [str(qemu), "-L", str(sysroot), str(formatter), "--version"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    print(f"strict formatter: {version.stdout.strip()}")
+    if version.returncode != 0 or "clang-format version 12.0.1" not in version.stdout:
+        print("error: strict formatter version check failed", file=sys.stderr)
+        return 2
+    with tempfile.TemporaryDirectory(prefix="cinderx-format-") as temp_dir:
+        wrapper = Path(temp_dir) / "clang-format"
+        wrapper.write_text(
+            f'#!/usr/bin/env bash\nexec "{qemu}" -L "{sysroot}" "{formatter}" "$@"\n',
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        checker = TESTGATE_DIR / "scripts" / "check_clean_code_incremental.py"
+        result = subprocess.run(
+            [sys.executable, str(checker), "--format", "--all", "--clang-format", str(wrapper)],
+            cwd=REPO_ROOT,
+            check=False,
+        )
+    return result.returncode
 DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),
     ("unsupported", "wheel_compat_negative"),
@@ -1703,7 +1797,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "pipeline",
         nargs="?",
-        choices=sorted(PIPELINES),
+        choices=sorted((*PIPELINES, "format")),
         help="pipeline name, for example: pr",
     )
     parser.add_argument(
@@ -1744,6 +1838,10 @@ def main(argv: list[str]) -> int:
         parser.error("pass exactly one of a pipeline name or --suite")
 
     try:
+        if args.pipeline == "format":
+            if args.coverage or args.list:
+                parser.error("format does not support --coverage or --list")
+            return run_strict_format()
         if args.suite:
             if args.suite == "daily":
                 parser.error("daily is pipeline-only; use `ci_pipeline/run_gate.py daily`")

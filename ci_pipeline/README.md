@@ -53,10 +53,13 @@ CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-Python 3.11 runs three `cp311_gate` jobs: `runtime_tests_311`,
-`setup_release_311`, and `test_release_311`. PR builds exactly one Release
-wheel, while the full Lib/test differential remains Daily-only. Python 3.14
-keeps the existing pipeline and runs in this order:
+Python 3.11 runs three fast `cp311_gate` jobs by default:
+`runtime_tests_311`, `setup_release_311`, and `test_release_311`. PR builds
+exactly one Release wheel. When a developer sets
+`CINDERX_LOCAL_RUN_LIBTEST=1`, `libtest_execute_72_311` also runs a
+self-contained stock 72 versus execute 72 differential without depending on
+Daily artifacts. The full Lib/test differential remains Daily-only. Python
+3.14 keeps the existing pipeline and runs in this order:
 
 1. `runtime`: build and run native `RuntimeTests` through CMake. `--coverage`
    applies only to this suite.
@@ -141,6 +144,18 @@ CINDERX_LOCAL_RUN_LIBTEST=1 \
 python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 ```
 
+Use the same switch for pre-submit L2 validation of both Python versions:
+
+```bash
+export CINDERX_LOCAL_RUN_LIBTEST=1
+python3.11 ci_pipeline/run_gate.py pr
+python3.14 ci_pipeline/run_gate.py pr
+```
+
+For 3.11 this adds the stock/execute 72 differential; for 3.14 it enables the
+existing local Lib/test jobs. Jenkins PR jobs leave the variable unset and
+therefore keep the default fast gate.
+
 ## Pipelines And Suites
 
 ### Pipelines
@@ -190,7 +205,7 @@ job.
 | `CINDERX_TEST_PYTHON` | Python interpreter used by the gate; defaults to the interpreter running `run_gate.py` |
 | `CINDERX_TEST_WHEEL` | External wheel tested by `daily` compat fan-out and the `wheel_compat` / `wheel_compat_negative` suites |
 | `CINDERX_UNSUPPORTED_TEST_PYTHON` | Unsupported Python interpreter used by `wheel_compat_negative` |
-| `CINDERX_LOCAL_RUN_LIBTEST=1` | Makes `cinderx_local` run Lib/test against the local wheel |
+| `CINDERX_LOCAL_RUN_LIBTEST=1` | Adds stock/execute 72 to the 3.11 PR and local-wheel Lib/test jobs to 3.14 `cinderx_local` |
 | `CINDERX_LOCAL_DEPS` | Local cache directory for CMake FetchContent dependencies |
 | `CINDERX_PIP_WHEELHOUSE` | Local Python wheelhouse used to bootstrap suite venvs |
 | `CINDERX_PIP_OFFLINE=1` | Requires pip installs to use `CINDERX_PIP_WHEELHOUSE` only |

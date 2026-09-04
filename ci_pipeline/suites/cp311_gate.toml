@@ -30,3 +30,11 @@ command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh setup_release \
 name = "test_release_311"
 phase = "test_release"
 command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh test_release \"{run_dir}\"'"
+
+# Developer-only L2 validation.  The self-contained execute gate runs its own
+# stock 72 control before the execute 72 arm; Jenkins PR jobs leave this off.
+[[jobs]]
+name = "libtest_execute_72_311"
+phase = "libtest"
+enabled_by_env = "CINDERX_LOCAL_RUN_LIBTEST"
+command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh libtest_execute_72 \"{run_dir}\"'"
