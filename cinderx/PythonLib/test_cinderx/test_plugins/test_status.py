@@ -140,6 +140,17 @@ class PluginStatusTests(unittest.TestCase):
         self.assertEqual(available.plugins[0].plugin_id, "example")
         self.assertEqual(available.plugins[0].reasons, ())
 
+    def test_negotiation_without_artifact_result_is_not_available(self) -> None:
+        discovery = discovered_plugin("example")
+
+        snapshot = build_status_snapshot(
+            (discovery,),
+            negotiation_results=(negotiation(discovery),),
+        )
+
+        self.assertEqual(snapshot.plugins[0].state, PluginState.DISCOVERED)
+        self.assertEqual(snapshot.plugins[0].reasons, ())
+
     def test_each_public_reason_is_mapped(self) -> None:
         cases = tuple(
             (reason, PluginStatusReason(reason.value))
@@ -543,6 +554,56 @@ class PluginStatusTests(unittest.TestCase):
             (PluginStatusReason.SCHEMA_INVALID,),
         )
 
+    def test_stage_input_overflow_fails_closed_independent_of_order(self) -> None:
+        discovery = discovered_plugin("target")
+        siblings = tuple(
+            discovered_plugin(f"sibling-{index:03d}")
+            for index in range(MAX_STATUS_PLUGINS * 4)
+        )
+        accepted_artifact = artifact("target")
+
+        cases = {
+            "discovery": (
+                lambda values: build_status_snapshot(values),
+                siblings + (object(),),
+            ),
+            "negotiation": (
+                lambda values: build_status_snapshot(
+                    (discovery,),
+                    negotiation_results=values,
+                    artifact_results=(accepted_artifact,),
+                ),
+                tuple(negotiation(item) for item in siblings)
+                + (negotiation(discovery),),
+            ),
+            "artifact": (
+                lambda values: build_status_snapshot(
+                    (discovery,),
+                    negotiation_results=(negotiation(discovery),),
+                    artifact_results=values,
+                ),
+                tuple(artifact(item.distribution_name) for item in siblings)
+                + (accepted_artifact,),
+            ),
+        }
+        for name, (build, values) in cases.items():
+            with self.subTest(stage=name):
+                forward = build(values)
+                reverse = build(tuple(reversed(values)))
+
+                self.assertEqual(forward, reverse)
+                self.assertEqual(len(forward.plugins), 1)
+                plugin = forward.plugins[0]
+                self.assertEqual(plugin.state, PluginState.UNAVAILABLE)
+                self.assertEqual(
+                    plugin.reasons,
+                    (PluginStatusReason.SCHEMA_INVALID,),
+                )
+                self.assertEqual(
+                    tuple(item.code for item in plugin.diagnostics),
+                    ("status_input_budget_exceeded",),
+                )
+
     def test_plugins_diagnostics_details_and_strings_are_bounded(self) -> None:
         oversized = "\N{SNOWMAN}" * (MAX_STATUS_STRING_BYTES + 1)
         diagnostic = StageDiagnostic(
@@ -661,6 +722,7 @@ class PluginStatusTests(unittest.TestCase):
             snapshot = update_status(
                 (discovery,),
                 negotiation_results=(negotiation(discovery),),
+                artifact_results=(artifact("example"),),
             )
             with patch.object(
                 builtins,

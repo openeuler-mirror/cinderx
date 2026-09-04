@@ -376,6 +376,30 @@ def _bounded_inputs(values: object) -> tuple[object, ...]:
     return tuple(results)
 
 
+def _bounded_stage_inputs(
+    values: object,
+) -> tuple[tuple[object, ...], bool]:
+    try:
+        iterator = iter(values)  # type: ignore[arg-type]
+    except Exception:
+        return (), False
+    results: list[object] = []
+    consecutive_errors = 0
+    while len(results) <= _MAX_STATUS_INPUT_RESULTS:
+        try:
+            value = next(iterator)
+        except StopIteration:
+            return tuple(results), False
+        except Exception:
+            consecutive_errors += 1
+            if consecutive_errors > 1:
+                return tuple(results), False
+            continue
+        consecutive_errors = 0
+        results.append(value)
+    return (), True
+
+
 def _normalized_name(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
@@ -449,6 +473,23 @@ def _malformed_status() -> PluginStatus:
             _schema_diagnostic(
                 "invalid_status_input",
                 "a discovery status input was malformed",
+            ),
+        ),
+    )
+
+
+def _input_budget_exceeded_status() -> PluginStatus:
+    return PluginStatus(
+        distribution_name=_INVALID_DISTRIBUTION_NAME,
+        normalized_distribution_name=_INVALID_DISTRIBUTION_NAME,
+        distribution_version="",
+        plugin_id=None,
+        state=PluginState.UNAVAILABLE,
+        reasons=(PluginStatusReason.SCHEMA_INVALID,),
+        diagnostics=(
+            _schema_diagnostic(
+                "status_input_budget_exceeded",
+                "status inputs exceeded the materialization budget",
             ),
         ),
     )
@@ -580,10 +621,11 @@ def _artifact_diagnostics(
     discovery: PluginDiscoveryResult,
     values: tuple[object, ...],
     diagnostics: _DiagnosticAccumulator,
-) -> set[PluginStatusReason]:
+) -> tuple[set[PluginStatusReason], bool]:
     reasons: set[PluginStatusReason] = set()
     malformed = False
     matching_results = 0
+    accepted_result = False
     expected_identity = _discovery_identity(discovery)
     try:
         expected_version = discovery.distribution_version
@@ -617,6 +659,7 @@ def _artifact_diagnostics(
             malformed = True
             continue
         if accepted:
+            accepted_result = True
             continue
         try:
             issue_code = issue.code  # type: ignore[union-attr]
@@ -635,7 +678,10 @@ def _artifact_diagnostics(
             "invalid_artifact_result",
             "an artifact status input was malformed",
         )
-    return reasons
+    return (
+        reasons,
+        matching_results == 1 and accepted_result and not malformed,
+    )
 
 
 def _plugin_status(
@@ -652,7 +698,10 @@ def _plugin_status(
     reasons.update(
         _negotiation_diagnostics(discovery, negotiations, diagnostics)
     )
-    reasons.update(_artifact_diagnostics(discovery, artifacts, diagnostics))
+    artifact_reasons, artifact_accepted = _artifact_diagnostics(
+        discovery, artifacts, diagnostics
+    )
+    reasons.update(artifact_reasons)
 
     try:
         distribution_name = discovery.distribution_name
@@ -665,7 +714,7 @@ def _plugin_status(
 
     if reasons:
         state = PluginState.UNAVAILABLE
-    elif negotiations:
+    elif negotiations and artifact_accepted:
         state = PluginState.AVAILABLE
     else:
         state = PluginState.DISCOVERED
@@ -691,12 +740,23 @@ def build_status_snapshot(
 ) -> StatusSnapshot:
     """Correlate already-computed stage results into one bounded snapshot."""
 
+    negotiation_values, negotiation_overflow = _bounded_stage_inputs(
+        negotiation_results
+    )
+    artifact_values, artifact_overflow = _bounded_stage_inputs(
+        artifact_results
+    )
+    discovery_values, discovery_overflow = _bounded_stage_inputs(
+        discovery_results
+    )
+    if discovery_overflow or negotiation_overflow or artifact_overflow:
+        return StatusSnapshot((_input_budget_exceeded_status(),))
+
     negotiations = _group_by_identity(
-        negotiation_results,
+        negotiation_values,
         _negotiation_identity,
     )
-    artifacts = _group_by_identity(artifact_results, _artifact_identity)
-    discovery_values = _bounded_inputs(discovery_results)
+    artifacts = _group_by_identity(artifact_values, _artifact_identity)
     identity_counts: dict[str, int] = {}
     for value in discovery_values:
         key = _discovery_identity(value)
