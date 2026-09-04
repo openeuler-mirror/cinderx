@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/codegen/gen_asm.h"
+
+#include <structmember.h>
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #endif
@@ -1661,6 +1663,478 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
 #endif
 }
 
+void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+  if (!env_.load_attr_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  Label slow_path = as_->newLabel();
+  Label hit = as_->newLabel();
+
+  constexpr int kEntriesOff =
+      static_cast<int>(jit::AttributeCache::entriesOffset());
+  constexpr int kEntrySize = sizeof(jit::AttributeMutator);
+  constexpr int kTypeOff =
+      static_cast<int>(jit::AttributeMutator::typeOffset());
+  constexpr int kTypeVerOff =
+      static_cast<int>(jit::AttributeMutator::typeVersionOffset());
+  constexpr int kValOffsetOff =
+      static_cast<int>(jit::AttributeMutator::splitValOffsetOffset());
+  constexpr int kSplitKeysOff =
+      static_cast<int>(jit::AttributeMutator::splitKeysOffset());
+  constexpr int kDictHintOff =
+      static_cast<int>(jit::AttributeMutator::dictHintOffset());
+  constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
+  constexpr uint64_t kDictKind = jit::AttributeMutator::dictKind();
+  constexpr uint64_t kMemberDescrKind =
+      jit::AttributeMutator::memberDescrKind();
+  constexpr int kMemberdefOff =
+      static_cast<int>(jit::AttributeMutator::memberDescrMemberdefOffset());
+  constexpr int kMemberTypeOff = offsetof(PyMemberDef, type);
+  constexpr int kMemberOffsetOff = offsetof(PyMemberDef, offset);
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset = -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+  constexpr int kMaValuesOffset = offsetof(PyDictObject, ma_values);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkNentriesOffset = offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+
+  if (is_shadow_compile_) {
+    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+  } else {
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  }
+  as_->bind(env_.load_attr_invoke_stub);
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_entry = [&](uint32_t index, Label next) {
+    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
+    as_->cbz(a64::x12, next);
+    as_->mov(a64::x13, ~kKindMask);
+    as_->and_(a64::x13, a64::x12, a64::x13);
+    as_->cmp(a64::x13, a64::x11);
+    as_->b_ne(next);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+
+    Label member_descr = as_->newLabel();
+    Label kdict = as_->newLabel();
+    as_->and_(a64::x14, a64::x12, kKindMask);
+    arch::cmp_immediate(as_, a64::x14, kMemberDescrKind);
+    as_->b_eq(member_descr);
+    arch::cmp_immediate(as_, a64::x14, kDictKind);
+    as_->b_eq(kdict);
+    as_->cbnz(a64::x14, slow_path);
+    Label split_materialized = as_->newLabel();
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, split_materialized);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kValOffsetOff));
+    as_->tbnz(a64::x14, 63, slow_path);
+    as_->ldrb(a64::w9, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x10, a64::x14, 2);
+    as_->cmp(a64::x10, a64::x9);
+    as_->b_hs(slow_path);
+    arch::add_immediate(as_, a64::x15, a64::x15, kValuesValuesOffset);
+    as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+
+    as_->bind(split_materialized);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kSplitKeysOff));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x15, kMaKeysOffset));
+    as_->cmp(a64::x9, a64::x14);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
+    as_->cbz(a64::x14, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValOffsetOff));
+    as_->tbnz(a64::x9, 63, slow_path);
+    as_->ldrb(a64::w10, arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x15, a64::x9, 2);
+    as_->cmp(a64::x15, a64::x10);
+    as_->b_hs(slow_path);
+    arch::add_immediate(as_, a64::x14, a64::x14, kValuesValuesOffset);
+    as_->add(a64::x14, a64::x14, a64::x9, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x14));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+
+    as_->bind(member_descr);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kMemberdefOff));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x14, kMemberTypeOff, arch::AccessSize::k32));
+    arch::cmp_immediate(as_, a64::x15, T_OBJECT_EX);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMemberOffsetOff));
+    as_->ldr(a64::x9, a64::ptr(a64::x1, a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+
+    as_->bind(kdict);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x14, slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x14, kMaKeysOffset));
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x13, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w9, slow_path);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kDictHintOff));
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x13, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(slow_path);
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(
+            a64::x13, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x10, 1);
+    as_->lsl(a64::x10, a64::x10, a64::x9);
+    as_->add(a64::x10, a64::x13, a64::x10);
+    arch::add_immediate(as_, a64::x10, a64::x10, kDkIndicesOffset);
+    as_->add(a64::x10, a64::x10, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x9, a64::ptr(a64::x10));
+    as_->cmp(a64::x9, a64::x2);
+    as_->b_ne(slow_path);
+    Label combined = as_->newLabel();
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMaValuesOffset));
+    as_->cbz(a64::x15, combined);
+    as_->ldrb(a64::w9, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x14, a64::x12, 2);
+    as_->cmp(a64::x14, a64::x9);
+    as_->b_hs(slow_path);
+    arch::add_immediate(as_, a64::x15, a64::x15, kValuesValuesOffset);
+    as_->add(a64::x15, a64::x15, a64::x12, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+    as_->bind(combined);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x10, 8));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+  };
+
+  const uint32_t count = jit::getConfig().attr_cache_size;
+  if (count == 0) {
+    as_->b(slow_path);
+  }
+  for (uint32_t index = 0; index < count; ++index) {
+    const bool more = index + 1 != count;
+    Label next = more ? as_->newLabel() : slow_path;
+    emit_entry(index, next);
+    if (more) {
+      as_->bind(next);
+    }
+  }
+
+  as_->bind(hit);
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->mov(a64::x0, a64::x9);
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::LoadAttrCache::invoke));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
+void NativeGenerator::emitAarch64LoadMethodStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+  if (!env_.load_method_invoke_stub.isValid()) {
+    return;
+  }
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  Label slow_path = as_->newLabel();
+  Label materialized = as_->newLabel();
+  Label hit = as_->newLabel();
+  constexpr int kEntriesOff =
+      static_cast<int>(jit::LoadMethodCache::entriesOffset());
+  constexpr int kEntrySize =
+      static_cast<int>(jit::LoadMethodCache::entrySize());
+  constexpr int kTypeOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeOffset());
+  constexpr int kValueOff =
+      static_cast<int>(jit::LoadMethodCache::entryValueOffset());
+  constexpr int kKeysVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryKeysVersionOffset());
+  constexpr int kTypeVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeVersionOffset());
+  constexpr int kPeekOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekShadowOffset());
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kHtCachedKeysOffset =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
+  constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset = -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+
+  if (is_shadow_compile_) {
+    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+  } else {
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  }
+  as_->bind(env_.load_method_invoke_stub);
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_entry = [&](uint32_t index, Label next) {
+    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
+    as_->cmp(a64::x12, a64::x11);
+    as_->b_ne(next);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x0, off + kPeekOff, arch::AccessSize::k8));
+    as_->cbnz(a64::w14, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, next);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
+    as_->cbz(a64::w15, hit);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x13, materialized);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+    as_->b(hit);
+  };
+
+  const uint32_t count =
+      static_cast<uint32_t>(jit::LoadMethodCache::numEntries());
+  for (uint32_t index = 0; index < count; ++index) {
+    const bool more = index + 1 != count;
+    Label next = more ? as_->newLabel() : slow_path;
+    emit_entry(index, next);
+    if (more) {
+      as_->bind(next);
+    }
+  }
+
+  as_->bind(materialized);
+  as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+  as_->cbz(a64::x13, hit);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaKeysOffset));
+  as_->ldr(
+      a64::w14,
+      arch::ptr_offset(a64::x14, kDkVersionOffset, arch::AccessSize::k32));
+  as_->cmp(a64::w14, a64::w15);
+  as_->b_ne(slow_path);
+
+  as_->bind(hit);
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  as_->mov(a64::x0, a64::x9);
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::LoadMethodCache::lookupHelper));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
+void NativeGenerator::emitAarch64StoreAttrStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+  if (!env_.store_attr_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  Label slow_path = as_->newLabel();
+  Label do_store = as_->newLabel();
+  Label member_store_fresh = as_->newLabel();
+
+  constexpr int kEntriesOff =
+      static_cast<int>(jit::AttributeCache::entriesOffset());
+  constexpr int kEntrySize = sizeof(jit::AttributeMutator);
+  constexpr int kTypeOff =
+      static_cast<int>(jit::AttributeMutator::typeOffset());
+  constexpr int kTypeVerOff =
+      static_cast<int>(jit::AttributeMutator::typeVersionOffset());
+  constexpr int kValOffsetOff =
+      static_cast<int>(jit::AttributeMutator::splitValOffsetOffset());
+  constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
+  constexpr uint64_t kMemberDescrKind =
+      jit::AttributeMutator::memberDescrKind();
+  constexpr int kMemberdefOff =
+      static_cast<int>(jit::AttributeMutator::memberDescrMemberdefOffset());
+  constexpr int kMemberTypeOff = offsetof(PyMemberDef, type);
+  constexpr int kMemberOffsetOff = offsetof(PyMemberDef, offset);
+  constexpr int kMemberFlagsOff = offsetof(PyMemberDef, flags);
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
+
+  if (is_shadow_compile_) {
+    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+  } else {
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  }
+  as_->bind(env_.store_attr_invoke_stub);
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_entry = [&](uint32_t index, Label next) {
+    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
+    as_->cbz(a64::x12, next);
+    as_->mov(a64::x13, ~kKindMask);
+    as_->and_(a64::x13, a64::x12, a64::x13);
+    as_->cmp(a64::x13, a64::x11);
+    as_->b_ne(next);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+
+    Label member = as_->newLabel();
+    as_->and_(a64::x14, a64::x12, kKindMask);
+    arch::cmp_immediate(as_, a64::x14, kMemberDescrKind);
+    as_->b_eq(member);
+    // New kDict and materialized shapes intentionally use the optimized C++
+    // helper, which owns dict versioning and GC tracking. Only live kSplit is
+    // safe for the raw slot store below.
+    as_->cbnz(a64::x14, slow_path);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kValOffsetOff));
+    as_->tbnz(a64::x14, 63, slow_path);
+    as_->ldrb(a64::w9, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x10, a64::x14, 2);
+    as_->cmp(a64::x10, a64::x9);
+    as_->b_hs(slow_path);
+    arch::add_immediate(as_, a64::x15, a64::x15, kValuesValuesOffset);
+    as_->add(a64::x10, a64::x15, a64::x14, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x10));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+    arch::cmp_immediate(as_, a64::x12, 1);
+    as_->b_eq(slow_path);
+    as_->b(do_store);
+
+    as_->bind(member);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kMemberdefOff));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x14, kMemberTypeOff, arch::AccessSize::k32));
+    arch::cmp_immediate(as_, a64::x15, T_OBJECT_EX);
+    as_->b_ne(slow_path);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x14, kMemberFlagsOff, arch::AccessSize::k32));
+    as_->tst(a64::x15, READONLY);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMemberOffsetOff));
+    as_->add(a64::x10, a64::x1, a64::x15);
+    as_->ldr(a64::x9, a64::ptr(a64::x10));
+    as_->cbz(a64::x9, member_store_fresh);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+    arch::cmp_immediate(as_, a64::x12, 1);
+    as_->b_eq(slow_path);
+    as_->b(do_store);
+  };
+
+  const uint32_t count = jit::getConfig().attr_cache_size;
+  if (count == 0) {
+    as_->b(slow_path);
+  }
+  for (uint32_t index = 0; index < count; ++index) {
+    const bool more = index + 1 != count;
+    Label next = more ? as_->newLabel() : slow_path;
+    emit_entry(index, next);
+    if (more) {
+      as_->bind(next);
+    }
+  }
+
+  as_->bind(do_store);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  arch::add_immediate(as_, a64::x14, a64::x14, 1);
+  as_->str(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  as_->str(a64::x3, a64::ptr(a64::x10));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::sub_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->mov(a64::w0, 0);
+  as_->ret(arch::lr);
+
+  as_->bind(member_store_fresh);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  arch::add_immediate(as_, a64::x14, a64::x14, 1);
+  as_->str(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  as_->str(a64::x3, a64::ptr(a64::x10));
+  as_->mov(a64::w0, 0);
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::StoreAttrCache::invoke));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     const asmjit::CodeHolder& code) {
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
@@ -2150,6 +2624,9 @@ void NativeGenerator::generateCode(
 
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
+  emitAarch64LoadAttrNewShapeStub311(codeholder);
+  emitAarch64LoadMethodStub311(codeholder);
+  emitAarch64StoreAttrStub311(codeholder);
   emitAarch64ExactLongAddSubStubs(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {

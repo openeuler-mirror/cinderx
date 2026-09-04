@@ -421,6 +421,37 @@ fun known_exact {
 #endif
 }
 
+#if defined(CINDER_AARCH64) && defined(Py_REF_DEBUG)
+TEST_F(LIRGeneratorTest, AttrCacheFastPathsDisabledWithRefDebug) {
+  const char* snippets[] = {
+      R"(
+def f(obj):
+  return obj.value
+)",
+      R"(
+def f(obj):
+  return obj.method()
+)",
+      R"(
+def f(obj, value):
+  obj.value = value
+  return value
+)",
+  };
+
+  for (const char* src : snippets) {
+    Ref<PyObject> pyfunc(compileAndGet(src, "f"));
+    ASSERT_NE(pyfunc.get(), nullptr);
+    auto lir = getLIRString(pyfunc.get());
+    ASSERT_FALSE(lir.empty());
+    EXPECT_EQ(lir.find("LoadAttrCachedFastPath"), std::string::npos) << lir;
+    EXPECT_EQ(lir.find("LoadMethodCachedFastPath"), std::string::npos) << lir;
+    EXPECT_EQ(lir.find("StoreAttrCachedFastPath"), std::string::npos) << lir;
+    EXPECT_NE(lir.find("Call"), std::string::npos) << lir;
+  }
+}
+#endif
+
 // CPython 3.11 intentionally links static_python_stub.cpp and does not provide
 // the _static module required by these translation tests.
 #if PY_VERSION_HEX >= 0x030C0000

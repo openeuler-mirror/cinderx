@@ -103,6 +103,20 @@ enum OperandSizeType {
     1,                                                                         \
     {},                                                                        \
     1)                                                                         \
+  X(LoadMethodCachedFastPath,                                                  \
+    false,                                                                     \
+    FlagEffects::kInvalidate,                                                  \
+    kAlways64,                                                                 \
+    1,                                                                         \
+    {},                                                                        \
+    1)                                                                         \
+  X(StoreAttrCachedFastPath,                                                   \
+    false,                                                                     \
+    FlagEffects::kInvalidate,                                                  \
+    kAlways64,                                                                 \
+    1,                                                                         \
+    {},                                                                        \
+    1)                                                                         \
   X(BinaryOpExactLongAddSubFastPath,                                           \
     false,                                                                     \
     FlagEffects::kInvalidate,                                                  \

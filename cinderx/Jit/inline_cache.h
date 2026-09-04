@@ -58,6 +58,10 @@ struct DictMutator {
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 
   BorrowedRef<> getattr_method;
+#if PY_VERSION_HEX < 0x030C0000
+  Py_ssize_t dict_hint{-1};
+  Py_ssize_t values_hint{-1};
+#endif
 };
 
 // Mutator for a data descriptor
@@ -105,6 +109,20 @@ struct GetAttrMutator {
   uint32_t keys_version;
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+struct TypeRecvMutator {
+  enum class Form : uint8_t { kValue, kMetaDescr, kStaticMethod };
+
+  PyObject* payload{nullptr};
+  uint32_t meta_version{0};
+  uint32_t payload_type_version{0};
+  Form form{Form::kValue};
+};
+static_assert(
+    sizeof(TypeRecvMutator) <= sizeof(DictMutator),
+    "type receiver entries must not grow AttributeMutator");
+#endif
+
 // An instance of AttributeMutator is specialized to more efficiently perform a
 // get/set of a particular kind of attribute.
 class AttributeMutator {
@@ -114,6 +132,11 @@ class AttributeMutator {
   enum class Kind : uint8_t {
     kSplit,
     kSplitInline,
+#if PY_VERSION_HEX < 0x030C0000
+    // CPython 3.11 has no inline-values dictionaries, so the tagged value
+    // otherwise used by kSplitInline is available for type receivers.
+    kTypeRecv = kSplitInline,
+#endif
     kCombined,
     kDataDescr,
     kMemberDescr,
@@ -152,12 +175,41 @@ class AttributeMutator {
       PyTypeObject* type,
       PyObject* getattr_method,
       uint32_t keys_version);
+#if PY_VERSION_HEX < 0x030C0000
+  void set_type_recv_value(
+      PyTypeObject* receiver,
+      uint32_t meta_version,
+      PyObject* payload,
+      uint32_t payload_type_version);
+  void set_type_recv_meta_descr(
+      PyTypeObject* metatype,
+      PyObject* payload,
+      uint32_t payload_type_version);
+  void set_type_recv_static_method(
+      PyTypeObject* receiver,
+      uint32_t meta_version,
+      PyObject* wrapper,
+      uint32_t wrapper_type_version);
+  bool isTypeRecv() const {
+    return !isEmpty() && get_kind() == Kind::kTypeRecv;
+  }
+  PyObject* getTypeRecvAttr(PyObject* obj, PyObject* name);
+#endif
   BorrowedRef<PyTypeObject> watchedDescrType() const;
 
   PyObject* getAttr(PyObject* obj, PyObject* name);
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 
   static void changeKindFromSplitInline(SplitMutator* split, Kind new_kind);
+#if PY_VERSION_HEX < 0x030C0000
+  static PyObject*
+  demoteSplitToDict(SplitMutator* split, PyObject* obj, PyObject* name);
+  static int demoteSplitToDictStore(
+      SplitMutator* split,
+      PyObject* obj,
+      PyObject* name,
+      PyObject* value);
+#endif
   static constexpr uintptr_t kindMask() {
     return 0x07;
   }
@@ -173,6 +225,27 @@ class AttributeMutator {
     return offsetof(AttributeMutator, split_) +
         offsetof(SplitMutator, val_offset);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  static constexpr size_t typeVersionOffset() {
+    return offsetof(AttributeMutator, type_version_);
+  }
+  static constexpr size_t splitKeysOffset() {
+    return offsetof(AttributeMutator, split_) + offsetof(SplitMutator, keys);
+  }
+  static constexpr size_t dictHintOffset() {
+    return offsetof(AttributeMutator, dict_) + offsetof(DictMutator, dict_hint);
+  }
+  static constexpr uintptr_t dictKind() {
+    return static_cast<uintptr_t>(Kind::kDict);
+  }
+  static constexpr size_t memberDescrMemberdefOffset() {
+    return offsetof(AttributeMutator, member_descr_) +
+        offsetof(MemberDescrMutator, memberdef);
+  }
+  static constexpr uintptr_t memberDescrKind() {
+    return static_cast<uintptr_t>(Kind::kMemberDescr);
+  }
+#endif
   template <typename T>
   static AttributeMutator* from(T* mutator) {
     return reinterpret_cast<AttributeMutator*>(
@@ -238,6 +311,9 @@ class AttributeMutator {
     MemberDescrMutator member_descr_;
     DescrOrClassVarMutator descr_or_cvar_;
     GetAttrMutator getattr_;
+#if PY_VERSION_HEX < 0x030C0000
+    TypeRecvMutator type_recv_;
+#endif
   };
 };
 
@@ -251,6 +327,11 @@ class AttributeCache {
   static constexpr size_t entriesOffset() {
     return offsetof(AttributeCache, entries_);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  PyObject* typeRecvGetAttr(PyObject* obj, PyObject* name);
+  void typeRecvTryFill(PyObject* obj, PyObject* name, PyObject* result);
+#endif
 
  protected:
   std::span<AttributeMutator> entries() {
@@ -421,6 +502,16 @@ class LoadMethodCache {
 #if PY_VERSION_HEX < 0x030C0000
     // Pull-based validity (see AttributeMutator::typeVersionMatches).
     uint32_t type_version{0};
+    bool peek_shadow{false};
+    static constexpr Py_ssize_t kPeekAbsent = -2;
+    PyDictKeysObject* peek_keys{nullptr};
+    Py_ssize_t peek_nentries{0};
+    Py_ssize_t peek_hint{-1};
+    bool inst_attr{false};
+    bool peek_keys_owned{false};
+
+    void setPeekKeys(PyDictKeysObject* keys, bool owned);
+    void clearPeekKeys();
 #endif
 
     bool isValidKeysVersion(BorrowedRef<> obj);
@@ -436,6 +527,33 @@ class LoadMethodCache {
   void initCacheStats(const char* filename, const char* method_name);
   void clearCacheStats();
   const CacheStats* cacheStats();
+
+  static constexpr size_t numEntries() {
+    return 4;
+  }
+  static constexpr size_t entriesOffset() {
+    return offsetof(LoadMethodCache, entries_);
+  }
+  static constexpr size_t entrySize() {
+    return sizeof(Entry);
+  }
+  static constexpr size_t entryTypeOffset() {
+    return offsetof(Entry, type);
+  }
+  static constexpr size_t entryValueOffset() {
+    return offsetof(Entry, value);
+  }
+  static constexpr size_t entryKeysVersionOffset() {
+    return offsetof(Entry, keys_version);
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  static constexpr size_t entryTypeVersionOffset() {
+    return offsetof(Entry, type_version);
+  }
+  static constexpr size_t entryPeekShadowOffset() {
+    return offsetof(Entry, peek_shadow);
+  }
+#endif
 
  private:
   LoadMethodResult lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);

@@ -169,6 +169,10 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_observe_311",
         "test_canary_execute_311",
         "test_execute_311",
+        "test_attr_cache_method_peek_311",
+        "test_attr_cache_new_shape_load_311",
+        "test_attr_cache_new_shape_store_311",
+        "test_early_quicken_311",
     ):
         assert script.count(module) == 1
     assert "--non-libtest" in script

@@ -2266,8 +2266,9 @@ void translateCall(Environ* env, const Instruction* instr) {
 }
 
 void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    !defined(Py_GIL_DISABLED)
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) &&                               \
+    (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
   auto output = instr->output();
   auto as = env->as;
 
@@ -2286,6 +2287,52 @@ void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
       } else {
         as->mov(out_reg, a64::x0);
       }
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
+// B0 scaffold only: B1/B2/B3 replace these generic translations when their
+// corresponding new cache shapes are connected to an AArch64 stub.
+void translateLoadMethodCachedFastPath(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+  auto output = instr->output();
+  auto as = env->as;
+  if (!env->load_method_invoke_stub.isValid()) {
+    env->load_method_invoke_stub = as->newLabel();
+  }
+  emitCall(*env, env->load_method_invoke_stub, instr);
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
+void translateStoreAttrCachedFastPath(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+  auto output = instr->output();
+  auto as = env->as;
+  if (!env->store_attr_invoke_stub.isValid()) {
+    env->store_attr_invoke_stub = as->newLabel();
+  }
+  emitCall(*env, env->store_attr_invoke_stub, instr);
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
     }
   }
 #else
@@ -4052,6 +4099,12 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kLoadAttrCachedFastPath:
       translateLoadAttrCachedFastPath(env, instr);
+      return;
+    case Instruction::kLoadMethodCachedFastPath:
+      translateLoadMethodCachedFastPath(env, instr);
+      return;
+    case Instruction::kStoreAttrCachedFastPath:
+      translateStoreAttrCachedFastPath(env, instr);
       return;
     case Instruction::kBinaryOpExactLongAddSubFastPath:
       translateBinaryOpExactLongAddSubFastPath(env, instr);

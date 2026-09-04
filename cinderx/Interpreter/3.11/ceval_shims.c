@@ -166,3 +166,7 @@ void _PyThread_cond_after(long long microseconds, struct timespec* deadline) {
   deadline->tv_sec = now.tv_sec + (now.tv_usec + microseconds) / 1000000;
   deadline->tv_nsec = ((now.tv_usec + microseconds) % 1000000) * 1000;
 }
+
+// The stock step is one. Execute mode raises it before any user code runs so
+// a numeric auto-JIT threshold can compile already-quickened bytecode.
+int Ci_QuickenWarmupStep_311 = 1;

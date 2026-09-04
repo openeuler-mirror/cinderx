@@ -69,9 +69,22 @@ static PyObject* Ci_PyObject_Vectorcall_311(
   return PyObject_Vectorcall(callable, args, nargsf, kwnames);
 }
 
+extern int Ci_QuickenWarmupStep_311;
+static inline void Ci_CodeWarmup_311(PyCodeObject* code) {
+  if (code->co_warmup != 0) {
+    code->co_warmup += Ci_QuickenWarmupStep_311;
+    if (code->co_warmup >= 0) {
+      code->co_warmup = 0;
+      _PyCode_Quicken(code);
+    }
+  }
+}
+#define _PyCode_Warmup Ci_CodeWarmup_311
+
 #define PyObject_Vectorcall Ci_PyObject_Vectorcall_311
 #include "upstream/ceval.c"
 #undef PyObject_Vectorcall
+#undef _PyCode_Warmup
 
 // Defined after the include so the static eval_frame_handle_pending() above
 // is in scope.  The wrapper adds nothing: the anchored source stays the
