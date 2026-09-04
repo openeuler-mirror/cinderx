@@ -47,6 +47,21 @@ def _discovery_disabled():
 
 
 def _read_located_manifest(distribution):
+    if isinstance(distribution, metadata.PathDistribution):
+        metadata_path = getattr(distribution, "_path", None)
+        if metadata_path is None:
+            return _BOUNDED_READ_UNAVAILABLE
+        normalized_path = PurePosixPath(
+            str(metadata_path).replace("\\", "/")
+        )
+        if not normalized_path.name.endswith(".dist-info"):
+            return None
+        try:
+            with metadata_path.joinpath(MANIFEST_FILENAME).open("rb") as source:
+                return source.read(MAX_MANIFEST_BYTES + 1)
+        except FileNotFoundError:
+            return None
+
     try:
         files = distribution.files
     except Exception:

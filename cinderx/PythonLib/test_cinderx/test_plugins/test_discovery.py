@@ -310,6 +310,11 @@ class PluginDiscoveryBootstrapTests(unittest.TestCase):
                 import_mock.assert_not_called()
 
     def test_preflight_bounds_standard_distribution_manifest_reads(self) -> None:
+        class GuardedPathDistribution(metadata.PathDistribution):
+            @property
+            def files(self):
+                raise AssertionError("manifest preflight parsed RECORD")
+
         self.assertEqual(
             bootstrap_module.MAX_MANIFEST_BYTES,
             MAX_MANIFEST_BYTES,
@@ -330,12 +335,35 @@ class PluginDiscoveryBootstrapTests(unittest.TestCase):
             (dist_info / MANIFEST_PATH).write_bytes(
                 b"x" * (MAX_MANIFEST_BYTES + 100)
             )
-            distribution = metadata.PathDistribution(dist_info)
+            distribution = GuardedPathDistribution(dist_info)
 
             payload = bootstrap_module._read_manifest(distribution)
 
         self.assertIsInstance(payload, bytes)
         self.assertEqual(len(payload), MAX_MANIFEST_BYTES + 1)
+
+    def test_preflight_missing_manifest_does_not_parse_record(self) -> None:
+        class GuardedPathDistribution(metadata.PathDistribution):
+            @property
+            def files(self):
+                raise AssertionError("manifest preflight parsed RECORD")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            dist_info = Path(tempdir) / "ordinary-1.0.dist-info"
+            dist_info.mkdir()
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: ordinary\nVersion: 1.0\n",
+                encoding="utf-8",
+            )
+            (dist_info / "RECORD").write_text(
+                "ordinary-1.0.dist-info/METADATA,,\n" * 100_000,
+                encoding="utf-8",
+            )
+            distribution = GuardedPathDistribution(dist_info)
+
+            payload = bootstrap_module._read_located_manifest(distribution)
+
+        self.assertIsNone(payload)
 
 
 class PluginBootstrapPackagingTests(unittest.TestCase):
