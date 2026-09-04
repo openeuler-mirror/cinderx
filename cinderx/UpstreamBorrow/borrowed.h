@@ -335,6 +335,11 @@ void Cix_format_exc_check_arg(
 
 PyObject* Ci_Builtin_Next_Core(PyObject* it, PyObject* def);
 
+#if PY_VERSION_HEX < 0x030C0000
+void Ci_DictKeys_IncRef_311(PyDictKeysObject* keys);
+void Ci_DictKeys_DecRef_311(PyDictKeysObject* keys);
+#endif
+
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
 PyObject* Cix_cr_getrunning(PyObject* self, void* ignored);
 PyObject* Cix_cr_getsuspended(PyObject* self, void* ignored);

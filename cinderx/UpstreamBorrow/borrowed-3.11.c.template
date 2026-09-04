@@ -305,6 +305,14 @@ PyObject* Ci_static_rand(PyObject* self) {
   return PyLong_FromLong(rand());
 }
 
+void Ci_DictKeys_IncRef_311(PyDictKeysObject* keys) {
+  dictkeys_incref(keys);
+}
+
+void Ci_DictKeys_DecRef_311(PyDictKeysObject* keys) {
+  dictkeys_decref(keys);
+}
+
 int init_upstream_borrow(void) {
   const char* code_str =
       "class GetAttr:\n"

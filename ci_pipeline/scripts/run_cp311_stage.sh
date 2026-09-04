@@ -224,7 +224,11 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_execution_infra_311 \
     test_cinderx.test_kunpeng.test_observe_311 \
     test_cinderx.test_kunpeng.test_canary_execute_311 \
-    test_cinderx.test_kunpeng.test_execute_311)
+    test_cinderx.test_kunpeng.test_execute_311 \
+    test_cinderx.test_kunpeng.test_attr_cache_method_peek_311 \
+    test_cinderx.test_kunpeng.test_attr_cache_new_shape_load_311 \
+    test_cinderx.test_kunpeng.test_attr_cache_new_shape_store_311 \
+    test_cinderx.test_kunpeng.test_early_quicken_311)
 }
 
 generator_refcount_matrix() {

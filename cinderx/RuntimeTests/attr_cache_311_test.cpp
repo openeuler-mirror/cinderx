@@ -116,6 +116,139 @@ PyTypeObject SelfDeletingDescr_Type = {
 
 class AttrCache311Test : public RuntimeTest {};
 
+TEST_F(AttrCache311Test, DictKeysLookupSkipsDeletedUnicodeEntries) {
+  auto dict = Ref<>::steal(PyDict_New());
+  ASSERT_NE(dict, nullptr);
+  auto deleted = Ref<>::steal(PyUnicode_InternFromString("deleted"));
+  auto retained = Ref<>::steal(PyUnicode_InternFromString("retained"));
+  auto value = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_EQ(PyDict_SetItem(dict, deleted, value), 0);
+  ASSERT_EQ(PyDict_SetItem(dict, retained, value), 0);
+  ASSERT_EQ(PyDict_DelItem(dict, deleted), 0);
+
+  auto* keys = reinterpret_cast<PyDictObject*>(dict.get())->ma_keys;
+  ASSERT_TRUE(DK_IS_UNICODE(keys));
+  ASSERT_EQ(DK_UNICODE_ENTRIES(keys)[0].me_key, nullptr);
+  EXPECT_GE(getDictKeysIndex(keys, retained), 0);
+  EXPECT_EQ(getDictKeysIndex(keys, deleted), -1);
+}
+
+TEST_F(AttrCache311Test, SplitEntrySurvivesMaterializationAndRekey) {
+  const char* src = R"(
+class P:
+    def __init__(self):
+        self.x = 7
+
+inst = P()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "inst");
+  ASSERT_NE(inst, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 7);
+
+  auto dict = Ref<>::steal(PyObject_GenericGetDict(inst, nullptr));
+  ASSERT_NE(dict, nullptr);
+  auto materialized =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+  ASSERT_NE(materialized, nullptr);
+  EXPECT_EQ(PyLong_AsLong(materialized), 7);
+
+  auto non_unicode_key = Ref<>::steal(PyLong_FromLong(42));
+  auto marker = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_EQ(PyDict_SetItem(dict, non_unicode_key, marker), 0);
+  auto rekeyed =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+  ASSERT_NE(rekeyed, nullptr);
+  EXPECT_EQ(PyLong_AsLong(rekeyed), 7);
+}
+
+TEST_F(AttrCache311Test, StoreEntrySurvivesMaterializationAndRekey) {
+  const char* src = R"(
+class P:
+    def __init__(self):
+        self.x = 1
+
+inst = P()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "inst");
+  ASSERT_NE(inst, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto cache = makeStoreAttrCache();
+
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, two), 0);
+  auto dict = Ref<>::steal(PyObject_GenericGetDict(inst, nullptr));
+  ASSERT_NE(dict, nullptr);
+  auto* dict_obj = reinterpret_cast<PyDictObject*>(dict.get());
+
+  auto three = Ref<>::steal(PyLong_FromLong(3));
+  uint64_t version = dict_obj->ma_version_tag;
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, three), 0);
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItem(dict, name)), 3);
+  EXPECT_NE(dict_obj->ma_version_tag, version);
+
+  auto non_unicode_key = Ref<>::steal(PyLong_FromLong(42));
+  auto marker = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_EQ(PyDict_SetItem(dict, non_unicode_key, marker), 0);
+  auto four = Ref<>::steal(PyLong_FromLong(4));
+  version = dict_obj->ma_version_tag;
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, four), 0);
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItem(dict, name)), 4);
+  EXPECT_NE(dict_obj->ma_version_tag, version);
+}
+
+TEST_F(AttrCache311Test, DictDemotionDoesNotMaterializeSiblingValues) {
+  const char* src = R"(
+class P:
+    def __init__(self):
+        self.x = 1
+
+normal = P()
+rekeyed = P()
+vars(rekeyed)[42] = "general"
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> normal = PyDict_GetItemString(globals, "normal");
+  BorrowedRef<> rekeyed = PyDict_GetItemString(globals, "rekeyed");
+  ASSERT_NE(normal, nullptr);
+  ASSERT_NE(rekeyed, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  auto three = Ref<>::steal(PyLong_FromLong(3));
+  auto cache = makeStoreAttrCache();
+
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), normal, name, two), 0);
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), rekeyed, name, two), 0);
+  ASSERT_NE(*_PyObject_ValuesPointer(normal.get()), nullptr);
+  ASSERT_EQ(*_PyObject_ManagedDictPointer(normal.get()), nullptr);
+
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), normal, name, three), 0);
+  EXPECT_NE(*_PyObject_ValuesPointer(normal.get()), nullptr);
+  EXPECT_EQ(*_PyObject_ManagedDictPointer(normal.get()), nullptr);
+  auto current = Ref<>::steal(PyObject_GetAttr(normal, name));
+  ASSERT_NE(current, nullptr);
+  EXPECT_EQ(PyLong_AsLong(current), 3);
+}
+
 TEST_F(AttrCache311Test, PullCheckRetiresStaleEntriesOnTypeMutation) {
   const char* src = R"(
 class P:
@@ -452,6 +585,70 @@ inst = C()
 
   run_arm(/*is_store=*/false);
   run_arm(/*is_store=*/true);
+}
+
+TEST_F(AttrCache311Test, MetaclassDescriptorSurvivesDeletingItselfMidSlot) {
+  if (SelfDeletingDescr_Type.tp_name == nullptr) {
+    SelfDeletingDescr_Type.tp_name = "SelfDeletingDescr";
+    SelfDeletingDescr_Type.tp_basicsize = sizeof(SelfDeletingDescr);
+    SelfDeletingDescr_Type.tp_dealloc = sdd_dealloc;
+    SelfDeletingDescr_Type.tp_flags = Py_TPFLAGS_DEFAULT;
+    SelfDeletingDescr_Type.tp_descr_get = sdd_descr_get;
+    SelfDeletingDescr_Type.tp_descr_set = sdd_descr_set;
+    ASSERT_GE(PyType_Ready(&SelfDeletingDescr_Type), 0);
+  }
+
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result = Ref<>::steal(PyRun_String(
+      "class Meta(type):\n"
+      "    pass\n"
+      "class C(metaclass=Meta):\n"
+      "    pass\n",
+      Py_file_input,
+      globals,
+      globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> meta = PyDict_GetItemString(globals, "Meta");
+  BorrowedRef<> klass = PyDict_GetItemString(globals, "C");
+  ASSERT_NE(meta, nullptr);
+  ASSERT_NE(klass, nullptr);
+
+  SelfDeletingDescr* descr =
+      PyObject_New(SelfDeletingDescr, &SelfDeletingDescr_Type);
+  ASSERT_NE(descr, nullptr);
+  descr->payload = 42;
+  {
+    auto warmed = Ref<>::steal(PyObject_GetAttrString(
+        reinterpret_cast<PyObject*>(descr), "__class__"));
+    ASSERT_NE(warmed, nullptr);
+  }
+  ASSERT_EQ(
+      PyObject_SetAttrString(meta, "x", reinterpret_cast<PyObject*>(descr)), 0);
+  Py_DECREF(descr);
+
+  sdd_owner = meta;
+  sdd_armed = false;
+  sdd_died_mid_slot = false;
+  sdd_dealloc_count = 0;
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), klass, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 42);
+
+  sdd_armed = true;
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), klass, name));
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyLong_AsLong(second), 42);
+  EXPECT_FALSE(sdd_died_mid_slot);
+  EXPECT_EQ(sdd_dealloc_count, 1);
+
+  sdd_armed = false;
+  sdd_owner = nullptr;
 }
 
 // --- __getattr__ hook ownership -------------------------------------------
@@ -973,6 +1170,262 @@ TEST_F(AttrCache311Test, TypeMethodCacheRetiresOnMetaclassDataDescriptor) {
   Py_XDECREF(after.self_or_null);
   ASSERT_NE(produced, nullptr);
   EXPECT_EQ(PyUnicode_CompareWithASCIIString(produced, "meta-cm"), 0);
+}
+
+TEST_F(AttrCache311Test, MethodPeekTracksMaterializedShadowChanges) {
+  const char* src = R"(
+class P:
+    def method(self):
+        return "class"
+
+p = P()
+q = P()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> p = PyDict_GetItemString(globals, "p");
+  BorrowedRef<> q = PyDict_GetItemString(globals, "q");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("method"));
+  jit::LoadMethodCache cache;
+
+  auto first = jit::LoadMethodCache::lookupHelper(&cache, p, name);
+  ASSERT_NE(first.callable, nullptr);
+  Py_XDECREF(first.callable);
+  Py_XDECREF(first.self_or_null);
+
+  auto p_dict = Ref<>::steal(PyObject_GenericGetDict(p, nullptr));
+  auto q_dict = Ref<>::steal(PyObject_GenericGetDict(q, nullptr));
+  ASSERT_NE(p_dict, nullptr);
+  ASSERT_NE(q_dict, nullptr);
+  auto shadow_src = Ref<>::steal(PyRun_String(
+      "shadow = lambda: 'instance'\n", Py_file_input, globals, globals));
+  ASSERT_NE(shadow_src, nullptr);
+  BorrowedRef<> shadow = PyDict_GetItemString(globals, "shadow");
+  ASSERT_EQ(PyDict_SetItem(p_dict, name, shadow), 0);
+
+  auto shadowed = jit::LoadMethodCache::lookupHelper(&cache, p, name);
+  EXPECT_EQ(shadowed.callable, Py_None);
+  EXPECT_EQ(shadowed.self_or_null, shadow.get());
+  Py_XDECREF(shadowed.callable);
+  Py_XDECREF(shadowed.self_or_null);
+
+  auto unshadowed = jit::LoadMethodCache::lookupHelper(&cache, q, name);
+  ASSERT_NE(unshadowed.callable, nullptr);
+  EXPECT_EQ(unshadowed.self_or_null, q.get());
+  Py_XDECREF(unshadowed.callable);
+  Py_XDECREF(unshadowed.self_or_null);
+
+  ASSERT_EQ(PyDict_DelItem(p_dict, name), 0);
+  auto restored = jit::LoadMethodCache::lookupHelper(&cache, p, name);
+  ASSERT_NE(restored.callable, nullptr);
+  EXPECT_EQ(restored.self_or_null, p.get());
+  Py_XDECREF(restored.callable);
+  Py_XDECREF(restored.self_or_null);
+}
+
+TEST_F(AttrCache311Test, MethodPeekPropagatesCombinedDictKeyErrorOnce) {
+  const char* src = R"(
+class UniqueError(Exception):
+    pass
+
+class Key:
+    count = 0
+    def __hash__(self):
+        return hash("method")
+    def __eq__(self, other):
+        Key.count += 1
+        raise UniqueError("combined-key-error")
+
+class P:
+    def method(self):
+        return "class"
+
+p = P()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "p");
+  BorrowedRef<> key_type = PyDict_GetItemString(globals, "Key");
+  BorrowedRef<> unique_error = PyDict_GetItemString(globals, "UniqueError");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("method"));
+  jit::LoadMethodCache cache;
+
+  auto first = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  ASSERT_NE(first.callable, nullptr);
+  Py_XDECREF(first.callable);
+  Py_XDECREF(first.self_or_null);
+
+  auto late = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_EQ(PyObject_SetAttrString(inst, "late", late), 0);
+  auto upgraded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  ASSERT_NE(upgraded.callable, nullptr);
+  Py_XDECREF(upgraded.callable);
+  Py_XDECREF(upgraded.self_or_null);
+
+  auto dict = Ref<>::steal(PyObject_GenericGetDict(inst, nullptr));
+  auto key = Ref<>::steal(PyObject_CallNoArgs(key_type));
+  auto marker = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_EQ(PyDict_SetItem(dict, key, marker), 0);
+  auto zero = Ref<>::steal(PyLong_FromLong(0));
+  ASSERT_EQ(PyObject_SetAttrString(key_type, "count", zero), 0);
+
+  auto failed = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  EXPECT_EQ(failed.callable, nullptr);
+  EXPECT_EQ(failed.self_or_null, nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(unique_error));
+  PyErr_Clear();
+  auto count = Ref<>::steal(PyObject_GetAttrString(key_type, "count"));
+  EXPECT_EQ(PyLong_AsLong(count), 1);
+}
+
+TEST_F(AttrCache311Test, TypeReceiverCacheRetiresOnMetaclassMutation) {
+  const char* src = R"(
+class Meta(type):
+    pass
+
+class T(metaclass=Meta):
+    value = "class"
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> type = PyDict_GetItemString(globals, "T");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("value"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(first, nullptr);
+  auto hit = Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(hit, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(hit, "class"), 0);
+
+  auto mutate = Ref<>::steal(PyRun_String(
+      "Meta.value = property(lambda cls: 'meta')\n",
+      Py_file_input,
+      globals,
+      globals));
+  ASSERT_NE(mutate, nullptr);
+  auto after =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(after, "meta"), 0);
+}
+
+TEST_F(AttrCache311Test, TypeReceiverCachePropagatesDescriptorError) {
+  const char* src = R"(
+class RaisingDescriptor:
+    def __get__(self, obj, owner):
+        if obj.raise_now:
+            raise RuntimeError("cached descriptor error")
+        return "ok"
+    def __set__(self, obj, value):
+        raise AssertionError("not used")
+
+class Meta(type):
+    value = RaisingDescriptor()
+
+class T(metaclass=Meta):
+    raise_now = False
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> type = PyDict_GetItemString(globals, "T");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("value"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "ok"), 0);
+
+  ASSERT_EQ(PyObject_SetAttrString(type, "raise_now", Py_True), 0);
+  EXPECT_EQ(jit::LoadAttrCache::invoke(cache.get(), type, name), nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+}
+
+TEST_F(AttrCache311Test, TypeReceiverCacheRetiresOnPayloadTypeMutation) {
+  const char* src = R"(
+class Value:
+    pass
+
+class T:
+    value = Value()
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> type = PyDict_GetItemString(globals, "T");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("value"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(first, nullptr);
+  auto hit = Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_EQ(hit.get(), first.get());
+
+  auto mutate = Ref<>::steal(PyRun_String(
+      "Value.__get__ = lambda self, obj, owner: 'descriptor'\n",
+      Py_file_input,
+      globals,
+      globals));
+  ASSERT_NE(mutate, nullptr);
+  auto after =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(after, "descriptor"), 0);
+}
+
+TEST_F(AttrCache311Test, TypeReceiverCacheRetiresOnDescriptorTypeMutation) {
+  const char* src = R"(
+class Descriptor:
+    def __get__(self, obj, owner):
+        return "meta"
+    def __set__(self, obj, value):
+        raise AssertionError("not used")
+
+class Meta(type):
+    value = Descriptor()
+
+class T(metaclass=Meta):
+    value = "class"
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> type = PyDict_GetItemString(globals, "T");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("value"));
+  auto cache = makeLoadAttrCache();
+
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "meta"), 0);
+
+  auto mutate = Ref<>::steal(PyRun_String(
+      "del Descriptor.__get__\n", Py_file_input, globals, globals));
+  ASSERT_NE(mutate, nullptr);
+  auto after =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), type, name));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(after, "class"), 0);
 }
 
 #endif

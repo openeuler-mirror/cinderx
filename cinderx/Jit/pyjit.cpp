@@ -5615,6 +5615,10 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 
 } // namespace
 
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" int Ci_QuickenWarmupStep_311;
+#endif
+
 namespace jit {
 
 void setUncompileMidpointHookForTest(void (*hook)()) {
@@ -6012,6 +6016,11 @@ int initialize() {
         "point; another component holds it");
     return -1;
   }
+  // Publish process-global quickening policy only after execute-mode
+  // initialization can no longer fail. CPython starts co_warmup at -8;
+  // advancing by eight quickens on the first interpreted entry, before the
+  // required PYTHONJITAUTO=2 compilation gate.
+  Ci_QuickenWarmupStep_311 = 8;
   getMutableConfig().state = State::kRunning;
   return 0;
 #endif

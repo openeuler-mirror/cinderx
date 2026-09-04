@@ -361,12 +361,14 @@ Instruction* getSecondCallResult(
   Instruction* src_instr = src->instr();
   BasicBlock* src_block = src_instr->basicblock();
   auto src_it = src_block->iterator_to(src_instr);
+  const bool src_is_call_like =
+      src_instr->isCall() || src_instr->isLoadMethodCachedFastPath();
   JIT_CHECK(
-      src_instr->isCall() || src_instr->isPhi(),
+      src_is_call_like || src_instr->isPhi(),
       "LoadSecondCallResult input must come from Call or Phi, not '{}'",
       *src_instr);
 
-  if (src_instr->isCall()) {
+  if (src_is_call_like) {
     // Check that this Call hasn't already been handled on behalf of another
     // LoadSecondCallResult. If we need to support this pattern in the future,
     // this rewrite function should probably become a standalone pass, with the
@@ -393,7 +395,7 @@ Instruction* getSecondCallResult(
   }
 
   Instruction::Opcode new_op =
-      src_instr->isCall() ? Instruction::kMove : Instruction::kPhi;
+      src_is_call_like ? Instruction::kMove : Instruction::kPhi;
   if (instr) {
     instr->setOpcode(new_op);
   } else {

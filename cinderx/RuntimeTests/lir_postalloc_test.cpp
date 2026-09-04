@@ -775,6 +775,61 @@ TEST_F(LIRPostAllocRewriteTest, LoadAttrCachedFastPathKeepsOpcode) {
   EXPECT_EQ(fast_path->getNumInputs(), 1);
 }
 
+TEST_F(LIRPostAllocRewriteTest, LoadMethodCachedFastPathKeepsOpcode) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  bb->allocateInstr(
+      Instruction::kLoadMethodCachedFastPath,
+      nullptr,
+      OutPhyReg{X0, DataType::kObject},
+      Imm{0x1234, DataType::kObject},
+      PhyReg{X1, DataType::k64bit},
+      PhyReg{X2, DataType::kObject},
+      PhyReg{X3, DataType::kObject});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  Instruction* fast_path = nullptr;
+  for (auto* instr : collectInstrs(*bb)) {
+    ASSERT_FALSE(instr->isCall());
+    if (instr->isLoadMethodCachedFastPath()) {
+      fast_path = instr;
+    }
+  }
+  ASSERT_NE(fast_path, nullptr);
+  EXPECT_EQ(fast_path->getNumInputs(), 1);
+}
+
+TEST_F(LIRPostAllocRewriteTest, StoreAttrCachedFastPathKeepsOpcode) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  bb->allocateInstr(
+      Instruction::kStoreAttrCachedFastPath,
+      nullptr,
+      OutPhyReg{X0, DataType::k32bit},
+      Imm{0x1234, DataType::kObject},
+      PhyReg{X1, DataType::k64bit},
+      PhyReg{X2, DataType::kObject},
+      PhyReg{X3, DataType::kObject},
+      PhyReg{X4, DataType::kObject});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  Instruction* fast_path = nullptr;
+  for (auto* instr : collectInstrs(*bb)) {
+    ASSERT_FALSE(instr->isCall());
+    if (instr->isStoreAttrCachedFastPath()) {
+      fast_path = instr;
+    }
+  }
+  ASSERT_NE(fast_path, nullptr);
+  EXPECT_EQ(fast_path->getNumInputs(), 1);
+}
+
 TEST_F(
     LIRPostAllocRewriteTest,
     BinaryOpExactLongAddSubFastPathKeepsOpcodeAndABI) {

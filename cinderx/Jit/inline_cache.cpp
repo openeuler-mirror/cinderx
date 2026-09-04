@@ -265,6 +265,16 @@ bool hookUsesGenericGetAttr(BorrowedRef<PyTypeObject> type) {
   return getattribute == cinderx::getModuleState()->object_getattribute;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+bool metaclassHookUsesTypeGetAttr(BorrowedRef<PyTypeObject> metatype) {
+  BorrowedRef<> getattribute =
+      _PyType_Lookup(metatype, &_Py_ID(__getattribute__));
+  BorrowedRef<> type_getattribute =
+      _PyType_Lookup(&PyType_Type, &_Py_ID(__getattribute__));
+  return getattribute != nullptr && getattribute == type_getattribute;
+}
+#endif
+
 // Check whether a type uses the __getattr__ hook as its tp_getattro.
 // CPython installs _Py_slot_tp_getattr_hook (captured as Ci_tp_getattr_hook)
 // when a class defines __getattr__ with the default __getattribute__. This
@@ -498,6 +508,27 @@ void AttributeMutator::changeKindFromSplitInline(
       static_cast<uintptr_t>(new_kind);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* AttributeMutator::demoteSplitToDict(
+    SplitMutator* split,
+    PyObject* obj,
+    PyObject* name) {
+  AttributeMutator* mutator = from(split);
+  mutator->set_dict(mutator->type());
+  return mutator->dict_.getAttr(obj, name);
+}
+
+int AttributeMutator::demoteSplitToDictStore(
+    SplitMutator* split,
+    PyObject* obj,
+    PyObject* name,
+    PyObject* value) {
+  AttributeMutator* mutator = from(split);
+  mutator->set_dict(mutator->type());
+  return mutator->dict_.setAttr(obj, name, value);
+}
+#endif
+
 PyDictKeysObject* getSplitKeys(BorrowedRef<PyTypeObject> type) {
   JIT_DCHECK(
       PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE),
@@ -721,9 +752,41 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   return result;
 }
 #else
+static void replaceMaterializedDictValue311(
+    PyDictObject* dict,
+    PyObject** slot,
+    PyObject* value) {
+  PyObject* old_value = *slot;
+  JIT_DCHECK(old_value != nullptr, "Only existing values may be overwritten");
+  Py_INCREF(value);
+  *slot = value;
+  dict->ma_version_tag = Cix_PyDict_NextVersion();
+  if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
+      _PyObject_GC_MAY_BE_TRACKED(value)) {
+    PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
+  }
+  Py_DECREF(old_value);
+}
+
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   PyDictValues* values = *_PyObject_ValuesPointer(obj);
   if (values == nullptr) {
+    PyDictObject* dict =
+        reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
+    if (dict != nullptr && dict->ma_keys == keys &&
+        dict->ma_values != nullptr && val_offset >= 0 &&
+        static_cast<size_t>(val_offset) + 2 <
+            reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
+      PyObject* old_value = dict->ma_values->values[val_offset];
+      if (old_value != nullptr) {
+        replaceMaterializedDictValue311(
+            dict, &dict->ma_values->values[val_offset], value);
+        return 0;
+      }
+    }
+    if (dict != nullptr && dict->ma_keys != keys) {
+      return AttributeMutator::demoteSplitToDictStore(this, obj, name, value);
+    }
     return PyObject_SetAttr(obj, name, value);
   }
 
@@ -741,6 +804,21 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
 PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   PyDictValues* values = *_PyObject_ValuesPointer(obj);
   if (values == nullptr) {
+    PyDictObject* dict =
+        reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
+    if (dict != nullptr) {
+      if (dict->ma_keys == keys && dict->ma_values != nullptr &&
+          val_offset >= 0 &&
+          static_cast<size_t>(val_offset) + 2 <
+              reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
+        PyObject* result = dict->ma_values->values[val_offset];
+        if (result != nullptr) {
+          return Py_NewRef(result);
+        }
+        return getAttrFallback(obj, name);
+      }
+      return AttributeMutator::demoteSplitToDict(this, obj, name);
+    }
     return PyObject_GetAttr(obj, name);
   }
 
@@ -838,6 +916,46 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
 // values into a real dict on 3.11, so reads go through the managed-dict
 // slot directly.
 int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  PyDictObject* managed =
+      reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
+  if (managed == nullptr && *_PyObject_ValuesPointer(obj) != nullptr) {
+    // A re-keyed receiver may demote this type-keyed entry to kDict while its
+    // siblings still use live split values. Let stock update those values;
+    // GenericGetDict would materialize every sibling unconditionally.
+    return PyObject_SetAttr(obj, name, value);
+  }
+  if (managed != nullptr) {
+    PyDictKeysObject* keys = managed->ma_keys;
+    if (DK_IS_UNICODE(keys)) {
+      Py_ssize_t hint = dict_hint;
+      if (hint < 0 || hint >= keys->dk_nentries ||
+          DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
+        hint = getDictKeysIndex(keys, name);
+        if (hint >= 0) {
+          dict_hint = hint;
+        }
+      }
+      if (hint >= 0) {
+        if (managed->ma_values != nullptr) {
+          if (static_cast<size_t>(hint) + 2 <
+              reinterpret_cast<const uint8_t*>(managed->ma_values)[-1]) {
+            PyObject* old_value = managed->ma_values->values[hint];
+            if (old_value != nullptr) {
+              replaceMaterializedDictValue311(
+                  managed, &managed->ma_values->values[hint], value);
+              return 0;
+            }
+          }
+        } else {
+          PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[hint];
+          if (entry->me_value != nullptr) {
+            replaceMaterializedDictValue311(managed, &entry->me_value, value);
+            return 0;
+          }
+        }
+      }
+    }
+  }
   auto dict = Ref<>::steal(PyObject_GenericGetDict(obj, nullptr));
   if (dict == nullptr) {
     return -1;
@@ -849,10 +967,57 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
   BorrowedRef<PyDictObject> dict =
       reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
   if (dict == nullptr) {
-    // Live inline values cannot hold this attribute: kDict was chosen
-    // because the name is absent from the (full) shared keys, and the
-    // pull-validated type version pins that keys era.
-    return getAttrFallback(obj, name);
+    PyDictValues* values = *_PyObject_ValuesPointer(obj);
+    PyDictKeysObject* keys = getSplitKeys(Py_TYPE(obj));
+    if (values != nullptr && keys != nullptr && DK_IS_UNICODE(keys)) {
+      Py_ssize_t hint = values_hint;
+      if (hint < 0 || hint >= keys->dk_nentries ||
+          DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
+        hint = getDictKeysIndex(keys, name);
+        if (hint >= 0) {
+          values_hint = hint;
+        }
+      }
+      if (hint >= 0 &&
+          static_cast<size_t>(hint) + 2 <
+              reinterpret_cast<const uint8_t*>(values)[-1]) {
+        PyObject* value = values->values[hint];
+        if (value != nullptr) {
+          return Py_NewRef(value);
+        }
+      }
+    }
+    GetAttrHookSnapshot311 hook(getattr_method);
+    PyObject* result = PyObject_GenericGetAttr(obj, name);
+    if (result == nullptr && hook.suppressAttributeError()) {
+      return hook.call(obj, name);
+    }
+    return result;
+  }
+  PyDictKeysObject* keys = dict->ma_keys;
+  if (DK_IS_UNICODE(keys)) {
+    Py_ssize_t hint = dict_hint;
+    if (hint < 0 || hint >= keys->dk_nentries ||
+        DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
+      hint = getDictKeysIndex(keys, name);
+      if (hint >= 0) {
+        dict_hint = hint;
+      }
+    }
+    if (hint >= 0) {
+      PyObject* value = nullptr;
+      if (dict->ma_values != nullptr) {
+        if (static_cast<size_t>(hint) + 2 <
+            reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
+          value = dict->ma_values->values[hint];
+        }
+      } else {
+        value = DK_UNICODE_ENTRIES(keys)[hint].me_value;
+      }
+      if (value != nullptr) {
+        return Py_NewRef(value);
+      }
+    }
   }
   auto strong_ref = Ref<>::create(dict);
   // Same pinned-hook protocol as CombinedMutator: error-preserving
@@ -1045,6 +1210,10 @@ void AttributeMutator::set_combined(PyTypeObject* type) {
 void AttributeMutator::set_dict(PyTypeObject* type) {
   set_type(type, Kind::kDict);
   dict_.getattr_method = getGetAttrForCaching(type);
+#if PY_VERSION_HEX < 0x030C0000
+  dict_.dict_hint = -1;
+  dict_.values_hint = -1;
+#endif
 }
 
 void AttributeMutator::set_data_descr(PyTypeObject* type, PyObject* descr) {
@@ -1091,6 +1260,92 @@ void AttributeMutator::set_getattr(
   getattr_.getattr_method = getattr_method;
   getattr_.keys_version = keys_version;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void AttributeMutator::set_type_recv_value(
+    PyTypeObject* receiver,
+    uint32_t meta_version,
+    PyObject* payload,
+    uint32_t payload_type_version) {
+  set_type(receiver, Kind::kTypeRecv);
+  type_recv_.payload = payload;
+  type_recv_.meta_version = meta_version;
+  type_recv_.payload_type_version = payload_type_version;
+  type_recv_.form = TypeRecvMutator::Form::kValue;
+}
+
+void AttributeMutator::set_type_recv_meta_descr(
+    PyTypeObject* metatype,
+    PyObject* payload,
+    uint32_t payload_type_version) {
+  set_type(metatype, Kind::kTypeRecv);
+  type_recv_.payload = payload;
+  type_recv_.meta_version = metatype->tp_version_tag;
+  type_recv_.payload_type_version = payload_type_version;
+  type_recv_.form = TypeRecvMutator::Form::kMetaDescr;
+}
+
+void AttributeMutator::set_type_recv_static_method(
+    PyTypeObject* receiver,
+    uint32_t meta_version,
+    PyObject* wrapper,
+    uint32_t wrapper_type_version) {
+  set_type(receiver, Kind::kTypeRecv);
+  type_recv_.payload = wrapper;
+  type_recv_.meta_version = meta_version;
+  type_recv_.payload_type_version = wrapper_type_version;
+  type_recv_.form = TypeRecvMutator::Form::kStaticMethod;
+}
+
+PyObject* AttributeMutator::getTypeRecvAttr(PyObject* obj, PyObject* name) {
+  auto receiver = reinterpret_cast<PyTypeObject*>(obj);
+  PyTypeObject* metatype = Py_TYPE(obj);
+  if (type_recv_.form != TypeRecvMutator::Form::kMetaDescr) {
+    if (type() != receiver || !typeVersionMatches(receiver) ||
+        !Ci_Type_HasValidVersionTag(metatype) ||
+        metatype->tp_version_tag != type_recv_.meta_version) {
+      reset();
+      return nullptr;
+    }
+    PyTypeObject* payload_type = Py_TYPE(type_recv_.payload);
+    if (!Ci_Type_HasValidVersionTag(payload_type) ||
+        payload_type->tp_version_tag != type_recv_.payload_type_version) {
+      reset();
+      return nullptr;
+    }
+    if (type_recv_.form == TypeRecvMutator::Form::kStaticMethod) {
+      if (Py_TYPE(type_recv_.payload) != &PyStaticMethod_Type) {
+        reset();
+        return nullptr;
+      }
+      PyObject* callable = Ci_PyStaticMethod_GetFunc(type_recv_.payload);
+      return callable == nullptr ? nullptr : Py_NewRef(callable);
+    }
+    return Py_NewRef(type_recv_.payload);
+  }
+
+  if (type() != metatype || !typeVersionMatches(metatype)) {
+    reset();
+    return nullptr;
+  }
+  PyTypeObject* payload_type = Py_TYPE(type_recv_.payload);
+  if (!Ci_Type_HasValidVersionTag(payload_type) ||
+      payload_type->tp_version_tag != type_recv_.payload_type_version ||
+      payload_type->tp_descr_get == nullptr ||
+      !PyDescr_IsData(type_recv_.payload)) {
+    reset();
+    return nullptr;
+  }
+  Ref<> payload = Ref<>::create(type_recv_.payload);
+  GetAttrHookSnapshot311 hook(obj);
+  PyObject* result = payload_type->tp_descr_get(
+      payload, obj, reinterpret_cast<PyObject*>(metatype));
+  if (result == nullptr && hook.suppressAttributeError()) {
+    return hook.call(obj, name);
+  }
+  return result;
+}
+#endif
 
 BorrowedRef<PyTypeObject> AttributeMutator::watchedDescrType() const {
   if (get_kind() == Kind::kDataDescr) {
@@ -1146,6 +1401,9 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 #if PY_VERSION_HEX >= 0x030E0000
     case AttributeMutator::Kind::kSplitInline:
       return split_.getAttrInline(obj, name);
+#elif PY_VERSION_HEX < 0x030C0000
+    case AttributeMutator::Kind::kTypeRecv:
+      return getTypeRecvAttr(obj, name);
 #endif
     case AttributeMutator::Kind::kCombined:
       return combined_.getAttr(obj, name);
@@ -1474,7 +1732,18 @@ void AttributeCache::fill(
         mut->set_dict(type);
         ac_watcher.watch(type, this);
         countAttrCacheFill311(is_set);
+        return;
       }
+
+#if PY_VERSION_HEX < 0x030C0000
+      // A late-added attribute can live in a materialized dict even while the
+      // type's shared keys are not full. B1 admitted the read side; B2 makes
+      // the same kDict shape available to stores, whose DictMutator consumer
+      // owns versioning, GC tracking and overwrite fallback semantics.
+      mut->set_dict(type);
+      ac_watcher.watch(type, this);
+      countAttrCacheFill311(is_set);
+#endif
 
       return;
     }
@@ -1542,10 +1811,103 @@ LoadAttrCache::invoke(LoadAttrCache* cache, PyObject* obj, PyObject* name) {
   return cache->doInvoke(obj, name);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* AttributeCache::typeRecvGetAttr(PyObject* obj, PyObject* name) {
+  auto receiver = reinterpret_cast<PyTypeObject*>(obj);
+  PyTypeObject* metatype = Py_TYPE(obj);
+  for (auto& entry : entries()) {
+    if (!entry.isTypeRecv() ||
+        (entry.type() != receiver && entry.type() != metatype)) {
+      continue;
+    }
+    return entry.getTypeRecvAttr(obj, name);
+  }
+  return nullptr;
+}
+
+void AttributeCache::typeRecvTryFill(
+    PyObject* obj,
+    PyObject* name,
+    PyObject* result) {
+  auto tp = reinterpret_cast<PyTypeObject*>(obj);
+  PyTypeObject* metatype = Py_TYPE(obj);
+  if ((metatype->tp_getattro != PyType_Type.tp_getattro &&
+       (metatype->tp_getattro != Ci_tp_getattr_hook ||
+        !metaclassHookUsesTypeGetAttr(metatype))) ||
+      !ensureVersionTag(metatype)) {
+    return;
+  }
+  auto pick_slot = [&](PyTypeObject* key) -> AttributeMutator* {
+    AttributeMutator* empty = nullptr;
+    for (auto& entry : entries()) {
+      if (entry.isTypeRecv() && entry.type() == key) {
+        return &entry;
+      }
+      if (empty == nullptr && entry.isEmpty()) {
+        empty = &entry;
+      }
+    }
+    return empty;
+  };
+
+  BorrowedRef<> meta_attr = _PyType_Lookup(metatype, name);
+  if (meta_attr != nullptr &&
+      Py_TYPE(meta_attr.get())->tp_descr_get != nullptr &&
+      PyDescr_IsData(meta_attr.get())) {
+    PyTypeObject* payload_type = Py_TYPE(meta_attr.get());
+    if (!ensureVersionTag(payload_type)) {
+      return;
+    }
+    AttributeMutator* slot = pick_slot(metatype);
+    if (slot != nullptr) {
+      slot->set_type_recv_meta_descr(
+          metatype, meta_attr.get(), payload_type->tp_version_tag);
+    }
+    return;
+  }
+
+  BorrowedRef<> raw = _PyType_Lookup(tp, name);
+  if (raw == nullptr) {
+    return;
+  }
+  PyObject* payload = nullptr;
+  PyTypeObject* raw_type = Py_TYPE(raw.get());
+  if (raw.get() == result) {
+    if (raw_type->tp_descr_get == nullptr || raw_type == &PyFunction_Type ||
+        raw_type == &PyWrapperDescr_Type || raw_type == &PyMethodDescr_Type) {
+      payload = raw.get();
+    }
+  } else if (
+      raw_type == &PyStaticMethod_Type &&
+      Ci_PyStaticMethod_GetFunc(raw.get()) == result) {
+    payload = raw.get();
+  }
+  PyTypeObject* payload_type = payload == nullptr ? nullptr : Py_TYPE(payload);
+  if (payload == nullptr || !ensureVersionTag(tp) ||
+      !ensureVersionTag(payload_type)) {
+    return;
+  }
+  AttributeMutator* slot = pick_slot(tp);
+  if (slot != nullptr) {
+    if (raw_type == &PyStaticMethod_Type) {
+      slot->set_type_recv_static_method(
+          tp, metatype->tp_version_tag, payload, payload_type->tp_version_tag);
+    } else {
+      slot->set_type_recv_value(
+          tp, metatype->tp_version_tag, payload, payload_type->tp_version_tag);
+    }
+  }
+}
+#endif
+
 PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
   PyTypeObject* tp = Py_TYPE(obj);
   for (auto& entry : entries()) {
-    if (entry.type() == tp) {
+    if (entry.type() == tp
+#if PY_VERSION_HEX < 0x030C0000
+        && !entry.isTypeRecv()
+#endif
+    ) {
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11, so a
       // hit must prove the receiver type is unchanged since fill -- and,
@@ -1563,6 +1925,17 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
       return entry.getAttr(obj, name);
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (PyType_Check(obj)) {
+    if (PyObject* result = typeRecvGetAttr(obj, name)) {
+      attrCacheStats311().load_attr.hits++;
+      return result;
+    }
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
+  }
+#endif
   return invokeSlowPath(obj, name);
 }
 
@@ -1580,6 +1953,11 @@ PyObject* __attribute__((noinline)) LoadAttrCache::invokeSlowPath(
     return nullptr;
   }
   fill(obj, name, /* is_set */ false);
+#if PY_VERSION_HEX < 0x030C0000
+  if (PyType_Check(obj)) {
+    typeRecvTryFill(obj, name, result.get());
+  }
+#endif
 
   return result.release();
 }
@@ -1806,6 +2184,9 @@ std::string_view cacheMissReason(CacheMissReason reason) {
 
 LoadMethodCache::~LoadMethodCache() {
   for (auto& entry : entries_) {
+#if PY_VERSION_HEX < 0x030C0000
+    entry.clearPeekKeys();
+#endif
     if (entry.type != nullptr) {
       lm_watcher.unwatch(entry.type, this);
       entry.type.reset();
@@ -1813,6 +2194,30 @@ LoadMethodCache::~LoadMethodCache() {
     }
   }
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void LoadMethodCache::Entry::setPeekKeys(PyDictKeysObject* keys, bool owned) {
+  if (peek_keys == keys && peek_keys_owned == owned) {
+    return;
+  }
+  clearPeekKeys();
+  if (keys != nullptr && owned) {
+    Ci_DictKeys_IncRef_311(keys);
+  }
+  peek_keys = keys;
+  peek_keys_owned = owned;
+}
+
+void LoadMethodCache::Entry::clearPeekKeys() {
+  if (peek_keys != nullptr && peek_keys_owned) {
+    Ci_DictKeys_DecRef_311(peek_keys);
+  }
+  peek_keys = nullptr;
+  peek_keys_owned = false;
+  peek_nentries = 0;
+  peek_hint = -1;
+}
+#endif
 
 LoadMethodResult LoadMethodCache::lookupHelper(
     LoadMethodCache* cache,
@@ -1902,10 +2307,102 @@ LoadMethodResult LoadMethodCache::lookup(
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11.
       if (tp->tp_version_tag != entry.type_version) {
+        entry.clearPeekKeys();
         entry.type.reset();
         entry.value.reset();
         attrCacheStats311().load_method.invalidations++;
         continue;
+      }
+
+      if (entry.peek_shadow) {
+        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+          PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
+          if (values != nullptr) {
+            PyDictKeysObject* live_keys = getSplitKeys(tp);
+            if (live_keys != nullptr && live_keys == entry.peek_keys &&
+                live_keys->dk_nentries == entry.peek_nentries) {
+              if (entry.peek_hint == Entry::kPeekAbsent ||
+                  (entry.peek_hint >= 0 &&
+                   DK_UNICODE_ENTRIES(live_keys)[entry.peek_hint].me_key ==
+                       name.get() &&
+                   static_cast<size_t>(entry.peek_hint) + 2 <
+                       reinterpret_cast<const uint8_t*>(values)[-1] &&
+                   values->values[entry.peek_hint] == nullptr)) {
+                attrCacheStats311().load_method.hits++;
+                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+              }
+            }
+          } else {
+            PyDictObject* materialized = reinterpret_cast<PyDictObject*>(
+                *_PyObject_ManagedDictPointer(obj.get()));
+            if (materialized != nullptr && materialized->ma_values == nullptr) {
+              PyDictKeysObject* keys = materialized->ma_keys;
+              if (DK_IS_UNICODE(keys) && keys == entry.peek_keys &&
+                  keys->dk_nentries == entry.peek_nentries) {
+                if (entry.peek_hint == Entry::kPeekAbsent ||
+                    (entry.peek_hint >= 0 &&
+                     DK_UNICODE_ENTRIES(keys)[entry.peek_hint].me_key ==
+                         name.get() &&
+                     DK_UNICODE_ENTRIES(keys)[entry.peek_hint].me_value ==
+                         nullptr)) {
+                  attrCacheStats311().load_method.hits++;
+                  return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+                }
+              }
+            }
+          }
+        }
+
+        // Generic dict lookup may run arbitrary __eq__ code. Match stock by
+        // pinning the descriptor selected before the callback, and never use
+        // an obj.__dict__ pointer captured before the callback returns.
+        Ref<> selected = Ref<>::create(entry.value);
+        PyObject* shadow = nullptr;
+        int found = peekInstanceAttr311(obj, name, &shadow);
+        if (found < 0) {
+          return {nullptr, nullptr};
+        }
+        if (found != 0) {
+          Py_DECREF(shadow);
+          break;
+        }
+
+        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+          PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
+          if (values != nullptr) {
+            // Re-entrant user code may have reset or refilled this entry.
+            // Only refresh an anchorable shape when this is still the same
+            // cache entry and type era; the pinned result remains valid either
+            // way.
+            if (entry.type == tp && entry.value == selected.get() &&
+                entry.type_version == tp->tp_version_tag) {
+              PyDictKeysObject* keys = getSplitKeys(tp);
+              if (keys != nullptr && DK_IS_UNICODE(keys)) {
+                Py_ssize_t index = getDictKeysIndex(keys, name);
+                entry.setPeekKeys(keys, false);
+                entry.peek_nentries = keys->dk_nentries;
+                entry.peek_hint = index >= 0 ? index : Entry::kPeekAbsent;
+              }
+            }
+          } else {
+            PyDictObject* materialized = reinterpret_cast<PyDictObject*>(
+                *_PyObject_ManagedDictPointer(obj.get()));
+            if (materialized != nullptr && materialized->ma_values == nullptr &&
+                entry.type == tp && entry.value == selected.get() &&
+                entry.type_version == tp->tp_version_tag &&
+                DK_IS_UNICODE(materialized->ma_keys) &&
+                (entry.peek_keys == nullptr ||
+                 entry.peek_keys == materialized->ma_keys)) {
+              PyDictKeysObject* keys = materialized->ma_keys;
+              Py_ssize_t index = getDictKeysIndex(keys, name);
+              entry.setPeekKeys(keys, true);
+              entry.peek_nentries = keys->dk_nentries;
+              entry.peek_hint = index >= 0 ? index : Entry::kPeekAbsent;
+            }
+          }
+        }
+        attrCacheStats311().load_method.hits++;
+        return {selected.release(), Py_NewRef(obj.get())};
       }
 #endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
@@ -1928,6 +2425,9 @@ LoadMethodResult LoadMethodCache::lookup(
 void LoadMethodCache::typeChanged(PyTypeObject* type) {
   for (auto& entry : entries_) {
     if (entry.type == type) {
+#if PY_VERSION_HEX < 0x030C0000
+      entry.clearPeekKeys();
+#endif
       entry.type.reset();
       entry.value.reset();
     }
@@ -2076,10 +2576,40 @@ void LoadMethodCache::fill(
     return;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  for (auto& entry : entries_) {
+    if (entry.type == type) {
+      lm_watcher.watch(type, this);
+#if PY_VERSION_HEX < 0x030C0000
+      entry.clearPeekKeys();
+#endif
+      entry.value = value;
+      entry.keys_version = 0;
+      entry.type_version = type->tp_version_tag;
+      entry.peek_shadow = true;
+      entry.inst_attr = false;
+      attrCacheStats311().load_method.fills++;
+      return;
+    }
+  }
+#endif
+
   for (auto& entry : entries_) {
     if (entry.type == nullptr) {
       uint32_t keys_version = 0;
       if (!canCacheAttribute(type, name, keys_version)) {
+#if PY_VERSION_HEX < 0x030C0000
+        lm_watcher.watch(type, this);
+        entry.clearPeekKeys();
+        entry.type = type;
+        entry.value = value;
+        entry.keys_version = 0;
+        entry.type_version = type->tp_version_tag;
+        entry.peek_shadow = true;
+        entry.inst_attr = false;
+        attrCacheStats311().load_method.fills++;
+        return;
+#endif
         break;
       }
 
@@ -2088,7 +2618,10 @@ void LoadMethodCache::fill(
       entry.value = value;
       entry.keys_version = keys_version;
 #if PY_VERSION_HEX < 0x030C0000
+      entry.clearPeekKeys();
       entry.type_version = type->tp_version_tag;
+      entry.peek_shadow = false;
+      entry.inst_attr = false;
       attrCacheStats311().load_method.fills++;
 #endif
       return;
