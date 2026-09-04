@@ -594,6 +594,38 @@ class ArtifactClosureTests(unittest.TestCase):
             )
         )
 
+    def test_default_enumeration_deduplicates_same_path_installation(
+        self,
+    ) -> None:
+        dist_info = self.root_path / "real_plugin-1.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            "Metadata-Version: 2.1\n"
+            "Name: Real.Plugin\n"
+            "Version: 1.0\n",
+            encoding="utf-8",
+        )
+        package_file = self.root_path / "real_plugin" / "__init__.py"
+        package_file.parent.mkdir()
+        payload = b"pass\n"
+        package_file.write_bytes(payload)
+        (dist_info / "RECORD").write_text(
+            "real_plugin/__init__.py,"
+            f"{_record_hash(payload)},{len(payload)}\n",
+            encoding="utf-8",
+        )
+        root = metadata.PathDistribution(dist_info)
+        rediscovered = metadata.PathDistribution(dist_info)
+
+        with patch(
+            "cinderx.plugins.artifacts.metadata.distributions",
+            return_value=(rediscovered,),
+        ):
+            result = verify_distribution_closure(root)
+
+        self.assertTrue(result.accepted)
+        self.assertIsNone(result.issue)
+
     def test_partial_root_enumeration_preserves_yielded_results(self) -> None:
         good = self.distribution("Good")
 
@@ -653,6 +685,78 @@ class ArtifactClosureTests(unittest.TestCase):
             record_result.issue.code,  # type: ignore[union-attr]
             ArtifactIssueCode.RECORD_BUDGET_EXCEEDED,
         )
+
+    def test_record_row_budget_stops_before_parsing_later_rows(self) -> None:
+        distribution = self.distribution("row_budget")
+        valid_record = distribution.read_text("RECORD")
+        assert valid_record is not None
+
+        def oversized_record(filename: str) -> str | None:
+            if filename != "RECORD":
+                return None
+            return (
+                valid_record
+                + "row_budget/overflow.py,,\n"
+                + "malformed,row\n"
+            )
+
+        distribution.read_text = oversized_record  # type: ignore[method-assign]
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+            budgets=ArtifactBudgets(max_file_records=1),
+        )
+
+        self.assertEqual(
+            result.issue.code,  # type: ignore[union-attr]
+            ArtifactIssueCode.FILE_BUDGET_EXCEEDED,
+        )
+        self.assertEqual(
+            result.issue.path,  # type: ignore[union-attr]
+            "row_budget/overflow.py",
+        )
+
+    def test_ordinary_hashless_record_entry_fails_closed(self) -> None:
+        distribution = self.distribution("hashless")
+        distribution.add_file(
+            "hashless/unverified.py",
+            hash_spec="",
+        )
+
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertEqual(
+            result.issue.code,  # type: ignore[union-attr]
+            ArtifactIssueCode.HASH_UNVERIFIABLE,
+        )
+        self.assertEqual(
+            result.issue.path,  # type: ignore[union-attr]
+            "hashless/unverified.py",
+        )
+
+    def test_installer_generated_hashless_entries_are_allowed(self) -> None:
+        distribution = self.distribution("generated")
+        distribution.add_file(
+            "generated/__pycache__/module.cpython-311.pyc",
+            b"python bytecode",
+            hash_spec="",
+        )
+        distribution.add_file(
+            "generated-1.0.dist-info/RECORD",
+            b"",
+            hash_spec="",
+        )
+
+        result = verify_distribution_closure(
+            distribution,
+            distributions=(distribution,),
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertIsNone(result.issue)
 
     def test_path_distribution_record_is_bounded_before_text_read(self) -> None:
         class GuardedPathDistribution(metadata.PathDistribution):

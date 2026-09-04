@@ -180,7 +180,7 @@ class _VerificationCache:
         int, tuple[metadata.Distribution, _RawRequirements]
     ] = field(default_factory=dict)
     inspections: dict[
-        int, tuple[metadata.Distribution, _DistributionInspection]
+        tuple[int, int], tuple[metadata.Distribution, _DistributionInspection]
     ] = field(default_factory=dict)
 
 
@@ -218,6 +218,23 @@ def _distribution_version(distribution: metadata.Distribution) -> str:
     except Exception:
         version = None
     return version if isinstance(version, str) else ""
+
+
+def _distribution_installation_identity(
+    distribution: metadata.Distribution,
+) -> tuple[str, object]:
+    if isinstance(distribution, metadata.PathDistribution):
+        metadata_path = getattr(distribution, "_path", None)
+        if metadata_path is not None:
+            try:
+                normalized_path = os.path.normcase(
+                    str(Path(metadata_path).resolve(strict=False))
+                )
+            except (OSError, TypeError, ValueError):
+                pass
+            else:
+                return ("path", normalized_path)
+    return ("object", id(distribution))
 
 
 def _issue(
@@ -465,13 +482,21 @@ def _resolve_closure(
         )
 
     by_name: dict[str, list[metadata.Distribution]] = {}
+    identities_by_name: dict[str, set[tuple[str, object]]] = {}
     for distribution in candidates:
-        bucket = by_name.setdefault(_distribution_name(distribution), [])
-        if all(distribution is not item for item in bucket):
+        name = _distribution_name(distribution)
+        bucket = by_name.setdefault(name, [])
+        identities = identities_by_name.setdefault(name, set())
+        identity = _distribution_installation_identity(distribution)
+        if identity not in identities:
             bucket.append(distribution)
+            identities.add(identity)
     root_bucket = by_name.setdefault(root_name, [])
-    if all(root is not item for item in root_bucket):
+    root_identities = identities_by_name.setdefault(root_name, set())
+    root_identity = _distribution_installation_identity(root)
+    if root_identity not in root_identities:
         root_bucket.append(root)
+        root_identities.add(root_identity)
     if root_identity_ambiguous or len(root_bucket) != 1:
         return _ClosureResolution(
             ((root_name, root),),
@@ -760,6 +785,7 @@ def _read_record_payload(
 def _record_rows(
     distribution: metadata.Distribution,
     byte_limit: int,
+    row_limit: int,
 ) -> _RecordRows:
     name = _distribution_name(distribution)
     payload, payload_issue = _read_record_payload(distribution, byte_limit)
@@ -772,6 +798,17 @@ def _record_rows(
     try:
         reader = csv.reader(io.StringIO(payload, newline=""), strict=True)
         for row in reader:
+            if len(rows) >= row_limit:
+                path = row[0] if row else None
+                return _RecordRows(
+                    tuple(rows),
+                    _issue(
+                        ArtifactIssueCode.FILE_BUDGET_EXCEEDED,
+                        name,
+                        "declared closure exceeded the installed-file-record budget",
+                        path=path,
+                    ),
+                )
             if len(row) != 3:
                 return _RecordRows(
                     tuple(rows),
@@ -981,6 +1018,26 @@ def _native_suffix(relative_path: str) -> bool:
     )
 
 
+def _hashless_record_allowed(
+    distribution: metadata.Distribution,
+    relative_path: str,
+) -> bool:
+    path = PurePosixPath(relative_path)
+    if path.suffix.casefold() == ".pyc" and "__pycache__" in path.parts:
+        return True
+    if path.name != "RECORD" or not path.parent.name.endswith(".dist-info"):
+        return False
+    if not isinstance(distribution, metadata.PathDistribution):
+        return True
+    metadata_path = getattr(distribution, "_path", None)
+    if metadata_path is None:
+        return False
+    try:
+        return path.parent.name == Path(metadata_path).name
+    except (TypeError, ValueError):
+        return False
+
+
 def _inspect_file(
     distribution: metadata.Distribution,
     relative_path: str,
@@ -991,6 +1048,15 @@ def _inspect_file(
     name = _distribution_name(distribution)
     hasher = None
     expected_digest = None
+    if not hash_spec and not _hashless_record_allowed(
+        distribution, relative_path
+    ):
+        return _issue(
+            ArtifactIssueCode.HASH_UNVERIFIABLE,
+            name,
+            "an installed RECORD entry has no verifiable hash",
+            path=relative_path,
+        )
     if hash_spec:
         hasher, expected_digest = _hash_factory(hash_spec)
         if hasher is None or expected_digest is None:
@@ -1060,8 +1126,11 @@ def _inspect_file(
 def _inspect_distribution(
     distribution: metadata.Distribution,
     record_byte_limit: int,
+    record_limit: int,
 ) -> _DistributionInspection:
-    record_result = _record_rows(distribution, record_byte_limit)
+    record_result = _record_rows(
+        distribution, record_byte_limit, record_limit
+    )
     if record_result.issue is not None:
         return _DistributionInspection(
             record_result.rows,
@@ -1125,13 +1194,16 @@ def _cached_inspection(
     distribution: metadata.Distribution,
     budgets: ArtifactBudgets,
     cache: _VerificationCache,
+    record_limit: int,
 ) -> _DistributionInspection:
-    cache_key = id(distribution)
+    cache_key = (id(distribution), record_limit)
     cached = cache.inspections.get(cache_key)
     if cached is not None and cached[0] is distribution:
         return cached[1]
     result = _inspect_distribution(
-        distribution, max(0, budgets.max_record_bytes)
+        distribution,
+        max(0, budgets.max_record_bytes),
+        record_limit,
     )
     cache.inspections[cache_key] = (distribution, result)
     return result
@@ -1226,7 +1298,9 @@ def _verify(
     inspected = 0
     for distribution_name, distribution in resolution.distributions:
         remaining = budgets.max_file_records - inspected
-        inspection = _cached_inspection(distribution, budgets, cache)
+        inspection = _cached_inspection(
+            distribution, budgets, cache, remaining
+        )
         if len(inspection.record_rows) > remaining:
             relative_path = inspection.record_rows[remaining][0]
             return _rejected(
