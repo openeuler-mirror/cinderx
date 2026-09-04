@@ -1,0 +1,23 @@
+# CinderX HIR pipeline golden - generated, do not hand-edit.
+# Format: step <n>: <Pass>#<occurrence> <fnv1a64 of normalized post-pass HIR> len=<bytes>
+# Diagnose a fingerprint diff: rerun with HIR_PIPELINE_FULL_DUMP=1 to print per-pass HIR.
+# Regenerate: TestScripts/update_hir_pipeline_golden.py <runtime_tests binary>
+# python: 3.14  arch: aarch64  config: kAllExceptInliner  case: RepeatedUnbox
+step  1: SSAify#1                         596f18fa7f4bb6e8 len=2419
+step  2: Simplify#1                       f9904f0dd2ad6216 len=2917
+step  3: FloatAccumulatorPromotion#1      f9904f0dd2ad6216 len=2917
+step  4: DynamicComparisonElimination#1   f9904f0dd2ad6216 len=2917
+step  5: GuardTypeRemoval#1               f9904f0dd2ad6216 len=2917
+step  6: PhiElimination#1                 f9904f0dd2ad6216 len=2917
+step  7: BuiltinLoadMethodElimination#1   f9904f0dd2ad6216 len=2917
+step  8: Simplify#2                       f9904f0dd2ad6216 len=2917
+step  9: FloatAccumulatorPromotion#2      f9904f0dd2ad6216 len=2917
+step 10: PrimitiveUnboxCSE#1              f9904f0dd2ad6216 len=2917
+step 11: FloatComparisonSimplification#1  f9904f0dd2ad6216 len=2917
+step 12: PrimitiveBoxRemat#1              c130ff9279ad5edb len=2577
+step 13: CleanCFG#1                       c130ff9279ad5edb len=2577
+step 14: DeadCodeElimination#1            4b53aae7447a356b len=2434
+step 15: CleanCFG#2                       4b53aae7447a356b len=2434
+step 16: TreeIterStateMachinePass#1       4b53aae7447a356b len=2434
+step 17: RefcountInsertion#1              0e28034a86c63b91 len=3123
+step 18: InsertUpdatePrevInstr#1          746506d24e42e584 len=3316

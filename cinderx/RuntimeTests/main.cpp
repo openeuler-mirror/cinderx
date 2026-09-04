@@ -174,6 +174,10 @@ void register_test(
 
 } // namespace
 
+// Defined in hir_pipeline_test.cpp; registers the HIR pipeline golden
+// suite that gates Compiler::runPasses against committed traces.
+void registerPipelineGoldenTests();
+
 #if defined(BUCK_BUILD) || defined(CINDERX_RUNTIME_TESTS_CMAKE)
 PyMODINIT_FUNC PyInit__cinderx() {
   return _cinderx_lib_init();
@@ -262,6 +266,8 @@ int main(int argc, char* argv[]) {
   register_test("all_passes_static_test.txt", RuntimeTest::kStaticCompiler);
   register_test("native_calls_test.txt", RuntimeTest::kStaticCompiler);
   register_test("static_array_item_test.txt", RuntimeTest::kStaticCompiler);
+
+  registerPipelineGoldenTests();
 
 #if PY_VERSION_HEX < 0x030C0000
   PyPreConfig preconfig;
