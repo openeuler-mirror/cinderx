@@ -529,3 +529,12 @@ def test_runtime_tests_disable_lightweight_frames_on_cpython311(
     assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in command
     assert "PYTHONJITLIGHTWEIGHTFRAME=1" not in command
     assert "env -u PYTHONJITLIGHTWEIGHTFRAME" in command
+
+
+def test_strict_format_missing_environment_is_fail_closed(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(run_gate.STRICT_FORMAT_ROOT_ENV, str(tmp_path))
+
+    assert run_gate.run_strict_format() == 2
+    output = capsys.readouterr().err
+    assert "严格 Jenkins format 环境缺失" in output
+    assert "qemu-user-static_arm64.deb" in output
