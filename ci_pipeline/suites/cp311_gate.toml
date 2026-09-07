@@ -31,10 +31,18 @@ name = "test_release_311"
 phase = "test_release"
 command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh test_release \"{run_dir}\"'"
 
-# Developer-only L2 validation.  The self-contained execute gate runs its own
-# stock 72 control before the execute 72 arm; Jenkins PR jobs leave this off.
+# Optional PR Lib/test validation.  The self-contained execute gate runs its
+# own stock 72 control before the execute 72 arm.
 [[jobs]]
 name = "libtest_execute_72_311"
 phase = "libtest"
 enabled_by_env = "CINDERX_LOCAL_RUN_LIBTEST"
 command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh libtest_execute_72 \"{run_dir}\"'"
+
+# Reuse the same opt-in for the ten-module Py_DEBUG reference-leak gate.  The
+# refleak runner owns and caches its debug interpreter and debug-ABI wheel.
+[[jobs]]
+name = "pydebug_refleak_10_311"
+phase = "libtest"
+enabled_by_env = "CINDERX_LOCAL_RUN_LIBTEST"
+command = "bash -lc 'ci_pipeline/scripts/run_refleak_311.sh \"{run_dir}/refleak\"'"

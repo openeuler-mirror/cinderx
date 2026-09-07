@@ -99,7 +99,7 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
     jobs = run_gate.load_suite("cp311_gate")["jobs"]
     jobs_by_name = {job["name"]: job for job in jobs}
 
-    assert len(jobs) == 4
+    assert len(jobs) == 5
     runtime_job = jobs_by_name["runtime_tests_311"]
     assert "run_rt311_green.sh" in runtime_job["command"]
     assert '"{run_dir}/rt311-build" --census' in runtime_job["command"]
@@ -109,6 +109,7 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
         "setup_release_311",
         "test_release_311",
         "libtest_execute_72_311",
+        "pydebug_refleak_10_311",
     }
     assert "sha256sum --check" in runtime_job["command"]
     assert "setup_release" in jobs_by_name["setup_release_311"]["command"]
@@ -116,6 +117,10 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
     libtest_job = jobs_by_name["libtest_execute_72_311"]
     assert libtest_job["enabled_by_env"] == "CINDERX_LOCAL_RUN_LIBTEST"
     assert "libtest_execute_72" in libtest_job["command"]
+    refleak_job = jobs_by_name["pydebug_refleak_10_311"]
+    assert refleak_job["enabled_by_env"] == "CINDERX_LOCAL_RUN_LIBTEST"
+    assert "run_refleak_311.sh" in refleak_job["command"]
+    assert '"{run_dir}/refleak"' in refleak_job["command"]
 
     monkeypatch.delenv("CINDERX_LOCAL_RUN_LIBTEST", raising=False)
     assert [
@@ -129,6 +134,7 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
         "setup_release_311",
         "test_release_311",
         "libtest_execute_72_311",
+        "pydebug_refleak_10_311",
     ]
 
     assert [
@@ -151,7 +157,7 @@ def test_cp311_daily_has_two_incremental_jobs():
     daily_jobs = run_gate.load_suite("cp311_daily")["jobs"]
     daily_names = [job["name"] for job in daily_jobs]
 
-    assert len(pr_jobs) + len(daily_jobs) == 6
+    assert len(pr_jobs) + len(daily_jobs) == 7
     assert daily_names == ["test_release_daily_311", "libtest_daily_311"]
     assert all("phase" in job for job in daily_jobs)
     assert {job["phase"] for job in daily_jobs} == {
@@ -201,6 +207,7 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_attr_cache_new_shape_load_311",
         "test_attr_cache_new_shape_store_311",
         "test_early_quicken_311",
+        "test_list_extend_refcount_311",
     ):
         assert script.count(module) == 1
     assert "--non-libtest" in script

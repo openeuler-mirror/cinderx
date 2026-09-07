@@ -113,7 +113,13 @@ extern "C" PyObject* __Invoke_PyList_Extend(
     PyThreadState* tstate,
     PyObject* list,
     PyObject* iterable) {
+#if PY_VERSION_HEX < 0x030D0000
+  PyObject* result =
+      _PyList_Extend(reinterpret_cast<PyListObject*>(list), iterable);
+  if (result == nullptr) {
+#else
   if (PyList_Extend(list, iterable) < 0) {
+#endif
     if (_PyErr_ExceptionMatches(tstate, PyExc_TypeError) &&
         Py_TYPE(iterable)->tp_iter == nullptr && !PySequence_Check(iterable)) {
       _PyErr_Clear(tstate);
@@ -126,7 +132,10 @@ extern "C" PyObject* __Invoke_PyList_Extend(
     return nullptr;
   }
 
-  Py_RETURN_NONE;
+#if PY_VERSION_HEX < 0x030D0000
+  Py_DECREF(result);
+#endif
+  return Py_None;
 }
 
 void finishYield(
