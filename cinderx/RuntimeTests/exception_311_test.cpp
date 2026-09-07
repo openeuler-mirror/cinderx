@@ -17,6 +17,9 @@
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/observe.h"
 
+extern "C" PyObject*
+__Invoke_PyList_Extend(PyThreadState*, PyObject*, PyObject*);
+
 #define SKIP_311_EXECUTABLE_COMPILE()                                    \
   do {                                                                   \
     if (jit::getConfig().state != jit::State::kRunning) {                \
