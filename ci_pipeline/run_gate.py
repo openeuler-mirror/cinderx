@@ -136,7 +136,7 @@ sha256sum \"$ROOT/sysroot/usr/bin/clang-format\"
 """
 
 
-def run_strict_format() -> int:
+def run_strict_format(base: str = "origin/master") -> int:
     root = Path(os.environ.get(STRICT_FORMAT_ROOT_ENV, str(STRICT_FORMAT_ROOT)))
     qemu = root / "qemu-x86_64-static"
     sysroot = root / "sysroot"
@@ -174,7 +174,16 @@ def run_strict_format() -> int:
         wrapper.chmod(0o755)
         checker = TESTGATE_DIR / "scripts" / "check_clean_code_incremental.py"
         result = subprocess.run(
-            [sys.executable, str(checker), "--format", "--all", "--clang-format", str(wrapper)],
+            [
+                sys.executable,
+                str(checker),
+                "--format",
+                "--base",
+                base,
+                "--no-untracked",
+                "--clang-format",
+                str(wrapper),
+            ],
             cwd=REPO_ROOT,
             check=False,
         )
@@ -1832,6 +1841,11 @@ def main(argv: list[str]) -> int:
             "write lcov/genhtml reports under the run artifact directory"
         ),
     )
+    parser.add_argument(
+        "--base",
+        default="origin/master",
+        help="base ref for format checks; format mode checks changed lines from this ref",
+    )
     args = parser.parse_args(argv)
 
     if bool(args.pipeline) == bool(args.suite):
@@ -1841,7 +1855,7 @@ def main(argv: list[str]) -> int:
         if args.pipeline == "format":
             if args.coverage or args.list:
                 parser.error("format does not support --coverage or --list")
-            return run_strict_format()
+            return run_strict_format(args.base)
         if args.suite:
             if args.suite == "daily":
                 parser.error("daily is pipeline-only; use `ci_pipeline/run_gate.py daily`")
