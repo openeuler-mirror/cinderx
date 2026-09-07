@@ -210,8 +210,6 @@ def guard(a, b):
 }
 
 TEST_F(Exception311Test, ListExtendHelperOwnsAndBorrowsNoneCorrectly) {
-  SKIP_311_EXECUTABLE_COMPILE();
-
   auto list = Ref<>::steal(PyList_New(0));
   auto one = Ref<>::steal(PyLong_FromLong(1));
   auto two = Ref<>::steal(PyLong_FromLong(2));
@@ -232,8 +230,6 @@ TEST_F(Exception311Test, ListExtendHelperOwnsAndBorrowsNoneCorrectly) {
 }
 
 TEST_F(Exception311Test, ListExtendHelperPreservesNativeFailure) {
-  SKIP_311_EXECUTABLE_COMPILE();
-
   auto list = Ref<>::steal(PyList_New(0));
   auto non_iterable = Ref<>::steal(PyLong_FromLong(42));
   ASSERT_NE(list, nullptr);
