@@ -7,6 +7,7 @@
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/deopt.h"
+#include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -203,6 +204,118 @@ def guard(a, b):
   EXPECT_EQ(PyLong_AsLong(again), -1);
   jit::TriggerStats after_again = jit::triggerStatsSnapshot();
   EXPECT_GT(after_again.organic_deopt_hits, after_raise.organic_deopt_hits);
+}
+
+TEST_F(Exception311Test, ListExtendHelperOwnsAndBorrowsNoneCorrectly) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  auto list = Ref<>::steal(PyList_New(0));
+  auto one = Ref<>::steal(PyLong_FromLong(1));
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  auto iterable = Ref<>::steal(PyTuple_Pack(2, one.get(), two.get()));
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(iterable, nullptr);
+
+  Py_ssize_t before = Py_REFCNT(Py_None);
+  for (int i = 0; i < 64; ++i) {
+    EXPECT_EQ(
+        __Invoke_PyList_Extend(PyThreadState_Get(), list.get(), iterable.get()),
+        Py_None);
+  }
+  EXPECT_EQ(Py_REFCNT(Py_None), before);
+  ASSERT_EQ(PyList_GET_SIZE(list.get()), 128);
+  EXPECT_EQ(PyLong_AsLong(PyList_GET_ITEM(list.get(), 0)), 1);
+  EXPECT_EQ(PyLong_AsLong(PyList_GET_ITEM(list.get(), 127)), 2);
+}
+
+TEST_F(Exception311Test, ListExtendHelperPreservesNativeFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  auto list = Ref<>::steal(PyList_New(0));
+  auto non_iterable = Ref<>::steal(PyLong_FromLong(42));
+  ASSERT_NE(list, nullptr);
+  ASSERT_NE(non_iterable, nullptr);
+
+  EXPECT_EQ(
+      __Invoke_PyList_Extend(
+          PyThreadState_Get(), list.get(), non_iterable.get()),
+      nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_TypeError));
+  PyErr_Clear();
+  EXPECT_EQ(PyList_GET_SIZE(list.get()), 0);
+}
+
+TEST_F(Exception311Test, ListExtendCompiledTryExceptAndPartialIterator) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* src = R"(
+def extend_and_catch(value):
+    try:
+        return [0, *value]
+    except TypeError:
+        return "caught"
+
+def extend_partial(value):
+    try:
+        return [0, *value]
+    except RuntimeError:
+        return "runtime-caught"
+
+class Partial:
+    def __init__(self):
+        self.count = 0
+    def __iter__(self):
+        return self
+    def __next__(self):
+        self.count += 1
+        if self.count <= 2:
+            return self.count
+        raise RuntimeError("boom")
+)";
+  Ref<PyFunctionObject> catch_func(compileAndGet(src, "extend_and_catch"));
+  ASSERT_NE(catch_func, nullptr);
+  auto one = Ref<>::steal(PyLong_FromLong(1));
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  auto tuple = Ref<>::steal(PyTuple_Pack(2, one.get(), two.get()));
+  auto args = Ref<>::steal(PyTuple_Pack(1, tuple.get()));
+  ASSERT_NE(args, nullptr);
+  for (int i = 0; i < 32; ++i) {
+    auto warm = Ref<>::steal(PyObject_Call(catch_func, args, nullptr));
+    ASSERT_NE(warm, nullptr);
+  }
+  ASSERT_EQ(jit::compileFunction(catch_func), jit::Result::OK);
+  auto compiled_ok = Ref<>::steal(PyObject_Call(catch_func, args, nullptr));
+  ASSERT_NE(compiled_ok, nullptr);
+  ASSERT_TRUE(PyList_Check(compiled_ok.get()));
+  EXPECT_EQ(PyList_GET_SIZE(compiled_ok.get()), 3);
+
+  auto bad = Ref<>::steal(PyLong_FromLong(7));
+  auto bad_args = Ref<>::steal(PyTuple_Pack(1, bad.get()));
+  auto caught = Ref<>::steal(PyObject_Call(catch_func, bad_args, nullptr));
+  ASSERT_NE(caught, nullptr);
+  EXPECT_TRUE(_PyUnicode_EqualToASCIIString(caught.get(), "caught"));
+
+  Ref<PyFunctionObject> partial_func(compileAndGet(src, "extend_partial"));
+  ASSERT_NE(partial_func, nullptr);
+  auto partial_type = getGlobal("Partial");
+  auto partial = Ref<>::steal(PyObject_CallObject(partial_type, nullptr));
+  auto partial_args = Ref<>::steal(PyTuple_Pack(1, partial.get()));
+  for (int i = 0; i < 32; ++i) {
+    auto warm =
+        Ref<>::steal(PyObject_Call(partial_func, partial_args, nullptr));
+    ASSERT_NE(warm, nullptr);
+    auto zero = Ref<>::steal(PyLong_FromLong(0));
+    ASSERT_EQ(PyObject_SetAttrString(partial.get(), "count", zero.get()), 0);
+  }
+  ASSERT_EQ(jit::compileFunction(partial_func), jit::Result::OK);
+  auto partial_result =
+      Ref<>::steal(PyObject_Call(partial_func, partial_args, nullptr));
+  ASSERT_NE(partial_result, nullptr);
+  EXPECT_TRUE(
+      _PyUnicode_EqualToASCIIString(partial_result.get(), "runtime-caught"));
+  auto count = Ref<>::steal(PyObject_GetAttrString(partial.get(), "count"));
+  ASSERT_NE(count, nullptr);
+  EXPECT_EQ(PyLong_AsLong(count.get()), 3);
 }
 
 TEST_F(Exception311Test, UnhandledTracebackStopsAtTheFaultingUnit) {
