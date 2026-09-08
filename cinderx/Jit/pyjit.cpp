@@ -5781,6 +5781,7 @@ int initialize() {
   auto use_stable_pointers = getConfig().use_stable_pointers;
 
 #if PY_VERSION_HEX < 0x030C0000
+  resetDictValueTransition311();
   // CPython 3.11 only initializes the compiler for the explicit shadow and
   // execute modes (or RuntimeTests' force-init hook). Observe and off stay
   // capability-gated before a compiler context or code allocator is

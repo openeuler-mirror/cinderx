@@ -1226,6 +1226,276 @@ q = P()
   Py_XDECREF(restored.self_or_null);
 }
 
+TEST_F(AttrCache311Test, MethodPeekPreservesCombinedKeysOwnership) {
+  Ref<> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result = Ref<>::steal(PyRun_String(
+      R"(
+class P:
+    def method(self):
+        return "class"
+p = P()
+p.__dict__ = {"padding": 1}
+shadow = lambda: "shadow"
+releases = []
+class Payload:
+    def __del__(self):
+        releases.append("released")
+)",
+      Py_file_input,
+      globals,
+      globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "p");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("method"));
+  auto dict = Ref<>::steal(PyObject_GenericGetDict(inst, nullptr));
+  ASSERT_NE(dict, nullptr);
+  auto* combined = reinterpret_cast<PyDictObject*>(dict.get());
+  ASSERT_EQ(combined->ma_values, nullptr);
+  ASSERT_EQ(combined->ma_keys->dk_refcnt, 1);
+  auto empty = Ref<>::steal(PyDict_New());
+  ASSERT_NE(empty, nullptr);
+  auto empty_copy = Ref<>::steal(PyDict_Copy(empty));
+  auto combined_copy = Ref<>::steal(PyDict_Copy(dict));
+  ASSERT_NE(empty_copy, nullptr);
+  ASSERT_NE(combined_copy, nullptr);
+  auto version = [](PyObject* value) {
+    return reinterpret_cast<PyDictObject*>(value)->ma_version_tag;
+  };
+  EXPECT_NE(version(empty), 0);
+  EXPECT_NE(version(empty), version(empty_copy));
+  EXPECT_NE(version(dict), version(combined_copy));
+  jit::LoadMethodCache cache;
+  for (int i = 0; i < 4; i++) {
+    auto loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+    ASSERT_NE(loaded.callable, nullptr);
+    EXPECT_EQ(loaded.self_or_null, inst.get());
+    Py_XDECREF(loaded.callable);
+    Py_XDECREF(loaded.self_or_null);
+    ASSERT_EQ(combined->ma_keys->dk_refcnt, 1)
+        << "LoadMethod must not share combined dict keys";
+  }
+
+  // Warm the store before refreshing the negative cache: its initial miss
+  // uses the generic store rather than recording a value-only transition.
+  auto stores = makeStoreAttrCache();
+  auto padding = Ref<>::steal(PyUnicode_InternFromString("padding"));
+  ASSERT_NE(padding, nullptr);
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_True), 0);
+  auto pair = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  auto method = Ref<>::steal(pair.callable);
+  Py_XDECREF(pair.self_or_null);
+  ASSERT_NE(method, nullptr);
+  Py_ssize_t inst_refs = Py_REFCNT(inst.get());
+  Py_ssize_t method_refs = Py_REFCNT(method.get());
+  const auto& stats = jit::attrCacheStats311().load_method;
+  uint64_t hits = stats.hits;
+  uint64_t misses = stats.misses;
+  // A fresh exact Unicode with the same logical name has a lazy hash. The
+  // combined transition does not inspect that hash; a generic dict recheck
+  // must compute it (and the Cix fallback requires an already cached hash).
+  // Combined storage, a changed version, and hits without misses exclude the
+  // inline, stable-version, and slow paths. Disabling the transition must
+  // therefore fail the hash assertion even when the returned pair is correct.
+  auto nameHash = [](BorrowedRef<> value) {
+    return _PyASCIIObject_CAST(value.get())->hash;
+  };
+  for (int i = 0; i < 100; i++) {
+    ASSERT_EQ(combined->ma_values, nullptr);
+    ASSERT_EQ(PyDict_Contains(dict, name), 0);
+    uint64_t before_version = version(dict);
+    ASSERT_NE(before_version, 0);
+    ASSERT_EQ(
+        jit::StoreAttrCache::invoke(
+            stores.get(), inst, padding, i & 1 ? Py_True : Py_False),
+        0);
+    ASSERT_NE(version(dict), 0);
+    ASSERT_NE(version(dict), before_version);
+    auto probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+    ASSERT_NE(probe_name, nullptr);
+    ASSERT_TRUE(PyUnicode_CheckExact(probe_name.get()));
+    ASSERT_EQ(PyUnicode_Compare(name, probe_name), 0);
+    ASSERT_EQ(nameHash(probe_name), -1);
+    auto refreshed =
+        jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+    EXPECT_EQ(nameHash(probe_name), -1);
+    EXPECT_EQ(stats.misses, misses);
+    EXPECT_EQ(stats.hits, hits + i + 1);
+    EXPECT_EQ(refreshed.callable, method.get());
+    EXPECT_EQ(refreshed.self_or_null, inst.get());
+    EXPECT_EQ(Py_REFCNT(inst.get()), inst_refs + 1);
+    EXPECT_EQ(Py_REFCNT(method.get()), method_refs + 1);
+    Py_XDECREF(refreshed.callable);
+    Py_XDECREF(refreshed.self_or_null);
+    ASSERT_EQ(combined->ma_keys->dk_refcnt, 1);
+  }
+  EXPECT_EQ(Py_REFCNT(inst.get()), inst_refs);
+  EXPECT_EQ(Py_REFCNT(method.get()), method_refs);
+  hits += 100;
+
+  // An unchanged dict hits the version cache, not the transition path.
+  auto probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+  ASSERT_NE(probe_name, nullptr);
+  ASSERT_EQ(nameHash(probe_name), -1);
+  auto loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  EXPECT_EQ(nameHash(probe_name), -1);
+  EXPECT_EQ(stats.hits, hits + 1);
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  EXPECT_EQ(stats.misses, misses);
+
+  // Replacing a slot with the identical mortal object must keep it alive and
+  // preserve reference balance, including when the dict holds its last owner
+  // besides this local reference.
+  auto payload = Ref<>::steal(
+      PyObject_CallNoArgs(PyDict_GetItemString(globals, "Payload")));
+  ASSERT_NE(payload, nullptr);
+  BorrowedRef<> releases = PyDict_GetItemString(globals, "releases");
+  ASSERT_NE(releases, nullptr);
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, payload), 0);
+  const Py_ssize_t payload_refs = Py_REFCNT(payload.get());
+  ASSERT_EQ(payload_refs, 2);
+  for (int i = 0; i < 100; i++) {
+    ASSERT_EQ(
+        jit::StoreAttrCache::invoke(stores.get(), inst, padding, payload), 0);
+    EXPECT_EQ(Py_REFCNT(payload.get()), payload_refs);
+    EXPECT_EQ(PyDict_GetItem(dict, padding), payload.get());
+    EXPECT_EQ(PyList_Size(releases), 0);
+    loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+    EXPECT_EQ(loaded.callable, method.get());
+    EXPECT_EQ(loaded.self_or_null, inst.get());
+    Py_XDECREF(loaded.callable);
+    Py_XDECREF(loaded.self_or_null);
+    EXPECT_EQ(Py_REFCNT(inst.get()), inst_refs);
+    EXPECT_EQ(Py_REFCNT(method.get()), method_refs);
+    EXPECT_EQ(combined->ma_keys->dk_refcnt, 1);
+  }
+  // Exercise the ownership order with the dict as the only strong owner.
+  // The borrowed argument aliases the slot being replaced: decrementing the
+  // old value before incrementing the new one would destroy the live value.
+  BorrowedRef<> sole_owned = payload;
+  payload.reset();
+  ASSERT_EQ(Py_REFCNT(sole_owned.get()), 1);
+  for (int i = 0; i < 100; i++) {
+    ASSERT_EQ(
+        jit::StoreAttrCache::invoke(stores.get(), inst, padding, sole_owned),
+        0);
+    EXPECT_EQ(Py_REFCNT(sole_owned.get()), 1);
+    EXPECT_EQ(PyDict_GetItem(dict, padding), sole_owned.get());
+    EXPECT_EQ(PyList_Size(releases), 0);
+  }
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_True), 0);
+  // sole_owned is now invalid; observe destruction without accessing it.
+  EXPECT_EQ(PyList_Size(releases), 1);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // Inserting a shadow after the negative peek must invalidate the hint.
+  BorrowedRef<> shadow = PyDict_GetItemString(globals, "shadow");
+  ASSERT_EQ(PyDict_SetItem(dict, name, shadow), 0);
+  probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+  ASSERT_NE(probe_name, nullptr);
+  ASSERT_EQ(nameHash(probe_name), -1);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+  EXPECT_NE(nameHash(probe_name), -1);
+  EXPECT_EQ(loaded.callable, Py_None);
+  EXPECT_EQ(loaded.self_or_null, shadow.get());
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+  ASSERT_EQ(PyDict_DelItem(dict, name), 0);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // A structural write between value-only stores must not be bridged.  Do
+  // not look up the method between stores: that would refresh the old miss.
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_False), 0);
+  ASSERT_EQ(PyDict_SetItemString(dict, "new_key", Py_None), 0);
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_True), 0);
+  probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+  ASSERT_NE(probe_name, nullptr);
+  ASSERT_EQ(nameHash(probe_name), -1);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  EXPECT_NE(nameHash(probe_name), -1);
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // The generic combined fallback above does not refresh the cached version.
+  // Use the ordinary hashed name to re-establish the negative anchor first.
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // After that refresh, one further value-only store can hit again.
+  hits = stats.hits;
+  misses = stats.misses;
+  uint64_t before_version = version(dict);
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_False), 0);
+  probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+  ASSERT_NE(probe_name, nullptr);
+  ASSERT_EQ(nameHash(probe_name), -1);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  EXPECT_NE(version(dict), before_version);
+  EXPECT_NE(version(dict), 0);
+  EXPECT_EQ(nameHash(probe_name), -1);
+  EXPECT_EQ(stats.hits, hits + 1);
+  EXPECT_EQ(stats.misses, misses);
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // Even a same-shape copy has a distinct version.  Its next value-only
+  // transition must not validate a miss cached for the previous dict.
+  auto replacement = Ref<>::steal(PyDict_Copy(dict));
+  ASSERT_NE(replacement, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(inst, "__dict__", replacement), 0);
+  ASSERT_EQ(
+      jit::StoreAttrCache::invoke(stores.get(), inst, padding, Py_True), 0);
+  probe_name = Ref<>::steal(PyUnicode_FromString("method"));
+  ASSERT_NE(probe_name, nullptr);
+  ASSERT_EQ(nameHash(probe_name), -1);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, probe_name);
+  EXPECT_EQ(loaded.callable, method.get());
+  EXPECT_EQ(loaded.self_or_null, inst.get());
+  EXPECT_NE(nameHash(probe_name), -1);
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+
+  // Resize and free the cached table while the cache is still alive.  Its
+  // destruction must never decref the old table (including on Release builds).
+  ASSERT_NE(
+      Ref<>::steal(PyRun_String(
+          "for i in range(100): p.__dict__[str(i)] = i\np.__dict__.clear()\n"
+          "p.method = shadow\n",
+          Py_file_input,
+          globals,
+          globals)),
+      nullptr);
+  loaded = jit::LoadMethodCache::lookupHelper(&cache, inst, name);
+  EXPECT_EQ(loaded.callable, Py_None);
+  EXPECT_EQ(loaded.self_or_null, shadow.get());
+  Py_XDECREF(loaded.callable);
+  Py_XDECREF(loaded.self_or_null);
+}
+
 TEST_F(AttrCache311Test, MethodPeekPropagatesCombinedDictKeyErrorOnce) {
   const char* src = R"(
 class UniqueError(Exception):
