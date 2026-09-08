@@ -752,15 +752,32 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   return result;
 }
 #else
+struct DictValueTransition311 {
+  uint64_t before{0};
+  uint64_t after{0};
+};
+
+// Under the 3.11 GIL, a value-only replacement preserves every absent key.
+// Remember only the most recent transition; no dict or keys pointer is held.
+static DictValueTransition311 last_dict_value_transition;
+
+template <bool kCombined>
 static void replaceMaterializedDictValue311(
     PyDictObject* dict,
     PyObject** slot,
     PyObject* value) {
   PyObject* old_value = *slot;
   JIT_DCHECK(old_value != nullptr, "Only existing values may be overwritten");
+  [[maybe_unused]] uint64_t old_version = 0;
+  if constexpr (kCombined) {
+    old_version = dict->ma_version_tag;
+  }
   Py_INCREF(value);
   *slot = value;
   dict->ma_version_tag = Cix_PyDict_NextVersion();
+  if constexpr (kCombined) {
+    last_dict_value_transition = {old_version, dict->ma_version_tag};
+  }
   if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
       _PyObject_GC_MAY_BE_TRACKED(value)) {
     PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
@@ -779,7 +796,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
             reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
       PyObject* old_value = dict->ma_values->values[val_offset];
       if (old_value != nullptr) {
-        replaceMaterializedDictValue311(
+        replaceMaterializedDictValue311<false>(
             dict, &dict->ma_values->values[val_offset], value);
         return 0;
       }
@@ -941,7 +958,7 @@ int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
               reinterpret_cast<const uint8_t*>(managed->ma_values)[-1]) {
             PyObject* old_value = managed->ma_values->values[hint];
             if (old_value != nullptr) {
-              replaceMaterializedDictValue311(
+              replaceMaterializedDictValue311<false>(
                   managed, &managed->ma_values->values[hint], value);
               return 0;
             }
@@ -949,7 +966,8 @@ int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
         } else {
           PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[hint];
           if (entry->me_value != nullptr) {
-            replaceMaterializedDictValue311(managed, &entry->me_value, value);
+            replaceMaterializedDictValue311<true>(
+                managed, &entry->me_value, value);
             return 0;
           }
         }
@@ -2196,24 +2214,17 @@ LoadMethodCache::~LoadMethodCache() {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-void LoadMethodCache::Entry::setPeekKeys(PyDictKeysObject* keys, bool owned) {
-  if (peek_keys == keys && peek_keys_owned == owned) {
+void LoadMethodCache::Entry::setInlinePeekKeys(PyDictKeysObject* keys) {
+  if (peek_keys == keys && peek_dict_version == 0) {
     return;
   }
   clearPeekKeys();
-  if (keys != nullptr && owned) {
-    Ci_DictKeys_IncRef_311(keys);
-  }
   peek_keys = keys;
-  peek_keys_owned = owned;
 }
 
 void LoadMethodCache::Entry::clearPeekKeys() {
-  if (peek_keys != nullptr && peek_keys_owned) {
-    Ci_DictKeys_DecRef_311(peek_keys);
-  }
   peek_keys = nullptr;
-  peek_keys_owned = false;
+  peek_dict_version = 0;
   peek_nentries = 0;
   peek_hint = -1;
 }
@@ -2319,7 +2330,8 @@ LoadMethodResult LoadMethodCache::lookup(
           PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
           if (values != nullptr) {
             PyDictKeysObject* live_keys = getSplitKeys(tp);
-            if (live_keys != nullptr && live_keys == entry.peek_keys &&
+            if (live_keys != nullptr && entry.peek_dict_version == 0 &&
+                live_keys == entry.peek_keys &&
                 live_keys->dk_nentries == entry.peek_nentries) {
               if (entry.peek_hint == Entry::kPeekAbsent ||
                   (entry.peek_hint >= 0 &&
@@ -2336,18 +2348,46 @@ LoadMethodResult LoadMethodCache::lookup(
             PyDictObject* materialized = reinterpret_cast<PyDictObject*>(
                 *_PyObject_ManagedDictPointer(obj.get()));
             if (materialized != nullptr && materialized->ma_values == nullptr) {
+              uint64_t version = materialized->ma_version_tag;
+              // Dict creation/copy and content changes use the real libpython
+              // version stream.  Equality alone proves the negative lookup
+              // remains valid, including across keys-table address reuse.
+              if (version != 0 && version == entry.peek_dict_version) {
+                attrCacheStats311().load_method.hits++;
+                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+              }
+              if (version != 0 && entry.peek_dict_version != 0 &&
+                  entry.peek_dict_version ==
+                      last_dict_value_transition.before &&
+                  version == last_dict_value_transition.after) {
+                // The only intervening change replaced an existing non-null
+                // value.  Its old-value destructor may run Python, but any
+                // content change then produces a different live dict version.
+                entry.peek_dict_version = version;
+                attrCacheStats311().load_method.hits++;
+                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+              }
+              // With exact Unicode names and keys, a miss can be refreshed
+              // here without running Python.  Avoid the generic peek's
+              // temporary ownership and second lookup after value-only writes.
               PyDictKeysObject* keys = materialized->ma_keys;
-              if (DK_IS_UNICODE(keys) && keys == entry.peek_keys &&
-                  keys->dk_nentries == entry.peek_nentries) {
-                if (entry.peek_hint == Entry::kPeekAbsent ||
-                    (entry.peek_hint >= 0 &&
-                     DK_UNICODE_ENTRIES(keys)[entry.peek_hint].me_key ==
-                         name.get() &&
-                     DK_UNICODE_ENTRIES(keys)[entry.peek_hint].me_value ==
-                         nullptr)) {
+              if (PyUnicode_CheckExact(name.get()) &&
+                  _PyASCIIObject_CAST(name.get())->hash != -1 &&
+                  DK_IS_UNICODE(keys)) {
+                Py_ssize_t index = Cix_PyDictKeys_StringLookup(keys, name);
+                if (index >= 0) {
+                  break;
+                }
+                if (index == DKIX_EMPTY) {
+                  if (version != 0) {
+                    entry.peek_dict_version = version;
+                  }
                   attrCacheStats311().load_method.hits++;
                   return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
                 }
+                // The exact-name, cached-hash and Unicode-keys checks prevent
+                // the specializer lookup's error-clearing hash path.  An
+                // unsupported result still falls back without caching.
               }
             }
           }
@@ -2379,25 +2419,10 @@ LoadMethodResult LoadMethodCache::lookup(
               PyDictKeysObject* keys = getSplitKeys(tp);
               if (keys != nullptr && DK_IS_UNICODE(keys)) {
                 Py_ssize_t index = getDictKeysIndex(keys, name);
-                entry.setPeekKeys(keys, false);
+                entry.setInlinePeekKeys(keys);
                 entry.peek_nentries = keys->dk_nentries;
                 entry.peek_hint = index >= 0 ? index : Entry::kPeekAbsent;
               }
-            }
-          } else {
-            PyDictObject* materialized = reinterpret_cast<PyDictObject*>(
-                *_PyObject_ManagedDictPointer(obj.get()));
-            if (materialized != nullptr && materialized->ma_values == nullptr &&
-                entry.type == tp && entry.value == selected.get() &&
-                entry.type_version == tp->tp_version_tag &&
-                DK_IS_UNICODE(materialized->ma_keys) &&
-                (entry.peek_keys == nullptr ||
-                 entry.peek_keys == materialized->ma_keys)) {
-              PyDictKeysObject* keys = materialized->ma_keys;
-              Py_ssize_t index = getDictKeysIndex(keys, name);
-              entry.setPeekKeys(keys, true);
-              entry.peek_nentries = keys->dk_nentries;
-              entry.peek_hint = index >= 0 ? index : Entry::kPeekAbsent;
             }
           }
         }
@@ -3064,6 +3089,10 @@ LoadModuleMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+void resetDictValueTransition311() {
+  last_dict_value_transition = {};
+}
+
 AttrCacheStats311& attrCacheStats311() {
   static AttrCacheStats311 stats;
   return stats;

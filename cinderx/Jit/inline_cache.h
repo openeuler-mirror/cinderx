@@ -504,13 +504,16 @@ class LoadMethodCache {
     uint32_t type_version{0};
     bool peek_shadow{false};
     static constexpr Py_ssize_t kPeekAbsent = -2;
+    // Borrowed shape data for inline values only.
     PyDictKeysObject* peek_keys{nullptr};
     Py_ssize_t peek_nentries{0};
     Py_ssize_t peek_hint{-1};
     bool inst_attr{false};
-    bool peek_keys_owned{false};
+    // A nonzero version records verified absence in that globally unique
+    // dict content state.  No combined keys pointer is retained.
+    uint64_t peek_dict_version{0};
 
-    void setPeekKeys(PyDictKeysObject* keys, bool owned);
+    void setInlinePeekKeys(PyDictKeysObject* keys);
     void clearPeekKeys();
 #endif
 
@@ -713,6 +716,7 @@ struct AttrCacheStats311 {
 };
 
 AttrCacheStats311& attrCacheStats311();
+void resetDictValueTransition311();
 #endif
 
 } // namespace jit
