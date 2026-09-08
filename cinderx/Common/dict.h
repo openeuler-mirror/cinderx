@@ -48,7 +48,9 @@ static inline Py_ssize_t getDictKeysIndex(
 #endif
   for (Py_ssize_t i = 0; i < keys->dk_nentries; i++) {
     PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[i];
-    if (PyUnicode_Compare(name, ep->me_key) == 0) {
+    // Combined unicode dictionaries retain deleted entries as tombstones.
+    // Their key is nullptr even though the slot remains below dk_nentries.
+    if (ep->me_key != NULL && PyUnicode_Compare(name, ep->me_key) == 0) {
       return i;
     }
   }

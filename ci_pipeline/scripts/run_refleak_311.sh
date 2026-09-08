@@ -132,7 +132,7 @@ for MODULE in "${MODULES[@]}"; do
   env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
       CINDERX_REFLEAK_LEDGER="$LEDGER" \
-      PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}" \
+      PYTHONPATH="$START" \
     "$VENV_PY" -m test -R "$ROUNDS" "$MODULE" > "$MODULE_LOG" 2>&1
   MODULE_RC=$?
   set -e
@@ -193,6 +193,7 @@ if [ -n "$BLK_MODULES" ]; then
   # shellcheck disable=SC2086
   if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
        CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+       PYTHONPATH="$START" \
        "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
        "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8 \
        --original-log-dir "$MODULE_LOG_DIR"; then

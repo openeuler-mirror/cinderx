@@ -113,7 +113,13 @@ extern "C" PyObject* __Invoke_PyList_Extend(
     PyThreadState* tstate,
     PyObject* list,
     PyObject* iterable) {
+#if PY_VERSION_HEX < 0x030D0000
+  PyObject* result =
+      _PyList_Extend(reinterpret_cast<PyListObject*>(list), iterable);
+  if (result == nullptr) {
+#else
   if (PyList_Extend(list, iterable) < 0) {
+#endif
     if (_PyErr_ExceptionMatches(tstate, PyExc_TypeError) &&
         Py_TYPE(iterable)->tp_iter == nullptr && !PySequence_Check(iterable)) {
       _PyErr_Clear(tstate);
@@ -126,7 +132,10 @@ extern "C" PyObject* __Invoke_PyList_Extend(
     return nullptr;
   }
 
-  Py_RETURN_NONE;
+#if PY_VERSION_HEX < 0x030D0000
+  Py_DECREF(result);
+#endif
+  return Py_None;
 }
 
 void finishYield(
@@ -2912,8 +2921,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache = env_->ctx->allocateLoadAttrCache();
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    !defined(Py_GIL_DISABLED)
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) &&                               \
+    (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
         bbb.appendInstr(
             dst,
             Instruction::kLoadAttrCachedFastPath,
@@ -3044,8 +3054,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+        bbb.appendInstr(
+            dst,
+            Instruction::kLoadMethodCachedFastPath,
+            LoadMethodCache::lookupHelper,
+            cache,
+            base,
+            name);
+#else
         appendCall2RetValues(
             bbb, dst, LoadMethodCache::lookupHelper, cache, base, name);
+#endif
         break;
       }
       case Opcode::kLoadModuleAttrCached: {
@@ -3851,13 +3872,26 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* name = getNameFromIdx(bbb, instr);
         hir::Register* value = instr->GetOperand(1);
         auto cache = env_->ctx->allocateStoreAttrCache();
-        Instruction* result = bbb.appendCallInstruction(
+        Instruction* result;
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+        result = bbb.appendInstr(
+            OutVReg{OperandBase::k32bit},
+            Instruction::kStoreAttrCachedFastPath,
+            jit::StoreAttrCache::invoke,
+            cache,
+            base,
+            name,
+            value);
+#else
+        result = bbb.appendCallInstruction(
             OutVReg{OperandBase::k32bit},
             jit::StoreAttrCache::invoke,
             cache,
             base,
             name,
             value);
+#endif
         appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, result);
         break;
       }

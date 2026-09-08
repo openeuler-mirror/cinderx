@@ -105,6 +105,8 @@ struct Environ {
   std::vector<PhyLocation> arg_locations;
 
   asmjit::Label load_attr_invoke_stub;
+  asmjit::Label load_method_invoke_stub;
+  asmjit::Label store_attr_invoke_stub;
 
   struct Aarch64ExactLongAddSubStub {
     asmjit::Label entry;
