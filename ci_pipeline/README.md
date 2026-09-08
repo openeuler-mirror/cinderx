@@ -57,9 +57,10 @@ Python 3.11 runs three fast `cp311_gate` jobs by default:
 `runtime_tests_311`, `setup_release_311`, and `test_release_311`. PR builds
 exactly one Release wheel. When a developer sets
 `CINDERX_LOCAL_RUN_LIBTEST=1`, `libtest_execute_72_311` also runs a
-self-contained stock 72 versus execute 72 differential without depending on
-Daily artifacts. The full Lib/test differential remains Daily-only. Python
-3.14 keeps the existing pipeline and runs in this order:
+self-contained stock 72 versus execute 72 differential and
+`pydebug_refleak_10_311` runs the ten-module Py_DEBUG reference-leak gate.
+Neither job depends on Daily artifacts. The full Lib/test differential remains
+Daily-only. Python 3.14 keeps the existing pipeline and runs in this order:
 
 1. `runtime`: build and run native `RuntimeTests` through CMake. `--coverage`
    applies only to this suite.
@@ -205,7 +206,7 @@ job.
 | `CINDERX_TEST_PYTHON` | Python interpreter used by the gate; defaults to the interpreter running `run_gate.py` |
 | `CINDERX_TEST_WHEEL` | External wheel tested by `daily` compat fan-out and the `wheel_compat` / `wheel_compat_negative` suites |
 | `CINDERX_UNSUPPORTED_TEST_PYTHON` | Unsupported Python interpreter used by `wheel_compat_negative` |
-| `CINDERX_LOCAL_RUN_LIBTEST=1` | Adds stock/execute 72 to the 3.11 PR and local-wheel Lib/test jobs to 3.14 `cinderx_local` |
+| `CINDERX_LOCAL_RUN_LIBTEST=1` | Adds stock/execute 72 and Py_DEBUG refleak 10 to the 3.11 PR, and local-wheel Lib/test jobs to 3.14 `cinderx_local` |
 | `CINDERX_LOCAL_DEPS` | Local cache directory for CMake FetchContent dependencies |
 | `CINDERX_PIP_WHEELHOUSE` | Local Python wheelhouse used to bootstrap suite venvs |
 | `CINDERX_PIP_OFFLINE=1` | Requires pip installs to use `CINDERX_PIP_WHEELHOUSE` only |
