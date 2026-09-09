@@ -414,7 +414,7 @@ def test_cp311_container_scripts_resolve_bare_executable_names():
     assert "CXX=$(resolve_executable g++)" in builder
 
 
-def test_cp311_release_builder_and_smoke_keep_exact_platform_anchor():
+def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
     pipeline_dir = Path(run_gate.REPO_ROOT) / "ci_pipeline"
     driver = (pipeline_dir / "build_cp311_wheel.py").read_text()
     scripts_dir = pipeline_dir / "scripts"
@@ -434,14 +434,17 @@ def test_cp311_release_builder_and_smoke_keep_exact_platform_anchor():
     assert "export CMAKE_BUILD_TYPE=Release" in builder
     assert "toolchain-311.txt" in builder
 
-    for script in (preflight, smoke):
-        assert "PYTHON3_NVR=3.11.6-34.oe2403sp3" in script
-    assert "python3-devel-${PYTHON3_NVR}" in preflight
+    assert '"/usr/local/cpython-3.11.6/bin/python3.11"' in preflight
+    assert 'sysconfig.get_config_var("Py_ENABLE_SHARED") != 1' in preflight
+    assert 'glob("libpython3.11*.so*")' in preflight
+    assert "expected system GCC 12.x" in preflight
     assert 'case "$cc_version"' in preflight
     assert 'case "$cxx_version"' in preflight
     assert "expected GCC 14.x" in preflight
     assert "expected G++ 14.x" in preflight
     assert "CC/CXX major mismatch" in preflight
+
+    assert "PYTHON3_NVR=3.11.6-34.oe2403sp3" in smoke
     assert 'for module in ("_testcapi", "_testinternalcapi")' in smoke
     assert "python3-devel-${PYTHON3_NVR}" in smoke
 
