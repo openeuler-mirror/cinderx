@@ -203,6 +203,21 @@ endif()
 set(GENERATED_HEADER_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${GENERATED_HEADER_DIR})
 
+# Runtime consumers need a stable identifier before importing any Python-side
+# adapter. Release builders may provide their own identifier; source checkouts
+# use their commit and source archives use their packaged version.
+include("${CMAKE_SOURCE_DIR}/cmake/CinderXBuildId.cmake")
+set(CINDERX_CORE_BUILD_ID "" CACHE STRING "Stable identifier for this CinderX core build")
+cinderx_resolve_core_build_id(
+  "${CMAKE_SOURCE_DIR}"
+  "${CINDERX_CORE_BUILD_ID}"
+  _cinderx_core_build_id)
+file(MAKE_DIRECTORY ${GENERATED_HEADER_DIR}/cinderx)
+configure_file(
+  ${PROJECT_SOURCE_DIR}/runtime_capabilities_build.h.in
+  ${GENERATED_HEADER_DIR}/cinderx/runtime_capabilities_build.h
+  @ONLY)
+
 option(ENABLE_RUNTIME_TESTS "Build RuntimeTests with CMake" OFF)
 
 ##############################################################################
@@ -634,6 +649,7 @@ set(CINDERX_LIB_SOURCES
   ${PROJECT_SOURCE_DIR}/module_state.cpp
   ${PROJECT_SOURCE_DIR}/module_c_state.cpp
   ${PROJECT_SOURCE_DIR}/python_runtime.cpp
+  ${PROJECT_SOURCE_DIR}/runtime_capabilities.cpp
 )
 
 set(SOURCES
