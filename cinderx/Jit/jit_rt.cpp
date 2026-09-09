@@ -1622,8 +1622,7 @@ PyObject* JITRT_Call311(
 } // namespace
 
 extern "C" {
-void* g_JITRT_Vectorcall311_slot =
-    reinterpret_cast<void*>(JITRT_Vectorcall311);
+void* g_JITRT_Vectorcall311_slot = reinterpret_cast<void*>(JITRT_Vectorcall311);
 void* g_JITRT_Call311_slot = reinterpret_cast<void*>(JITRT_Call311);
 }
 #endif

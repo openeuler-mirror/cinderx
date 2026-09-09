@@ -3904,6 +3904,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         size_t flags = 0;
 #if PY_VERSION_HEX < 0x030C0000
+#if defined(CINDER_AARCH64)
         Instruction* callable = bbb.getDefInstr(hir_instr.func());
         Instruction* target = nullptr;
         constexpr int32_t kVectorcallOffset =
@@ -3956,6 +3957,25 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         if (!(hir_instr.flags() & CallFlags::KwArgs)) {
           instr->addOperands(Imm{0});
         }
+#else
+        uint64_t func =
+            reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
+        if (!(hir_instr.func()->type() <= TFunc)) {
+          func = reinterpret_cast<uint64_t>(JITRT_VectorcallTstate);
+        }
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(),
+            Instruction::kVectorCallTstate,
+            Imm{func},
+            Imm{flags},
+            VReg{env_->asm_tstate});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+#endif
         break;
 #else
         uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
@@ -4088,7 +4108,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCallMethod: {
         auto& hir_instr = static_cast<const CallMethod&>(i);
         size_t flags = 0;
-#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
         Instruction* callable = bbb.getDefInstr(hir_instr.func());
         constexpr int32_t kVectorcallOffset =
             static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
@@ -4099,10 +4119,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* zero = bbb.appendInstr(
             Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{0});
         Instruction* is_null = bbb.appendInstr(
-            Instruction::kEqual,
-            OutVReg{OperandBase::k8bit},
-            callable,
-            zero);
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, callable, zero);
         Instruction* non_null = bbb.appendInstr(
             Instruction::kSelect,
             OutVReg{OperandBase::k64bit},
@@ -4114,10 +4131,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutVReg{OperandBase::k64bit},
             Imm{reinterpret_cast<uint64_t>(Py_None)});
         Instruction* is_none = bbb.appendInstr(
-            Instruction::kEqual,
-            OutVReg{OperandBase::k8bit},
-            non_null,
-            none);
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, non_null, none);
         Instruction* safe_callable = bbb.appendInstr(
             Instruction::kSelect,
             OutVReg{OperandBase::k64bit},
@@ -4156,10 +4170,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // supplies a null receiver. Keep that shape on the helper arm.
         Instruction* receiver = bbb.getDefInstr(hir_instr.self());
         Instruction* receiver_is_null = bbb.appendInstr(
-            Instruction::kEqual,
-            OutVReg{OperandBase::k8bit},
-            receiver,
-            zero);
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, receiver, zero);
         Instruction* selected_address = bbb.appendInstr(
             Instruction::kSelect,
             OutVReg{OperandBase::k64bit},
@@ -4171,10 +4182,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutVReg{OperandBase::k64bit},
             Ind{selected_address, 0});
         Instruction* instr = bbb.appendInstr(
-            hir_instr.output(),
-            Instruction::kVectorCall,
-            target,
-            Imm{flags});
+            hir_instr.output(), Instruction::kVectorCall, target, Imm{flags});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
@@ -4206,15 +4214,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
     PY_VERSION_HEX < 0x030C0000
         if (hir_instr.addr() ==
-                reinterpret_cast<void*>(JITRT_StoreFrameLocal311)) {
+            reinterpret_cast<void*>(JITRT_StoreFrameLocal311)) {
           // Match JITRT_StoreFrameLocal311 and stock SETLOCAL exactly:
           // take the frame-owned reference first, publish the new slot, then
           // release the old value.  The cold zero-refcount arm may invoke
           // arbitrary __del__ code, which must observe the new slot already.
-          Instruction* idx =
-              bbb.getDefInstr(hir_instr.GetOperand(0));
-          Instruction* value =
-              bbb.getDefInstr(hir_instr.GetOperand(1));
+          Instruction* idx = bbb.getDefInstr(hir_instr.GetOperand(0));
+          Instruction* value = bbb.getDefInstr(hir_instr.GetOperand(1));
           Instruction* frame = makeCurrentFrameAccessor(bbb).load();
           constexpr int32_t kLocalsplusOffset =
               offsetof(_PyInterpreterFrame, localsplus);
@@ -4238,8 +4244,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               std::nullopt,
               /* xdecref= */ true,
               /* possible_immortal= */ true);
-          bbb.appendInstr(
-              hir_instr.output(), Instruction::kMove, Imm{0});
+          bbb.appendInstr(hir_instr.output(), Instruction::kMove, Imm{0});
           break;
         }
 #endif

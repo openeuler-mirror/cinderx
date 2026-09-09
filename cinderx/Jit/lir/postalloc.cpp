@@ -364,6 +364,18 @@ int rewriteVectorCallTstateFunctions(instr_iter_t instr_iter, int base_offset) {
   return rewriteVectorCallCommon(instr_iter, base_offset, 1, 3, kFirstArg);
 }
 
+int rewriteVectorCallFunctions(instr_iter_t instr_iter, int base_offset) {
+  // The target already has the four-argument vectorcall ABI: input 0 is the
+  // selected entry, input 1 is flags, input 2 is callable, and the final input
+  // is kwnames.
+  return rewriteVectorCallCommon(
+      instr_iter,
+      base_offset,
+      /*reg_offset=*/0,
+      /*callable_input=*/2,
+      /*first_arg=*/3);
+}
+
 int rewriteVarArgCall(instr_iter_t instr_iter, int base_offset) {
   auto instr = instr_iter->get();
   instr->setOpcode(Instruction::kCall);
@@ -395,8 +407,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
         std::max<int>(env->max_arg_buffer_size, base_offset + rsp_sub);
     return kChanged;
   } else if (
-      !instr->isCall() && !instr->isVectorCallTstate() &&
-      !instr->isLoadAttrCachedFastPath() &&
+      !instr->isCall() && !instr->isVectorCall() &&
+      !instr->isVectorCallTstate() && !instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() &&
       !instr->isStoreAttrCachedFastPath() &&
       !instr->isBinaryOpExactLongAddSubFastPath()) {
@@ -415,7 +427,9 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   int rsp_sub = 0;
   auto block = instr->basicblock();
 
-  if (instr->isVectorCallTstate()) {
+  if (instr->isVectorCall()) {
+    rsp_sub = rewriteVectorCallFunctions(instr_iter, base_offset);
+  } else if (instr->isVectorCallTstate()) {
     rsp_sub = rewriteVectorCallTstateFunctions(instr_iter, base_offset);
   } else {
     rsp_sub = rewriteRegularFunction(instr_iter, base_offset);
