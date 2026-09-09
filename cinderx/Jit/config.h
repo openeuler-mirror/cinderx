@@ -134,7 +134,7 @@ struct Config {
   std::optional<bool> force_init;
   FrameMode frame_mode{
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000
-      FrameMode::kLightweight
+    FrameMode::kLightweight
 #else
       FrameMode::kNormal
 #endif

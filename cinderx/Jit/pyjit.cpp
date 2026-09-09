@@ -1397,7 +1397,11 @@ FlagProcessor initFlagProcessor() {
   // inliner disabled for normal-frame runs so tests and explicit normal-mode
   // configurations do not build inline frames that cannot be safely unlinked.
   bool force_disable_inliner_for_normal_frame =
+#if PY_VERSION_HEX < 0x030C0000
+      true;
+#else
       getConfig().frame_mode != FrameMode::kLightweight;
+#endif
   if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
   }
@@ -6146,6 +6150,9 @@ void finalize() {
     mod_state->jit_context.reset();
     mod_state->code_allocator.reset();
     setCodeDestroyedHook(nullptr);
+#if PY_VERSION_HEX < 0x030C0000
+    Ci_QuickenWarmupStep_311 = 1;
+#endif
     getMutableConfig().state = State::kNotInitialized;
     return;
   }
@@ -6237,6 +6244,9 @@ void finalize() {
   // Past this point nothing can service a code-death notification.
   setCodeDestroyedHook(nullptr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_QuickenWarmupStep_311 = 1;
+#endif
   getMutableConfig().state = State::kNotInitialized;
   getMutableConfig().osr_capable = false;
   syncOSRFlags();
