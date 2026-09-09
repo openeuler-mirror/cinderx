@@ -2520,8 +2520,7 @@ void NativeGenerator::generateCode(
   // CompiledFunction pin before calling vectorcall_entry_, so unpublishing
   // from inside the body cannot free the stub or body while either executes.
   as_->mov(a64::x4, reinterpret_cast<uint64_t>(env_.code_rt));
-  as_->mov(
-      a64::x16, reinterpret_cast<uint64_t>(&Ci_JitShell311_ArtifactEntry));
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(&Ci_JitShell311_ArtifactEntry));
   as_->br(a64::x16);
   env_.addAnnotation("Artifact-specific guarded entry", artifact_entry_cursor);
 #endif

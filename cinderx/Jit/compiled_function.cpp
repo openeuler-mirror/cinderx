@@ -452,6 +452,19 @@ void CompiledFunction::clear(
   // The owner is nulled below, but the runtime hand-back at the bottom
   // still needs it: only the owner knows which slab the storage came from.
   [[maybe_unused]] CompiledFunctionOwner* entry_owner = owner_;
+#if PY_VERSION_HEX < 0x030C0000
+  // Orphaned artifacts skip the owner walk below.  If a caller detached
+  // us without restoring interpreter entries, a later jump through the
+  // artifact stub would enter freed code.  Only rewrite vectorcalls that
+  // still name this stub: a successor may already own the function.
+  if (owner_ == nullptr) {
+    for (PyFunctionObject* func : functions_) {
+      if (func->vectorcall == artifactGuardedEntry311()) {
+        func->vectorcall = getInterpretedVectorcall(func);
+      }
+    }
+  }
+#endif
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {

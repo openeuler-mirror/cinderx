@@ -507,6 +507,19 @@ def replacement(a, b):
   EXPECT_TRUE(new_art->functions().contains(func.get()));
   EXPECT_FALSE(prior_art->functions().contains(func.get()))
       << "the settled takeover left the prior claim standing";
+#if PY_VERSION_HEX < 0x030C0000
+  if (new_art->artifactGuardedEntry311() != nullptr) {
+    EXPECT_EQ(func->vectorcall, new_art->artifactGuardedEntry311())
+        << "takeover left the function on the prior stub";
+    if (prior_art->artifactGuardedEntry311() != nullptr) {
+      EXPECT_NE(func->vectorcall, prior_art->artifactGuardedEntry311());
+    }
+  } else {
+    EXPECT_EQ(
+        func->vectorcall,
+        reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry));
+  }
+#endif
   EXPECT_EQ(
       PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
       reinterpret_cast<PyObject*>(new_art));
