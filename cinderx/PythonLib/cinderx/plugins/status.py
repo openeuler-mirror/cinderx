@@ -10,7 +10,7 @@ it never discovers distributions, imports adapters, or probes native state.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 from threading import Lock
@@ -277,8 +277,16 @@ class PluginStatus:
     state: PluginState
     reasons: tuple[PluginStatusReason, ...] = ()
     diagnostics: tuple[StageDiagnostic, ...] = ()
+    _identity_digest: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        # Preserve the bounded full identity before truncating display fields.
+        # Keep it out of constructor parameters, repr and value comparisons.
+        object.__setattr__(
+            self,
+            "_identity_digest",
+            _identity_key(self.normalized_distribution_name) or "",
+        )
         object.__setattr__(
             self,
             "distribution_name",
@@ -315,13 +323,17 @@ class PluginStatus:
         )
 
 
-def _plugin_order(plugin: PluginStatus) -> tuple[str, ...]:
+def _plugin_order(plugin: PluginStatus) -> tuple[object, ...]:
     return (
         plugin.normalized_distribution_name,
         plugin.distribution_name.casefold(),
         plugin.distribution_name,
         plugin.distribution_version,
         plugin.plugin_id or "",
+        plugin._identity_digest,
+        plugin.state.value,
+        tuple(reason.value for reason in plugin.reasons),
+        tuple(_diagnostic_order(item) for item in plugin.diagnostics),
     )
 
 
@@ -338,13 +350,15 @@ class StatusSnapshot:
             values: list[PluginStatus] = []
         else:
             values = []
-            while len(values) < _MAX_STATUS_INPUT_RESULTS:
+            inspected = 0
+            while inspected < _MAX_STATUS_INPUT_RESULTS:
                 try:
                     value = next(iterator)
                 except StopIteration:
                     break
                 except Exception:
                     break
+                inspected += 1
                 if isinstance(value, PluginStatus):
                     values.append(value)
         object.__setattr__(
@@ -411,11 +425,6 @@ def _identity_key(value: object) -> str | None:
     if normalized is None:
         return None
     return sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
-def _bounded_normalized_name(value: object) -> str | None:
-    normalized = _normalized_name(value)
-    return _bounded_text(normalized) if normalized is not None else None
 
 
 def _discovery_identity(value: object) -> str | None:
@@ -720,7 +729,7 @@ def _plugin_status(
     return PluginStatus(
         distribution_name=distribution_name,
         normalized_distribution_name=(
-            _bounded_normalized_name(normalized_name)
+            _normalized_name(normalized_name)
             or _INVALID_DISTRIBUTION_NAME
         ),
         distribution_version=distribution_version,

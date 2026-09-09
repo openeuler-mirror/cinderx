@@ -105,6 +105,115 @@ def artifact(
 
 
 class PluginStatusTests(unittest.TestCase):
+    def test_snapshot_input_budget_counts_invalid_elements(self) -> None:
+        plugin = PluginStatus(
+            "example", "example", "1", "shared", PluginState.DISCOVERED
+        )
+        budget = MAX_STATUS_PLUGINS * 4
+        for period, expected_count in ((0, 0), (64, 8), (1, MAX_STATUS_PLUGINS)):
+            with self.subTest(valid_every=period):
+                inspected = 0
+
+                def inputs():
+                    nonlocal inspected
+                    for index in range(10_000):
+                        inspected += 1
+                        yield plugin if period and index % period == 0 else None
+
+                snapshot = StatusSnapshot(inputs())  # type: ignore[arg-type]
+
+                self.assertEqual(inspected, budget)
+                self.assertEqual(len(snapshot.plugins), expected_count)
+
+    def test_snapshot_stops_before_endless_invalid_input_exceeds_budget(self) -> None:
+        inspected = 0
+        budget = MAX_STATUS_PLUGINS * 4
+
+        def inputs():
+            nonlocal inspected
+            while True:
+                inspected += 1
+                if inspected > budget:
+                    # Keep a regression from hanging the test process.
+                    raise AssertionError("snapshot read past its input budget")
+                yield None
+
+        snapshot = StatusSnapshot(inputs())  # type: ignore[arg-type]
+
+        self.assertEqual(inspected, budget)
+        self.assertEqual(snapshot.plugins, ())
+
+    def test_long_display_identity_collisions_have_stable_selection(self) -> None:
+        for count in (2, MAX_STATUS_PLUGINS + 1):
+            with self.subTest(count=count):
+                discoveries = tuple(
+                    discovered_plugin(
+                        "x" * MAX_STATUS_STRING_BYTES + f"-{index:03d}",
+                        "shared",
+                    )
+                    for index in range(count)
+                )
+                negotiated = tuple(negotiation(item) for item in discoveries)
+                accepted = (artifact(discoveries[0].distribution_name),)
+                forward = build_status_snapshot(
+                    discoveries,
+                    negotiation_results=negotiated,
+                    artifact_results=accepted,
+                )
+                reverse = build_status_snapshot(
+                    tuple(reversed(discoveries)),
+                    negotiation_results=negotiated,
+                    artifact_results=accepted,
+                )
+
+                self.assertEqual(forward, reverse)
+                self.assertEqual(
+                    len(forward.plugins), min(count, MAX_STATUS_PLUGINS)
+                )
+                self.assertEqual(
+                    len({item.distribution_name for item in forward.plugins}), 1
+                )
+                # The private tie-break must survive reusing materialized values.
+                self.assertEqual(
+                    StatusSnapshot(tuple(reversed(forward.plugins))), forward
+                )
+
+    def test_snapshot_equal_identity_uses_bounded_status_details_as_tiebreak(self) -> None:
+        plugins = tuple(
+            PluginStatus(
+                "same",
+                "same",
+                "1",
+                "shared",
+                state,
+                reasons=(reason,) if reason is not None else (),
+                diagnostics=(StageDiagnostic("status", code),),
+            )
+            for state, reason, code in (
+                (PluginState.AVAILABLE, None, "a"),
+                (PluginState.UNAVAILABLE, None, "b"),
+                (PluginState.UNAVAILABLE, None, "c"),
+                (PluginState.UNAVAILABLE, PluginStatusReason.SPI_MISMATCH, "c"),
+            )
+        )
+
+        self.assertEqual(StatusSnapshot(plugins), StatusSnapshot(plugins[::-1]))
+
+    def test_identity_digest_does_not_hash_oversized_input(self) -> None:
+        name = "x" * (MAX_STATUS_STRING_BYTES * 4 + 1)
+        with patch(
+            "cinderx.plugins.status.sha256",
+            side_effect=AssertionError("hashed an over-budget identity"),
+        ):
+            plugin = PluginStatus(
+                name, name, "1", "shared", PluginState.DISCOVERED
+            )
+
+        self.assertEqual(plugin._identity_digest, "")
+        self.assertLessEqual(
+            len(plugin.normalized_distribution_name), MAX_STATUS_STRING_BYTES
+        )
+
     def test_public_enums_have_exact_stable_values(self) -> None:
         self.assertEqual(
             tuple(state.value for state in PluginState),
