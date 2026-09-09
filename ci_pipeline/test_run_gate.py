@@ -435,14 +435,15 @@ def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
     assert "export CMAKE_BUILD_TYPE=Release" in builder
     assert "toolchain-311.txt" in builder
 
-    assert "--enable-shared" in dev_image
-    assert "LDFLAGS=-Wl,-Bsymbolic-functions" in dev_image
-    assert "LD_LIBRARY_PATH=/usr/local/cpython-${PYTHON_VERSION}/lib" in dev_image
-    assert "CPATH=/usr/local/cpython-${PYTHON_VERSION}/include/python3.11" in dev_image
+    assert '"python3-${PYTHON3_NVR}"' in dev_image
+    assert '"python3-devel-${PYTHON3_NVR}"' in dev_image
+    assert "LDFLAGS=-Wl,-Bsymbolic-functions" not in dev_image
+    assert "CPATH=/usr/include/python3.11" in dev_image
     assert "PIP_INDEX_URL,CPATH,LD_LIBRARY_PATH" in dev_image
-    assert '"/usr/local/cpython-3.11.6/bin/python3.11"' in preflight
+    assert '"/usr/bin/python3.11"' in preflight
+    assert "PYTHON3_NVR=3.11.6-34.oe2403sp3" in preflight
     assert 'sysconfig.get_config_var("Py_ENABLE_SHARED") == 1' in preflight
-    assert 'glob("libpython3.11*.so*")' in preflight
+    assert 'pathlib.Path("/usr/lib64").glob("libpython3.11*.so*")' in preflight
     assert "expected system GCC 12.x" in preflight
     assert 'case "$cc_version"' in preflight
     assert 'case "$cxx_version"' in preflight

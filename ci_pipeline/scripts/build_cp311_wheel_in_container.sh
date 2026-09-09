@@ -4,10 +4,10 @@
 #
 # Deliberately NOT a fat/manylinux wheel: the 3.11 product targets exactly
 # the anchored openEuler 24.03-LTS-SP3 environment. The build image uses
-# source-built CPython 3.11.6 from /usr/local/cpython-3.11.6, while
-# runnability is proven against the distro CPython 3.11.6 in a stock
-# openEuler image by scripts/smoke_cp311_wheel_in_runtime.sh. The normalize
-# step enforces the deterministic-zip and dependency contracts.
+# the anchored openEuler CPython 3.11.6 packages, and runnability is proven
+# against the same distribution runtime in a stock openEuler image by
+# scripts/smoke_cp311_wheel_in_runtime.sh. The normalize step enforces the
+# deterministic-zip and dependency contracts.
 #
 # Mounts (provided by ci_pipeline/build_cp311_wheel.py):
 #   /src  read-only source checkout
