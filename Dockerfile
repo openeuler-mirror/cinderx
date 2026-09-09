@@ -3,8 +3,8 @@
 # Toolchain contract:
 #   * CPython is built with the openEuler system GCC 12.
 #   * CinderX, RuntimeTests, and coverage are built with GCC 14.
-#   * CPython is static/non-shared and does not contain GCC 12 LTO objects,
-#     so GCC 14 can safely link RuntimeTests against libpython3.14.a.
+#   * CPython is a static/non-shared PGO+LTO build. RuntimeTests keep their
+#     own LTO disabled by default when linking against libpython3.14.a.
 #
 # Build:
 #   docker build -t cinderx-dev:py314 .
@@ -126,6 +126,7 @@ RUN test "$(/usr/bin/gcc -dumpfullversion | cut -d. -f1)" = "12" \
     && CC=/usr/bin/gcc CXX=/usr/bin/g++ ./configure \
         --prefix="/usr/local/cpython-${PYTHON_VERSION}" \
         --enable-optimizations \
+        --with-lto \
         --with-ensurepip=install \
     && make -j"${BUILD_JOBS}" \
     && make altinstall \
@@ -151,7 +152,7 @@ RUN ln -sf "${CINDERX_TEST_PYTHON}" /usr/local/bin/python3 \
     && ln -sf "${CXX}" /usr/local/bin/g++-${GCC_TOOLSET_MAJOR} \
     && test "$("${CC}" -dumpfullversion | cut -d. -f1)" = "${GCC_TOOLSET_MAJOR}" \
     && test "$("${CXX}" -dumpfullversion | cut -d. -f1)" = "${GCC_TOOLSET_MAJOR}" \
-    && "${CINDERX_TEST_PYTHON}" -c 'import pathlib, subprocess, sys, sysconfig; assert sys.version_info[:3] == (3, 14, 3), sys.version; assert sysconfig.get_config_var("Py_ENABLE_SHARED") != 1; assert subprocess.check_output(["/usr/bin/gcc", "-dumpfullversion"], text=True).split(".")[0] == "12"; assert not any(pathlib.Path("/usr/local/cpython-3.14.3/lib").glob("libpython3.14*.so*")); print(sys.version); print("CPython CC:", sysconfig.get_config_var("CC"))'
+    && "${CINDERX_TEST_PYTHON}" -c 'import pathlib, subprocess, sys, sysconfig; assert sys.version_info[:3] == (3, 14, 3), sys.version; assert sysconfig.get_config_var("Py_ENABLE_SHARED") != 1; assert "--with-lto" in sysconfig.get_config_var("CONFIG_ARGS"); assert subprocess.check_output(["/usr/bin/gcc", "-dumpfullversion"], text=True).split(".")[0] == "12"; assert not any(pathlib.Path("/usr/local/cpython-3.14.3/lib").glob("libpython3.14*.so*")); print(sys.version); print("CPython CC:", sysconfig.get_config_var("CC")); print("CPython CONFIG_ARGS:", sysconfig.get_config_var("CONFIG_ARGS"))'
 
 # Bake the exact FetchContent revisions used by this repository so run_gate
 # does not depend on GitHub availability after the image is built.
