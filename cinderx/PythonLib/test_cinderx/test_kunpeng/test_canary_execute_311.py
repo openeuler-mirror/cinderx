@@ -1696,10 +1696,16 @@ class CanaryExecute311Test(unittest.TestCase):
                     finalized.append(True)
                     cinderjit.force_uncompile(loop)
 
+            gc.collect()
             killer = Killer()
             del killer
+            # Keep enough tracked allocations alive that the threshold can
+            # be armed below the current count in every build configuration.
+            gc_padding = [[] for _ in range(8)]
             old_threshold = gc.get_threshold()
-            gc.set_threshold(1, 1, 1)
+            armed_threshold = gc.get_count()[0] - 1
+            assert armed_threshold > 0, (gc.get_count(), gc_padding)
+            gc.set_threshold(armed_threshold, 1, 1)
             try:
                 sites = cinderjit.deopt_sites(loop)
             finally:
