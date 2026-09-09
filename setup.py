@@ -432,6 +432,22 @@ class BuildExt(build_ext):
             local = os.environ.get(CINDERX_LOCAL_DEPS_ENV)
         self.local = normalize_local_deps_dir(local)
 
+    def _copy_required_pythonlib_file(
+        self,
+        filename: str,
+        *,
+        label: str | None = None,
+    ) -> None:
+        source = os.path.join(PYTHON_LIB_DIR, filename)
+        destination = os.path.join(self.build_lib, filename)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(
+                f"Required file not found: {source}. "
+                f"Ensure {filename} exists in the source directory."
+            )
+        print(f"Copying {label or filename} to {destination}")
+        self.copy_file(source, destination, preserve_mode=False)
+
     def run(self) -> None:
         # Partition into CMake extensions and everything else.
         cmake_extensions = []
@@ -454,25 +470,11 @@ class BuildExt(build_ext):
         os.makedirs(self.build_lib, exist_ok=True)
 
         # Copy .pth file to build_lib root for auto-import on Python startup
-        pth_source = os.path.join(PYTHON_LIB_DIR, "cinderx.pth")
-        pth_dest = os.path.join(self.build_lib, "cinderx.pth")
-        if not os.path.isfile(pth_source):
-            raise FileNotFoundError(
-                f"Required file not found: {pth_source}. "
-                "Ensure cinderx.pth exists in the source directory."
-            )
-        print(f"Copying .pth file to {pth_dest}")
-        self.copy_file(pth_source, pth_dest, preserve_mode=False)
-
-        auto_source = os.path.join(PYTHON_LIB_DIR, "_cinderx_auto.py")
-        auto_dest = os.path.join(self.build_lib, "_cinderx_auto.py")
-        if not os.path.isfile(auto_source):
-            raise FileNotFoundError(
-                f"Required file not found: {auto_source}. "
-                "Ensure _cinderx_auto.py exists in the source directory."
-            )
-        print(f"Copying _cinderx_auto.py to {auto_dest}")
-        self.copy_file(auto_source, auto_dest, preserve_mode=False)
+        self._copy_required_pythonlib_file("cinderx.pth", label=".pth file")
+        self._copy_required_pythonlib_file("_cinderx_auto.py")
+        self._copy_required_pythonlib_file(
+            "_cinderx_plugins_bootstrap.py",
+        )
 
     def _run_cmake(self, extension: CMakeExtension) -> None:
         # pyre-ignore[16]: No pyre types for build_ext.
