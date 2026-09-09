@@ -48,11 +48,18 @@ def keyword_target(value, *, multiplier=2):
     return value * multiplier
 
 
+def creator_direct(value):
+    def inner(inner_value):
+        return inner_value + 11
+
+    return inner(value)
+
+
 def raises(value):
     raise ValueError(value)
 
 
-for function in (dispatch, dispatch_kw, dispatch_method, Holder.call):
+for function in (creator_direct, dispatch, dispatch_kw, dispatch_method, Holder.call):
     assert cinderjit.force_compile(function) is True, function.__qualname__
 
 before = entries()
@@ -84,6 +91,7 @@ emit(
     generic_results=generic_results,
     keyword_results=keyword_results,
     method_results=method_results,
+    creator_result=creator_direct(6),
     exception=exception,
     entry_delta=entries() - before,
 )

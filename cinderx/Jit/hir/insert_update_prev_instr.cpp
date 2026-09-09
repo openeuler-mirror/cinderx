@@ -70,26 +70,31 @@ struct InlineStackState {
 
 #if PY_VERSION_HEX < 0x030C0000
 template <typename UpdateOne>
-void updateMaterializedPosition311(Function &func, Instr &instr, BeginInlinedFunction *parent, int &prev_published_bc,
-                                   int &prev_emitted_lno_or_bc, Instr *&last_emitted, UpdateOne &&update_one)
-{
-    auto target_code = parent == nullptr ? func.code : parent->code();
-    if (target_code != nullptr && instr.bytecodeOffset().value() >= 0) {
-        BytecodeInstruction bc_instr{target_code, instr.bytecodeOffset()};
-        BCIndex published = bc_instr.opcodeIndex();
-        if (bc_instr.opcode() == CALL) {
-            published = bc_instr.nextInstrOffset().asIndex() - 1;
-        }
-        if (published.value() != prev_published_bc) {
-            prev_emitted_lno_or_bc = INT_MAX;
-            update_one();
-            JIT_DCHECK(last_emitted != nullptr, "missing position update");
-            last_emitted->setBytecodeOffset(published);
-            prev_published_bc = published.value();
-        }
-    } else {
-        update_one();
+void updateMaterializedPosition311(
+    Function& func,
+    Instr& instr,
+    BeginInlinedFunction* parent,
+    int& prev_published_bc,
+    int& prev_emitted_lno_or_bc,
+    Instr*& last_emitted,
+    UpdateOne&& update_one) {
+  auto target_code = parent == nullptr ? func.code : parent->code();
+  if (target_code != nullptr && instr.bytecodeOffset().value() >= 0) {
+    BytecodeInstruction bc_instr{target_code, instr.bytecodeOffset()};
+    BCIndex published = bc_instr.opcodeIndex();
+    if (bc_instr.opcode() == CALL) {
+      published = bc_instr.nextInstrOffset().asIndex() - 1;
     }
+    if (published.value() != prev_published_bc) {
+      prev_emitted_lno_or_bc = INT_MAX;
+      update_one();
+      JIT_DCHECK(last_emitted != nullptr, "missing position update");
+      last_emitted->setBytecodeOffset(published);
+      prev_published_bc = published.value();
+    }
+  } else {
+    update_one();
+  }
 }
 #endif
 
@@ -206,6 +211,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
             BCIndex(target_code->_co_firsttraceable));
         update_instr->InsertBefore(instr);
         last_emitted = update_instr;
+#if PY_VERSION_HEX < 0x030C0000
+        prev_published_bc = target_code->_co_firsttraceable;
+#endif
 
         inited_once = true;
       }
@@ -219,7 +227,13 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
       }
 #endif
 #if PY_VERSION_HEX < 0x030C0000
+      // Normal frames are also observable from Python callees. Keep their
+      // cursor precise just as for materialized lightweight frames.
       if (hasArbitraryExecution(instr)) {
+        if (inited_once && prev_published_bc == INT_MAX) {
+          auto target_code = parent == nullptr ? func.code : parent->code();
+          prev_published_bc = target_code->_co_firsttraceable;
+        }
         updateMaterializedPosition311(
             func,
             instr,
@@ -245,8 +259,14 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         // cache units before entering the callee, so a callee inspecting its
         // caller observes the last CALL cache. CALL_FUNCTION_EX has no cache
         // on 3.11 and therefore naturally resolves to its opcode unit.
-        updateMaterializedPosition311(func, instr, parent, prev_published_bc, prev_emitted_lno_or_bc, last_emitted,
-                                      update_one);
+        updateMaterializedPosition311(
+            func,
+            instr,
+            parent,
+            prev_published_bc,
+            prev_emitted_lno_or_bc,
+            last_emitted,
+            update_one);
 #else
         update_one();
 #endif

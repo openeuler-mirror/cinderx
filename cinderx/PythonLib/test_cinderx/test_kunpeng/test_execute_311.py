@@ -321,6 +321,7 @@ class Execute311Test(unittest.TestCase):
         self.assertEqual(payload["generic_results"], [6, 3, 12, 1, 6, 42])
         self.assertEqual(payload["keyword_results"], [12, 15])
         self.assertEqual(payload["method_results"], [7, 9])
+        self.assertEqual(payload["creator_result"], 17)
         self.assertEqual(payload["exception"], [9])
         self.assertGreater(payload["entry_delta"], 0)
 
