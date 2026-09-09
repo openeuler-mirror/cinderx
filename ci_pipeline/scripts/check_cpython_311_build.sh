@@ -36,11 +36,12 @@ assert pathlib.Path(sys.executable).resolve() == pathlib.Path(
 config_args = sysconfig.get_config_var("CONFIG_ARGS") or ""
 assert "--prefix=/usr/local/cpython-3.11.6" in config_args, config_args
 assert "CC=/usr/bin/gcc" in config_args, config_args
-assert sysconfig.get_config_var("Py_ENABLE_SHARED") != 1
+assert "LDFLAGS=-Wl,-Bsymbolic-functions" in config_args, config_args
+assert sysconfig.get_config_var("Py_ENABLE_SHARED") == 1
 assert subprocess.check_output(
     ["/usr/bin/gcc", "-dumpfullversion"], text=True
 ).split(".")[0] == "12"
-assert not list(pathlib.Path("/usr/local/cpython-3.11.6/lib").glob("libpython3.11*.so*"))
+assert list(pathlib.Path("/usr/local/cpython-3.11.6/lib").glob("libpython3.11*.so*"))
 print(sys.version)
 print(f"CONFIG_ARGS={config_args}")
 PY

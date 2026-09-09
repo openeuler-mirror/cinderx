@@ -416,6 +416,7 @@ def test_cp311_container_scripts_resolve_bare_executable_names():
 
 def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
     pipeline_dir = Path(run_gate.REPO_ROOT) / "ci_pipeline"
+    dev_image = (Path(run_gate.REPO_ROOT) / "Dockerfile.cp311-dev").read_text()
     driver = (pipeline_dir / "build_cp311_wheel.py").read_text()
     scripts_dir = pipeline_dir / "scripts"
     builder = (scripts_dir / "build_cp311_wheel_in_container.sh").read_text()
@@ -434,8 +435,13 @@ def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
     assert "export CMAKE_BUILD_TYPE=Release" in builder
     assert "toolchain-311.txt" in builder
 
+    assert "--enable-shared" in dev_image
+    assert "LDFLAGS=-Wl,-Bsymbolic-functions" in dev_image
+    assert "LD_LIBRARY_PATH=/usr/local/cpython-${PYTHON_VERSION}/lib" in dev_image
+    assert "CPATH=/usr/local/cpython-${PYTHON_VERSION}/include/python3.11" in dev_image
+    assert "PIP_INDEX_URL,CPATH,LD_LIBRARY_PATH" in dev_image
     assert '"/usr/local/cpython-3.11.6/bin/python3.11"' in preflight
-    assert 'sysconfig.get_config_var("Py_ENABLE_SHARED") != 1' in preflight
+    assert 'sysconfig.get_config_var("Py_ENABLE_SHARED") == 1' in preflight
     assert 'glob("libpython3.11*.so*")' in preflight
     assert "expected system GCC 12.x" in preflight
     assert 'case "$cc_version"' in preflight
