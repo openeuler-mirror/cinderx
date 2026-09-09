@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build the ordinary CPython 3.11 CinderX wheel inside the release builder
-# image (cinderx-cp311-builder, gcc-toolset-14 based).
+# Build the ordinary CPython 3.11 CinderX wheel inside the repository's
+# CPython 3.11 development image (cinderx-dev:py311).
 #
 # Deliberately NOT a fat/manylinux wheel: the 3.11 product targets exactly
-# the anchored openEuler 24.03-LTS-SP3 environment (distro python3-3.11.6
-# rpm), so one plain cp311-cp311-linux_aarch64 wheel built against the
-# distro python is the whole contract.  Runnability on a stock openEuler
-# image is proven by scripts/smoke_cp311_wheel_in_runtime.sh, and the
-# normalize step enforces the deterministic-zip and dependency contracts.
+# the anchored openEuler 24.03-LTS-SP3 environment. The build image uses
+# source-built CPython 3.11.6 from /usr/local/cpython-3.11.6, while
+# runnability is proven against the distro CPython 3.11.6 in a stock
+# openEuler image by scripts/smoke_cp311_wheel_in_runtime.sh. The normalize
+# step enforces the deterministic-zip and dependency contracts.
 #
 # Mounts (provided by ci_pipeline/build_cp311_wheel.py):
 #   /src  read-only source checkout

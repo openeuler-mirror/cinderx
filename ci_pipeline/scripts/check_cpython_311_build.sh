@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builder preflight for the cp311 release wheel.  This script is intentionally
-# stricter than PR/dev builds: the deliverable is anchored to the distro
-# CPython NVR and the GCC 14 toolset in the openEuler 24.03-LTS-SP3 image.
+# Builder preflight for the cp311 release wheel. Refuses to build unless the
+# image contains source-built CPython 3.11.6 compiled with system GCC 12,
+# GCC 14 for CinderX, cmake, a sufficiently new setuptools, and the static
+# libstdc++ archive required by the self-contained wheel link.
 set -Eeuo pipefail
 
 resolve_executable() {
@@ -17,17 +18,38 @@ resolve_executable() {
   fi
 }
 
-PYTHON3_NVR=3.11.6-34.oe2403sp3
-test "$(rpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}' python3)" = \
-  "python3-${PYTHON3_NVR}"
-test "$(rpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}' python3-devel)" = \
-  "python3-devel-${PYTHON3_NVR}"
-
 PYTHON=$(resolve_executable python3.11)
-CC=$(resolve_executable gcc)
-CXX=$(resolve_executable g++)
+CC=$(resolve_executable "${CC:-gcc}")
+CXX=$(resolve_executable "${CXX:-g++}")
 export PYTHON CC CXX
-"$PYTHON" -c "import sys; assert sys.version_info[:3] == (3, 11, 6), sys.version"
+
+"$PYTHON" - <<'PY'
+import pathlib
+import subprocess
+import sys
+import sysconfig
+
+assert sys.version_info[:3] == (3, 11, 6), sys.version
+assert pathlib.Path(sys.executable).resolve() == pathlib.Path(
+    "/usr/local/cpython-3.11.6/bin/python3.11"
+).resolve(), sys.executable
+config_args = sysconfig.get_config_var("CONFIG_ARGS") or ""
+assert "--prefix=/usr/local/cpython-3.11.6" in config_args, config_args
+assert "CC=/usr/bin/gcc" in config_args, config_args
+assert sysconfig.get_config_var("Py_ENABLE_SHARED") != 1
+assert subprocess.check_output(
+    ["/usr/bin/gcc", "-dumpfullversion"], text=True
+).split(".")[0] == "12"
+assert not list(pathlib.Path("/usr/local/cpython-3.11.6/lib").glob("libpython3.11*.so*"))
+print(sys.version)
+print(f"CONFIG_ARGS={config_args}")
+PY
+
+system_gcc_version=$(/usr/bin/gcc -dumpfullversion)
+case "$system_gcc_version" in
+  12.*) echo "CPython gcc ${system_gcc_version}" ;;
+  *) echo "expected system GCC 12.x, got ${system_gcc_version}" >&2; exit 1 ;;
+esac
 
 cc_version=$("$CC" -dumpfullversion)
 cxx_version=$("$CXX" -dumpfullversion)
@@ -45,7 +67,7 @@ test "${cc_version%%.*}" = "${cxx_version%%.*}" || {
 }
 echo "gcc ${cc_version}; g++ ${cxx_version}"
 
-cmake --version | head -n 1
+cmake --version | sed -n '1p'
 
 # Actually link once, with the release link mode: version strings alone
 # missed a toolset packaging gap where the compiler installed without its

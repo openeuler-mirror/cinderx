@@ -8,7 +8,8 @@ wheel whose runnability is proven on a stock openEuler image instead of by
 manylinux tags.
 
 Flow:
-  1. run the release builder image (scripts/build_cp311_wheel_in_container.sh):
+  1. run the CPython 3.11 development image
+     (scripts/build_cp311_wheel_in_container.sh):
      builder preflight, interpreter config snapshot, pip wheel with a static
      C++ runtime, then normalize_cp311_wheel.py -- deterministic zip
      metadata, structure and NEEDED-allowlist enforcement, embedded
@@ -37,7 +38,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_IMAGE = "cinderx-cp311-builder:v1"
+DEFAULT_IMAGE = "cinderx-dev:py311"
 DEFAULT_RUNTIME_IMAGE = "openeuler/openeuler:24.03-lts-sp3"
 # Keeps fd-heavy tests fast: some docker daemons default nofile to 2**30,
 # which turns close_fds-style loops into multi-minute crawls.
