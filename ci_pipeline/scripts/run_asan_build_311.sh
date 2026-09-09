@@ -74,6 +74,11 @@ from cmake_options import cmake_feature_options
 opts = cmake_feature_options(py_version="3.11")
 print(" ".join(f"-D{k}={v}" for k, v in sorted(opts.items())))
 ' "$REPO_ROOT/ci_pipeline")
+if [[ " $FLAGS " != *" -DENABLE_LIGHTWEIGHT_FRAMES=1 "* ]]; then
+  echo "CPython 3.11 ASAN gate requires -DENABLE_LIGHTWEIGHT_FRAMES=1"
+  echo "resolved CMake feature flags: $FLAGS"
+  exit 1
+fi
 if [ -n "${CINDERX_LOCAL_DEPS_DIR:-}${CINDERX_LOCAL_DEPS:-}" ]; then
   FLAGS="$FLAGS -DCINDERX_LOCAL_DEPS_DIR=${CINDERX_LOCAL_DEPS_DIR:-$CINDERX_LOCAL_DEPS}"
 fi
@@ -133,25 +138,6 @@ env "${RUNTIME_TEST_ENV[@]}" "$BIN" --gtest_list_tests 2>/dev/null \
 EXPECTED=$(awk -F. 'NR == FNR { fam[$1] = 1; next } ($1 in fam)' \
   "$MANIFEST" "$EXEC_DIR-registered.txt" | wc -l | tr -d ' ')
 FILTER=$(awk '{printf "%s.*:", $1}' "$MANIFEST")
-set +e
-(cd "$REPO_ROOT/cinderx" && \
-  env ASAN_OPTIONS=detect_leaks=0 "${RUNTIME_TEST_ENV[@]}" \
-    "$BIN" --gtest_filter="${FILTER%:}") \
-  > "$EXEC_DIR-run.log" 2>&1
-EXEC_CODE=$?
-set -e
-if [ "$EXEC_CODE" != 0 ]; then
-  echo "asan minimal execution set FAILED (exit $EXEC_CODE)"
-  tail -30 "$EXEC_DIR-run.log"
-  exit 1
-fi
-# Exit status alone would accept a mistyped filter (zero matches, exit 0) or
-# a sanitizer-induced skip, so hand the log to the green gate's own verdict:
-# no skips, and PASSED exactly equal to the manifest population.
-bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
-  --verify-green-log "$EXEC_DIR-run.log" "$EXPECTED"
-echo "asan minimal execution set ok ($EXPECTED tests)"
-
 # The green families skip every case that installs machine code, because on
 # 3.11 only the executing mode installs.  Under a sanitizer that is exactly
 # the population worth running: the install, entry and lifecycle paths are
@@ -166,22 +152,54 @@ CANARY_EXPECTED=$(printf '%s\n' "$CANARY_CASES" | grep -c .)
   echo "would be sanitized in neither leg"
   exit 1
 }
-set +e
-(cd "$REPO_ROOT/cinderx" && \
-  env ASAN_OPTIONS=detect_leaks=0 CINDERX_JIT_MODE=canary \
-    "${RUNTIME_TEST_ENV[@]}" "$BIN" \
-    --gtest_filter="$(printf '%s\n' "$CANARY_CASES" | paste -sd: -)") \
-  > "$EXEC_DIR-canary.log" 2>&1
-CANARY_CODE=$?
-set -e
-if [ "$CANARY_CODE" != 0 ]; then
-  echo "asan canary-mode RuntimeTests FAILED (exit $CANARY_CODE)"
-  tail -40 "$EXEC_DIR-canary.log"
-  exit 1
-fi
-bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
-  --verify-green-log "$EXEC_DIR-canary.log" "$CANARY_EXPECTED"
-echo "asan canary-mode RuntimeTests ok ($CANARY_EXPECTED tests)"
+
+run_runtime_frame_mode() {
+  local mode_name=$1
+  local frame_mode=$2
+  local frame_env=(
+    "PYTHONJITLIGHTWEIGHTFRAME=$frame_mode"
+    "${RUNTIME_TEST_ENV[@]}"
+  )
+  local run_log="$EXEC_DIR-$mode_name-run.log"
+  local canary_log="$EXEC_DIR-$mode_name-canary.log"
+
+  set +e
+  (cd "$REPO_ROOT/cinderx" && \
+    env ASAN_OPTIONS=detect_leaks=0 "${frame_env[@]}" \
+      "$BIN" --gtest_filter="${FILTER%:}") > "$run_log" 2>&1
+  local exec_code=$?
+  set -e
+  if [ "$exec_code" != 0 ]; then
+    echo "asan $mode_name minimal execution set FAILED (exit $exec_code)"
+    tail -30 "$run_log"
+    exit 1
+  fi
+  # Exit status alone would accept a mistyped filter (zero matches, exit 0)
+  # or a sanitizer-induced skip.  Reuse the green gate's exact-count verdict.
+  bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
+    --verify-green-log "$run_log" "$EXPECTED"
+  echo "asan $mode_name minimal execution set ok ($EXPECTED tests)"
+
+  set +e
+  (cd "$REPO_ROOT/cinderx" && \
+    env ASAN_OPTIONS=detect_leaks=0 CINDERX_JIT_MODE=canary \
+      "${frame_env[@]}" "$BIN" \
+      --gtest_filter="$(printf '%s\n' "$CANARY_CASES" | paste -sd: -)") \
+    > "$canary_log" 2>&1
+  local canary_code=$?
+  set -e
+  if [ "$canary_code" != 0 ]; then
+    echo "asan $mode_name canary RuntimeTests FAILED (exit $canary_code)"
+    tail -40 "$canary_log"
+    exit 1
+  fi
+  bash "$REPO_ROOT/ci_pipeline/scripts/run_rt311_green.sh" \
+    --verify-green-log "$canary_log" "$CANARY_EXPECTED"
+  echo "asan $mode_name canary RuntimeTests ok ($CANARY_EXPECTED tests)"
+}
+
+run_runtime_frame_mode normal 0
+run_runtime_frame_mode lwf 1
 
 # RuntimeTests exercise the native compiler and execute-mode cases, but they
 # do not prove that the Python extension itself is instrumented and safe to
@@ -212,21 +230,32 @@ CANARY_PYTHONPATH="$(dirname "$ASAN_EXT"):$REPO_ROOT/cinderx/PythonLib"
 if [ -n "$PYTHON_EXTENSIONS_DIR" ]; then
   CANARY_PYTHONPATH="$CANARY_PYTHONPATH:$PYTHON_EXTENSIONS_DIR"
 fi
-(cd "$REPO_ROOT" && \
-  env LD_PRELOAD="$ASAN_RUNTIME" \
-    ASAN_OPTIONS=detect_leaks=0:alloc_dealloc_mismatch=0 \
-    CINDERX_JIT_MODE=canary PYTHONJITAUTO=1 \
-    PYTHONPATH="$CANARY_PYTHONPATH" \
-    "$TEST_PYTHON" "$REPO_ROOT/ci_pipeline/scripts/asan_canary_smoke.py") \
-  > "$EXEC_DIR-extension-canary.log" 2>&1 || {
-    echo "asan extension canary FAILED"
-    tail -30 "$EXEC_DIR-extension-canary.log"
+
+run_extension_frame_mode() {
+  local mode_name=$1
+  local frame_mode=$2
+  local canary_log="$EXEC_DIR-$mode_name-extension-canary.log"
+
+  (cd "$REPO_ROOT" && \
+    env LD_PRELOAD="$ASAN_RUNTIME" \
+      ASAN_OPTIONS=detect_leaks=0:alloc_dealloc_mismatch=0 \
+      CINDERX_JIT_MODE=canary PYTHONJITAUTO=1 \
+      PYTHONJITLIGHTWEIGHTFRAME="$frame_mode" \
+      PYTHONPATH="$CANARY_PYTHONPATH" \
+      "$TEST_PYTHON" "$REPO_ROOT/ci_pipeline/scripts/asan_canary_smoke.py") \
+    > "$canary_log" 2>&1 || {
+      echo "asan $mode_name extension canary FAILED"
+      tail -30 "$canary_log"
+      exit 1
+    }
+  grep -q 'asan canary entries=' "$canary_log" || {
+    echo "asan $mode_name extension canary produced no machine-code entry proof"
+    tail -20 "$canary_log"
     exit 1
   }
-grep -q 'asan canary entries=' "$EXEC_DIR-extension-canary.log" || {
-  echo "asan extension canary produced no machine-code entry proof"
-  tail -20 "$EXEC_DIR-extension-canary.log"
-  exit 1
+  grep 'asan canary ' "$canary_log"
+  echo "asan $mode_name extension canary ok"
 }
-grep 'asan canary ' "$EXEC_DIR-extension-canary.log"
-echo "asan extension canary ok"
+
+run_extension_frame_mode normal 0
+run_extension_frame_mode lwf 1

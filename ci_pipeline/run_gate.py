@@ -729,10 +729,7 @@ def runtime_tests_command(
         parallelism,
     ]
     ctest_args = ["ctest", "--output-on-failure", "-C", build_type]
-    if (
-        not is_cp311
-        and truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR"))
-    ):
+    if truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR")):
         osr_regex = env.get("CINDERX_RUNTIME_TEST_OSR_REGEX", "OSR|Osr|osr")
         lightweight_regex = env.get(
             "CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX",
@@ -748,16 +745,15 @@ def runtime_tests_command(
                 osr_regex,
             ]
         )
-        lwf_ctest_command = shell_join(
-            [
-                "env",
-                "PYTHONJITLIGHTWEIGHTFRAME=1",
-                "CINDERX_OSR_ENABLED=0",
-                *ctest_args,
-                "-R",
-                lightweight_regex,
-            ]
-        )
+        lwf_ctest_args = [
+            "env",
+            "PYTHONJITLIGHTWEIGHTFRAME=1",
+            "CINDERX_OSR_ENABLED=0",
+            *ctest_args,
+        ]
+        if not is_cp311:
+            lwf_ctest_args.extend(["-R", lightweight_regex])
+        lwf_ctest_command = shell_join(lwf_ctest_args)
         osr_ctest_command = shell_join(
             [
                 "env",
@@ -768,11 +764,12 @@ def runtime_tests_command(
                 osr_regex,
             ]
         )
+        ctest_commands = [normal_ctest_command, lwf_ctest_command]
+        if not is_cp311:
+            ctest_commands.append(osr_ctest_command)
         ctest_command = (
             f"cd {shlex.quote(str(build_dir))} && "
-            f"{normal_ctest_command} && "
-            f"{lwf_ctest_command} && "
-            f"{osr_ctest_command}"
+            + " && ".join(ctest_commands)
         )
     else:
         ctest_prefix = (

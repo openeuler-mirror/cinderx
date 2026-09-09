@@ -71,55 +71,54 @@ class MyDeoptPatcher : public jit::JumpPatcher {
   bool on_unpatch_{false};
 };
 
-TEST_F(CodePatcherTest, Python311ArtifactGuardedEntryHasDedicatedStub)
-{
+TEST_F(CodePatcherTest, Python311ArtifactGuardedEntryHasDedicatedStub) {
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
-    Ref<PyFunctionObject> pyfunc(compileAndGet(
-            R"(
+  Ref<PyFunctionObject> pyfunc(compileAndGet(
+      R"(
 def func(value):
   return value + 1
 )",
-            "func"));
-    ASSERT_NE(pyfunc, nullptr);
+      "func"));
+  ASSERT_NE(pyfunc, nullptr);
 
-    auto irfunc = buildHIR(pyfunc);
-    jit::Compiler::runPasses(*irfunc, jit::PassConfig::kAllExceptInliner);
-    jit::codegen::NativeGeneratorFactory factory;
-    jit::codegen::NativeGenerator generator(irfunc.get(), factory);
-    void *vectorcall_entry = generator.getVectorcallEntry();
-    ASSERT_NE(vectorcall_entry, nullptr);
-    void *artifact_entry = generator.getArtifactGuardedEntry311();
-    ASSERT_NE(artifact_entry, nullptr);
-    EXPECT_NE(artifact_entry, vectorcall_entry);
+  auto irfunc = buildHIR(pyfunc);
+  jit::Compiler::runPasses(*irfunc, jit::PassConfig::kAllExceptInliner);
+  jit::codegen::NativeGeneratorFactory factory;
+  jit::codegen::NativeGenerator generator(irfunc.get(), factory);
+  void* vectorcall_entry = generator.getVectorcallEntry();
+  ASSERT_NE(vectorcall_entry, nullptr);
+  void* artifact_entry = generator.getArtifactGuardedEntry311();
+  ASSERT_NE(artifact_entry, nullptr);
+  EXPECT_NE(artifact_entry, vectorcall_entry);
 
-    auto code = generator.getCodeBuffer();
-    ASSERT_FALSE(code.empty());
-    EXPECT_EQ(artifact_entry, code.data());
-    const auto artifact_size =
-            static_cast<const std::byte *>(vectorcall_entry) - static_cast<const std::byte *>(artifact_entry);
-    ASSERT_GT(artifact_size, 0);
-    ASSERT_LE(static_cast<size_t>(artifact_size), code.size());
+  auto code = generator.getCodeBuffer();
+  ASSERT_FALSE(code.empty());
+  EXPECT_EQ(artifact_entry, code.data());
+  const auto artifact_size = static_cast<const std::byte*>(vectorcall_entry) -
+      static_cast<const std::byte*>(artifact_entry);
+  ASSERT_GT(artifact_size, 0);
+  ASSERT_LE(static_cast<size_t>(artifact_size), code.size());
 
-    ASSERT_EQ(artifact_size % sizeof(uint32_t), 0);
-    const auto *words = static_cast<const uint32_t *>(artifact_entry);
-    const size_t word_count = artifact_size / sizeof(uint32_t);
-    bool writes_x4 = false;
-    bool writes_x16 = false;
-    bool branches_x16 = false;
-    for (size_t i = 0; i < word_count; ++i) {
-        const uint32_t instruction = words[i];
-        writes_x4 |= (instruction & 0x1f) == 4;
-        writes_x16 |= (instruction & 0x1f) == 16;
-        if (instruction == 0xd61f0200) {
-            branches_x16 = true;
-            break;
-        }
+  ASSERT_EQ(artifact_size % sizeof(uint32_t), 0);
+  const auto* words = static_cast<const uint32_t*>(artifact_entry);
+  const size_t word_count = artifact_size / sizeof(uint32_t);
+  bool writes_x4 = false;
+  bool writes_x16 = false;
+  bool branches_x16 = false;
+  for (size_t i = 0; i < word_count; ++i) {
+    const uint32_t instruction = words[i];
+    writes_x4 |= (instruction & 0x1f) == 4;
+    writes_x16 |= (instruction & 0x1f) == 16;
+    if (instruction == 0xd61f0200) {
+      branches_x16 = true;
+      break;
     }
-    EXPECT_TRUE(writes_x4);
-    EXPECT_TRUE(writes_x16);
-    EXPECT_TRUE(branches_x16);
+  }
+  EXPECT_TRUE(writes_x4);
+  EXPECT_TRUE(writes_x16);
+  EXPECT_TRUE(branches_x16);
 #else
-    GTEST_SKIP() << "AArch64 CPython 3.11 artifact entry";
+  GTEST_SKIP() << "AArch64 CPython 3.11 artifact entry";
 #endif
 }
 

@@ -123,7 +123,6 @@ CmdLineTest.JITEnabledFlags_BatchCompileWorkers
 CmdLineTest.JITEnabledFlags_MatchLineNumbers
 CmdLineTest.JITEnabledFlags_MultithreadCompile
 CmdLineTest.JITLogFile
-CmdLineTest.LightweightFrameFlagRequiresCompileSupport
 CmdLineTest.OSRBackedgeThresholdFlag
 CmdLineTest.OSRCompileBudgetFlag
 CmdLineTest.OSREnabledFlag
