@@ -72,8 +72,6 @@ def run_localsplus_reuse_case() -> None:
 
 
 def run_mode_case() -> None:
-    if not cinderx.is_lightweight_frames_enabled():
-        raise RuntimeError("LWF not compiled in")
     if cinderjit is None:
         raise RuntimeError("cinderjit unavailable")
     mode = cinderjit.jit_frame_mode()
@@ -83,8 +81,6 @@ def run_mode_case() -> None:
 
 
 def run_normal_generator_case() -> None:
-    if not cinderx.is_lightweight_frames_enabled():
-        raise RuntimeError("LWF not compiled in")
     if not cinderx.jit.is_enabled():
         raise RuntimeError("JIT not enabled")
     if cinderjit is None:
@@ -103,8 +99,6 @@ def run_normal_generator_case() -> None:
 
 
 def run_recursion_case() -> None:
-    if not cinderx.is_lightweight_frames_enabled():
-        raise RuntimeError("LWF not compiled in")
     if not cinderx.jit.is_enabled():
         raise RuntimeError("JIT not enabled")
     if cinderjit is None:
@@ -392,6 +386,77 @@ def run_exit_ownership_case() -> None:
     print("CASE_RESULT exit_ownership OK mode=1")
 
 
+def run_deopt_materialized_frame_case() -> None:
+    require_lightweight_jit()
+
+    def materialize_caller():
+        return sys._getframe(1)
+
+    def target(value):
+        escaped = materialize_caller()
+        try:
+            1 / value
+        except ZeroDivisionError as exc:
+            return escaped, exc.__traceback__.tb_frame
+        raise AssertionError("expected ZeroDivisionError")
+
+    assert cinderx.jit.force_compile(target)
+    escaped, traceback_frame = target(0)
+    assert escaped is traceback_frame, (escaped, traceback_frame)
+    print("CASE_RESULT deopt_materialized_frame OK mode=1")
+
+
+def run_generator_frame_lifecycle_case() -> None:
+    require_lightweight_jit()
+
+    def cyclic(box):
+        yield box
+
+    assert cinderx.jit.force_compile(cyclic)
+    box = []
+    suspended = cyclic(box)
+    box.append(suspended)
+    next(suspended)
+    suspended_ref = weakref.ref(suspended)
+    del suspended, box
+    gc.collect()
+    gc.collect()
+    assert suspended_ref() is None, "generator cycle leaked"
+
+    def finished():
+        value = object()
+        yield value
+
+    assert cinderx.jit.force_compile(finished)
+    completed = finished()
+    next(completed)
+    escaped_frame = completed.gi_frame
+    list(completed)
+    assert "value" in escaped_frame.f_locals, escaped_frame.f_locals
+    print("CASE_RESULT generator_frame_lifecycle OK mode=1")
+
+
+def run_f_locals_ownership_case() -> None:
+    require_lightweight_jit()
+
+    class Marker:
+        __slots__ = ("__weakref__",)
+
+    def target(value):
+        dir()
+        return value is not None
+
+    assert cinderx.jit.force_compile(target)
+    marker = Marker()
+    marker_ref = weakref.ref(marker)
+    for _ in range(5):
+        assert target(marker)
+    del marker
+    gc.collect()
+    assert marker_ref() is None, "f_locals retained the argument"
+    print("CASE_RESULT f_locals_ownership OK mode=1")
+
+
 def main() -> int:
     cases = {
         "fallback",
@@ -406,6 +471,9 @@ def main() -> int:
         "generator_close_gc",
         "forced_deopt_restore",
         "exit_ownership",
+        "deopt_materialized_frame",
+        "generator_frame_lifecycle",
+        "f_locals_ownership",
         "normal_generator",
         "recursion",
     }
@@ -415,7 +483,9 @@ def main() -> int:
             "<fallback|inline|execute|localsplus_reuse|mode|materialize_getframe|"
             "materialize_traceback|generator_return_cleanup|"
             "generator_argument_lifetime|generator_close_gc|"
-            "forced_deopt_restore|exit_ownership|normal_generator|recursion>"
+            "forced_deopt_restore|exit_ownership|deopt_materialized_frame|"
+            "generator_frame_lifecycle|f_locals_ownership|normal_generator|"
+            "recursion>"
         )
     if sys.argv[1] == "mode":
         run_mode_case()
@@ -439,6 +509,12 @@ def main() -> int:
         run_forced_deopt_restore_case()
     elif sys.argv[1] == "exit_ownership":
         run_exit_ownership_case()
+    elif sys.argv[1] == "deopt_materialized_frame":
+        run_deopt_materialized_frame_case()
+    elif sys.argv[1] == "generator_frame_lifecycle":
+        run_generator_frame_lifecycle_case()
+    elif sys.argv[1] == "f_locals_ownership":
+        run_f_locals_ownership_case()
     elif sys.argv[1] == "execute":
         run_case(dump_assembly=False)
     else:

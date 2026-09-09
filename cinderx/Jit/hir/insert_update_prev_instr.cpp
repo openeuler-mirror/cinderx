@@ -209,7 +209,7 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
 
         inited_once = true;
       }
-#if PY_VERSION_HEX < 0x030F0000
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000
       // Stock CPython 3.14 has no JIT executable reifier callback. Keep
       // instr_ptr current before arbitrary execution so frame APIs observe a
       // complete frame at the right source line.
@@ -219,10 +219,16 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
       }
 #endif
 #if PY_VERSION_HEX < 0x030C0000
-      if (getConfig().frame_mode != FrameMode::kLightweight && hasArbitraryExecution(instr)) {
-          updateMaterializedPosition311(func, instr, parent, prev_published_bc, prev_emitted_lno_or_bc, last_emitted,
-                                        update_one);
-          last_emitted = nullptr;
+      if (hasArbitraryExecution(instr)) {
+        updateMaterializedPosition311(
+            func,
+            instr,
+            parent,
+            prev_published_bc,
+            prev_emitted_lno_or_bc,
+            last_emitted,
+            update_one);
+        last_emitted = nullptr;
       }
 #endif
 #else

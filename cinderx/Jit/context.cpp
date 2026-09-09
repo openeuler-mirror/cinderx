@@ -1590,6 +1590,11 @@ void Context::clearForMultithreadedCompileTest() {
 
   for (auto& compiled : pinned) {
 #if PY_VERSION_HEX < 0x030C0000
+    for (PyFunctionObject* func : compiled->functions()) {
+      if (func->vectorcall == compiled->artifactGuardedEntry311()) {
+        func->vectorcall = getInterpretedVectorcall(func);
+      }
+    }
     // Once detached, no function death routes back to this artifact: the
     // death watch reports into the context registries, which are empty by
     // now.  A retained association would be a pointer with nothing keeping

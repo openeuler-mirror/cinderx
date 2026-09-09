@@ -508,7 +508,11 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   BorrowedRef<PyCodeObject> code = frameCode(frame);
   frame->f_builtins = func->func_builtins;
   frame->f_globals = func->func_globals;
+#if PY_VERSION_HEX >= 0x030C0000
   frame->f_locals = nullptr;
+#else
+  // Preserve an already-materialized locals dictionary across deopt.
+#endif
 #if PY_VERSION_HEX >= 0x030E0000
   frame->stackpointer = frame->localsplus + code->co_nlocalsplus;
 #ifdef Py_DEBUG
@@ -518,7 +522,8 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   frame->stacktop = code->co_nlocalsplus;
 #endif
 #if PY_VERSION_HEX < 0x030C0000
-  frame->frame_obj = nullptr;
+  // Preserve an already-materialized frame object so slab migration can
+  // retarget PyFrameObject::f_frame after deopt.
 #else
   // Preserve an already-materialized frame object. Stock CPython 3.14 can
   // create it directly from f_executable without going through Cinder's
@@ -715,7 +720,7 @@ void jitFrameInitLightweight(
   jitFramePopulateFrame(frame);
 #endif
 #else
-  frame->stacktop = 0;
+  frame->stacktop = code->co_nlocalsplus;
   for (int i = 0; i < code->co_nlocalsplus; i++) {
     frame->localsplus[i] = nullptr;
   }
@@ -828,6 +833,9 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
   int free_offset = 0;
 #else
   int free_offset = code->co_nlocalsplus - numFreevars(code);
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  Py_CLEAR(frame->f_locals);
 #endif
   for (int i = free_offset; i < code->co_nlocalsplus; i++) {
     Ci_STACK_CLEAR(frame->localsplus[i]);

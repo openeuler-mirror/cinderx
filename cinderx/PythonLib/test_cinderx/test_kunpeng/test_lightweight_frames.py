@@ -207,7 +207,10 @@ class LightweightFramesTests(unittest.TestCase):
 
     @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 delivery contract")
     def test_python311_jit_recursion_balances_frame_modes(self) -> None:
-        for frame_mode in ("lightweight", "rollback"):
+        frame_modes = ["rollback"]
+        if cinderx.is_lightweight_frames_enabled():
+            frame_modes.insert(0, "lightweight")
+        for frame_mode in frame_modes:
             with self.subTest(frame_mode=frame_mode):
                 _run_recursion_case(frame_mode)
 
@@ -370,6 +373,33 @@ class LightweightFramesTests(unittest.TestCase):
     def test_normal_and_exceptional_exits_release_owned_argument_once(self) -> None:
         output = _run_lightweight_case("exit_ownership", jit_mode="canary")
         self.assertIn("CASE_RESULT exit_ownership OK mode=1", output)
+
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_deopt_preserves_materialized_frame_identity(self) -> None:
+        output = _run_lightweight_case("deopt_materialized_frame")
+        self.assertIn("CASE_RESULT deopt_materialized_frame OK mode=1", output)
+
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 delivery contract")
+    def test_generator_frame_traversal_and_escape_lifecycle(self) -> None:
+        output = _run_lightweight_case(
+            "generator_frame_lifecycle", enable_generators=True
+        )
+        self.assertIn("CASE_RESULT generator_frame_lifecycle OK mode=1", output)
+
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_f_locals_dictionary_releases_owned_argument(self) -> None:
+        output = _run_lightweight_case("f_locals_ownership")
+        self.assertIn("CASE_RESULT f_locals_ownership OK mode=1", output)
 
 
 if __name__ == "__main__":
