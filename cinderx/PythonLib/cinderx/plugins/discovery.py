@@ -157,7 +157,7 @@ def _discover_distribution(
 
     name, normalized_name, version = _distribution_identity(distribution)
     try:
-        validation = validate_manifest(payload)
+        validation = validate_manifest(payload, allow_unsupported_spi=True)
     except Exception:
         return _invalid_payload_result(distribution)
     return PluginDiscoveryResult(
