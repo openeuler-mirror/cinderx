@@ -11,6 +11,8 @@
 #include "cinderx/Common/watchers.h"
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/runtime_capabilities.h"
+#include "cinderx/runtime_capabilities_build.h"
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/eval_hook.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
@@ -56,6 +58,9 @@
 #include "internal/pycore_modsupport.h"
 #endif
 
+#include <exception>
+#include <new>
+
 #ifndef WIN32
 #include <dlfcn.h>
 #endif
@@ -65,6 +70,55 @@ namespace {
 /*
  * Misc. Python-facing utility functions.
  */
+
+PyDoc_STRVAR(
+    get_runtime_capabilities_doc,
+    "get_runtime_capabilities()\n\n"
+    "Return deterministic native build, CPU, and NUMA capabilities.");
+
+PyObject* get_runtime_capabilities_impl() {
+  const auto& native_caps = cinderx::runtime_capabilities::getSnapshot();
+  Ref<> cpu_caps = Ref<>::steal(PyTuple_New(native_caps.cpu_capability_count));
+  if (cpu_caps == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < native_caps.cpu_capability_count; i++) {
+    Ref<> cap = jit::stringAsUnicode(native_caps.cpu_capabilities[i]);
+    if (cap == nullptr) {
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(cpu_caps, i, cap.release());
+  }
+
+  Ref<> build_id = Ref<>::steal(PyUnicode_FromString(CINDERX_CORE_BUILD_ID));
+  Ref<> py_node_count = native_caps.numa_node_count.has_value()
+      ? Ref<>::steal(PyLong_FromLong(*native_caps.numa_node_count))
+      : Ref<>::create(Py_None);
+  Ref<> result = Ref<>::steal(PyDict_New());
+  if (build_id == nullptr || py_node_count == nullptr || result == nullptr) {
+    return nullptr;
+  }
+  if (PyDict_SetItemString(result, "core_build_id", build_id) < 0 ||
+      PyDict_SetItemString(result, "cpu_caps", cpu_caps) < 0 ||
+      PyDict_SetItemString(result, "numa_node_count", py_node_count) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+
+PyObject* get_runtime_capabilities(PyObject*, PyObject*) {
+  try {
+    return get_runtime_capabilities_impl();
+  } catch (const std::bad_alloc&) {
+    return PyErr_NoMemory();
+  } catch (const std::exception& error) {
+    PyErr_SetString(PyExc_RuntimeError, error.what());
+  } catch (...) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "unknown native runtime capability failure");
+  }
+  return nullptr;
+}
 
 PyObject* clear_caches(PyObject* mod, PyObject*) {
   auto state = cinderx::getModuleState(mod);
@@ -1070,6 +1124,10 @@ static PyObject* native_recursion_probe_operand_for_test(PyObject*, PyObject*) {
 #endif
 
 PyMethodDef _cinderx_methods[] = {
+    {"get_runtime_capabilities",
+     get_runtime_capabilities,
+     METH_NOARGS,
+     get_runtime_capabilities_doc},
 #if PY_VERSION_HEX < 0x030C0000
     {"_get_observe_stats",
      get_observe_stats,

@@ -12,9 +12,17 @@ ulimit -s unlimited || true
 # comparison, and no inherited GTEST_*/TESTBRIDGE_* that could shard or
 # filter away the population this leg is supposed to instrument.
 export LC_ALL=C
+# The sanitizer leg is a compare-only gate, never a Golden Sample generator.
+export UPDATE_HIR_PIPELINE_GOLDEN=0
 while IFS='=' read -r name _; do
   case "$name" in GTEST_*|TESTBRIDGE_*) unset "$name" ;; esac
 done < <(env)
+if [ "${1:-}" = "--verify-golden-update-env" ]; then
+  # Self-test entry: cover the direct RuntimeTests invocation without paying
+  # for either sanitizer build.
+  printf '%s\n' "$UPDATE_HIR_PIPELINE_GOLDEN"
+  exit 0
+fi
 BUILD_DIR=${1:?usage: run_asan_build_311.sh <build_dir>}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 if [ -n "${CINDERX_RUNTIME_TEST_PYTHON:-}" ]; then

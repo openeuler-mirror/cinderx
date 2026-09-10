@@ -1,5 +1,13 @@
 fail_fast = true
 
+# This suite runs the full runtime_tests binary, which includes the
+# HIRPipelineGolden suite (RuntimeTests/hir_pipeline_test.cpp): the
+# no-behavior-drift gate for Compiler::runPasses.  Golden Samples are
+# anchored per (python, arch).  This suite carries the 3.14/aarch64
+# line; the 3.11/aarch64 line is in the cp311 gate's fail-closed
+# runtime_tests green-family run (see
+# RuntimeTests/hir_pipeline_golden/README.md).
+
 [target]
 python = "3.14"
 arch = "arm64"
@@ -10,6 +18,9 @@ name = "runtime_tests"
 kind = "runtime_tests"
 coverage = true
 [jobs.env]
+# Runtime gates compare committed Golden Samples; only the dedicated update
+# script may inject update mode intentionally.
+UPDATE_HIR_PIPELINE_GOLDEN = "0"
 CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX = "CmdLineTest.LightweightFrame|ReifyFrameTest|Deopt"
 CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR = "1"
 ENABLE_LIGHTWEIGHT_FRAMES = "1"

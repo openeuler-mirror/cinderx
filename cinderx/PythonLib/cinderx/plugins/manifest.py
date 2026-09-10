@@ -451,6 +451,8 @@ def _validate_provides(
 
 def _validate_parsed_manifest(
     value: Any,
+    *,
+    allow_unsupported_spi: bool,
 ) -> tuple[PluginManifest, tuple[ManifestIssue, ...]]:
     manifest = _require_object(value, "$")
     _validate_field_set(
@@ -461,8 +463,8 @@ def _validate_parsed_manifest(
     )
 
     plugin_id = _bounded_text(manifest["id"], "$.id")
-    spi_version = manifest["spi_version"]
-    if spi_version != CURRENT_SPI_VERSION:
+    spi_version = _bounded_text(manifest["spi_version"], "$.spi_version")
+    if not allow_unsupported_spi and spi_version != CURRENT_SPI_VERSION:
         _reject(
             ManifestIssueCode.SCHEMA_INVALID,
             "$.spi_version",
@@ -517,7 +519,11 @@ def _bounded_utf8_size(payload: str) -> int:
     return byte_count
 
 
-def validate_manifest(payload: str | bytes) -> ManifestValidationResult:
+def validate_manifest(
+    payload: str | bytes,
+    *,
+    allow_unsupported_spi: bool = False,
+) -> ManifestValidationResult:
     """Validate one v1 manifest without importing plugin-owned modules."""
 
     if not isinstance(payload, (str, bytes)):
@@ -568,7 +574,10 @@ def validate_manifest(payload: str | bytes) -> ManifestValidationResult:
         )
 
     try:
-        manifest, entry_rejections = _validate_parsed_manifest(parsed)
+        manifest, entry_rejections = _validate_parsed_manifest(
+            parsed,
+            allow_unsupported_spi=allow_unsupported_spi,
+        )
     except _ManifestRejected as error:
         return _rejected(error.issue)
     except RecursionError:

@@ -10,6 +10,9 @@
 set -euo pipefail
 # C collation for every sort/comm: committed lists are byte-ordered.
 export LC_ALL=C
+# This differential compares RuntimeTests behavior. It must never rewrite the
+# committed Golden Samples in either the archived base or the live HEAD tree.
+export UPDATE_HIR_PIPELINE_GOLDEN=0
 # Inherited GTEST_*/TESTBRIDGE_* (filter, sharding, repeat, output) can
 # silently shrink or reshape what actually executes -- symmetrically, so
 # the two sides would still compare equal.  The differential owns its
@@ -18,6 +21,13 @@ while IFS='=' read -r name _; do
   case "$name" in GTEST_*|TESTBRIDGE_*) unset "$name" ;; esac
 done < <(env)
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+
+if [ "${1:-}" = "--verify-golden-update-env" ]; then
+  # Self-test entry: prove a dirty parent environment cannot put either side
+  # of the differential in Golden Sample update mode.
+  printf '%s\n' "$UPDATE_HIR_PIPELINE_GOLDEN"
+  exit 0
+fi
 
 ALLOWLIST_BOOTSTRAP_COUNT=4
 ALLOWLIST_BOOTSTRAP_SHA256=7dfb47d7b0488f63d87bdcfa30ecd47890cc17b1b2b71f8fef50985d05ad92c2

@@ -456,6 +456,17 @@ def test_configure_toolchain_keeps_explicit_compilers(monkeypatch):
     assert env["CXX"] == "/custom/g++"
 
 
+def test_runtime_gate_forces_golden_sample_compare_mode(monkeypatch):
+    monkeypatch.setenv("UPDATE_HIR_PIPELINE_GOLDEN", "1")
+    monkeypatch.setattr(run_gate, "configure_toolchain", lambda env: None)
+
+    suite = run_gate.load_suite("runtime")
+    job = suite["jobs"][0]
+    env = run_gate.merged_env(job)
+
+    assert env["UPDATE_HIR_PIPELINE_GOLDEN"] == "0"
+
+
 def test_runtime_tests_disable_lightweight_frames_on_cpython311(
     monkeypatch,
     tmp_path,

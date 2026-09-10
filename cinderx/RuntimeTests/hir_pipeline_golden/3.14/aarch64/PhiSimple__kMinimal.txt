@@ -1,0 +1,7 @@
+# CinderX HIR pipeline golden - generated, do not hand-edit.
+# Format: step <n>: <Pass>#<occurrence> <fnv1a64 of normalized post-pass HIR> len=<bytes>
+# Diagnose a fingerprint diff: rerun with HIR_PIPELINE_FULL_DUMP=1 to print per-pass HIR.
+# Regenerate: TestScripts/update_hir_pipeline_golden.py <runtime_tests binary>
+# python: 3.14  arch: aarch64  config: kMinimal  case: PhiSimple
+step  1: SSAify#1                         94b31f4c8da33181 len=1995
+step  2: RefcountInsertion#1              54db5280726919ca len=2353

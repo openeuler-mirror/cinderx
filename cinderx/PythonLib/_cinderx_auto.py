@@ -343,3 +343,21 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         _install_autojit_import_provider()
         _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
         _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+
+
+if (
+    not _cinderx_force_disabled()
+    and not _env_flag_enabled("CINDERX_PLUGIN_DISCOVERY_DISABLE")
+):
+    if _cinderx_plugin_enabled():
+        _cinderx._autojit_setup_enter()
+        try:
+            import _cinderx_plugins_bootstrap
+
+            _cinderx_plugins_bootstrap.bootstrap()
+        finally:
+            _cinderx._autojit_setup_leave()
+    else:
+        import _cinderx_plugins_bootstrap
+
+        _cinderx_plugins_bootstrap.bootstrap()
