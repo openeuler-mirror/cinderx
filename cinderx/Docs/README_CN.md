@@ -156,6 +156,7 @@ CINDERX_PLUGIN_ENABLE=1 python3.14 -X jit-auto=auto:2 your_app.py
 | `CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET=N` | `32` | 单轮 deopt 预算基数 |
 | `CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS=N` | `1` | 允许反编译后重新预热的最大轮数 |
 | `CINDERX_AUTOJIT_ROI_REWARM_FACTOR=N` | `64` | 重新预热阈值倍率 |
+| `CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS=MS` | `60000` | 未冻结函数的 deopt 历史计数每经过一个完整周期减半；`0` 关闭老化并保留原累计计数路径，不影响已冻结函数 |
 | `CINDERX_AUTOJIT_GATE_STATS=1` | 关闭 | 进程退出时输出 AutoJIT 准入统计 |
 | `CINDERX_AUTOJIT_GATE_STATS_FILE=/path/to/file.jsonl` | stderr | 将准入统计写入 JSONL 文件 |
 | `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE=/path/to/file.jsonl` | 关闭 | 记录 forced compile 事件、阶段和函数形状，供性能分析使用 |
