@@ -1397,7 +1397,11 @@ FlagProcessor initFlagProcessor() {
   // inliner disabled for normal-frame runs so tests and explicit normal-mode
   // configurations do not build inline frames that cannot be safely unlinked.
   bool force_disable_inliner_for_normal_frame =
+#if PY_VERSION_HEX < 0x030C0000
+      true;
+#else
       getConfig().frame_mode != FrameMode::kLightweight;
+#endif
   if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
   }
@@ -5039,6 +5043,15 @@ PyMethodDef jit_methods_311_canary[] = {
      is_enabled,
      METH_NOARGS,
      PyDoc_STR("Check whether the JIT is enabled and usable")},
+    {"jit_frame_mode",
+     jit_frame_mode,
+     METH_NOARGS,
+     PyDoc_STR(
+         "Get JIT frame mode (0 = normal frames, 1 = lightweight frames).")},
+    {"is_lightweight_frames_enabled",
+     is_lightweight_frames_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True when JIT lightweight frames are compiled in.")},
     {"is_attr_caches_enabled",
      is_attr_caches_enabled,
      METH_NOARGS,
@@ -6137,6 +6150,9 @@ void finalize() {
     mod_state->jit_context.reset();
     mod_state->code_allocator.reset();
     setCodeDestroyedHook(nullptr);
+#if PY_VERSION_HEX < 0x030C0000
+    Ci_QuickenWarmupStep_311 = 1;
+#endif
     getMutableConfig().state = State::kNotInitialized;
     return;
   }
@@ -6228,6 +6244,9 @@ void finalize() {
   // Past this point nothing can service a code-death notification.
   setCodeDestroyedHook(nullptr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_QuickenWarmupStep_311 = 1;
+#endif
   getMutableConfig().state = State::kNotInitialized;
   getMutableConfig().osr_capable = false;
   syncOSRFlags();

@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 #include "cinderx/Jit/hir/instr_effects.h"
@@ -43,6 +45,15 @@ std::unordered_set<int> publishedOffsets(const Function& func) {
   return offsets;
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+int countPublishedOffset(const Function& func, int expected) {
+  return countIf(func, [expected](const Instr& instr) {
+    return instr.IsUpdatePrevInstr() &&
+        instr.bytecodeOffset().asIndex().value() == expected;
+  });
+}
+#endif
+
 int firstPublishedOffset(
     BorrowedRef<PyCodeObject> code,
     int opcode,
@@ -75,6 +86,11 @@ std::unique_ptr<Function> compileAndRunPass(
 } // namespace
 
 TEST_F(InsertUpdatePrevInstrTest, RedundantStoresEliminated) {
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+  auto saved_mode = jit::getConfig().frame_mode;
+  SCOPE_EXIT(jit::getMutableConfig().frame_mode = saved_mode);
+  jit::getMutableConfig().frame_mode = jit::FrameMode::kLightweight;
+#endif
   // Four len() calls on consecutive lines produce four arbitrary-execution
   // points on different source lines. The additions produce more. Without
   // dead store elimination, each line change emits its own UpdatePrevInstr.
@@ -91,8 +107,20 @@ def test(a):
   auto irfunc = compileAndRunPass(this, src);
   ASSERT_NE(irfunc, nullptr);
 
-  int update_count =
-      countIf(*irfunc, [](const Instr& i) { return i.IsUpdatePrevInstr(); });
+  int first_traceable = irfunc->code->_co_firsttraceable;
+  int update_count = countIf(*irfunc, [first_traceable](const Instr& i) {
+    if (!i.IsUpdatePrevInstr()) {
+      return false;
+    }
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+    // The LWF frame-entry publication is required for a complete materialized
+    // frame, and is not one of the ordinary stores tested below.
+    if (i.bytecodeOffset().asIndex().value() == first_traceable) {
+      return false;
+    }
+#endif
+    return true;
+  });
   int arbitrary_count = countIf(*irfunc, hasArbitraryExecution);
 
   // There must be at least one UpdatePrevInstr.
@@ -118,10 +146,47 @@ def test(a):
   EXPECT_GT(update_count, 0);
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+TEST_F(InsertUpdatePrevInstrTest, NormalFramePublishesCallPosition) {
+  auto saved_mode = jit::getConfig().frame_mode;
+  SCOPE_EXIT(jit::getMutableConfig().frame_mode = saved_mode);
+  jit::getMutableConfig().frame_mode = jit::FrameMode::kNormal;
+  const char* src = R"(
+def test(function, value):
+  function()
+  value.member
+  return value + 1
+)";
+  auto irfunc = compileAndRunPass(this, src);
+  ASSERT_NE(irfunc, nullptr);
+  EXPECT_EQ(countPublishedOffset(*irfunc, irfunc->code->_co_firsttraceable), 1);
+  int call_offset = firstPublishedOffset(irfunc->code, CALL, true);
+  ASSERT_GE(call_offset, 0);
+  EXPECT_TRUE(publishedOffsets(*irfunc).contains(call_offset));
+}
+
+TEST_F(InsertUpdatePrevInstrTest, FrameEntryPublishesFirstTraceableOnce) {
+  const char* src = R"(
+def test(value):
+  return len(value)
+)";
+  auto irfunc = compileAndRunPass(this, src);
+  ASSERT_NE(irfunc, nullptr);
+
+  int first_traceable = irfunc->code->_co_firsttraceable;
+  EXPECT_EQ(countPublishedOffset(*irfunc, first_traceable), 1);
+}
+#endif
+
 #if PY_VERSION_HEX < 0x030C0000
 TEST_F(
     InsertUpdatePrevInstrTest,
     PythonVisibleBoundariesPublishPrecisePositions) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  auto saved_mode = jit::getConfig().frame_mode;
+  SCOPE_EXIT(jit::getMutableConfig().frame_mode = saved_mode);
+  jit::getMutableConfig().frame_mode = jit::FrameMode::kLightweight;
+#endif
   struct Case {
     const char* source;
     int opcode;

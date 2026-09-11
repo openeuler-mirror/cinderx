@@ -47,6 +47,7 @@ extern "C" {
 #include "cinderx/Jit/lir/block_builder.h"
 #include "cinderx/Jit/lir/interpframe.h"
 #include "cinderx/Jit/threaded_compile.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
@@ -417,7 +418,7 @@ class FrameInitPlan {
       plan.groups_[plan.num_groups_++] = {
           static_cast<uint8_t>(start), static_cast<uint8_t>(i - start)};
     }
-#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+#if !defined(ENABLE_LIGHTWEIGHT_FRAMES) || PY_VERSION_HEX < 0x030C0000
     if (nlocalsplus > 0) {
       plan.localsplus_zero_offset_ =
           static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
@@ -464,8 +465,9 @@ class FrameInitPlan {
       }
     }
 
-    // Zero localsplus slots (non-LW frames need this so the GC doesn't
-    // see garbage pointers).
+    // Zero localsplus slots before argument binding can replace and decref
+    // their old values. CPython 3.11 LWF stores live on uninitialized native
+    // stack space, so they need the same initialization as normal frames.
     if (localsplus_zero_count_ > 0) {
       Instruction* zero =
           bbb.appendInstr(OutVReg{}, Instruction::kMove, Imm{0});
@@ -3902,13 +3904,81 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         size_t flags = 0;
 #if PY_VERSION_HEX < 0x030C0000
-        // _PyObject_VectorcallTstate is a static inline on 3.11 and cannot
-        // be materialized as a call target; the jit_rt helper wraps it.
+#if defined(CINDER_AARCH64)
+        Instruction* callable = bbb.getDefInstr(hir_instr.func());
+        Instruction* target = nullptr;
+        constexpr int32_t kVectorcallOffset =
+            static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+        if (hir_instr.func()->type() <= TFunc) {
+          target = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, kVectorcallOffset});
+        } else {
+          // Select an address before loading the target. This avoids reading
+          // PyFunctionObject::vectorcall from a non-function object.
+          Instruction* type = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, static_cast<int32_t>(offsetof(PyObject, ob_type))});
+          Instruction* function_type = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+          Instruction* is_function = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              type,
+              function_type);
+          Instruction* fast_address = bbb.appendInstr(
+              Instruction::kLea,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, kVectorcallOffset});
+          Instruction* slow_address = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)});
+          Instruction* selected_address = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              is_function,
+              fast_address,
+              slow_address);
+          target = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{selected_address, 0});
+        }
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(), Instruction::kVectorCall, target, Imm{flags});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+#else
         uint64_t func =
             reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
+        if (!(hir_instr.func()->type() <= TFunc)) {
+          func = reinterpret_cast<uint64_t>(JITRT_VectorcallTstate);
+        }
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(),
+            Instruction::kVectorCallTstate,
+            Imm{func},
+            Imm{flags},
+            VReg{env_->asm_tstate});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+#endif
+        break;
 #else
         uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
-#endif
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
@@ -3930,6 +4000,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           instr->addOperands(Imm{0});
         }
         break;
+#endif
       }
       case Opcode::kCallCFunc: {
         const auto kFuncPtrMap = std::to_array({
@@ -4037,6 +4108,89 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCallMethod: {
         auto& hir_instr = static_cast<const CallMethod&>(i);
         size_t flags = 0;
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+        Instruction* callable = bbb.getDefInstr(hir_instr.func());
+        constexpr int32_t kVectorcallOffset =
+            static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+        Instruction* sentinel = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(Py_True)});
+        Instruction* zero = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{0});
+        Instruction* is_null = bbb.appendInstr(
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, callable, zero);
+        Instruction* non_null = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_null,
+            sentinel,
+            callable);
+        Instruction* none = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(Py_None)});
+        Instruction* is_none = bbb.appendInstr(
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, non_null, none);
+        Instruction* safe_callable = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_none,
+            sentinel,
+            non_null);
+        Instruction* type = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Ind{safe_callable,
+                static_cast<int32_t>(offsetof(PyObject, ob_type))});
+        Instruction* function_type = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+        Instruction* is_function = bbb.appendInstr(
+            Instruction::kEqual,
+            OutVReg{OperandBase::k8bit},
+            type,
+            function_type);
+        Instruction* fast_address = bbb.appendInstr(
+            Instruction::kLea,
+            OutVReg{OperandBase::k64bit},
+            Ind{safe_callable, kVectorcallOffset});
+        Instruction* slow_address = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Imm{reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot)});
+        Instruction* address_by_type = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            is_function,
+            fast_address,
+            slow_address);
+        // JITRT_Call must shift its argument window when LOAD_METHOD
+        // supplies a null receiver. Keep that shape on the helper arm.
+        Instruction* receiver = bbb.getDefInstr(hir_instr.self());
+        Instruction* receiver_is_null = bbb.appendInstr(
+            Instruction::kEqual, OutVReg{OperandBase::k8bit}, receiver, zero);
+        Instruction* selected_address = bbb.appendInstr(
+            Instruction::kSelect,
+            OutVReg{OperandBase::k64bit},
+            receiver_is_null,
+            slow_address,
+            address_by_type);
+        Instruction* target = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Ind{selected_address, 0});
+        Instruction* instr = bbb.appendInstr(
+            hir_instr.output(), Instruction::kVectorCall, target, Imm{flags});
+        for (hir::Register* arg : hir_instr.GetOperands()) {
+          instr->addOperands(VReg{bbb.getDefInstr(arg)});
+        }
+        if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+          instr->addOperands(Imm{0});
+        }
+        break;
+#else
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
             Instruction::kVectorCallTstate,
@@ -4052,10 +4206,48 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           instr->addOperands(Imm{0});
         }
         break;
+#endif
       }
 
       case Opcode::kCallStatic: {
         auto& hir_instr = static_cast<const CallStatic&>(i);
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+        if (hir_instr.addr() ==
+            reinterpret_cast<void*>(JITRT_StoreFrameLocal311)) {
+          // Match JITRT_StoreFrameLocal311 and stock SETLOCAL exactly:
+          // take the frame-owned reference first, publish the new slot, then
+          // release the old value.  The cold zero-refcount arm may invoke
+          // arbitrary __del__ code, which must observe the new slot already.
+          Instruction* idx = bbb.getDefInstr(hir_instr.GetOperand(0));
+          Instruction* value = bbb.getDefInstr(hir_instr.GetOperand(1));
+          Instruction* frame = makeCurrentFrameAccessor(bbb).load();
+          constexpr int32_t kLocalsplusOffset =
+              offsetof(_PyInterpreterFrame, localsplus);
+          Instruction* old = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Ind{frame, idx, sizeof(PyObject*), kLocalsplusOffset});
+          makeIncref(bbb, value, /* xincref= */ true, /* immortal= */ true);
+          bbb.appendInstr(
+              OutInd{
+                  frame,
+                  idx,
+                  sizeof(PyObject*),
+                  kLocalsplusOffset,
+                  DataType::kObject},
+              Instruction::kMove,
+              value);
+          makeDecref(
+              bbb,
+              old,
+              std::nullopt,
+              /* xdecref= */ true,
+              /* possible_immortal= */ true);
+          bbb.appendInstr(hir_instr.output(), Instruction::kMove, Imm{0});
+          break;
+        }
+#endif
         std::vector<Instruction*> args;
         // Generate the argument conversions before the call.
         for (hir::Register* reg_arg : hir_instr.GetOperands()) {
@@ -5793,6 +5985,14 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
   }
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   else if (func_->frameMode == FrameMode::kLightweight) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Normal frames count at JITRT_AllocateAndLinkInterpreterFrame and
+    // generators count at their resume dispatch.  The 3.11 lightweight
+    // prologue inlines frame setup, so this is its unique entry-counting site.
+    bbb.annotateNext("Record machine-code entry");
+    bbb.appendInvokeInstruction(
+        triggerStatsOnMachineCodeEntry, func_->code.get());
+#endif
 #if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     // Compute the address of the deopt_idx field once
     // TranslateOneBasicBlock reuses this for all deopt index stores.
@@ -5863,9 +6063,11 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
                     executable_or_reifier_obj.get());
                 return executable_or_reifier;
               } else {
-                JIT_DCHECK(
-                    _Py_IsImmortal(cinderx::getModuleState()->frame_reifier),
-                    "Reifier must be immortal");
+                JIT_CHECK(
+                    cinderx::getModuleState()->frame_reifier != nullptr &&
+                        _Py_IsImmortal(
+                            cinderx::getModuleState()->frame_reifier),
+                    "frame reifier must exist and be immortal");
                 return bbb.appendInstr(
                     OutVReg{},
                     Instruction::kMove,
@@ -6027,6 +6229,14 @@ void LIRGenerator::emitUnlinkFrame(
     PyObject* executable,
     std::optional<destructor> exec_dtor,
     Instruction* callee_frame) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Executing-mode CPython 3.11 frames own observer copies of fast locals.
+  // The inline unlink paths do not clear localsplus, so use the helper which
+  // unlinks the frame before releasing those references (finalizers may
+  // re-enter Python and inspect the frame chain).
+  bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+  return;
+#endif
   if (has_freevars) {
     bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
   } else if (!env_->can_deopt) {

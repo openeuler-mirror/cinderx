@@ -204,10 +204,12 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_canary_execute_311",
         "test_execute_311",
         "test_attr_cache_method_peek_311",
+        "test_attr_cache_combined_keys_311",
         "test_attr_cache_new_shape_load_311",
         "test_attr_cache_new_shape_store_311",
         "test_early_quicken_311",
         "test_list_extend_refcount_311",
+        "test_lightweight_frames",
     ):
         assert script.count(module) == 1
     assert "--non-libtest" in script
@@ -347,6 +349,11 @@ def test_rt311_runner_honors_gate_python_deps_and_parallelism():
     assert "RT311_CENSUS_SHARD_SIZE" in script
     assert 'split -d -a 4 -l "$CENSUS_SHARD_SIZE"' in script
     assert 'if [ "$CENSUS_RAN" != "$CENSUS_EXPECTED" ]' in script
+    assert 'run_frame_mode "$BUILD_DIR" 0' in script
+    assert 'run_frame_mode "$BUILD_DIR-lwf" 1' in script
+    assert 'RUNTIME_TEST_ENV=("PYTHONJITLIGHTWEIGHTFRAME=$2")' in script
+    assert 'if [[ " $FLAGS " != *" -DENABLE_LIGHTWEIGHT_FRAMES=1 "* ]]' in script
+    assert "CPython 3.11 gate requires -DENABLE_LIGHTWEIGHT_FRAMES=1" in script
 
 
 def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
@@ -368,6 +375,12 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
 
     assert "RUNTIME_TEST_ENV" in asan_script
     assert 'env "${RUNTIME_TEST_ENV[@]}" "$BIN"' in asan_script
+    assert "run_runtime_frame_mode normal 0" in asan_script
+    assert "run_runtime_frame_mode lwf 1" in asan_script
+    assert "run_extension_frame_mode normal 0" in asan_script
+    assert "run_extension_frame_mode lwf 1" in asan_script
+    assert '"PYTHONJITLIGHTWEIGHTFRAME=$frame_mode"' in asan_script
+    assert "CPython 3.11 ASAN gate requires -DENABLE_LIGHTWEIGHT_FRAMES=1" in asan_script
     assert 'EXEC_DIR="$BUILD_DIR"' in asan_script
     assert 'BUILD_DIR-exec' not in asan_script
     assert asan_script.count("cmake -S") == 1
@@ -509,7 +522,7 @@ def test_configure_toolchain_keeps_explicit_compilers(monkeypatch):
     assert env["CXX"] == "/custom/g++"
 
 
-def test_runtime_tests_disable_lightweight_frames_on_cpython311(
+def test_runtime_tests_enable_runtime_selectable_frames_on_cpython311(
     monkeypatch,
     tmp_path,
 ):
@@ -528,15 +541,18 @@ def test_runtime_tests_disable_lightweight_frames_on_cpython311(
     )
 
     options = run_gate.runtime_tests_cmake_options(
-        {
-            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
-            "ENABLE_LIGHTWEIGHT_FRAMES": "1",
-            "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
-        }
+        {"CINDERX_TEST_PYTHON": "/usr/bin/python3.11"}
     )
 
-    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in options
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=1" in options
     assert "-DENABLE_INTERPRETER_LOOP=1" in options
+    disabled = run_gate.runtime_tests_cmake_options(
+        {
+            "CINDERX_TEST_PYTHON": "/usr/bin/python3.11",
+            "ENABLE_LIGHTWEIGHT_FRAMES": "0",
+        }
+    )
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in disabled
 
     command = run_gate.runtime_tests_command(
         {"name": "runtime_tests_311"},
@@ -547,9 +563,10 @@ def test_runtime_tests_disable_lightweight_frames_on_cpython311(
             "CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR": "1",
         },
     )
-    assert "-DENABLE_LIGHTWEIGHT_FRAMES=0" in command
-    assert "PYTHONJITLIGHTWEIGHTFRAME=1" not in command
-    assert "env -u PYTHONJITLIGHTWEIGHTFRAME" in command
+    assert "-DENABLE_LIGHTWEIGHT_FRAMES=1" in command
+    assert "PYTHONJITLIGHTWEIGHTFRAME=0" in command
+    assert "PYTHONJITLIGHTWEIGHTFRAME=1" in command
+    assert "CINDERX_OSR_ENABLED=1" not in command
 
 
 def test_strict_format_missing_environment_is_fail_closed(tmp_path, monkeypatch, capsys):

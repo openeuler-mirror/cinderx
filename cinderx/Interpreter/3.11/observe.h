@@ -236,6 +236,17 @@ PyObject* Ci_JitShell311_GuardedEntry(
     size_t nargsf,
     PyObject* kwnames);
 
+// Target of an artifact-specific AArch64 entry stub.  The stub tail-branches
+// here with its CodeRuntime in the fifth argument; this static function pins
+// the owning CompiledFunction before entering generated code and therefore
+// remains safe when the function is unpublished reentrantly by its own body.
+PyObject* Ci_JitShell311_ArtifactEntry(
+    PyObject* func,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames,
+    void* code_runtime);
+
 #ifdef __cplusplus
 }
 #endif

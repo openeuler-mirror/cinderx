@@ -1329,8 +1329,7 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->coro_type = Ref<PyTypeObject>::steal(coro_type);
 
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000 && \
-    PY_VERSION_HEX < 0x030E0000
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX < 0x030E0000
   Ref<PyTypeObject> frame_reifier_type = Ref<PyTypeObject>::steal(
       (PyTypeObject*)PyType_FromSpec(&jit::JitFrameReifier_Spec));
   if (frame_reifier_type == nullptr) {
@@ -1346,7 +1345,11 @@ int _cinderx_exec_impl(PyObject* m) {
   state->frame_reifier = Ref<>::create(reifier);
 
   // Mark as immortal so we don't have to refcount this.
+#if PY_VERSION_HEX < 0x030C0000
+  _Py_SetImmortal(reifier);
+#else
   immortalize(reifier);
+#endif
 #endif
 
   // PyType_FromSpec wants us to provide a module name, but we really don't

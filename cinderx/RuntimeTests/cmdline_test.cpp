@@ -742,6 +742,10 @@ TEST_F(CmdLineTest, OSREnabledFlagSyncsRuntimeGate) {
 
 TEST_F(CmdLineTest, LightweightFrameFlagRequiresCompileSupport) {
   ScopedEnvVar lightweight_env{"PYTHONJITLIGHTWEIGHTFRAME"};
+#if PY_VERSION_HEX < 0x030C0000
+  ScopedEnvVar runtime_mode_env{"CINDERX_JIT_MODE"};
+  runtime_mode_env.set("canary");
+#endif
   ScopedJitConfigState config_guard;
   jit::finalize();
   jit::shutdown_jit_genobject_type();
@@ -760,10 +764,21 @@ TEST_F(CmdLineTest, LightweightFrameFlagRequiresCompileSupport) {
   jit::shutdown_jit_genobject_type();
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+TEST_F(CmdLineTest, Python311DefaultsToNormalFramesWhenSupportIsCompiledIn) {
+  Config config;
+  EXPECT_EQ(config.frame_mode, FrameMode::kNormal);
+}
+#endif
+
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
 TEST_F(CmdLineTest, LightweightFrameRejectsOSRConflict) {
   ScopedEnvVar lightweight_env{"PYTHONJITLIGHTWEIGHTFRAME"};
   ScopedEnvVar osr_env{"CINDERX_OSR_ENABLED"};
+#if PY_VERSION_HEX < 0x030C0000
+  ScopedEnvVar runtime_mode_env{"CINDERX_JIT_MODE"};
+  runtime_mode_env.set("canary");
+#endif
   ScopedJitConfigState config_guard;
   jit::finalize();
   jit::shutdown_jit_genobject_type();

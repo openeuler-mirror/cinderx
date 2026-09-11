@@ -16,6 +16,8 @@
 
 namespace jit {
 
+class CompiledFunction;
+
 constexpr ptrdiff_t kInvalidYieldFromOffset =
     std::numeric_limits<ptrdiff_t>::max();
 
@@ -59,6 +61,19 @@ class alignas(16) CodeRuntime {
 
   // Release any references this CodeRuntime holds to Python objects.
   void releaseReferences();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The artifact-specific 3.11 entry stub carries CodeRuntime because it is
+  // available while native code is emitted.  CompiledFunction fills this
+  // back-pointer before publication, allowing the static guarded entry to
+  // acquire its normal per-call owning pin without a registry lookup.
+  CompiledFunction* compiledFunction() const {
+    return compiled_function_;
+  }
+  void setCompiledFunction(CompiledFunction* compiled) {
+    compiled_function_ = compiled;
+  }
+#endif
 
   // Store meta-data about generator yield point.
   GenYieldPoint* addGenYieldPoint(GenYieldPoint&& gen_yield_point);
@@ -164,6 +179,10 @@ class alignas(16) CodeRuntime {
   BorrowedRef<PyCodeObject> code_;
   BorrowedRef<PyDictObject> builtins_;
   BorrowedRef<PyDictObject> globals_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  CompiledFunction* compiled_function_{nullptr};
+#endif
 
   // References owned by this CodeRuntime.
   std::unordered_set<ThreadedRef<PyObject>> references_;

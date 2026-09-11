@@ -851,31 +851,42 @@ bool Context::finalizeFunc(
 
   // The takeover settles only now: the prior claim ends with the new one
   // fully published, so a failure above never leaves the function
-  // claimless.  The detained anchor reference is not released here at all:
-  // even after settlement, releasing it inside this call stack runs
-  // arbitrary Python between the verdict a caller is about to compute and
-  // the moment that verdict is reported -- a __del__ calling disable()
-  // would unpublish what the caller then reports as installed -- and a
-  // release inside the enable() reattach walk would mutate the parked set
-  // being iterated.  It is queued instead, and drained at control-plane
-  // boundaries that re-verify what they report.
-  if (prior != nullptr) {
-    prior->removeFunction(func);
+  // claimless.  Publish the new entry point before dropping the prior
+  // membership or queuing an anchor release: those later steps can
+  // allocate, and a reentrant call must already see the successor stub
+  // rather than a vectorcall that still names the prior artifact after
+  // it has lost this function.  The detained anchor is not released
+  // here at all: even after settlement, releasing it inside this call
+  // stack runs arbitrary Python between the verdict a caller is about
+  // to compute and the moment that verdict is reported -- a __del__
+  // calling disable() would unpublish what the caller then reports as
+  // installed -- and a release inside the enable() reattach walk would
+  // mutate the parked set being iterated.  It is queued instead, and
+  // drained at control-plane boundaries that re-verify what they
+  // report.
+  // Route 3.11 calls through the guarded entry, which re-checks the code
+  // identity and the call form that compilation assumed before entering
+  // machine code (see Jit/pyjit_311_gate.cpp).
+  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
+#if defined(CINDER_AARCH64)
+  if (compiled->artifactGuardedEntry311() != nullptr) {
+    entry = compiled->artifactGuardedEntry311();
   }
-  if (displaced_anchor != nullptr) {
-    deferred_anchor_releases_.emplace_back(std::move(displaced_anchor));
+#endif
+  setVectorcall(func, entry);
+  if (hasFunctionEntryCache(func)) {
+    void** indirect = findFunctionEntryCache(func);
+    *indirect = compiled->staticEntry();
   }
 
   // In case the function had previously been deopted.
   removeDeoptedFunc(func);
 
-  // Route 3.11 calls through the guarded entry, which re-checks the code
-  // identity and the call form that compilation assumed before entering
-  // machine code (see Jit/pyjit_311_gate.cpp).
-  setVectorcall(func, Ci_JitShell311_GuardedEntry);
-  if (hasFunctionEntryCache(func)) {
-    void** indirect = findFunctionEntryCache(func);
-    *indirect = compiled->staticEntry();
+  if (prior != nullptr) {
+    prior->removeFunction(func);
+  }
+  if (displaced_anchor != nullptr) {
+    deferred_anchor_releases_.emplace_back(std::move(displaced_anchor));
   }
   return true;
 #else
@@ -1584,6 +1595,11 @@ void Context::clearForMultithreadedCompileTest() {
 
   for (auto& compiled : pinned) {
 #if PY_VERSION_HEX < 0x030C0000
+    for (PyFunctionObject* func : compiled->functions()) {
+      if (func->vectorcall == compiled->artifactGuardedEntry311()) {
+        func->vectorcall = getInterpretedVectorcall(func);
+      }
+    }
     // Once detached, no function death routes back to this artifact: the
     // death watch reports into the context registries, which are empty by
     // now.  A retained association would be a pointer with nothing keeping

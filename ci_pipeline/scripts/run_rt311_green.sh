@@ -191,6 +191,11 @@ from cmake_options import cmake_feature_options
 opts = cmake_feature_options(py_version="3.11")
 print(" ".join(f"-D{k}={v}" for k, v in sorted(opts.items())))
 ' "$REPO_ROOT/ci_pipeline")
+if [[ " $FLAGS " != *" -DENABLE_LIGHTWEIGHT_FRAMES=1 "* ]]; then
+  echo "CPython 3.11 gate requires -DENABLE_LIGHTWEIGHT_FRAMES=1"
+  echo "resolved CMake feature flags: $FLAGS"
+  exit 1
+fi
 if [ -n "${CINDERX_LOCAL_DEPS_DIR:-${CINDERX_LOCAL_DEPS:-}}" ]; then
   FLAGS="$FLAGS -DCINDERX_LOCAL_DEPS_DIR=${CINDERX_LOCAL_DEPS_DIR:-$CINDERX_LOCAL_DEPS}"
 fi
@@ -214,7 +219,11 @@ cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
 make -C "$BUILD_DIR" -j"$BUILD_JOBS" runtime_tests 2>&1 \
   | tee "$BUILD_DIR-build.log"
 BIN=$(find "$BUILD_DIR" -name runtime_tests -type f | head -1)
-RUNTIME_TEST_ENV=()
+
+# Reuse the compiled binary, but keep each frame mode's evidence separate.
+run_frame_mode() (
+BUILD_DIR=$1
+RUNTIME_TEST_ENV=("PYTHONJITLIGHTWEIGHTFRAME=$2")
 if [ -n "$PYTHON_EXTENSIONS_DIR" ]; then
   RUNTIME_TEST_ENV+=(
     "PYTHONPATH=$PYTHON_EXTENSIONS_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -247,13 +256,7 @@ if [ "$MODE" = "--census" ]; then
   [ "$CENSUS_SHARD_SIZE" -gt 0 ] \
     || { echo "RT311_CENSUS_SHARD_SIZE must be greater than zero"; exit 2; }
   CENSUS_TARGETS="$BUILD_DIR-census-targets.txt"
-  # This pre-existing 3.11-only failure is not part of issue #20.  Keep its
-  # single case out until a separate reviewed change can fix it or update the
-  # protected known-failure baseline without weakening the growth guard.
-  grep -v 'DISABLED_' "$BUILD_DIR-registered.txt" \
-    | grep -v -E \
-        '^InsertUpdatePrevInstrTest\.RedundantStoresEliminated$' \
-    > "$CENSUS_TARGETS"
+  grep -v 'DISABLED_' "$BUILD_DIR-registered.txt" > "$CENSUS_TARGETS"
   CENSUS_EXPECTED=$(wc -l < "$CENSUS_TARGETS" | tr -d ' ')
   [ "$CENSUS_EXPECTED" -gt 0 ] || { echo "census target list is empty"; exit 1; }
   CENSUS_SHARD_DIR=$(mktemp -d "$BUILD_DIR-census-shards.XXXXXX")
@@ -487,3 +490,7 @@ if [ "${CANARY_PASSED:-0}" != "$CANARY_EXPECTED" ]; then
   exit 1
 fi
 echo "canary-mode RuntimeTests ok ($CANARY_PASSED tests)"
+)
+
+run_frame_mode "$BUILD_DIR" 0
+run_frame_mode "$BUILD_DIR-lwf" 1

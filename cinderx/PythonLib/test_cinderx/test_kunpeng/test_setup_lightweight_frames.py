@@ -22,6 +22,17 @@ should_enable_lightweight_frames = _load_setup_function(
 
 
 class LightweightFramesDefaultTests(unittest.TestCase):
+    def test_oss_311_builds_runtime_selectable_support(self) -> None:
+        for machine in ("aarch64", "x86_64"):
+            with self.subTest(machine=machine):
+                self.assertTrue(
+                    should_enable_lightweight_frames(
+                        py_version="3.11",
+                        meta_python=False,
+                        machine=machine,
+                    )
+                )
+
     def test_oss_314_aarch64_default_on(self) -> None:
         self.assertTrue(
             should_enable_lightweight_frames(

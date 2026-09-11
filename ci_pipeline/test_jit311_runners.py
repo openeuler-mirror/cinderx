@@ -670,6 +670,11 @@ def test_runtime_tests_manifests_are_consistent():
     ]
     assert not green_skips, green_skips
     assert "HIRBuildTest" in families
+    assert "CmdLineTest.LightweightFrameFlagRequiresCompileSupport" in required
+    assert (
+        "InsertUpdatePrevInstrTest.FrameEntryPublishesFirstTraceableOnce"
+        in required
+    )
 
     runner = (
         Path(runners.REPO_ROOT)
@@ -678,9 +683,7 @@ def test_runtime_tests_manifests_are_consistent():
         / "run_rt311_green.sh"
     ).read_text()
     assert "DeoptStressTest\\." not in runner
-    assert runner.count(
-        "InsertUpdatePrevInstrTest\\.RedundantStoresEliminated"
-    ) == 1
+    assert "InsertUpdatePrevInstrTest\\.RedundantStoresEliminated" not in runner
     assert "https://gitcode.com/openeuler/cinderx/issues/20" not in runner
 
 
