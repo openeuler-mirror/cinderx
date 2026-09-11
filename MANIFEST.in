@@ -6,3 +6,7 @@ recursive-include cinderx/UpstreamBorrow *.template *.md *.txt *.html
 # Opcode directories have invalid Python package names (e.g. opcodes/3.14) so
 # they have to be included manually.
 recursive-include cinderx/PythonLib/opcodes *.py
+
+# The CPython 3.11 PGO trainer is run directly from an extracted source
+# distribution before a wheel exists.
+recursive-include cinderx/TestScripts *.py
