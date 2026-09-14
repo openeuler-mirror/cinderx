@@ -46,8 +46,9 @@ BLOCK_START_RE = re.compile(r"^ {0,3}(#{1,6}(\s|$)|>|[-*+]\s|\d{1,9}[.)]\s|`{3,}
 
 
 def git_lines(args: list[str], *, cwd: Path) -> list[str]:
+    # Git emits UTF-8 paths even when the Windows locale uses a legacy encoding.
     result = subprocess.run(
-        ["git", *args], cwd=cwd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ["git", *args], cwd=cwd, check=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 

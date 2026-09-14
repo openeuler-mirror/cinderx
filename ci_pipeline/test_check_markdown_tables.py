@@ -1,5 +1,8 @@
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -156,3 +159,52 @@ def test_check_file_reports_invalid_utf8(tmp_path):
 )
 def test_delimiter_variants(line):
     assert mdt.is_delimiter_row(line)
+
+
+@pytest.mark.parametrize("args", [[], ["--all"], ["README.md"]], ids=["incremental", "all", "explicit"])
+@pytest.mark.parametrize("malformed", [False, True], ids=["valid", "invalid"])
+def test_cli_in_non_ascii_repo_with_legacy_encoding(tmp_path, args, malformed):
+    repo = tmp_path / "中文仓库"
+    repo.mkdir()
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args], cwd=repo, check=True, encoding="utf-8", capture_output=True
+        )
+
+    git("init", "--quiet")
+    git(
+        "-c", "user.name=Markdown test",
+        "-c", "user.email=markdown-test@example.invalid",
+        "-c", "commit.gpgsign=false",
+        "-c", "core.hooksPath=/dev/null",
+        "commit", "--quiet", "--allow-empty", "-m", "baseline",
+    )
+    git("update-ref", "refs/remotes/origin/master", "HEAD")
+    delimiter = "|---|---|---|" if malformed else "|---|---|"
+    (repo / "README.md").write_text(f"| a | b |\n{delimiter}\n| 1 | 2 |\n", encoding="utf-8")
+    git("add", "README.md")
+
+    # Exercise the real CLI and Git processes. Force the Windows legacy
+    # decoding fallback on every platform, independently of console encoding.
+    launcher = (
+        "import locale, runpy, sys\n"
+        "locale.getencoding = lambda: 'cp936'\n"
+        "path = sys.argv.pop(1)\n"
+        "runpy.run_path(path, run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8=0", "-c", launcher, mdt.__file__, *args],
+        cwd=repo,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        encoding="utf-8",
+        capture_output=True,
+    )
+
+    assert result.returncode == (1 if malformed else 0), result.stdout + result.stderr
+    assert "markdown-tables: checked 1 file(s)" in result.stdout
+    if malformed:
+        assert "README.md:2: table delimiter row has 3 column(s) but header has 2" in result.stdout
+        assert result.stderr == "markdown-tables: 1 error(s)\n"
+    else:
+        assert result.stderr == ""
