@@ -231,6 +231,10 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_attr_cache_new_shape_store_311 \
     test_cinderx.test_kunpeng.test_early_quicken_311 \
     test_cinderx.test_kunpeng.test_list_extend_refcount_311 \
+    test_cinderx.test_kunpeng.test_exact_float_inplace_311 \
+    test_cinderx.test_kunpeng.test_float_box_sink_311 \
+    test_cinderx.test_kunpeng.test_float_power_exact_311 \
+    test_cinderx.test_kunpeng.test_subscript_profitability_311 \
     test_cinderx.test_kunpeng.test_lightweight_frames)
 }
 

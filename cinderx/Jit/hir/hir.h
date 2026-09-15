@@ -676,8 +676,11 @@ class INSTR_CLASS(
       InPlaceOpKind op,
       Register* left,
       Register* right,
-      const FrameState& frame)
-      : InstrT(dst, left, right, frame), op_(op) {}
+      const FrameState& frame,
+      bool float_fast_path = false)
+      : InstrT(dst, left, right, frame),
+        op_(op),
+        float_fast_path_(float_fast_path) {}
 
   InPlaceOpKind op() const {
     return op_;
@@ -691,8 +694,19 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  // A specialization hint only. The fallback operation must leave it clear
+  // so repeated Simplify runs do not recursively split the slow path.
+  bool hasFloatFastPath() const {
+    return float_fast_path_;
+  }
+
+  void setFloatFastPath(bool enabled) {
+    float_fast_path_ = enabled;
+  }
+
  private:
   InPlaceOpKind op_;
+  bool float_fast_path_;
 };
 
 // Builds a slice object, with 2 or 3 operands from the stack

@@ -579,6 +579,121 @@ class DeoptStressTest : public RuntimeTest {
   }
 };
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(__aarch64__)
+TEST_F(DeoptStressTest, SunkFloatTemporaryReifiesBeforeInPlaceAdd) {
+  const char* src = R"(
+events = []
+class Left:
+  def __iadd__(self, rhs):
+    assert type(rhs) is float and rhs == 6.0
+    events.append(rhs)
+    raise ValueError(rhs)
+
+def test(items, x, y):
+  try:
+    items[0] += x * y
+  except ValueError as exc:
+    return (exc.args[0] is events[0], events[0], len(events))
+  return items[0]
+
+for _ in range(40):
+  assert test([1.0], 2.0, 3.0) == 7.0
+items = [Left()]
+expected = (True, 6.0, 1)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  // Use the existing exact-pipeline helper, including instrumentation polls
+  // inserted before optimization. A bare buildHIR/runPasses omits those polls.
+  auto saved_state = jit::getConfig().state;
+  SCOPE_EXIT(jit::getMutableConfig().state = saved_state);
+  jit::getMutableConfig().state = jit::State::kRunning;
+  auto irfunc = jit::compileToFinalHIRForTest(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  CheckInstrumentation* target = nullptr;
+  bool sunk_box = false;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsInPlaceOp()) {
+        auto& op = static_cast<InPlaceOp&>(instr);
+        Instr* producer = op.right()->instr();
+        // Refcount insertion may add checks and ownership operations between
+        // the sunk allocation and its consumer.
+        sunk_box |= producer != nullptr && producer->IsPrimitiveBox() &&
+            producer->block() == &block;
+      }
+      if (!instr.IsCheckInstrumentation()) {
+        continue;
+      }
+      auto* check = static_cast<CheckInstrumentation*>(&instr);
+      auto* fs = check->frameState();
+      if (fs == nullptr || fs->stack.isEmpty()) {
+        continue;
+      }
+      BytecodeInstruction bc{fs->code, fs->cur_instr_offs};
+      if (bc.opcode() == BINARY_OP && bc.oparg() == NB_INPLACE_ADD &&
+          fs->stack.top()->type() <= TCDouble) {
+        ASSERT_EQ(target, nullptr);
+        target = check;
+      }
+    }
+  }
+  ASSERT_TRUE(sunk_box) << HIRPrinter().ToString(*irfunc);
+  ASSERT_NE(target, nullptr) << HIRPrinter().ToString(*irfunc);
+
+  // Insert after optimization: another optimization pass could fold this
+  // intentional failure away. Copy the real post-rematerialization exit's
+  // ownership and frame metadata, including its unboxed temporary stack slot.
+  Register* zero = irfunc->env.AllocateRegister();
+  zero->set_type(TNullptr);
+  LoadConst::create(zero, TNullptr)->InsertBefore(*target);
+  auto* guard = Guard::create(zero);
+  guard->setFrameState(*target->frameState());
+  guard->live_regs() = target->live_regs();
+  guard->setBytecodeOffset(target->frameState()->cur_instr_offs);
+  constexpr int nonce = 73119;
+  guard->set_nonce(nonce);
+  guard->InsertBefore(*target);
+
+  ASSERT_EQ(PyType_Ready(getCompiledFunctionType()), 0);
+  NativeGeneratorFactory factory;
+  NativeGenerator gen(irfunc.get(), factory);
+  auto entry = reinterpret_cast<vectorcallfunc>(gen.getVectorcallEntry());
+  ASSERT_NE(entry, nullptr);
+  CompiledFunctionData data;
+  data.code = gen.getCodeBuffer();
+  data.vectorcall_entry = entry;
+  auto compiled = CompiledFunction::create(std::move(data), false);
+  ASSERT_NE(compiled, nullptr);
+  int failures = 0;
+  getContext()->setGuardFailureCallback([&](const DeoptMetadata& metadata) {
+    ++failures;
+    EXPECT_EQ(metadata.nonce, nonce);
+    ASSERT_GT(metadata.frame_meta.size(), 0);
+    const auto& frame = metadata.innermostFrame();
+    EXPECT_EQ(frame.code, reinterpret_cast<PyCodeObject*>(func->func_code));
+    ASSERT_GT(frame.stack.size(), 0);
+    int rhs_index = frame.stack[frame.stack.size() - 1];
+    ASSERT_GE(rhs_index, 0);
+    ASSERT_LT(static_cast<size_t>(rhs_index), metadata.live_values.size());
+    EXPECT_EQ(metadata.live_values[rhs_index].value_kind, ValueKind::kDouble);
+  });
+  auto items = getGlobal("items");
+  auto x = Ref<>::steal(PyFloat_FromDouble(2.0));
+  auto y = Ref<>::steal(PyFloat_FromDouble(3.0));
+  PyObject* args[] = {items.get(), x.get(), y.get()};
+  auto result = Ref<>::steal(Ci_JitShell311_InvokeArtifact(
+      compiled.get(), reinterpret_cast<PyObject*>(func.get()), args, 3,
+      nullptr));
+  getContext()->clearGuardFailureCallback();
+  ASSERT_EQ(failures, 1) << "The intended native guard must actually execute";
+  ASSERT_NE(result, nullptr);
+  auto expected = getGlobal("expected");
+  EXPECT_EQ(PyObject_RichCompareBool(result, expected, Py_EQ), 1);
+}
+#endif
+
 TEST_F(DeoptStressTest, BinaryOps) {
   const char* src = R"(
 def test(a, b, c):

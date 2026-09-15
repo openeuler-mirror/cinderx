@@ -1271,6 +1271,60 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   return nullptr;
 }
 
+// Keep failed float predictions inside the compiled function. In particular,
+// an accumulator initialized with integer zero needs the generic operation on
+// its first iteration, not a deopt of the whole loop.
+Register* trySimplifyFloatInPlace(Env& env, const InPlaceOp* instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (!instr->hasFloatFastPath() || !getConfig().specialized_opcodes ||
+      (instr->op() != InPlaceOpKind::kAdd &&
+       instr->op() != InPlaceOpKind::kSubtract)) {
+    return nullptr;
+  }
+  Register* left = instr->left();
+  Register* right = instr->right();
+  if (!left->type().couldBe(TFloatExact) ||
+      !right->type().couldBe(TFloatExact)) {
+    return nullptr;
+  }
+  const FrameState& frame = *instr->frameState();
+  CFG& cfg = env.func.cfg;
+  BasicBlock* check_right = cfg.AllocateBlock();
+  BasicBlock* fast = cfg.AllocateBlock();
+  BasicBlock* slow = cfg.AllocateBlock();
+  env.new_blocks += 4; // Three paths plus the split-off continuation.
+
+  env.emit<CondBranchCheckType>(left, TFloatExact, check_right, slow);
+  BasicBlock* done = cfg.splitAfter(*std::prev(env.cursor));
+  env.block = check_right;
+  env.cursor = check_right->end();
+  env.emit<CondBranchCheckType>(right, TFloatExact, fast, slow);
+
+  env.block = fast;
+  env.cursor = fast->end();
+  Register* float_left = env.emit<RefineType>(TFloatExact, left);
+  Register* float_right = env.emit<RefineType>(TFloatExact, right);
+  BinaryOpKind op = instr->op() == InPlaceOpKind::kAdd
+      ? BinaryOpKind::kAdd
+      : BinaryOpKind::kSubtract;
+  Register* fast_result =
+      env.emit<FloatBinaryOp>(op, float_left, float_right, frame);
+  env.emit<Branch>(done);
+
+  env.block = slow;
+  env.cursor = slow->end();
+  Register* slow_result = env.emit<InPlaceOp>(instr->op(), left, right, frame);
+  env.emit<Branch>(done);
+
+  env.block = done;
+  env.cursor = done->begin();
+  return env.emit<Phi>(std::unordered_map<BasicBlock*, Register*>{
+      {fast, fast_result}, {slow, slow_result}});
+#else
+  return nullptr;
+#endif
+}
+
 Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
   Register* lhs = instr->left();
   Register* rhs = instr->right();
@@ -1369,7 +1423,7 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
       return env.emit<FloatBinaryOp>(*binop, lhs, rhs, *instr->frameState());
     }
   }
-  return nullptr;
+  return trySimplifyFloatInPlace(env, instr);
 }
 
 Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
@@ -1433,8 +1487,7 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // it with sqrt/mul/div changes rounding even for finite positive inputs
   // (for example, 2.0 ** -1.5). Keep the object operation and its exception
   // behavior until a bit-equivalent fast path is available.
-  if (op == BinaryOpKind::kPower &&
-      !instr->left()->type().hasObjectSpec()) {
+  if (op == BinaryOpKind::kPower && !instr->left()->type().hasObjectSpec()) {
     return nullptr;
   }
 #endif
