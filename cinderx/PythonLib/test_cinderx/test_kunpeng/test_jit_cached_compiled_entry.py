@@ -56,6 +56,9 @@ class CachedCompiledEntryTests(unittest.TestCase):
     def test_instrumentation_disables_cached_compiled_entry_fast_path(self) -> None:
         self.assert_clean_jit_subprocess_succeeds("instrumentation-bail")
 
+    def test_many_recreated_functions_preserve_cached_entry_semantics(self) -> None:
+        self.assert_clean_jit_subprocess_succeeds("many-recreated")
+
     def test_cached_entry_does_not_cross_globals(self) -> None:
         globs = {
             "value": "original",

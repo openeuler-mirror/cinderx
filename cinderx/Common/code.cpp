@@ -48,6 +48,28 @@ CodeDestroyedHook g_code_destroyed_hook = nullptr;
 // would look exactly like a clean census.
 size_t g_live_code_extra_blocks = 0;
 
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+struct CodeExtraResolverProbeForTest {
+  PyCodeObject* target{nullptr};
+  size_t get_or_create_count{0};
+  size_t if_exists_count{0};
+};
+
+thread_local CodeExtraResolverProbeForTest s_code_extra_resolver_probe;
+
+void noteCodeExtraGetOrCreateForTest(PyCodeObject* code) {
+  if (s_code_extra_resolver_probe.target == code) {
+    s_code_extra_resolver_probe.get_or_create_count++;
+  }
+}
+
+void noteCodeExtraIfExistsForTest(PyCodeObject* code) {
+  if (s_code_extra_resolver_probe.target == code) {
+    s_code_extra_resolver_probe.if_exists_count++;
+  }
+}
+#endif
+
 #if PY_VERSION_HEX < 0x030C0000
 // 3.11: the free call is a dead code object's only signal, so the block
 // names its owner in a version-local header (shared struct untouched).
@@ -377,6 +399,26 @@ bool consumeJitPublishStepForTest(int step) {
   }
   return false;
 }
+
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+void resetCodeExtraResolverCountsForTest(PyCodeObject* target) {
+  s_code_extra_resolver_probe.target = target;
+  s_code_extra_resolver_probe.get_or_create_count = 0;
+  s_code_extra_resolver_probe.if_exists_count = 0;
+}
+
+void disableCodeExtraResolverCountingForTest() {
+  s_code_extra_resolver_probe.target = nullptr;
+}
+
+size_t codeExtraGetOrCreateCountForTest() {
+  return s_code_extra_resolver_probe.get_or_create_count;
+}
+
+size_t codeExtraIfExistsCountForTest() {
+  return s_code_extra_resolver_probe.if_exists_count;
+}
+#endif
 } // namespace jit
 
 namespace {
@@ -479,14 +521,22 @@ size_t codeCallCount(PyCodeObject* code) {
 } // namespace
 
 CodeExtra* codeExtra(PyCodeObject* code) {
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+  noteCodeExtraGetOrCreateForTest(code);
+#endif
   return codeExtraImpl(code, false /* preserve_error */);
 }
 
 CodeExtra* codeExtraOrError(PyCodeObject* code) {
+  // Publication is not a scheduling lookup.  Keep it outside the
+  // CMake-only schedule probe so a publication cannot be double-counted.
   return codeExtraImpl(code, true /* preserve_error */);
 }
 
 CodeExtra* codeExtraIfExists(PyCodeObject* code) {
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+  noteCodeExtraIfExistsForTest(code);
+#endif
   auto* state = cinderx::getModuleState();
   // On shutdown the module state becomes inaccessible.
   if (state == nullptr) {

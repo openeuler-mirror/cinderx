@@ -465,6 +465,12 @@ include_directories(
 
 file(GLOB_RECURSE COMMON_SOURCES ${PROJECT_SOURCE_DIR}/Common/*.cpp ${PROJECT_SOURCE_DIR}/Common/*.c)
 add_library(common ${COMMON_SOURCES})
+if(ENABLE_RUNTIME_TESTS AND NOT ${PY_VERSION} EQUAL 3.11)
+  set_property(
+    SOURCE ${PROJECT_SOURCE_DIR}/Common/code.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS CINDERX_RUNTIME_TESTS_CMAKE
+  )
+endif()
 if (${ENABLE_ZLIB})
     target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt ZLIB::ZLIB)
 else()
@@ -606,6 +612,12 @@ endif()
 
 add_library(jit ${JIT_SOURCES})
 target_compile_options(jit PRIVATE -Wno-free-nonheap-object)
+if(ENABLE_RUNTIME_TESTS AND NOT ${PY_VERSION} EQUAL 3.11)
+  set_property(
+    SOURCE ${PROJECT_SOURCE_DIR}/Jit/pyjit.cpp
+    APPEND PROPERTY COMPILE_DEFINITIONS CINDERX_RUNTIME_TESTS_CMAKE
+  )
+endif()
 target_link_libraries(jit PRIVATE asmjit::asmjit interpreter fmt::fmt)
 if (${ENABLE_DISASSEMBLER})
   target_link_libraries(jit PRIVATE capstone_static)
