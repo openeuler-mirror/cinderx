@@ -255,6 +255,60 @@ int try_flag_and_envvar_effect(
   return init_status;
 }
 
+TEST_F(CmdLineTest, RoiAgingIntervalAcceptsUint32) {
+  ScopedEnvVar env_guard("CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS");
+  const auto saved = getConfig().roi_aging_interval_ms;
+  const auto saved_force_init = getConfig().force_init;
+  SCOPE_EXIT(getMutableConfig().roi_aging_interval_ms = saved);
+  SCOPE_EXIT(getMutableConfig().force_init = saved_force_init);
+  getMutableConfig().force_init = true;
+  for (uint32_t value : {0u, 1u, 60000u, UINT32_MAX}) {
+    SCOPED_TRACE(value);
+    const std::wstring flag =
+        L"jit-auto-roi-aging-interval-ms=" + std::to_wstring(value);
+    const std::string env =
+        "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS=" + std::to_string(value);
+    EXPECT_EQ(
+        try_flag_and_envvar_effect(
+            flag.c_str(),
+            env.c_str(),
+            []() { getMutableConfig().roi_aging_interval_ms = 60000; },
+            [value]() { EXPECT_EQ(getConfig().roi_aging_interval_ms, value); }),
+        0);
+  }
+}
+
+TEST_F(CmdLineTest, RoiAgingIntervalRejectsMalformedAndOverflowValues) {
+  ScopedEnvVar env_guard("CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS");
+  const auto saved = getConfig().roi_aging_interval_ms;
+  const auto saved_force_init = getConfig().force_init;
+  SCOPE_EXIT(getMutableConfig().roi_aging_interval_ms = saved);
+  SCOPE_EXIT(getMutableConfig().force_init = saved_force_init);
+  getMutableConfig().force_init = true;
+  for (const std::string value :
+       {"",
+        "-1",
+        "+1",
+        "1ms",
+        "1.0",
+        " 1",
+        "1 ",
+        "4294967296",
+        "18446744073709551616"}) {
+    SCOPED_TRACE(value);
+    const std::wstring flag = L"jit-auto-roi-aging-interval-ms=" +
+        std::wstring(value.begin(), value.end());
+    const std::string env = "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS=" + value;
+    EXPECT_EQ(
+        try_flag_and_envvar_effect(
+            flag.c_str(),
+            env.c_str(),
+            []() { getMutableConfig().roi_aging_interval_ms = 60000; },
+            []() { EXPECT_EQ(getConfig().roi_aging_interval_ms, 60000); }),
+        0);
+  }
+}
+
 TEST_F(CmdLineTest, BasicFlags) {
   // easy flags that don't interact with one another in tricky ways
   ASSERT_EQ(

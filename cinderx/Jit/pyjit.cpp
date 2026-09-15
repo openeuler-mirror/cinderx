@@ -47,6 +47,7 @@
 #include "cinderx/Jit/mmap_file.h"
 #include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
+#include "cinderx/Jit/roi_backoff_aging.h"
 #include "cinderx/module_state.h"
 
 #ifndef WIN32
@@ -101,6 +102,8 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_uncompile{0};
   std::atomic<uint64_t> roi_recompile{0};
   std::atomic<uint64_t> roi_frozen{0};
+  std::atomic<uint64_t> roi_aging_events{0};
+  std::atomic<uint64_t> roi_aging_count_reduced{0};
 };
 
 struct AutoJitGateState {
@@ -115,6 +118,16 @@ std::atomic<bool> g_auto_jit_gate_stats_enabled{false};
 void incAutoJitGateStat(std::atomic<uint64_t>& stat) {
   if (g_auto_jit_gate_stats_enabled.load(std::memory_order_relaxed)) {
     stat.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void recordAutoJitAgingStats(uint32_t count_reduced) {
+  if (count_reduced != 0 &&
+      g_auto_jit_gate_stats_enabled.load(std::memory_order_relaxed)) {
+    g_auto_jit_gate_stats.roi_aging_events.fetch_add(
+        1, std::memory_order_relaxed);
+    g_auto_jit_gate_stats.roi_aging_count_reduced.fetch_add(
+        count_reduced, std::memory_order_relaxed);
   }
 }
 
@@ -135,6 +148,9 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_uncompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_recompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_frozen.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_aging_events.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_aging_count_reduced.store(
+      0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -876,6 +892,26 @@ FlagProcessor initFlagProcessor() {
       "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
       getMutableConfig().roi_rewarm_factor,
       "Multiplier for AutoJIT ROI backoff recompile floor");
+
+  flag_processor
+      .addOption(
+          "jit-auto-roi-aging-interval-ms",
+          "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS",
+          [](const std::string& value) {
+            uint32_t interval_ms;
+            if (!parse_uint32_arg(value, &interval_ms)) {
+              JIT_LOG(
+                  "Invalid uint32 value for jit-auto-roi-aging-interval-ms/"
+                  "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS: {}",
+                  value);
+              return;
+            }
+            getMutableConfig().roi_aging_interval_ms = interval_ms;
+          },
+          "Halve unfrozen AutoJIT deopt history per elapsed steady-clock "
+          "interval (default 60000 milliseconds; 0 disables aging). "
+          "Does not revive frozen code")
+      .withFlagParamName("MS");
 
   flag_processor.addOption(
       "jit-auto-code-dedup",
@@ -4297,7 +4333,14 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats, "roi_recompile", g_auto_jit_gate_stats.roi_recompile) != 0 ||
       setAutoJitGateStat(
-          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0) {
+          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0 ||
+      setAutoJitGateStat(
+          stats, "roi_aging_events", g_auto_jit_gate_stats.roi_aging_events) !=
+          0 ||
+      setAutoJitGateStat(
+          stats,
+          "roi_aging_count_reduced",
+          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0) {
     return nullptr;
   }
 
@@ -5724,6 +5767,7 @@ void triggerRoiBackoff(
   }
 
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+  extra->roi_aging_epoch_ms = 0;
   if (frozen) {
     Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
     Ci_code_extra_or_skey_release(extra, kSkeyDecidedColdBit);
@@ -5758,6 +5802,16 @@ void recordDeoptForRoiBackoff(
     return;
   }
 
+  const uint32_t interval_ms = getConfig().roi_aging_interval_ms;
+  // Count, epoch, and the possible pending/frozen transition form one update.
+  // The existing FT entrypoint mutex is recursive, so triggerRoiBackoff can
+  // retain its own guard. Disabled aging takes neither this lock nor a clock
+  // sample and keeps the original atomic-counter path.
+  std::optional<FreeThreadedJITEntrypointGuard> aging_guard;
+  if (interval_ms != 0) {
+    aging_guard.emplace();
+  }
+
   BorrowedRef<PyCodeObject> code = code_runtime->code();
   CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
@@ -5771,7 +5825,23 @@ void recordDeoptForRoiBackoff(
 
   uint32_t round = roiBackoffRound(ctl);
   uint32_t budget = roiBackoffBudgetForRound(round);
-  uint32_t count = Ci_code_extra_incr_roi_deopt_count(extra);
+  uint32_t count;
+  if (interval_ms == 0) {
+    count = Ci_code_extra_incr_roi_deopt_count(extra);
+  } else {
+    const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    const auto update = advanceRoiAging(
+        Ci_code_extra_load_roi_deopt_count_relaxed(extra),
+        extra->roi_aging_epoch_ms,
+        now_ms,
+        interval_ms);
+    extra->roi_aging_epoch_ms = update.epoch_ms;
+    Ci_code_extra_store_roi_deopt_count_relaxed(extra, update.count);
+    recordAutoJitAgingStats(update.count_reduced);
+    count = update.count;
+  }
   if (count < budget) {
     return;
   }

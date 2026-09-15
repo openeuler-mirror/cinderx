@@ -263,6 +263,9 @@ struct Config {
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
+  // Halve unfrozen deopt history once per elapsed interval. Zero disables
+  // aging; it does not disable ROI backoff or revive frozen code.
+  uint32_t roi_aging_interval_ms{60000};
   GdbOptions gdb;
   JitListOptions jit_list;
   LogOptions log;

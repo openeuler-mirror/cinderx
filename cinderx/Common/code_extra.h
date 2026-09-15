@@ -71,6 +71,12 @@ typedef struct CodeExtra {
   // every version; only the 3.11 scheduler reads or writes it.
   uint32_t jit311_ctl;
   uint64_t roi_recompile_floor;
+  // Start of the current ROI aging interval in steady-clock milliseconds.
+  // Initialized by the first counted deopt and reset with roi_deopt_count.
+  // The JIT accesses this together with count/ctl under the GIL or
+  // FreeThreadedJITEntrypointGuard. Appending preserves existing field offsets;
+  // the whole block remains calloc-initialized and owns no extra allocation.
+  uint64_t roi_aging_epoch_ms;
 } CodeExtra;
 
 // Thread-safe accessors for CodeExtra::calls.
@@ -127,6 +133,11 @@ static inline int Ci_code_extra_cas_roi_ctl_release(
       0,
       __ATOMIC_RELEASE,
       __ATOMIC_RELAXED);
+}
+
+static inline uint32_t Ci_code_extra_load_roi_deopt_count_relaxed(
+    const CodeExtra* extra) {
+  return __atomic_load_n(&extra->roi_deopt_count, __ATOMIC_RELAXED);
 }
 
 static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
@@ -199,6 +210,11 @@ static inline int Ci_code_extra_cas_roi_ctl_release(
   }
   extra->roi_ctl = desired;
   return 1;
+}
+
+static inline uint32_t Ci_code_extra_load_roi_deopt_count_relaxed(
+    const CodeExtra* extra) {
+  return extra->roi_deopt_count;
 }
 
 static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
