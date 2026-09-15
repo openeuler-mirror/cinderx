@@ -210,6 +210,23 @@ TEST_F(FloatPowerStrengthReductionTest, RewritesRecognizedConstantExponents) {
     ASSERT_TRUE(checkFunc(*func, std::cerr));
 
     ActualShape actual = collectShape(*func);
+#if PY_VERSION_HEX < 0x030C0000
+    // CP311 preserves libm pow rounding for runtime bases, including these
+    // exponents. Verify the retained operation instead of skipping coverage.
+    EXPECT_TRUE(actual.unboxes.empty());
+    EXPECT_TRUE(actual.binary_ops.empty());
+    EXPECT_TRUE(actual.compares.empty());
+    EXPECT_TRUE(actual.guards.empty());
+    EXPECT_TRUE(actual.boxes.empty());
+    ASSERT_EQ(actual.float_binary_ops.size(), 1);
+    const auto* power = actual.float_binary_ops.front();
+    EXPECT_EQ(power->op(), BinaryOpKind::kPower);
+    ASSERT_TRUE(power->right()->type().hasObjectSpec());
+    ASSERT_TRUE(PyFloat_CheckExact(power->right()->type().objectSpec()));
+    EXPECT_DOUBLE_EQ(
+        PyFloat_AS_DOUBLE(power->right()->type().objectSpec()),
+        std::stod(std::string(expected.exponent)));
+#else
     ASSERT_EQ(actual.unboxes.size(), 1);
     EXPECT_EQ(actual.unboxes.front()->type(), TCDouble);
     ASSERT_EQ(actual.boxes.size(), 1);
@@ -247,6 +264,7 @@ TEST_F(FloatPowerStrengthReductionTest, RewritesRecognizedConstantExponents) {
     EXPECT_EQ(
         operandName(actual.boxes.front()->value(), actual),
         std::string(expected.result));
+#endif
   }
 }
 

@@ -1427,6 +1427,17 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
     return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython float_pow uses libm pow for non-constant operands. Replacing
+  // it with sqrt/mul/div changes rounding even for finite positive inputs
+  // (for example, 2.0 ** -1.5). Keep the object operation and its exception
+  // behavior until a bit-equivalent fast path is available.
+  if (op == BinaryOpKind::kPower &&
+      !instr->left()->type().hasObjectSpec()) {
+    return nullptr;
+  }
+#endif
+
   // Constant-exponent strength reduction for `x ** const_float`.
   //
   // For the common numerical exponents used in scientific Python
