@@ -2731,11 +2731,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kIndexUnbox: {
         auto instr = static_cast<const IndexUnbox*>(&i);
-        bbb.appendCallInstruction(
-            instr->output(),
-            PyNumber_AsSsize_t,
-            instr->GetOperand(0),
-            instr->exception());
+        if (instr->GetOperand(0)->type() <= TLongExact) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_UnboxExactIndexI64,
+              instr->GetOperand(0),
+              instr->exception());
+        } else {
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyNumber_AsSsize_t,
+              instr->GetOperand(0),
+              instr->exception());
+        }
         break;
       }
       case Opcode::kPrimitiveUnaryOp: {

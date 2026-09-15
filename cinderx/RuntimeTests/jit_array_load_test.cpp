@@ -6,11 +6,49 @@
 
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
 
 using ArrayLoadTest = RuntimeTest;
+
+TEST_F(ArrayLoadTest, ExactIndexHelperPreservesIndexError) {
+  auto small = Ref<>::steal(PyLong_FromLong(7));
+  ASSERT_NE(small, nullptr);
+  EXPECT_EQ(JITRT_UnboxExactIndexI64(small, PyExc_IndexError), 7);
+  EXPECT_FALSE(PyErr_Occurred());
+  auto negative = Ref<>::steal(PyLong_FromLong(-1));
+  ASSERT_NE(negative, nullptr);
+  EXPECT_EQ(JITRT_UnboxExactIndexI64(negative, PyExc_IndexError), -1);
+  EXPECT_FALSE(PyErr_Occurred());
+
+  auto huge = Ref<>::steal(PyLong_FromString(
+      const_cast<char*>("1267650600228229401496703205376"), nullptr, 10));
+  ASSERT_NE(huge, nullptr);
+  EXPECT_EQ(JITRT_UnboxExactIndexI64(huge, PyExc_IndexError), -1);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_IndexError));
+  auto exc = Ref<>::steal(PyErr_GetRaisedException());
+  ASSERT_NE(exc, nullptr);
+  auto text = Ref<>::steal(PyObject_Str(exc));
+  ASSERT_NE(text, nullptr);
+  EXPECT_STREQ(
+      PyUnicode_AsUTF8(text), "cannot fit 'int' into an index-sized integer");
+
+  auto negative_huge = Ref<>::steal(PyLong_FromString(
+      const_cast<char*>("-1267650600228229401496703205376"), nullptr, 10));
+  ASSERT_NE(negative_huge, nullptr);
+  EXPECT_EQ(
+      JITRT_UnboxExactIndexI64(negative_huge, PyExc_OverflowError), -1);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_OverflowError));
+  auto overflow = Ref<>::steal(PyErr_GetRaisedException());
+  ASSERT_NE(overflow, nullptr);
+  auto overflow_text = Ref<>::steal(PyObject_Str(overflow));
+  ASSERT_NE(overflow_text, nullptr);
+  EXPECT_STREQ(
+      PyUnicode_AsUTF8(overflow_text),
+      "cannot fit 'int' into an index-sized integer");
+}
 
 namespace {
 // The array.array('d') subscript fast path is emitted by the Simplify pass, so
@@ -52,6 +90,32 @@ size_t countBinarySubscrs(const jit::hir::Function& irfunc) {
   return count;
 }
 } // namespace
+
+TEST_F(ArrayLoadTest, OversizedIndexUsesIndexErrorConversion) {
+  std::unique_ptr<jit::hir::Function> irfunc;
+  CompileToHIR(
+      R"(
+from array import array
+def load_array_double(a):
+    return a[-1267650600228229401496703205376]
+)",
+      "load_array_double",
+      irfunc);
+  ASSERT_NE(irfunc, nullptr);
+  runArrayFastPath(irfunc);
+  bool found = false;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsIndexUnbox()) {
+        found = true;
+        EXPECT_EQ(
+            static_cast<const jit::hir::IndexUnbox&>(instr).exception(),
+            PyExc_IndexError);
+      }
+    }
+  }
+  EXPECT_TRUE(found);
+}
 
 // Test that BINARY_SUBSCR on array('d') with a known index shape generates
 // LoadArrayItem(TCDouble) in HIR.

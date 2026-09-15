@@ -1338,6 +1338,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
   switch (opcode) {
     case BEFORE_WITH:
     case BINARY_OP:
+    case BINARY_SUBSCR:
     case BUILD_CONST_KEY_MAP:
     case BUILD_LIST:
     case BUILD_MAP:
@@ -1399,6 +1400,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case SET_ADD:
     case STORE_ATTR:
     case STORE_FAST:
+    case STORE_SUBSCR:
     case SWAP:
     case UNARY_INVERT:
     case UNARY_NEGATIVE:
@@ -1449,11 +1451,53 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
     return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
   }
   BytecodeInstructionBlock bc_instrs{code};
+  // Subscript execution was opened for the profiled floating-point kernels.
+  // Keep that extension scoped to functions with arithmetic that this backend
+  // can specialize. Unconditionally admitting subscription-only helpers also
+  // compiles small dictionary/cache functions, where CP311 call/frame overhead
+  // outweighs the work saved. This is an admission policy, not a type proof:
+  // the HIR guards and generic slow paths must still handle changing inputs.
+  bool has_float_arithmetic = false;
+  bool has_float_constant = false;
+  bool has_arithmetic = false;
+  bool has_numeric_kernel_shape = false;
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
     }
-    if (!isExecuteOpcodeSupported311(bc_it->opcode())) {
+    if (bc_it->opcode() == LOAD_CONST) {
+      has_float_constant |= PyFloat_CheckExact(
+          PyTuple_GET_ITEM(code->co_consts, bc_it->oparg()));
+    }
+    has_arithmetic |= bc_it->opcode() == BINARY_OP;
+    has_numeric_kernel_shape |=
+        bc_it->isBackwardBranch() || bc_it->opcode() == STORE_SUBSCR;
+    switch (bc_it->specializedOpcode()) {
+      case BINARY_OP_ADD_FLOAT:
+      case BINARY_OP_SUBTRACT_FLOAT:
+      case BINARY_OP_MULTIPLY_FLOAT:
+        has_float_arithmetic = true;
+        break;
+      default:
+        break;
+    }
+  }
+  // A timestamp calculation in an otherwise generic constructor is not a
+  // numeric kernel. Scope the extension to repeated work or container updates.
+  // All evidence comes from normal-flow-reachable instructions.
+  bool allow_subscripts = has_numeric_kernel_shape &&
+      (has_float_arithmetic || (has_float_constant && has_arithmetic));
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    if (!reachable.contains(bc_it->baseIndex().value())) {
+      continue;
+    }
+    // AutoJIT can request compilation before bytecode quickening. Preserve
+    // cold numeric kernels with explicit floating-point constants as well.
+    bool unprofitable_subscript =
+        !allow_subscripts &&
+        (bc_it->opcode() == BINARY_SUBSCR || bc_it->opcode() == STORE_SUBSCR);
+    if (unprofitable_subscript ||
+        !isExecuteOpcodeSupported311(bc_it->opcode())) {
       return {
           "REFUSE_SHAPE_EXECUTE_SURFACE",
           bc_it->opcode(),
@@ -5820,7 +5864,8 @@ Register* HIRBuilder::emitArrayIndexGuard(
   tc.block = idx_ok;
   tc.emit<RefineType>(sub, TLongExact, sub);
   Register* unboxed_idx = temps_.AllocateStack();
-  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
+  // Sequence indices overflow with IndexError, not numeric OverflowError.
+  tc.emit<IndexUnbox>(unboxed_idx, sub);
   Register* neg_check = temps_.AllocateStack();
   tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
   return unboxed_idx;

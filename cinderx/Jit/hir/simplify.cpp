@@ -923,7 +923,8 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   env.block = idx_ok;
   env.cursor = idx_ok->end();
   Register* idx = env.emit<RefineType>(TLongExact, sub);
-  Register* unboxed_idx = env.emit<PrimitiveUnbox>(idx, TCInt64);
+  // Match array indexing's IndexError for integers outside Py_ssize_t.
+  Register* unboxed_idx = env.emit<IndexUnbox>(idx);
   env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
   Register* descr = env.emit<LoadField>(
       arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
