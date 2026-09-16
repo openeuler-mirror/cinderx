@@ -3,7 +3,7 @@
 # for every sub-step.
 set -euo pipefail
 
-STAGE=${1:?usage: run_cp311_stage.sh <setup_release|test_release|libtest_execute_72|test_release_daily|libtest_daily> <run_dir>}
+STAGE=${1:?usage: run_cp311_stage.sh <setup_release|test_release|libtest_execute_72|test_release_daily|libtest_daily|execution_acceptance_daily|lifecycle_acceptance_daily|runtime_transition_acceptance_daily> <run_dir>}
 RUN_DIR=${2:?usage: run_cp311_stage.sh <stage> <run_dir>}
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
@@ -13,6 +13,8 @@ VENV="$RUN_DIR/venv"
 PYTHON="$VENV/bin/python"
 PIP="$VENV/bin/pip"
 LOG_DIR="$RUN_DIR/logs/cp311-$STAGE"
+PYTEST_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-test.txt"
+BUILD_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-build.txt"
 
 case "$BUILD_JOBS" in
   ''|*[!0-9]*) echo "CINDERX_TEST_JOBS must be a positive integer"; exit 2 ;;
@@ -32,6 +34,24 @@ assert sysconfig.get_config_var("SOABI") == "cpython-311-aarch64-linux-gnu"
 print("CPython 3.11 gate interpreter", sys.executable)
 print("CPython 3.11 gate prefix", sys.base_prefix)
 PY
+
+check_python_test_support() {
+  "$TEST_PYTHON" -I - <<'PY'
+import importlib
+
+for name in ("test", "_testcapi"):
+    try:
+        module = importlib.import_module(name)
+    except ImportError as exc:
+        raise SystemExit(
+            f"CPython test support is unavailable: {name}: {exc}. "
+            "Repair the selected Python installation or rebuild the test image."
+        ) from exc
+    print(f"CPython test support {name}: {module.__file__}")
+PY
+}
+
+check_python_test_support
 
 run_step() {
   local name=$1
@@ -149,15 +169,13 @@ setup_release() {
       fi
       ;;
     daily)
-      if [ -z "$wheel" ]; then
-        echo "Daily mode requires CINDERX_TEST_WHEEL"
-        return 2
+      if [ -n "$wheel" ]; then
+        [ -f "$wheel" ] || {
+          echo "CINDERX_TEST_WHEEL does not exist: $wheel"
+          return 2
+        }
+        verify_daily_wheel_source "$wheel"
       fi
-      [ -f "$wheel" ] || {
-        echo "CINDERX_TEST_WHEEL does not exist: $wheel"
-        return 2
-      }
-      verify_daily_wheel_source "$wheel"
       ;;
     *)
       echo "CINDERX_CP311_PIPELINE_MODE must be pr or daily, got: ${PIPELINE_MODE:-<unset>}"
@@ -165,13 +183,28 @@ setup_release() {
       ;;
   esac
   pip_args
-  if [ "$PIPELINE_MODE" = "daily" ]; then
+  if [ "$PIPELINE_MODE" = "daily" ] && [ -n "$wheel" ]; then
     echo "setup_release_311: using CINDERX_TEST_WHEEL=$wheel"
+  elif [ "$PIPELINE_MODE" = "daily" ]; then
+    rm -rf "$wheel_dir" "$RUN_DIR/cp311-wheel-build"
+    mkdir -p "$wheel_dir"
+    CINDERX_CP311_WHEEL_SOURCE_DIR="$REPO_ROOT" \
+      CINDERX_CP311_WHEEL_OUTPUT_DIR="$wheel_dir" \
+      CINDERX_CP311_WHEEL_WORK_DIR="$RUN_DIR/cp311-wheel-build" \
+      CINDERX_CP311_WHEEL_TRACKED_SOURCE=1 \
+      CINDERX_GIT_SHA="$(git rev-parse HEAD)" \
+      CINDERX_BUILDER_IMAGE="${CINDERX_BUILDER_IMAGE:-cp311-daily-in-place}" \
+      CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" \
+      bash ci_pipeline/scripts/build_cp311_wheel_in_container.sh
+    wheel=$(find "$wheel_dir" -maxdepth 1 -name 'cinderx-*-cp311-*.whl' \
+      -type f -print -quit)
+    [ -n "$wheel" ] || { echo "Daily Release wheel was not produced"; return 1; }
+    verify_daily_wheel_source "$wheel"
+    echo "setup_release_311: built Daily Release wheel $wheel"
   else
     rm -rf "$wheel_dir"
     mkdir -p "$wheel_dir"
-    "$TEST_PYTHON" -m pip install "${PIP_ARGS[@]}" --upgrade \
-      'setuptools>=77.0.3' wheel
+    "$TEST_PYTHON" -m pip install "${PIP_ARGS[@]}" -r "$BUILD_REQUIREMENTS"
     CMAKE_BUILD_TYPE=Release CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" \
       "$TEST_PYTHON" -m pip wheel . -w "$wheel_dir" \
         --no-cache-dir --no-deps --no-build-isolation
@@ -189,7 +222,7 @@ setup_release() {
   rm -rf "$VENV"
   "$TEST_PYTHON" -m venv "$VENV"
   "$PIP" install "${PIP_ARGS[@]}" --force-reinstall "$wheel"
-  "$PIP" install "${PIP_ARGS[@]}" pytest==9.0.3
+  "$PIP" install "${PIP_ARGS[@]}" -r "$PYTEST_REQUIREMENTS"
   printf '%s\n' "$wheel" > "$RUN_DIR/cp311-tested-wheel.txt"
 }
 
@@ -328,6 +361,51 @@ libtest_daily() {
   finish_daily_stage
 }
 
+tested_wheel() {
+  local record="$RUN_DIR/cp311-tested-wheel.txt"
+  [ -s "$record" ] || {
+    echo "tested wheel record is missing: $record" >&2
+    return 2
+  }
+  local wheel
+  wheel=$(cat "$record")
+  [ -f "$wheel" ] || {
+    echo "tested wheel does not exist: $wheel" >&2
+    return 2
+  }
+  printf '%s\n' "$wheel"
+}
+
+execution_acceptance_daily() {
+  local wheel
+  wheel=$(tested_wheel)
+  run_step execution_acceptance "$TEST_PYTHON" \
+    ci_pipeline/jit311/execution_acceptance.py \
+    --wheel "$wheel" --source "$REPO_ROOT" --python "$PYTHON" \
+    --stock-dir "$RUN_DIR/libtest-off/stock" \
+    --jobs "$BUILD_JOBS" --out "$RUN_DIR/execution-acceptance"
+}
+
+lifecycle_acceptance_daily() {
+  local wheel
+  wheel=$(tested_wheel)
+  run_step lifecycle_acceptance "$TEST_PYTHON" \
+    -m ci_pipeline.jit311.lifecycle_acceptance \
+    --wheel "$wheel" --source "$REPO_ROOT" --python "$PYTHON" \
+    --asan-build "$RUN_DIR/asan-build" \
+    --jobs "$BUILD_JOBS" --out "$RUN_DIR/lifecycle-acceptance"
+}
+
+runtime_transition_acceptance_daily() {
+  local wheel
+  wheel=$(tested_wheel)
+  run_step runtime_transition_acceptance "$TEST_PYTHON" \
+    -m ci_pipeline.jit311.runtime_transition_acceptance \
+    --wheel "$wheel" --source "$REPO_ROOT" --python "$PYTHON" \
+    --stock-dir "$RUN_DIR/libtest-off/stock" \
+    --jobs "$BUILD_JOBS" --out "$RUN_DIR/runtime-transition-acceptance"
+}
+
 unified_libtest_report() {
   local base="$RUN_DIR/libtest-daily-trigger-summary.json"
   "$PYTHON" -m ci_pipeline.jit311.runners \
@@ -393,6 +471,18 @@ case "$STAGE" in
   libtest_daily)
     require_candidate
     libtest_daily
+    ;;
+  execution_acceptance_daily)
+    require_candidate
+    execution_acceptance_daily
+    ;;
+  lifecycle_acceptance_daily)
+    require_candidate
+    lifecycle_acceptance_daily
+    ;;
+  runtime_transition_acceptance_daily)
+    require_candidate
+    runtime_transition_acceptance_daily
     ;;
   *)
     echo "unknown CPython 3.11 stage: $STAGE" >&2

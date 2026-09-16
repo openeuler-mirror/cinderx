@@ -23,10 +23,6 @@ ARG GCC_TOOLSET_MAJOR=14
 ARG LCOV_VERSION=1.16
 ARG PYPERFORMANCE_VERSION=1.13.0
 ARG PYPERF_VERSION=2.9.0
-ARG SETUPTOOLS_VERSION=80.9.0
-ARG PYTEST_VERSION=8.3.4
-ARG WHEEL_VERSION=0.45.1
-ARG BUILD_VERSION=1.3.0
 ARG BUILD_JOBS=16
 ARG PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple
 ARG PYTHON3_NVR=3.11.6-34.oe2403sp3
@@ -37,10 +33,6 @@ ARG GCC_TOOLSET_MAJOR
 ARG LCOV_VERSION
 ARG PYPERFORMANCE_VERSION
 ARG PYPERF_VERSION
-ARG SETUPTOOLS_VERSION
-ARG PYTEST_VERSION
-ARG WHEEL_VERSION
-ARG BUILD_VERSION
 ARG BUILD_JOBS
 ARG PIP_INDEX_URL
 ARG PYTHON3_NVR
@@ -165,21 +157,20 @@ RUN set -eux; \
     clone_dep capstone https://github.com/capstone-engine/capstone 52c66920fc7bfa15fd9626dfd9f646c698aaa99b; \
     clone_dep googletest https://github.com/google/googletest 52eb8108c5bdec04579160ae17225d66034bd723
 
+COPY ci_pipeline/requirements-cp311-test.txt /opt/cinderx-requirements/requirements-cp311-test.txt
+COPY ci_pipeline/requirements-cp311-build.txt /opt/cinderx-requirements/requirements-cp311-build.txt
+
 RUN "${CINDERX_TEST_PYTHON}" -m pip install --no-cache-dir --upgrade pip \
     && "${CINDERX_TEST_PYTHON}" -m pip install --no-cache-dir \
-        "setuptools==${SETUPTOOLS_VERSION}" \
-        "wheel==${WHEEL_VERSION}" \
-        "build==${BUILD_VERSION}" \
-        "pytest==${PYTEST_VERSION}" \
+        -r /opt/cinderx-requirements/requirements-cp311-build.txt \
+        -r /opt/cinderx-requirements/requirements-cp311-test.txt \
         "pyperformance==${PYPERFORMANCE_VERSION}" \
         "pyperf==${PYPERF_VERSION}" \
     && mkdir -p /opt/cinderx-pydeps \
     && "${CINDERX_TEST_PYTHON}" -m pip download --dest /opt/cinderx-pydeps \
         pip \
-        "setuptools==${SETUPTOOLS_VERSION}" \
-        "wheel==${WHEEL_VERSION}" \
-        "build==${BUILD_VERSION}" \
-        "pytest==${PYTEST_VERSION}" \
+        -r /opt/cinderx-requirements/requirements-cp311-build.txt \
+        -r /opt/cinderx-requirements/requirements-cp311-test.txt \
         "pyperformance==${PYPERFORMANCE_VERSION}" \
         "pyperf==${PYPERF_VERSION}"
 

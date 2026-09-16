@@ -10,6 +10,23 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 - Linux (aarch64)
 - CPython 3.11.6 目前仅支持 openEuler 24.03 (LTS-SP3)；CPython 3.14 推荐 openEuler 24.03 (LTS-SP3)
 
+### Docker 开发与测试环境
+
+在 Linux AArch64 主机的仓库根目录执行，按 Python 版本分别构建镜像：
+
+```bash
+docker build --build-arg BUILD_JOBS=16 -t cinderx-dev:py314 .
+docker build -f Dockerfile.cp311-dev --build-arg BUILD_JOBS=16 -t cinderx-dev:py311 .
+```
+
+- 两套镜像默认基于 `openeuler/openeuler:24.03-lts-sp3`。镜像构建需要联网，预装 CinderX、测试及性能工具。
+- [Dockerfile](Dockerfile) 使用 GCC 12 构建 CPython 3.14.3（静态 libpython、PGO+LTO）；[Dockerfile.cp311-dev](Dockerfile.cp311-dev) 使用固定的 openEuler `python3/python3-devel-3.11.6-34.oe2403sp3` 包和共享 libpython。
+- CinderX wheel 和 RuntimeTests 均使用 GCC 14；RuntimeTests 默认关闭 LTO，覆盖率模式不能与 LTO/PGO 同时启用。
+- 镜像预置 `/opt/cinderx-deps` 和 `/opt/cinderx-pydeps`，默认启用 pip 离线安装。pytest 统一为 `9.0.3`；3.11 构建依赖以 [requirements-cp311-build.txt](ci_pipeline/requirements-cp311-build.txt) 为准，离线缓存必须包含指定版本及其传递依赖。
+- Dockerfile、Python、编译器或依赖版本变化后须重建镜像。镜像包含构建时复制的源码；挂载新源码后须重新构建安装 CinderX。CI 应记录源码 SHA 和镜像 ID。
+
+完整 PR/Daily 运行方式见 [CI 测试指南](ci_pipeline/README_CN.md)。
+
 ## 兼容性
 
 当前发布的 CinderX whl 包对各平台的兼容情况如下：

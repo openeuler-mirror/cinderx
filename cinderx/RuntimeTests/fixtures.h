@@ -8,11 +8,32 @@
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 #include "cinderx/module_state.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+// A mode gate, not a version gate.  These cases compile and install
+// machine code, which on 3.11 the executing (canary) mode does and the
+// shadow mode does not -- so what decides is the mode the binary was
+// started in, not the version it was built for.  Left as a version gate
+// they skipped on every 3.11 build, including the sanitized one, which is
+// the only place a use-after-free in the install and lifecycle paths would
+// actually be caught.  Run the binary with CINDERX_JIT_MODE=canary to
+// execute them.
+#define SKIP_311_EXECUTABLE_COMPILE()                                    \
+  do {                                                                   \
+    if (jit::getConfig().state != jit::State::kRunning) {                \
+      GTEST_SKIP() << "3.11 executes machine code only in canary mode; " \
+                      "set CINDERX_JIT_MODE=canary to run this";         \
+    }                                                                    \
+  } while (0)
+#else
+#define SKIP_311_EXECUTABLE_COMPILE() static_cast<void>(0)
+#endif
 
 #define JIT_TEST_MOD_NAME "jittestmodule"
 

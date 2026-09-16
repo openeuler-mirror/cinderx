@@ -576,14 +576,14 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # one more when MR-08 opened the exception family, 333 once MR-09's
     # pull-validated attribute caches guard attribute sites across 72
     # importing modules (import-time class mutation retires
-    # receiver-version guards by design), and 330 in the shared-3.11 gate
-    # after the CPython test support path is added.  The base build and this
+    # receiver-version guards by design), and 333 in the current shared-3.11
+    # gate after the CPython test support path is added.  The base build and this
     # branch measure alike in that invocation context.  The count is
     # sensitive to sys.path; the gate runs with its system-3.11 venv plus
     # the matching CPython 3.11.6 test support paths.  Verified deterministic
     # across base and candidate reruns; the exact pin keeps the fail-closed
     # drift guard.
-    default = execute_holds(expected_organic_deopts=330) + [
+    default = execute_holds(expected_organic_deopts=333) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]

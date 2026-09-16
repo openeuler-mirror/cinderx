@@ -36,6 +36,8 @@ class ExecutionAcceptanceRunner:
         lanes: set[str],
         jobs: int,
         timeout: int,
+        python: Path | None = None,
+        stock_dir: Path | None = None,
     ) -> None:
         self.wheel = wheel.resolve()
         self.source = source.resolve()
@@ -45,7 +47,9 @@ class ExecutionAcceptanceRunner:
         self.timeout = timeout
         self.stage = self.output / "harness"
         self.venv = self.output / "venv"
-        self.python = self.venv / "bin" / "python"
+        self.python = python.absolute() if python else self.venv / "bin" / "python"
+        self.reused_python = python is not None
+        self.stock_dir = stock_dir.resolve() if stock_dir else None
         self.logs = self.output / "logs"
         self.results: dict[str, dict] = {}
         self.command_results: dict[str, dict] = {}
@@ -60,13 +64,17 @@ class ExecutionAcceptanceRunner:
         env.update(PYTHONHASHSEED="0", PYTHONUNBUFFERED="1")
         return env
 
-    def _product_env(self, *, threshold: str = "1000000") -> dict[str, str]:
+    def _stage_env(self) -> dict[str, str]:
         env = self._base_env()
+        env["PYTHONPATH"] = str(self.stage)
+        return env
+
+    def _product_env(self, *, threshold: str = "1000000") -> dict[str, str]:
+        env = self._stage_env()
         env.update(
             CINDERX_JIT_MODE="canary",
             PYTHONJITAUTO=threshold,
             PYTHONJITGENERATOR="1",
-            PYTHONPATH=str(self.stage),
         )
         return env
 
@@ -115,6 +123,50 @@ class ExecutionAcceptanceRunner:
         except (OSError, json.JSONDecodeError):
             return None
 
+    def _frozen_stdlib_targets(self) -> list[str]:
+        return [
+            line.strip()
+            for line in (
+                self.stage / "ci_pipeline/jit311/data/frozen_stdlib_modules.txt"
+            ).read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+
+    def _reuse_stock_arm(self, name: str, directory: Path, target_name: str) -> int:
+        if self.stock_dir is None:
+            raise ValueError("a reusable Stock directory was not configured")
+        return self._run(
+            name,
+            [
+                str(self.python),
+                str(self.stage / "ci_pipeline/libtest_diff_311.py"),
+                "reuse-stock",
+                "--stock-dir",
+                str(self.stock_dir),
+                "--out",
+                str(directory),
+                "--python",
+                str(self.python),
+                "--target-name",
+                target_name,
+                "--tests",
+                *self._frozen_stdlib_targets(),
+            ],
+        )
+
+    def _require_candidate_module_path(self, module_path: str) -> Path:
+        resolved = Path(module_path).resolve()
+        candidate_prefix = self.python.parent.parent.resolve()
+        if (
+            not resolved.is_relative_to(candidate_prefix)
+            or "site-packages" not in resolved.parts
+        ):
+            raise RuntimeError(
+                "product module did not load from candidate site-packages: "
+                f"{resolved}"
+            )
+        return resolved
+
     def preflight(self) -> dict:
         if not self.wheel.is_file() or self.wheel.suffix != ".whl":
             raise ValueError(f"wheel does not exist: {self.wheel}")
@@ -149,17 +201,19 @@ class ExecutionAcceptanceRunner:
             else:
                 shutil.copy2(source_path, destination)
 
-        self._run(
-            "00-create-venv",
-            [sys.executable, "-m", "venv", "--system-site-packages", str(self.venv)],
-        )
+        if not self.reused_python:
+            self._run(
+                "00-create-venv",
+                [sys.executable, "-m", "venv", "--system-site-packages", str(self.venv)],
+            )
         if not self.python.is_file():
-            raise RuntimeError("venv creation failed; see 00-create-venv.log")
-        if self._run(
-            "01-install-wheel",
-            [str(self.python), "-m", "pip", "install", "--no-index", "--no-deps", str(self.wheel)],
-        ) != 0:
-            raise RuntimeError("wheel installation failed; see 01-install-wheel.log")
+            raise RuntimeError(f"candidate Python does not exist: {self.python}")
+        if not self.reused_python:
+            if self._run(
+                "01-install-wheel",
+                [str(self.python), "-m", "pip", "install", "--no-index", "--no-deps", str(self.wheel)],
+            ) != 0:
+                raise RuntimeError("wheel installation failed; see 01-install-wheel.log")
 
         wheel_sha = hashlib.sha256(self.wheel.read_bytes()).hexdigest()
         embedded = None
@@ -199,17 +253,32 @@ class ExecutionAcceptanceRunner:
         )
         runtime = json.loads(runtime_probe.stdout.strip().splitlines()[-1])
         for module_path in (runtime["cinderx"], runtime["_cinderx"]):
-            resolved = Path(module_path).resolve()
-            if str(resolved).startswith(str(self.source)) or "site-packages" not in str(resolved):
-                raise RuntimeError(f"product module did not load from wheel site-packages: {resolved}")
+            self._require_candidate_module_path(module_path)
+        installed_build_info = (
+            Path(runtime["cinderx"]).resolve().parent
+            / "_native"
+            / "build_info_311.json"
+        )
+        try:
+            installed = json.loads(installed_build_info.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"installed wheel provenance is missing or invalid: {exc}"
+            ) from exc
+        if installed != embedded:
+            raise RuntimeError(
+                "candidate interpreter does not contain the requested wheel"
+            )
 
         provenance = {
             "python": runtime["python"],
             "python_executable": str(self.python),
+            "reused_python": self.reused_python,
             "architecture": platform.machine(),
             "wheel": self.wheel.name,
             "wheel_sha256": wheel_sha,
             "wheel_embedded": embedded,
+            "installed_wheel_matches_input": True,
             "source_git_sha": source_sha,
             "cinderx_file": runtime["cinderx"],
             "_cinderx_file": runtime["_cinderx"],
@@ -230,7 +299,7 @@ class ExecutionAcceptanceRunner:
         rc_negative = self._run(
             "10-S-negative",
             [str(self.python), "-m", module, "--expect-mode", "off", "--out", str(negative)],
-            env={**self._base_env(), "PYTHONPATH": str(self.stage)},
+            env=self._stage_env(),
         )
         rc_positive = self._run(
             "11-S-threshold50",
@@ -318,7 +387,10 @@ class ExecutionAcceptanceRunner:
             "from ci_pipeline.jit311 import semantic_conformance_hook\n",
             encoding="utf-8",
         )
-        rc0 = self._run("20-C0-stock", self._arm_command(out=c0))
+        if self.stock_dir is None:
+            rc0 = self._run("20-C0-stock", self._arm_command(out=c0))
+        else:
+            rc0 = self._reuse_stock_arm("20-C0-stock", directory, "c0")
         rc1 = self._run(
             "21-C1-instrumented",
             self._arm_command(out=c1, startup=c1_startup, mode="instrumented", journal=c1_journal),
@@ -333,7 +405,7 @@ class ExecutionAcceptanceRunner:
         c0c1 = directory / "c0-vs-c1.json"
         c1c2 = directory / "c1-vs-c2.json"
         report_module = "ci_pipeline.jit311.execution_report"
-        common_env = {**self._base_env(), "PYTHONPATH": str(self.stage)}
+        common_env = self._stage_env()
         rc_c0c1 = self._run(
             "23-C0-vs-C1",
             [str(self.python), "-m", report_module, "compare", "--stock", str(c0 / "result.json"), "--execute", str(c1 / "result.json"), "--deviations", str(empty_deviations), "--out", str(c0c1)],
@@ -452,6 +524,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
+        "--python",
+        type=Path,
+        help="reuse an already provisioned candidate interpreter",
+    )
+    parser.add_argument(
+        "--stock-dir",
+        type=Path,
+        help="reuse a completed frozen Stock arm for semantic conformance",
+    )
+    parser.add_argument(
         "--case",
         type=lambda value: value.replace("-", "_").lower(),
         choices=("execution_smoke", "semantic_conformance", "specialization_conformance"),
@@ -477,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
         lanes=set(args.case or ("execution_smoke", "semantic_conformance", "specialization_conformance")),
         jobs=args.jobs,
         timeout=args.timeout,
+        python=args.python,
+        stock_dir=args.stock_dir,
     )
     try:
         final = runner.run()

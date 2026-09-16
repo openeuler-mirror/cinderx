@@ -1,15 +1,20 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 from ci_pipeline.jit311.execution_report import (
     classify_compile_all,
     compare_with_deviations,
     validate_execute_surfaces,
 )
-from ci_pipeline.jit311.execution_acceptance import require_matching_source_sha
+from ci_pipeline.jit311.execution_acceptance import (
+    ExecutionAcceptanceRunner,
+    require_matching_source_sha,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +22,89 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class ExecutionReportTest(unittest.TestCase):
+    def test_acceptance_env_isolates_stage_and_activation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = ExecutionAcceptanceRunner(
+                wheel=root / "candidate.whl",
+                source=ROOT,
+                output=root / "out",
+                lanes=set(),
+                jobs=1,
+                timeout=30,
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PYTHONPATH": "/untrusted",
+                    "CINDERX_JIT_MODE": "shadow",
+                },
+                clear=False,
+            ):
+                base = runner._base_env()
+                staged = runner._stage_env()
+
+        self.assertNotIn("PYTHONPATH", base)
+        self.assertNotIn("CINDERX_JIT_MODE", base)
+        self.assertEqual(
+            staged["PYTHONPATH"].split(os.pathsep),
+            [str(runner.stage)],
+        )
+
+    def test_daily_reuses_candidate_python_and_stock_without_running_an_arm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stock = root / "daily-stock"
+            python = root / "venv/bin/python"
+            runner = ExecutionAcceptanceRunner(
+                wheel=root / "candidate.whl",
+                source=ROOT,
+                output=root / "out",
+                lanes={"semantic_conformance"},
+                jobs=4,
+                timeout=30,
+                python=python,
+                stock_dir=stock,
+            )
+            runner.stage = ROOT
+            commands = []
+            runner._run = lambda name, command, **kwargs: commands.append(
+                (name, command)
+            ) or 0
+            rc = runner._reuse_stock_arm("20-C0-stock", root, "c0")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.python, python.absolute())
+        self.assertEqual(commands[0][0], "20-C0-stock")
+        self.assertIn("reuse-stock", commands[0][1])
+        self.assertIn(str(stock.resolve()), commands[0][1])
+        self.assertIn("c0", commands[0][1])
+
+    def test_candidate_modules_may_live_in_a_repo_local_build_venv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = ExecutionAcceptanceRunner(
+                wheel=root / "candidate.whl",
+                source=root / "source",
+                output=root / "source/build/testgate/acceptance",
+                lanes=set(),
+                jobs=1,
+                timeout=30,
+                python=root / "source/build/testgate/venv/bin/python",
+            )
+            installed = (
+                root
+                / "source/build/testgate/venv/lib/python3.11/site-packages/cinderx/__init__.py"
+            )
+            source_module = root / "source/cinderx/PythonLib/cinderx/__init__.py"
+
+            self.assertEqual(
+                runner._require_candidate_module_path(str(installed)),
+                installed.resolve(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "candidate site-packages"):
+                runner._require_candidate_module_path(str(source_module))
+
     def test_release_provenance_requires_exact_source_sha(self):
         require_matching_source_sha("a" * 40, "a" * 40)
         with self.assertRaisesRegex(RuntimeError, "provenance mismatch"):

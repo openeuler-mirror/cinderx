@@ -26,7 +26,7 @@ else
   TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
   PYTHON_INCLUDE_DIR=${CINDERX_TEST_PYTHON_INCLUDE_DIR:-}
   PYTHON_LIBRARY=${CINDERX_TEST_PYTHON_LIBRARY:-}
-  PYTHON_EXTENSIONS_DIR=${CINDERX_TEST_PYTHON_EXTENSIONS_DIR:-}
+  PYTHON_EXTENSIONS_DIR=
 fi
 PYTHON_ROOT=$("$TEST_PYTHON" -c 'import sys; print(sys.base_prefix)')
 BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
@@ -58,10 +58,33 @@ fi
 
 # The sanitizer runtime lives with the toolchain, which is not on the
 # loader's default path here (the project already carries libstdc++ the same
-# way).  Bake it in as an rpath rather than exporting LD_LIBRARY_PATH, which
-# would also reorder library resolution for every child process the build
-# and the tests spawn.
-ASAN_LIBDIR=$(dirname "$("$ASAN_CC" -print-file-name=libasan.so)")
+# way).  Some openEuler GCC installations return a linker script for the
+# unversioned libasan.so.  Resolve the soname actually linked into the probe
+# before choosing the rpath and preload target.
+is_elf() {
+  [ -f "$1" ] && readelf -h "$1" >/dev/null 2>&1
+}
+ASAN_SONAME=$(readelf -d "$PREFLIGHT/probe" 2>/dev/null \
+  | sed -n 's/.*Shared library: \[\(libasan\.so[^]]*\)\].*/\1/p' \
+  | head -1)
+ASAN_RUNTIME=""
+if [ -n "$ASAN_SONAME" ]; then
+  candidate=$("$ASAN_CC" -print-file-name="$ASAN_SONAME")
+  if is_elf "$candidate"; then
+    ASAN_RUNTIME=$candidate
+  fi
+fi
+if [ -z "$ASAN_RUNTIME" ]; then
+  candidate=$("$ASAN_CC" -print-file-name=libasan.so)
+  if is_elf "$candidate"; then
+    ASAN_RUNTIME=$candidate
+  fi
+fi
+[ -n "$ASAN_RUNTIME" ] || {
+  echo "asan leg: cannot resolve an ELF sanitizer runtime (soname: ${ASAN_SONAME:-unknown})"
+  exit 1
+}
+ASAN_LIBDIR=$(dirname "$ASAN_RUNTIME")
 ASAN_RPATH=""
 if [ -d "$ASAN_LIBDIR" ]; then
   ASAN_RPATH="-Wl,-rpath,$ASAN_LIBDIR"
@@ -225,7 +248,6 @@ if [ "$ASAN_SYMS" -lt 1 ] || [ "$ASAN_NEEDED" -lt 1 ]; then
 fi
 echo "asan extension instrumented ($ASAN_SYMS __asan symbols): $ASAN_EXT"
 
-ASAN_RUNTIME=$("$ASAN_CC" -print-file-name=libasan.so)
 CANARY_PYTHONPATH="$(dirname "$ASAN_EXT"):$REPO_ROOT/cinderx/PythonLib"
 if [ -n "$PYTHON_EXTENSIONS_DIR" ]; then
   CANARY_PYTHONPATH="$CANARY_PYTHONPATH:$PYTHON_EXTENSIONS_DIR"

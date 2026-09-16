@@ -1,6 +1,7 @@
 # CPython 3.11 Daily-only increments.  ``daily`` first executes cp311_gate,
-# with setup_release_311 consuming CINDERX_TEST_WHEEL, then appends these two
-# jobs without rebuilding the Release wheel.
+# with setup_release_311 verifying an external wheel or building one, then
+# appends these two jobs and the three formal JIT acceptance domains without rebuilding the
+# Release wheel, rerunning Stock 72, or rebuilding the ASAN extension.
 
 fail_fast = false
 
@@ -18,3 +19,18 @@ command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh test_release_da
 name = "libtest_daily_311"
 phase = "libtest"
 command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh libtest_daily \"{run_dir}\"'"
+
+[[jobs]]
+name = "execution_acceptance_daily_311"
+phase = "execution_acceptance"
+command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh execution_acceptance_daily \"{run_dir}\"'"
+
+[[jobs]]
+name = "lifecycle_acceptance_daily_311"
+phase = "lifecycle_acceptance"
+command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh lifecycle_acceptance_daily \"{run_dir}\"'"
+
+[[jobs]]
+name = "runtime_transition_acceptance_daily_311"
+phase = "runtime_transition_acceptance"
+command = "bash -lc 'bash ci_pipeline/scripts/run_cp311_stage.sh runtime_transition_acceptance_daily \"{run_dir}\"'"

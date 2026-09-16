@@ -226,6 +226,8 @@ class RuntimeTransitionAcceptanceRunner:
         lanes: set[str],
         jobs: int,
         timeout: int,
+        python: Path | None = None,
+        stock_dir: Path | None = None,
     ) -> None:
         self.base = ExecutionAcceptanceRunner(
             wheel=wheel,
@@ -234,6 +236,8 @@ class RuntimeTransitionAcceptanceRunner:
             lanes=set(),
             jobs=jobs,
             timeout=timeout,
+            python=python,
+            stock_dir=stock_dir,
         )
         self.lanes = lanes
         self.results: dict[str, dict] = {}
@@ -295,12 +299,11 @@ class RuntimeTransitionAcceptanceRunner:
         return command
 
     def _jit_all_env(self) -> dict[str, str]:
-        env = self.base._base_env()
+        env = self.base._stage_env()
         env.update(
             CINDERX_JIT_MODE="canary",
             PYTHONJITALL="1",
             PYTHONJITGENERATOR="1",
-            PYTHONPATH=str(self.base.stage),
         )
         return env
 
@@ -334,7 +337,7 @@ class RuntimeTransitionAcceptanceRunner:
         return self.base._run(
             name,
             command,
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+            env=self.base._stage_env(),
         )
 
     def run_autocompile_coverage(self) -> dict:
@@ -372,9 +375,14 @@ class RuntimeTransitionAcceptanceRunner:
                     / "test_cinderx/test_kunpeng/test_jitall_scheduler_config.py"
                 ),
             ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+            env=self.base._stage_env(),
         )
-        rc0 = self.base._run("20-autocompile-stock", self._arm_command(out=stock))
+        if self.base.stock_dir is None:
+            rc0 = self.base._run("20-autocompile-stock", self._arm_command(out=stock))
+        else:
+            rc0 = self.base._reuse_stock_arm(
+                "20-autocompile-stock", directory, "p0-stock"
+            )
         rc2 = self.base._run(
             "22-autocompile-jit-all",
             self._arm_command(
@@ -477,7 +485,7 @@ class RuntimeTransitionAcceptanceRunner:
                     "--out",
                     str(stock_out),
                 ],
-                env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+                env=self.base._stage_env(),
             )
             rc_probe_jit = self.base._run(
                 f"{number}-{tag}-jit",
@@ -1110,6 +1118,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", type=Path, default=None)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
+        "--python",
+        type=Path,
+        help="reuse an already provisioned candidate interpreter",
+    )
+    parser.add_argument(
+        "--stock-dir",
+        type=Path,
+        help="reuse a completed frozen Stock arm for autocompile coverage",
+    )
+    parser.add_argument(
         "--case",
         type=lambda value: value.replace("-", "_").lower(),
         choices=("autocompile_coverage", "state_transition", "transition_recovery"),
@@ -1134,6 +1152,8 @@ def main(argv: list[str] | None = None) -> int:
         lanes=set(args.case or ("autocompile_coverage", "state_transition", "transition_recovery")),
         jobs=args.jobs,
         timeout=args.timeout,
+        python=args.python,
+        stock_dir=args.stock_dir,
     )
     try:
         final = runner.run()

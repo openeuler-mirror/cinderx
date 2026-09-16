@@ -74,14 +74,17 @@ CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
 
-Python 3.11 Daily 必须传入 fat wheel；`setup_release_311` 直接安装它，不再构建
-第二个 wheel，然后追加 `test_release_daily_311` 和 `libtest_daily_311`：
+Python 3.11 Daily 可以传入已构建的正式 wheel；`setup_release_311` 会校验其
+provenance 和源码 SHA。没有传入 wheel 时，它会在 RuntimeTests 之后自行构建并
+规范化当前 HEAD 的 Release wheel，然后追加 Daily 增量测试和三个 JIT acceptance job：
 
 ```bash
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
-CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
 python3.11 ci_pipeline/run_gate.py daily
 ```
+
+两种方式均要求所选 CPython 自带可直接导入的 `test` 和 `_testcapi`。
+缺失时应修复 Python 安装或重新构建测试镜像。
 
 `libtest_daily_311` 只执行一次 stock 440 和 evaluator-off 440，随后从 stock
 440 结果中抽取 72 模块基线，只运行 execute 72、Py_DEBUG refleak 10，并写
@@ -92,6 +95,11 @@ Lib/test arm。
 包括精确的 organic-deopt 漂移守卫。pyperformance completion 命令保留为
 显式手工诊断入口，不属于 PR 或 Daily；因此自动功能门禁不声明覆盖完整的
 pyperformance worker crash、reject ledger 或 benchmark completion。
+
+随后依次运行 execution、lifecycle 和 runtime-transition acceptance。它们复用
+`setup_release_311` 已安装的候选解释器；execution 和 runtime-transition 从 Stock
+440 结果中抽取各自的 72 模块控制组，lifecycle 复用 Daily 的 ASAN 构建。Daily
+不会为这三项重新创建候选 venv、重新运行 Stock 72 或重新构建 ASAN。
 
 `daily` pipeline 的顺序是：
 
