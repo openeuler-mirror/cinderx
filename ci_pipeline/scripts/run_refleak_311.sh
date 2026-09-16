@@ -25,6 +25,7 @@ export LC_ALL=C
 WORK=${1:?usage: run_refleak_311.sh <work-dir> [module ...]}
 shift || true
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+BUILD_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-build.txt"
 PY_VERSION=3.11.6
 THRESHOLD=${PYTHONJITAUTO:-20}
 # -R <warmups>:<repetitions>.  regrtest reports a leak only when the
@@ -86,7 +87,7 @@ fi
 # CinderX against that interpreter.  The wheel carries the cp311d ABI tag,
 # so it can never be confused with the release one.
 "$PYD" -m pip install -q "${PIP_ARGS[@]}" \
-  setuptools==82.0.1 wheel==0.47.0 > "$WORK/pip.log" 2>&1
+  -r "$BUILD_REQUIREMENTS" > "$WORK/pip.log" 2>&1
 rm -rf "$WORK/wheels"
 ( cd "$REPO_ROOT" && CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" \
     CMAKE_BUILD_TYPE=Release "$PYD" -m pip wheel . \

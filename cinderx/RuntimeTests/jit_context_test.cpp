@@ -28,25 +28,6 @@
 #include <pthread.h>
 #endif
 
-#if PY_VERSION_HEX < 0x030C0000
-// A mode gate, not a version gate.  These cases compile and install
-// machine code, which on 3.11 the executing (canary) mode does and the
-// shadow mode does not -- so what decides is the mode the binary was
-// started in, not the version it was built for.  Left as a version gate
-// they skipped on every 3.11 build, including the sanitized one, which is
-// the only place a use-after-free in the install and lifecycle paths would
-// actually be caught.  Run the binary with CINDERX_JIT_MODE=canary to
-// execute them.
-#define SKIP_311_EXECUTABLE_COMPILE()                                    \
-  do {                                                                   \
-    if (jit::getConfig().state != jit::State::kRunning) {                \
-      GTEST_SKIP() << "3.11 executes machine code only in canary mode; " \
-                      "set CINDERX_JIT_MODE=canary to run this";         \
-    }                                                                    \
-  } while (0)
-#else
-#define SKIP_311_EXECUTABLE_COMPILE() static_cast<void>(0)
-#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 // A milestone gate, not a mode gate.  These cases assert a surface the 3.11
@@ -3385,8 +3366,7 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledArithmeticUnaryModAndPower) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def kernel(a, b):
@@ -3411,8 +3391,7 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGlobalNameLoad) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 ANSWER = 321
@@ -3470,8 +3449,7 @@ def drive():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledVectorcallEntry) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def callee(a, b, c):
@@ -3525,8 +3503,7 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledAttributesMethodsAndLoops) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 class Box:

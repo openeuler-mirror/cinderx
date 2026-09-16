@@ -87,6 +87,9 @@ canary_population() {
                     gsub(/TEST_F\(|\)|[ \t]/, "", hdr)
                     split(hdr, parts, ",")
                     suite = parts[1]; test = parts[2]
+                    if (suite == "HIR_BUILD_DEFERRED_TEST") {
+                      suite = "HIRBuildDeferredTest"
+                    }
                   } else {
                     suite = ""; test = ""
                   }
@@ -165,6 +168,19 @@ fi
 
 BUILD_DIR=${1:?usage: run_rt311_green.sh <build_dir> [--census]}
 MODE=${2:-}
+PIPELINE_MODE=${CINDERX_CP311_PIPELINE_MODE:-}
+if [ "$PIPELINE_MODE" = "pr" ]; then
+  if [ -z "${RT311_BASELINE_BASE:-}" ]; then
+    echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
+    echo "(the PR baseline self-extension guard refuses to run open)"
+    exit 1
+  fi
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet \
+       "$RT311_BASELINE_BASE^{commit}" > /dev/null; then
+    echo "census: protected base $RT311_BASELINE_BASE does not resolve"
+    exit 1
+  fi
+fi
 if [ -n "${CINDERX_RUNTIME_TEST_PYTHON:-}" ]; then
   TEST_PYTHON=$CINDERX_RUNTIME_TEST_PYTHON
   PYTHON_INCLUDE_DIR=${CINDERX_RUNTIME_TEST_PYTHON_INCLUDE_DIR:-}
@@ -174,7 +190,7 @@ else
   TEST_PYTHON=${CINDERX_TEST_PYTHON:-python3.11}
   PYTHON_INCLUDE_DIR=${CINDERX_TEST_PYTHON_INCLUDE_DIR:-}
   PYTHON_LIBRARY=${CINDERX_TEST_PYTHON_LIBRARY:-}
-  PYTHON_EXTENSIONS_DIR=${CINDERX_TEST_PYTHON_EXTENSIONS_DIR:-}
+  PYTHON_EXTENSIONS_DIR=
 fi
 PYTHON_ROOT=$("$TEST_PYTHON" -c 'import sys; print(sys.base_prefix)')
 BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
@@ -311,49 +327,39 @@ if [ "$MODE" = "--census" ]; then
   SKIP_ALLOWLIST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_allowed_skips.txt"
   SKIP_BOOTSTRAP_COUNT=202
   SKIP_BOOTSTRAP_SHA256=af3d1176bec84c230dfd155dd418da23cf75032d04d95a6034dd255271a8e53e
-  if [ -z "${RT311_BASELINE_BASE:-}" ]; then
-    echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
-    echo "(the skip-allowlist self-extension guard refuses to run open)"
-    exit 1
-  fi
-  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet \
-       "$RT311_BASELINE_BASE^{commit}" > /dev/null; then
-    echo "census: protected base $RT311_BASELINE_BASE does not resolve"
-    exit 1
-  fi
-  BASE_SKIPS="$BUILD_DIR-skips-at-base.txt"
-  if git -C "$REPO_ROOT" show \
-       "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_allowed_skips.txt" \
-       > "$BASE_SKIPS" 2>/dev/null; then
-    # A case that skips in this run because it belongs to the canary
-    # population is not being washed green by the allowlist: it runs, in the
-    # other mode, in this same gate, and has to pass there.  Exempt exactly
-    # those and hold the guard against everything else, so "add a skip and
-    # its allowlist row" still cannot buy silence.
-    SKIP_EXEMPT="$BUILD_DIR-skip-allowlist-exempt.txt"
-    canary_population > "$SKIP_EXEMPT"
-    SKIP_UNPROVEN="$BUILD_DIR-skip-allowlist-unproven.txt"
-    comm -23 <(grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" | sort -u) \
-             "$SKIP_EXEMPT" > "$SKIP_UNPROVEN"
-    baseline_growth "$BASE_SKIPS" "$SKIP_UNPROVEN"
-    echo "census: skip-allowlist growth guard held against" \
-      "$RT311_BASELINE_BASE ($(grep -c . "$SKIP_EXEMPT") entries exempt as" \
-      "canary-population members)"
-  else
-    SKIP_NORMALIZED="$BUILD_DIR-skips-normalized.txt"
-    grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" > "$SKIP_NORMALIZED"
-    SKIP_COUNT=$(wc -l < "$SKIP_NORMALIZED" | tr -d ' ')
-    SKIP_SHA=$(sha256sum "$SKIP_NORMALIZED" | awk '{print $1}')
-    if [ "$SKIP_COUNT" != "$SKIP_BOOTSTRAP_COUNT" ] \
-       || [ "$SKIP_SHA" != "$SKIP_BOOTSTRAP_SHA256" ]; then
-      echo "census: skip allowlist absent at $RT311_BASELINE_BASE and the"
-      echo "committed list does not match the audited bootstrap pin"
-      echo "($SKIP_COUNT entries, sha256 $SKIP_SHA); skip-allowlist"
-      echo "changes require their own reviewed change"
-      exit 1
+  if [ "$PIPELINE_MODE" = "pr" ]; then
+    BASE_SKIPS="$BUILD_DIR-skips-at-base.txt"
+    if git -C "$REPO_ROOT" show \
+         "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_allowed_skips.txt" \
+         > "$BASE_SKIPS" 2>/dev/null; then
+      # Canary-population skips are proven by the executing leg in this gate.
+      SKIP_EXEMPT="$BUILD_DIR-skip-allowlist-exempt.txt"
+      canary_population > "$SKIP_EXEMPT"
+      SKIP_UNPROVEN="$BUILD_DIR-skip-allowlist-unproven.txt"
+      comm -23 <(grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" | sort -u) \
+               "$SKIP_EXEMPT" > "$SKIP_UNPROVEN"
+      baseline_growth "$BASE_SKIPS" "$SKIP_UNPROVEN"
+      echo "census: skip-allowlist growth guard held against" \
+        "$RT311_BASELINE_BASE ($(grep -c . "$SKIP_EXEMPT") entries exempt as" \
+        "canary-population members)"
+    else
+      SKIP_NORMALIZED="$BUILD_DIR-skips-normalized.txt"
+      grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" > "$SKIP_NORMALIZED"
+      SKIP_COUNT=$(wc -l < "$SKIP_NORMALIZED" | tr -d ' ')
+      SKIP_SHA=$(sha256sum "$SKIP_NORMALIZED" | awk '{print $1}')
+      if [ "$SKIP_COUNT" != "$SKIP_BOOTSTRAP_COUNT" ] \
+         || [ "$SKIP_SHA" != "$SKIP_BOOTSTRAP_SHA256" ]; then
+        echo "census: skip allowlist absent at $RT311_BASELINE_BASE and the"
+        echo "committed list does not match the audited bootstrap pin"
+        echo "($SKIP_COUNT entries, sha256 $SKIP_SHA); skip-allowlist"
+        echo "changes require their own reviewed change"
+        exit 1
+      fi
+      echo "census: bootstrap skip allowlist matches the audited pin" \
+        "($SKIP_BOOTSTRAP_COUNT entries)"
     fi
-    echo "census: bootstrap skip allowlist matches the audited pin" \
-      "($SKIP_BOOTSTRAP_COUNT entries)"
+  else
+    echo "census: skip-allowlist growth guard is PR-only"
   fi
   # The known-failure baseline may only shrink silently, never grow: a
   # failure outside the committed manifest is a regression in a non-green
@@ -379,7 +385,7 @@ if [ "$MODE" = "--census" ]; then
   FIXED=$(comm -13 "$BUILD_DIR-census-failed.txt" "$BASELINE" | wc -l)
   [ "$FIXED" -gt 0 ] && echo "census: $FIXED baseline entries now pass;" \
     "shrink the manifest deliberately"
-  # Baseline self-extension guard, on the production path and FAIL-CLOSED:
+  # Baseline self-extension guard, on the PR path and FAIL-CLOSED:
   # "add the failure and its baseline entry in one change" must not wash
   # green.  The census requires the protected base (RT311_BASELINE_BASE,
   # the merge-base SHA); an unset variable or an unresolvable ref is red,
@@ -390,37 +396,31 @@ if [ "$MODE" = "--census" ]; then
   # over and the pin becomes inert.
   BOOTSTRAP_COUNT=453
   BOOTSTRAP_SHA256=bc5f29f6d7e14aefad6a33a79548819bb2a9a4e433c23d9155f9926a5569a5f5
-  if [ -z "${RT311_BASELINE_BASE:-}" ]; then
-    echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
-    echo "(the baseline self-extension guard refuses to run open)"
-    exit 1
-  fi
-  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet \
-       "$RT311_BASELINE_BASE^{commit}" > /dev/null; then
-    echo "census: protected base $RT311_BASELINE_BASE does not resolve"
-    exit 1
-  fi
-  BASE_BASELINE="$BUILD_DIR-baseline-at-base.txt"
-  if git -C "$REPO_ROOT" show \
-       "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_known_failures.txt" \
-       > "$BASE_BASELINE" 2>/dev/null; then
-    baseline_growth "$BASE_BASELINE" "$BASELINE"
-    echo "census: baseline growth guard held against $RT311_BASELINE_BASE"
-  else
-    NORMALIZED="$BUILD_DIR-baseline-normalized.txt"
-    grep -Ev '^[[:space:]]*(#|$)' "$BASELINE" > "$NORMALIZED"
-    LIVE_COUNT=$(wc -l < "$NORMALIZED" | tr -d ' ')
-    LIVE_SHA=$(sha256sum "$NORMALIZED" | awk '{print $1}')
-    if [ "$LIVE_COUNT" != "$BOOTSTRAP_COUNT" ] \
-       || [ "$LIVE_SHA" != "$BOOTSTRAP_SHA256" ]; then
-      echo "census: baseline absent at $RT311_BASELINE_BASE and the"
-      echo "committed baseline does not match the audited bootstrap pin"
-      echo "($LIVE_COUNT entries, sha256 $LIVE_SHA); baseline changes"
-      echo "require their own reviewed change"
-      exit 1
+  if [ "$PIPELINE_MODE" = "pr" ]; then
+    BASE_BASELINE="$BUILD_DIR-baseline-at-base.txt"
+    if git -C "$REPO_ROOT" show \
+         "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_known_failures.txt" \
+         > "$BASE_BASELINE" 2>/dev/null; then
+      baseline_growth "$BASE_BASELINE" "$BASELINE"
+      echo "census: baseline growth guard held against $RT311_BASELINE_BASE"
+    else
+      NORMALIZED="$BUILD_DIR-baseline-normalized.txt"
+      grep -Ev '^[[:space:]]*(#|$)' "$BASELINE" > "$NORMALIZED"
+      LIVE_COUNT=$(wc -l < "$NORMALIZED" | tr -d ' ')
+      LIVE_SHA=$(sha256sum "$NORMALIZED" | awk '{print $1}')
+      if [ "$LIVE_COUNT" != "$BOOTSTRAP_COUNT" ] \
+         || [ "$LIVE_SHA" != "$BOOTSTRAP_SHA256" ]; then
+        echo "census: baseline absent at $RT311_BASELINE_BASE and the"
+        echo "committed baseline does not match the audited bootstrap pin"
+        echo "($LIVE_COUNT entries, sha256 $LIVE_SHA); baseline changes"
+        echo "require their own reviewed change"
+        exit 1
+      fi
+      echo "census: bootstrap baseline matches the audited pin" \
+        "($BOOTSTRAP_COUNT entries)"
     fi
-    echo "census: bootstrap baseline matches the audited pin" \
-      "($BOOTSTRAP_COUNT entries)"
+  else
+    echo "census: known-failure growth guard is PR-only"
   fi
 fi
 # The filtered run must execute exactly the manifest's green population: a

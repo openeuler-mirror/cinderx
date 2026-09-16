@@ -103,7 +103,7 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
     runtime_job = jobs_by_name["runtime_tests_311"]
     assert "run_rt311_green.sh" in runtime_job["command"]
     assert '"{run_dir}/rt311-build" --census' in runtime_job["command"]
-    assert "RT311_BASELINE_BASE" in runtime_job["command"]
+    assert "RT311_BASELINE_BASE" not in runtime_job["command"]
     assert set(jobs_by_name) == {
         "runtime_tests_311",
         "setup_release_311",
@@ -152,17 +152,26 @@ def test_cp311_pr_suite_wires_the_acceptance_surface_by_phase(monkeypatch):
     ] == ["runtime_tests", "setup_release", "test_release", "libtest"]
 
 
-def test_cp311_daily_has_two_incremental_jobs():
+def test_cp311_daily_adds_the_three_acceptance_domains_after_incremental_jobs():
     pr_jobs = run_gate.load_suite("cp311_gate")["jobs"]
     daily_jobs = run_gate.load_suite("cp311_daily")["jobs"]
     daily_names = [job["name"] for job in daily_jobs]
 
-    assert len(pr_jobs) + len(daily_jobs) == 7
-    assert daily_names == ["test_release_daily_311", "libtest_daily_311"]
+    assert len(pr_jobs) + len(daily_jobs) == 10
+    assert daily_names == [
+        "test_release_daily_311",
+        "libtest_daily_311",
+        "execution_acceptance_daily_311",
+        "lifecycle_acceptance_daily_311",
+        "runtime_transition_acceptance_daily_311",
+    ]
     assert all("phase" in job for job in daily_jobs)
     assert {job["phase"] for job in daily_jobs} == {
         "test_release",
         "libtest",
+        "execution_acceptance",
+        "lifecycle_acceptance",
+        "runtime_transition_acceptance",
     }
 
 
@@ -177,7 +186,9 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
     assert "CINDERX_TEST_WHEEL" in script
     assert "CINDERX_CP311_PIPELINE_MODE" in script
     assert "PR mode rejects CINDERX_TEST_WHEEL" in script
-    assert "Daily mode requires CINDERX_TEST_WHEEL" in script
+    assert "CINDERX_CP311_WHEEL_SOURCE_DIR" in script
+    assert 'CINDERX_GIT_SHA="$(git rev-parse HEAD)"' in script
+    assert "built Daily Release wheel" in script
     assert 'archive.read("cinderx/_native/build_info_311.json")' in script
     assert "require_matching_source_sha" in script
     assert "run_step_continue asan_runtime_tests" in script
@@ -189,10 +200,10 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
     assert script.count("finish_daily_stage") == 3
     assert script.count("-m pip wheel") == 1
     build_requirements = (
-        '"$TEST_PYTHON" -m pip install "${PIP_ARGS[@]}" --upgrade'
+        '"$TEST_PYTHON" -m pip install "${PIP_ARGS[@]}" -r "$BUILD_REQUIREMENTS"'
     )
     assert build_requirements in script
-    assert "'setuptools>=77.0.3' wheel" in script
+    assert 'BUILD_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-build.txt"' in script
     assert script.index(build_requirements) < script.index("-m pip wheel")
     assert "pytest -q test_cinderx/test_kunpeng" not in script
     for module in (
@@ -215,15 +226,21 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
     assert "--non-libtest" in script
     assert script.count("libtest_diff_311.py off-gate") == 1
     assert script.count("execute-gate --jobs") == 2
-    assert script.count('--stock-dir "$RUN_DIR/libtest-off/stock"') == 1
+    assert script.count('--stock-dir "$RUN_DIR/libtest-off/stock"') == 3
     assert '"$RUN_DIR/libtest-execute-local"' in script
+    assert "execution_acceptance.py" in script
+    assert "ci_pipeline.jit311.lifecycle_acceptance" in script
+    assert "ci_pipeline.jit311.runtime_transition_acceptance" in script
+    assert '--asan-build "$RUN_DIR/asan-build"' in script
+    assert script.count('--python "$PYTHON"') == 3
+    assert script.count('wheel=$(tested_wheel)') == 3
     assert "libtest-tri" not in script
     assert "evaluator-off-vs-shadow" not in script
     assert "cinderx-test-support.pth" not in script
     assert "import test, test.test_threading" in script
     assert "print(test.__file__)" in script
     assert '"$PYTHON" -I -c' not in script
-    assert script.count('--jobs "$BUILD_JOBS"') == 3
+    assert script.count('--jobs "$BUILD_JOBS"') == 6
     assert "stock_to_evaluator_off" not in script
     assert "evaluator_off_to_shadow" not in script
     assert "--skip-test-cinderx" not in script
@@ -276,13 +293,6 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
         set -e
         test "$pr_rc" -eq 2
 
-        PIPELINE_MODE=daily
-        CINDERX_TEST_WHEEL=
-        set +e
-        setup_release
-        daily_wheel_rc=$?
-        set -e
-        test "$daily_wheel_rc" -eq 2
         """
     )
 
@@ -297,28 +307,31 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_python_test_support_is_scoped_to_release_test_jobs():
-    base_env = {
-        "CINDERX_TEST_PYTHON_STDLIB_DIR": "/opt/python/lib/python3.11",
-        "CINDERX_TEST_PYTHON_EXTENSIONS_DIR": (
-            "/opt/python/lib/python3.11/lib-dynload"
-        ),
-        "PYTHONPATH": "/candidate/site-packages",
-    }
+def test_cp311_test_support_preflight_reports_missing_module():
+    import sys
 
-    test_env = dict(base_env)
-    run_gate.configure_python_test_support(
-        test_env, {"phase": "test_release"}
-    )
-    assert test_env["PYTHONPATH"].split(run_gate.os.pathsep) == [
-        "/opt/python/lib/python3.11",
-        "/opt/python/lib/python3.11/lib-dynload",
-        "/candidate/site-packages",
-    ]
+    script = (Path(run_gate.REPO_ROOT) / "ci_pipeline/scripts/run_cp311_stage.sh").read_text()
+    probe = script.split("check_python_test_support() {", 1)[1]
+    probe = probe.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    for missing in ("test", "_testcapi"):
+        prefix = f"""
+import importlib
+from types import SimpleNamespace
 
-    setup_env = dict(base_env)
-    run_gate.configure_python_test_support(setup_env, {"phase": "setup_release"})
-    assert setup_env["PYTHONPATH"] == "/candidate/site-packages"
+def load(name):
+    if name == {missing!r}:
+        raise ModuleNotFoundError(name)
+    return SimpleNamespace(__file__='/builtin/' + name)
+
+importlib.import_module = load
+"""
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", prefix + probe],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert f"CPython test support is unavailable: {missing}" in result.stderr
+        assert "rebuild the test image" in result.stderr
 
 
 def test_rt311_runner_honors_gate_python_deps_and_parallelism():
@@ -354,6 +367,29 @@ def test_rt311_runner_honors_gate_python_deps_and_parallelism():
     assert 'RUNTIME_TEST_ENV=("PYTHONJITLIGHTWEIGHTFRAME=$2")' in script
     assert 'if [[ " $FLAGS " != *" -DENABLE_LIGHTWEIGHT_FRAMES=1 "* ]]' in script
     assert "CPython 3.11 gate requires -DENABLE_LIGHTWEIGHT_FRAMES=1" in script
+    assert 'PIPELINE_MODE=${CINDERX_CP311_PIPELINE_MODE:-}' in script
+    assert 'if [ "$PIPELINE_MODE" = "pr" ]' in script
+    assert "the PR baseline self-extension guard refuses to run open" in script
+    assert "known-failure growth guard is PR-only" in script
+
+
+def test_rt311_pr_requires_scheduler_baseline_before_build(tmp_path):
+    script = Path(run_gate.REPO_ROOT) / "ci_pipeline/scripts/run_rt311_green.sh"
+    env = dict(run_gate.os.environ)
+    env["CINDERX_CP311_PIPELINE_MODE"] = "pr"
+    env.pop("RT311_BASELINE_BASE", None)
+
+    completed = subprocess.run(
+        ["bash", str(script), str(tmp_path / "build"), "--census"],
+        cwd=run_gate.REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 1
+    assert "RT311_BASELINE_BASE must be set" in completed.stdout
 
 
 def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
@@ -425,6 +461,11 @@ def test_cp311_container_scripts_resolve_bare_executable_names():
     assert "PYTHON=$(resolve_executable python3.11)" in builder
     assert "CC=$(resolve_executable gcc)" in builder
     assert "CXX=$(resolve_executable g++)" in builder
+    assert "CINDERX_CP311_WHEEL_SOURCE_DIR" in builder
+    assert "CINDERX_CP311_WHEEL_OUTPUT_DIR" in builder
+    assert "CINDERX_CP311_WHEEL_WORK_DIR" in builder
+    assert "CINDERX_CP311_WHEEL_TRACKED_SOURCE" in builder
+    assert 'git -C "$SOURCE_DIR" archive --format=tar HEAD' in builder
 
 
 def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
@@ -435,6 +476,30 @@ def test_cp311_release_builder_and_smoke_keep_exact_platform_anchors():
     builder = (scripts_dir / "build_cp311_wheel_in_container.sh").read_text()
     preflight = (scripts_dir / "check_cpython_311_build.sh").read_text()
     smoke = (scripts_dir / "smoke_cp311_wheel_in_runtime.sh").read_text()
+
+    pytest_requirements = (
+        pipeline_dir / "requirements-cp311-test.txt"
+    ).read_text().splitlines()
+    assert pytest_requirements == ["pytest==9.0.3"]
+    build_requirements = (
+        pipeline_dir / "requirements-cp311-build.txt"
+    ).read_text().splitlines()
+    assert build_requirements == [
+        "setuptools==80.9.0",
+        "wheel==0.45.1",
+        "build==1.3.0",
+    ]
+    assert "PYTEST_VERSION" not in dev_image
+    assert dev_image.count(
+        "-r /opt/cinderx-requirements/requirements-cp311-test.txt"
+    ) == 2
+    assert dev_image.count(
+        "-r /opt/cinderx-requirements/requirements-cp311-build.txt"
+    ) == 2
+    stage = (scripts_dir / "run_cp311_stage.sh").read_text()
+    assert 'PYTEST_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-test.txt"' in stage
+    assert '"$PIP" install "${PIP_ARGS[@]}" -r "$PYTEST_REQUIREMENTS"' in stage
+    assert "pytest==" not in stage
 
     for inherited in (
         '"CINDERX_SKIP_BUILDER_CHECK"',

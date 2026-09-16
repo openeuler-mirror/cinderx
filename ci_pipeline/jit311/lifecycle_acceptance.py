@@ -39,6 +39,7 @@ from datetime import datetime
 import fnmatch
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -307,6 +308,7 @@ class LifecycleAcceptanceRunner:
         stdlib_regression: str,
         regression_base: str | None,
         cases: set[str],
+        python: Path | None = None,
     ) -> None:
         self.base = ExecutionAcceptanceRunner(
             wheel=wheel,
@@ -315,6 +317,7 @@ class LifecycleAcceptanceRunner:
             lanes=set(),
             jobs=jobs,
             timeout=timeout,
+            python=python,
         )
         self.command_failures: list[str] = []
         self.asan_build = asan_build.resolve() if asan_build else None
@@ -577,7 +580,8 @@ class LifecycleAcceptanceRunner:
     # -- MEMSAFE ---------------------------------------------------------
 
     def _asan_env(self, extension_dir: Path, runtime: Path, extra=None) -> dict:
-        env = self.base._base_env()
+        env = self.base._stage_env()
+        test_support = env["PYTHONPATH"]
         env.update(
             LD_PRELOAD=str(runtime),
             ASAN_OPTIONS="detect_leaks=0:alloc_dealloc_mismatch=0",
@@ -588,7 +592,7 @@ class LifecycleAcceptanceRunner:
                 [
                     str(extension_dir),
                     str(self.base.source / "cinderx/PythonLib"),
-                    str(self.base.stage),
+                    test_support,
                 ]
             ),
         )
@@ -612,11 +616,39 @@ class LifecycleAcceptanceRunner:
         gcc = shutil.which("gcc")
         runtime = None
         if gcc:
-            probe = subprocess.run(
+            # openEuler may expose libasan.so as a linker script.  Resolve
+            # the versioned soname required by the instrumented extension so
+            # LD_PRELOAD receives an ELF object rather than that script.
+            candidates = []
+            unversioned = subprocess.run(
                 [gcc, "-print-file-name=libasan.so"], capture_output=True, text=True
-            )
-            candidate = Path(probe.stdout.strip())
-            runtime = candidate if candidate.is_file() else None
+            ).stdout.strip()
+            candidates.append(unversioned)
+            if extensions:
+                dynamic = subprocess.run(
+                    ["readelf", "-d", str(extensions[0])],
+                    capture_output=True,
+                    text=True,
+                ).stdout
+                sonames = re.findall(
+                    r"Shared library: \[(libasan\.so[^]]*)\]", dynamic
+                )
+                candidates.extend(
+                    subprocess.run(
+                        [gcc, "-print-file-name=" + soname],
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    for soname in sonames
+                )
+            for candidate_name in candidates:
+                candidate = Path(candidate_name)
+                if candidate.is_file() and subprocess.run(
+                    ["readelf", "-h", str(candidate)],
+                    capture_output=True,
+                ).returncode == 0:
+                    runtime = candidate
+                    break
         errors = []
         if not extensions:
             errors.append("no instrumented _cinderx.so under the ASAN build")
@@ -869,7 +901,7 @@ class LifecycleAcceptanceRunner:
                 "--out",
                 str(classification_path),
             ],
-            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+            env=self.base._stage_env(),
         )
         classification = self._json(classification_path)
         path_errors = judge_penetration_path(classification)
@@ -972,6 +1004,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", type=Path, default=_default_source())
     parser.add_argument("--out", type=Path)
     parser.add_argument(
+        "--python",
+        type=Path,
+        help="reuse an already provisioned candidate interpreter",
+    )
+    parser.add_argument(
         "--case",
         # Kebab-case on the command line, canonical upper-snake inside.
         type=lambda value: value.replace("-", "_").upper(),
@@ -1018,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         stdlib_regression=args.stdlib_regression,
         regression_base=args.regression_base,
         cases=set(args.case or CASES),
+        python=args.python,
     )
     try:
         status = runner.run()

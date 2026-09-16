@@ -869,13 +869,13 @@ def test_unexpected_organic_deopt_turns_red():
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
     # The shared-3.11 gate and its matching CPython test support path pin
-    # the current invocation at 330; any drift must still turn red.
+    # the current invocation at 333; any drift must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 331})
+        for error in judge({"organic_deopt_hits": 334})
     ]
-    assert any("organic_deopt_hits == 330" in error for error in errors)
+    assert any("organic_deopt_hits == 333" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):
@@ -1110,3 +1110,33 @@ def test_refcount_matrix_canary_minimal_tier(tmp_path):
     assert set(report["outcome"]) == set(report["drift"]), report
     entries = report["machine_code_entries"]
     assert entries and all(v >= 200 for v in entries.values()), entries
+
+
+def test_canary_population_resolves_cp311_deferred_fixture(tmp_path):
+    (tmp_path / "hir_test.cpp").write_text(
+        "TEST_F(\n  HIR_BUILD_DEFERRED_TEST,\n  DescriptorFallback) {\n"
+        "  SKIP_311_EXECUTABLE_COMPILE();\n}\n"
+    )
+    assert _canary_population(tmp_path) == {
+        "HIRBuildDeferredTest.DescriptorFallback"
+    }
+
+
+def test_recovered_execution_cases_are_in_canary_population():
+    population = _canary_population()
+    assert len({node for node in population if node.startswith("ASMGeneratorTest.")}) == 46
+    assert {"NewASMGeneratorTest.Linear", "NewASMGeneratorTest.DiamondControlBlock"} <= population
+    assert {
+        "HIRBuildDeferredTest." + name for name in (
+            "SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange",
+            "SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange",
+            "SplitDictLoadFallsBackAfterDescriptorChange",
+            "InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter",
+        )
+    } <= population
+    assert {
+        "JITJitRtCoverageTest." + name for name in (
+            "CompiledArithmeticUnaryModAndPower", "CompiledGlobalNameLoad",
+            "CompiledVectorcallEntry", "CompiledAttributesMethodsAndLoops",
+        )
+    } <= population

@@ -83,15 +83,19 @@ CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
 
-Python 3.11 Daily requires the fat wheel. `setup_release_311` installs it
-instead of building a second wheel, then Daily appends
-`test_release_daily_311` and `libtest_daily_311`:
+Python 3.11 Daily may receive a previously built release wheel;
+`setup_release_311` verifies its provenance and source SHA. Without one, it
+builds and normalizes a Release wheel from the current HEAD after RuntimeTests.
+Daily then appends its incremental tests and the three JIT acceptance jobs:
 
 ```bash
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
-CINDERX_TEST_WHEEL=/path/to/cinderx-fat.whl \
 python3.11 ci_pipeline/run_gate.py daily
 ```
+
+Both paths require the selected CPython installation to provide `test` and
+`_testcapi` directly. If either cannot be imported, repair the Python installation
+or rebuild the test image.
 
 `libtest_daily_311` runs stock 440 and evaluator-off 440 once each, extracts
 the 72-module control baseline from that stock result, and then runs only
@@ -104,6 +108,13 @@ including its exact organic-deopt drift guard. The pyperformance completion
 commands remain explicit manual diagnostics and are not part of PR or Daily;
 therefore the automatic functional gates do not claim full pyperformance
 worker-crash, reject-ledger, or benchmark-completion coverage.
+
+The execution, lifecycle, and runtime-transition acceptance jobs then run in
+that order. They reuse the candidate interpreter provisioned by
+`setup_release_311`; execution and runtime-transition extract their 72-module
+controls from the Stock 440 result, and lifecycle reuses Daily's ASAN build.
+Daily does not create another candidate venv, rerun Stock 72, or rebuild ASAN
+for these jobs.
 
 The `daily` pipeline runs in this order:
 

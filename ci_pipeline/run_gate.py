@@ -509,26 +509,7 @@ def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
         env[AUTO_IMPORT_ENABLE_ENV] = "1"
     for key, value in job.get("env", {}).items():
         env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
-    configure_python_test_support(env, job)
     return env
-
-
-def configure_python_test_support(
-    env: dict[str, str], job: dict[str, Any]
-) -> None:
-    if str(job.get("phase", "")) not in {"test_release", "libtest"}:
-        return
-
-    support_paths = [
-        env.get("CINDERX_TEST_PYTHON_STDLIB_DIR", "").strip(),
-        env.get("CINDERX_TEST_PYTHON_EXTENSIONS_DIR", "").strip(),
-    ]
-    existing = env.get("PYTHONPATH", "").strip()
-    if existing:
-        support_paths.append(existing)
-    configured = os.pathsep.join(path for path in support_paths if path)
-    if configured:
-        env["PYTHONPATH"] = configured
 
 
 def coverage_tool_paths() -> dict[str, str]:

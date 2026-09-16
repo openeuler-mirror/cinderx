@@ -1185,12 +1185,7 @@ closure_baseline_error = capture_error(closure_baseline, closure_missing)
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
-#if PY_VERSION_HEX < 0x030C0000
-  if (jit::getConfig().state != jit::State::kRunning) {
-    GTEST_SKIP() << "3.11 executes machine code only in canary mode; "
-                    "set CINDERX_JIT_MODE=canary to run this";
-  }
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class YieldBox:
     def values(self):
@@ -2911,9 +2906,7 @@ def test(value):
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2955,10 +2948,7 @@ def replace_descriptor():
 }
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SplitDictLoadFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 attribute invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class Vector:
     def __init__(self, x, y, z):
@@ -3008,9 +2998,7 @@ def replace_descriptor():
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 events = []
 
