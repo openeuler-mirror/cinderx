@@ -51,6 +51,17 @@ from .negotiation import (
     RuntimeFingerprint,
     negotiate,
 )
+from .registry import (
+    AdmissionInputs,
+    NamespaceSnapshot,
+    PluginRegistry,
+    RegistrationResult,
+    RegistryEntry,
+    RegistryEntryFamily,
+    RegistryRejection,
+    RegistryRejectionReason,
+    RegistrySnapshot,
+)
 from .status import (
     MAX_STATUS_DETAILS_PER_DIAGNOSTIC,
     MAX_STATUS_DIAGNOSTICS_PER_PLUGIN,
@@ -68,6 +79,7 @@ from .status import (
 )
 
 __all__ = [
+    "AdmissionInputs",
     "ArtifactBudgets",
     "ArtifactIssue",
     "ArtifactIssueCode",
@@ -97,6 +109,7 @@ __all__ = [
     "ManifestIssue",
     "ManifestIssueCode",
     "ManifestValidationResult",
+    "NamespaceSnapshot",
     "NegotiationIssue",
     "NegotiationReason",
     "PluginAdapter",
@@ -104,9 +117,16 @@ __all__ = [
     "PluginManifest",
     "PluginNegotiationResult",
     "PluginProvides",
+    "PluginRegistry",
     "PluginState",
     "PluginStatus",
     "PluginStatusReason",
+    "RegistrationResult",
+    "RegistryEntry",
+    "RegistryEntryFamily",
+    "RegistryRejection",
+    "RegistryRejectionReason",
+    "RegistrySnapshot",
     "RuntimeABI",
     "RuntimeFingerprint",
     "StageDiagnostic",
