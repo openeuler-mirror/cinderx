@@ -420,6 +420,7 @@ uint32_t JITRT_UnboxU32(PyObject* obj);
 uint16_t JITRT_UnboxU16(PyObject* obj);
 uint8_t JITRT_UnboxU8(PyObject* obj);
 int64_t JITRT_UnboxI64(PyObject* obj);
+int64_t JITRT_UnboxExactIndexI64(PyObject* obj, PyObject* exc);
 int32_t JITRT_UnboxI32(PyObject* obj);
 int16_t JITRT_UnboxI16(PyObject* obj);
 int8_t JITRT_UnboxI8(PyObject* obj);

@@ -8,6 +8,31 @@
 
 using ArrayStoreTest = RuntimeTest;
 
+TEST_F(ArrayStoreTest, OversizedIndexUsesIndexErrorConversion) {
+  std::unique_ptr<jit::hir::Function> irfunc;
+  CompileToHIR(
+      R"(
+from array import array
+def store_array_double(a):
+    a[1267650600228229401496703205376] = 1.5
+)",
+      "store_array_double",
+      irfunc);
+  ASSERT_NE(irfunc, nullptr);
+  bool found = false;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsIndexUnbox()) {
+        found = true;
+        EXPECT_EQ(
+            static_cast<const jit::hir::IndexUnbox&>(instr).exception(),
+            PyExc_IndexError);
+      }
+    }
+  }
+  EXPECT_TRUE(found);
+}
+
 // Test that getStdlibArrayType returns a valid type object.
 TEST_F(ArrayStoreTest, GetStdlibArrayTypeReturnsNonNull) {
   auto func = compileAndGet(

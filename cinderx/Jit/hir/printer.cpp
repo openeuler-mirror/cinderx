@@ -666,6 +666,10 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     }
     case Opcode::kInPlaceOp: {
       const auto& inplace_op = static_cast<const InPlaceOp&>(instr);
+      if (inplace_op.hasFloatFastPath()) {
+        return fmt::format(
+            "{}, FloatFastPath", GetInPlaceOpName(inplace_op.op()));
+      }
       return std::string{GetInPlaceOpName(inplace_op.op())};
     }
     case Opcode::kBuildSlice: {

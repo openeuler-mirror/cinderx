@@ -923,7 +923,8 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   env.block = idx_ok;
   env.cursor = idx_ok->end();
   Register* idx = env.emit<RefineType>(TLongExact, sub);
-  Register* unboxed_idx = env.emit<PrimitiveUnbox>(idx, TCInt64);
+  // Match array indexing's IndexError for integers outside Py_ssize_t.
+  Register* unboxed_idx = env.emit<IndexUnbox>(idx);
   env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
   Register* descr = env.emit<LoadField>(
       arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
@@ -1270,6 +1271,60 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   return nullptr;
 }
 
+// Keep failed float predictions inside the compiled function. In particular,
+// an accumulator initialized with integer zero needs the generic operation on
+// its first iteration, not a deopt of the whole loop.
+Register* trySimplifyFloatInPlace(Env& env, const InPlaceOp* instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (!instr->hasFloatFastPath() || !getConfig().specialized_opcodes ||
+      (instr->op() != InPlaceOpKind::kAdd &&
+       instr->op() != InPlaceOpKind::kSubtract)) {
+    return nullptr;
+  }
+  Register* left = instr->left();
+  Register* right = instr->right();
+  if (!left->type().couldBe(TFloatExact) ||
+      !right->type().couldBe(TFloatExact)) {
+    return nullptr;
+  }
+  const FrameState& frame = *instr->frameState();
+  CFG& cfg = env.func.cfg;
+  BasicBlock* check_right = cfg.AllocateBlock();
+  BasicBlock* fast = cfg.AllocateBlock();
+  BasicBlock* slow = cfg.AllocateBlock();
+  env.new_blocks += 4; // Three paths plus the split-off continuation.
+
+  env.emit<CondBranchCheckType>(left, TFloatExact, check_right, slow);
+  BasicBlock* done = cfg.splitAfter(*std::prev(env.cursor));
+  env.block = check_right;
+  env.cursor = check_right->end();
+  env.emit<CondBranchCheckType>(right, TFloatExact, fast, slow);
+
+  env.block = fast;
+  env.cursor = fast->end();
+  Register* float_left = env.emit<RefineType>(TFloatExact, left);
+  Register* float_right = env.emit<RefineType>(TFloatExact, right);
+  BinaryOpKind op = instr->op() == InPlaceOpKind::kAdd
+      ? BinaryOpKind::kAdd
+      : BinaryOpKind::kSubtract;
+  Register* fast_result =
+      env.emit<FloatBinaryOp>(op, float_left, float_right, frame);
+  env.emit<Branch>(done);
+
+  env.block = slow;
+  env.cursor = slow->end();
+  Register* slow_result = env.emit<InPlaceOp>(instr->op(), left, right, frame);
+  env.emit<Branch>(done);
+
+  env.block = done;
+  env.cursor = done->begin();
+  return env.emit<Phi>(std::unordered_map<BasicBlock*, Register*>{
+      {fast, fast_result}, {slow, slow_result}});
+#else
+  return nullptr;
+#endif
+}
+
 Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
   Register* lhs = instr->left();
   Register* rhs = instr->right();
@@ -1368,7 +1423,7 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
       return env.emit<FloatBinaryOp>(*binop, lhs, rhs, *instr->frameState());
     }
   }
-  return nullptr;
+  return trySimplifyFloatInPlace(env, instr);
 }
 
 Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
@@ -1427,132 +1482,45 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
     return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
   }
 
-  // Constant-exponent strength reduction for `x ** const_float`.
-  //
-  // For the common numerical exponents used in scientific Python
-  // rewrite to an unboxed sqrt / mul / div chain instead of calling
-  // PyFloat.__pow__ -> float_pow -> libm pow.
-  if (op == BinaryOpKind::kPower) {
-    Type right_type = instr->right()->type();
-    // Skip strength reduction when the base is itself a compile-time float
-    // constant: the constant-folding path at the end of this function will
-    // evaluate `c1 ** c2` to a single LoadConst.
-    Type left_type_for_pow = instr->left()->type();
-    if (!left_type_for_pow.hasObjectSpec() && right_type.hasObjectSpec() &&
-        PyFloat_Check(right_type.objectSpec())) {
-      double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
-
-      auto unbox_x = [&]() {
-        return env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-      };
-      auto load = [&](double d) {
-        return env.emit<LoadConst>(Type::fromCDouble(d));
-      };
-      auto sqrt_of = [&](Register* r) {
-        // LIR lowering (generator.cpp) rewrites Power-by-0.5 into sqrt().
-        return env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, r, load(0.5));
-      };
-      auto mul = [&](Register* a, Register* b) {
-        return env.emit<DoubleBinaryOp>(BinaryOpKind::kMultiply, a, b);
-      };
-      auto rdiv1 = [&](Register* r) {
-        return env.emit<DoubleBinaryOp>(
-            BinaryOpKind::kTrueDivide, load(1.0), r);
-      };
-      auto guard_cmp = [&](PrimitiveCompareOp cmp_op, Register* r, double d) {
-        Register* ok = env.emit<PrimitiveCompare>(cmp_op, r, load(d));
-        env.emitInstr<Guard>(ok);
-      };
-      auto guard_finite = [&](Register* r) {
-        guard_cmp(PrimitiveCompareOp::kGreaterThan, r, -DBL_MAX);
-        guard_cmp(PrimitiveCompareOp::kLessThan, r, DBL_MAX);
-      };
-      // Single-sided upper-bound guard for results that are provably
-      // non-negative in IEEE-754 (e.g. x*x, 1/(x*x)). No `-inf` overflow is
-      // possible, so `-DBL_MAX < r` is redundant.
-      auto guard_finite_nonneg = [&](Register* r) {
-        guard_cmp(PrimitiveCompareOp::kLessThan, r, DBL_MAX);
-      };
-      auto box = [&](Register* r) {
-        return env.emit<PrimitiveBox>(r, TCDouble, *instr->frameState());
-      };
-
-      // x ** 0.5 = sqrt(x). Guard x > 0 so negative inputs deopt to
-      // Python's complex-result path and both signed zeros deopt to the
-      // interpreter, which returns +0.0 for ** 0.5.
-      if (val == 0.5) {
-        Register* x = unbox_x();
-        guard_cmp(PrimitiveCompareOp::kGreaterThan, x, 0.0);
-        return box(sqrt_of(x));
-      }
-      // x ** 1.0 = x. Identity; PrimitiveBox produces a fresh PyFloat, so
-      // Python's "float ** float returns a new object" contract holds.
-      if (val == 1.0) {
-        return box(unbox_x());
-      }
-      // x ** 1.5 = x * sqrt(x). Guard x >= 0 so a negative base deopts to
-      // Python's complex-result path; guard finite because huge x overflows
-      // through the multiply.
-      if (val == 1.5) {
-        Register* x = unbox_x();
-        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, x, 0.0);
-        Register* result = mul(x, sqrt_of(x));
-        guard_finite(result);
-        return box(result);
-      }
-      // x ** 2.0 = x * x. `x*x` is non-negative, so `-inf` overflow is
-      // impossible and only the upper-bound finite guard is needed.
-      if (val == 2.0) {
-        Register* x = unbox_x();
-        Register* result = mul(x, x);
-        guard_finite_nonneg(result);
-        return box(result);
-      }
-      // x ** 3.0 = x * x * x. Odd exponent preserves sign so no base guard.
-      // Guard finite (large |x| overflows).
-      if (val == 3.0) {
-        Register* x = unbox_x();
-        Register* result = mul(mul(x, x), x);
-        guard_finite(result);
-        return box(result);
-      }
-      // x ** -0.5 = 1.0 / sqrt(x). Guard x > 0 so a negative base deopts to
-      // Python's complex-result path and zero deopts to ZeroDivisionError.
-      if (val == -0.5) {
-        Register* x = unbox_x();
-        guard_cmp(PrimitiveCompareOp::kGreaterThan, x, 0.0);
-        Register* result = rdiv1(sqrt_of(x));
-        guard_finite(result);
-        return box(result);
-      }
-      // x ** -1.0 = 1.0 / x. Guard x != 0 (ZeroDivisionError); negative x
-      // is fine (returns negative reciprocal per Python).
-      if (val == -1.0) {
-        Register* x = unbox_x();
-        guard_cmp(PrimitiveCompareOp::kNotEqual, x, 0.0);
-        Register* result = rdiv1(x);
-        guard_finite(result);
-        return box(result);
-      }
-      // x ** -1.5 = 1.0 / (x * sqrt(x)). Guard the intermediate
-      // t = x * sqrt(x) into the normal range [DBL_MIN, DBL_MAX)
-      if (val == -1.5) {
-        Register* x = unbox_x();
-        Register* t = mul(x, sqrt_of(x));
-        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, t, DBL_MIN);
-        guard_cmp(PrimitiveCompareOp::kLessThan, t, DBL_MAX);
-        return box(rdiv1(t));
-      }
-      // x ** -2.0 = 1.0 / (x * x). Even exponent -> negative base is fine
-      // (result is positive). Guard x*x between [DBL_MIN, DBL_MAX)
-      if (val == -2.0) {
-        Register* x = unbox_x();
-        Register* t = mul(x, x);
-        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, t, DBL_MIN);
-        guard_cmp(PrimitiveCompareOp::kLessThan, t, DBL_MAX);
-        return box(rdiv1(t));
+#if PY_VERSION_HEX >= 0x030E0000
+  // Keep the modern numerical path unboxed, but compute the same libm pow
+  // as CPython instead of a sqrt/multiply/reciprocal approximation. Guards
+  // leave exceptional and complex-valued inputs to the original bytecode.
+  if (op == BinaryOpKind::kPower && !instr->left()->type().hasObjectSpec()) {
+    Type exponent_type = instr->right()->type();
+    if (exponent_type.hasObjectSpec() &&
+        PyFloat_CheckExact(exponent_type.objectSpec())) {
+      double exponent = PyFloat_AS_DOUBLE(exponent_type.objectSpec());
+      if (exponent == 0.5 || exponent == 1.0 || exponent == 1.5 ||
+          exponent == 2.0 || exponent == 3.0 || exponent == -0.5 ||
+          exponent == -1.0 || exponent == -1.5 || exponent == -2.0) {
+        auto* base = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        auto* zero = env.emit<LoadConst>(Type::fromCDouble(0.0));
+        auto* limit = env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+        auto guard = [&](PrimitiveCompareOp comparison,
+                         Register* value,
+                         Register* bound) {
+          auto* valid = env.emit<PrimitiveCompare>(comparison, value, bound);
+          env.emitInstr<Guard>(valid)->setFrameState(*instr->frameState());
+        };
+        guard(PrimitiveCompareOp::kGreaterThan, base, zero);
+        auto* power = env.emit<DoubleBinaryOp>(
+            BinaryOpKind::kPower,
+            base,
+            env.emit<LoadConst>(Type::fromCDouble(exponent)));
+        guard(PrimitiveCompareOp::kLessThan, power, limit);
+        return env.emit<PrimitiveBox>(power, TCDouble, *instr->frameState());
       }
     }
+  }
+#endif
+
+  // Preserve CPython float_pow rounding and exceptions on every supported
+  // version. sqrt/mul/div chains can differ even for finite positive inputs
+  // (for example, 2.0 ** -1.5). Constant operands still fold below through
+  // the same Python numeric slot used at runtime.
+  if (op == BinaryOpKind::kPower && !instr->left()->type().hasObjectSpec()) {
+    return nullptr;
   }
 
   // This isn't safe in the multi-threaded compilation on 3.12 because

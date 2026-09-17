@@ -2190,6 +2190,20 @@ int64_t JITRT_UnboxI64(PyObject* obj) {
   return PyLong_AsSsize_t(obj);
 }
 
+int64_t JITRT_UnboxExactIndexI64(PyObject* obj, PyObject* exc) {
+  JIT_DCHECK(PyLong_CheckExact(obj), "expected exact int index");
+  JIT_DCHECK(exc != nullptr, "exact index conversion requires an exception");
+  Py_ssize_t index = PyLong_AsSsize_t(obj);
+  if (index == -1 && PyErr_ExceptionMatches(PyExc_OverflowError)) {
+    PyErr_Clear();
+    PyErr_Format(
+        exc,
+        "cannot fit '%.200s' into an index-sized integer",
+        Py_TYPE(obj)->tp_name);
+  }
+  return index;
+}
+
 int32_t JITRT_UnboxI32(PyObject* obj) {
   return checkedUnboxImpl<int32_t>(obj);
 }

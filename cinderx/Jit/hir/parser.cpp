@@ -677,10 +677,17 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
     case Opcode::kInPlaceOp: {
       expect("<");
       InPlaceOpKind op = ParseInPlaceOpName(GetNextToken());
+      bool float_fast_path = false;
+      if (peekNextToken() == ",") {
+        expect(",");
+        expect("FloatFastPath");
+        float_fast_path = true;
+      }
       expect(">");
       auto left = ParseRegister();
       auto right = ParseRegister();
       instruction = newInstr<InPlaceOp>(dst, op, left, right);
+      static_cast<InPlaceOp*>(instruction)->setFloatFastPath(float_fast_path);
       break;
     }
     case Opcode::kUnaryOp: {

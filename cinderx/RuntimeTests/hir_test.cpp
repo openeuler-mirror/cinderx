@@ -1998,7 +1998,8 @@ def make_arange(n):
 TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
 #if PY_VERSION_HEX < 0x030C0000
   EXPECT_TRUE(isExecuteOpcodeSupported311(LOAD_ATTR));
-  EXPECT_FALSE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
+  // Backend support does not imply profitable admission for every function.
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
 
   Ref<PyFunctionObject> func(
       compileAndGet("def test(values):\n    return values[0]", "test"));
