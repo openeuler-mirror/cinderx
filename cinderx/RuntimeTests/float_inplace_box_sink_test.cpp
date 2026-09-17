@@ -37,24 +37,29 @@ fun test {
     v12 = Assign v4
     Snapshot {
       CurInstrOffset 2
-)" + locals + R"(
+)" + locals +
+      R"(
       Stack<2> v0 v4
     }
-)" + gap + R"(
+)" + gap +
+      R"(
     CondBranchCheckType<1, 2, FloatExact> v0
   }
   bb 1 {
     v5 = RefineType<FloatExact> v0
-    v8 = FloatBinaryOp<)" + op + R"(> v5 v2
+    v8 = FloatBinaryOp<)" +
+      op + R"(> v5 v2
     Branch<3>
   }
   bb 2 {
-    v9 = InPlaceOp<)" + op + R"(> v0 v4
+    v9 = InPlaceOp<)" +
+      op + R"(> v0 v4
     Branch<3>
   }
   bb 3 {
     v10 = Phi<1, 2> v8 v9
-)" + tail + R"(
+)" + tail +
+      R"(
     Return v10
   }
 }
@@ -106,9 +111,12 @@ void checkUnmoved(std::unique_ptr<Function> func) {
 
 TEST_F(FloatInPlaceBoxSinkTest, SplitsFlaggedAddAndSubtractOnlyOnce) {
   for (const std::string op : {"Add", "Subtract"}) {
-    std::string hir = "fun test {\n  bb 0 {\n"
+    std::string hir =
+        "fun test {\n  bb 0 {\n"
         "    v0 = LoadArg<0>\n    v1 = LoadArg<1>\n"
-        "    v2 = InPlaceOp<" + op + ", FloatFastPath> v0 v1\n"
+        "    v2 = InPlaceOp<" +
+        op +
+        ", FloatFastPath> v0 v1\n"
         "    Return v2\n  }\n}\n";
     auto func = HIRParser{}.ParseHIR(hir.c_str());
     ASSERT_NE(func, nullptr);
@@ -172,19 +180,19 @@ TEST_F(FloatInPlaceBoxSinkTest, RetainsNamedAndAliasedObjects) {
 }
 
 TEST_F(FloatInPlaceBoxSinkTest, RetainsBoxesAcrossCallsAndOtherAllocations) {
+  checkUnmoved(
+      slowPathHIR("Add", "Locals<2> v0 v1", "    v20 = VectorCall<0> v0\n"));
   checkUnmoved(slowPathHIR(
-      "Add", "Locals<2> v0 v1", "    v20 = VectorCall<0> v0\n"));
-  checkUnmoved(slowPathHIR(
-      "Subtract", "Locals<2> v0 v1",
-      "    v20 = PrimitiveBox<CDouble> v3\n"));
+      "Subtract", "Locals<2> v0 v1", "    v20 = PrimitiveBox<CDouble> v3\n"));
 }
 
 TEST_F(FloatInPlaceBoxSinkTest, RetainsAdditionalDirectAndLaterStackUses) {
   checkUnmoved(slowPathHIR(
-      "Add", "Locals<2> v0 v1",
-      "    v20 = PrimitiveUnbox<CDouble> v4\n"));
+      "Add", "Locals<2> v0 v1", "    v20 = PrimitiveUnbox<CDouble> v4\n"));
   checkUnmoved(slowPathHIR(
-      "Subtract", "Locals<2> v0 v1", "",
+      "Subtract",
+      "Locals<2> v0 v1",
+      "",
       "    Snapshot {\n      CurInstrOffset 4\n      Stack<1> v4\n    }\n"));
 }
 #endif

@@ -376,7 +376,12 @@ Type outputType(
       return TLongExact;
     }
     case Opcode::kFloatBinaryOp:
-      return TFloatExact;
+      // Negative bases raised to fractional powers can return complex values.
+      // Do not let downstream float consumers unbox that result unchecked.
+      return static_cast<const FloatBinaryOp&>(instr).op() ==
+              BinaryOpKind::kPower
+          ? TObject
+          : TFloatExact;
     case Opcode::kFloatCompare:
     case Opcode::kLongCompare:
     case Opcode::kUnicodeCompare:

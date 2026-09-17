@@ -2,14 +2,13 @@
 
 #include <gtest/gtest.h>
 
-#include "cinderx/RuntimeTests/fixtures.h"
-
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/hir.h"
-#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
+#include "cinderx/Jit/jit_rt.h"
+#include "cinderx/RuntimeTests/fixtures.h"
 
 using ArrayLoadTest = RuntimeTest;
 
@@ -38,8 +37,7 @@ TEST_F(ArrayLoadTest, ExactIndexHelperPreservesIndexError) {
   auto negative_huge = Ref<>::steal(PyLong_FromString(
       const_cast<char*>("-1267650600228229401496703205376"), nullptr, 10));
   ASSERT_NE(negative_huge, nullptr);
-  EXPECT_EQ(
-      JITRT_UnboxExactIndexI64(negative_huge, PyExc_OverflowError), -1);
+  EXPECT_EQ(JITRT_UnboxExactIndexI64(negative_huge, PyExc_OverflowError), -1);
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_OverflowError));
   auto overflow = Ref<>::steal(PyErr_GetRaisedException());
   ASSERT_NE(overflow, nullptr);

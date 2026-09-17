@@ -2429,17 +2429,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const DoubleBinaryOp*>(&i);
 
         if (instr->op() == BinaryOpKind::kPower) {
+#if PY_VERSION_HEX < 0x030E0000
           Type right_type = instr->right()->type();
           if (right_type.hasDoubleSpec() && right_type.doubleSpec() == 0.5) {
             bbb.appendCallInstruction(
                 instr->output(), JITRT_SqrtDouble, instr->left());
-          } else {
-            bbb.appendCallInstruction(
-                instr->output(),
-                JITRT_PowerDouble,
-                instr->left(),
-                instr->right());
+            break;
           }
+#endif
+          bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_PowerDouble,
+              instr->left(),
+              instr->right());
           break;
         }
 
@@ -2605,7 +2607,86 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         } else if (src_type <= TCInt32) {
           func = reinterpret_cast<uint64_t>(JITRT_BoxI32);
         } else if (src_type <= TCDouble) {
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 &&           \
+    SIZEOF_VOID_P == 8 && !defined(Py_GIL_DISABLED) && !defined(Py_DEBUG) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_STATS)
+          // Match CPython 3.14's freelist pop and new_reference initialization.
+          // The JIT already has tstate; avoid TLS lookup and ABI spills on
+          // hits. Tracing, debug/statistics and empty-pool cases use the
+          // original API.
+          auto check_freelist = bbb.allocateBlock();
+          auto fast_box = bbb.allocateBlock();
+          auto slow_box = bbb.allocateBlock();
+          auto done_box = bbb.allocateBlock();
+          auto* tracer = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              MemImm{&_PyRuntime.ref_tracer.tracer_func});
+          bbb.appendBranch(
+              Instruction::kCondBranch, tracer, slow_box, check_freelist);
+
+          bbb.switchBlock(check_freelist);
+          auto* interp = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Ind{env_->asm_tstate, offsetof(PyThreadState, interp)});
+          auto* freelist = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kLea,
+              Ind{interp,
+                  offsetof(PyInterpreterState, object_state.freelists.floats)});
+          auto* result = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Ind{freelist,
+                  offsetof(_Py_freelist, freelist),
+                  DataType::kObject});
+          bbb.appendBranch(
+              Instruction::kCondBranch, result, fast_box, slow_box);
+
+          bbb.switchBlock(fast_box);
+          auto* next = bbb.appendInstr(
+              OutVReg{DataType::k64bit}, Instruction::kMove, Ind{result, 0});
+          auto* size = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Ind{freelist, offsetof(_Py_freelist, size)});
+          bbb.appendInstr(
+              OutInd{freelist, offsetof(_Py_freelist, freelist)},
+              Instruction::kMove,
+              next);
+          bbb.appendInstr(Instruction::kDec, size);
+          bbb.appendInstr(
+              OutInd{freelist, offsetof(_Py_freelist, size)},
+              Instruction::kMove,
+              size);
+          bbb.appendInstr(
+              OutInd{result, offsetof(PyObject, ob_refcnt_full)},
+              Instruction::kMove,
+              Imm{1});
+          bbb.appendInstr(
+              OutInd{
+                  result, offsetof(PyFloatObject, ob_fval), DataType::kDouble},
+              Instruction::kMove,
+              src);
+          auto* fast_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_box);
+
+          bbb.switchBlock(slow_box);
+          auto* boxed = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject}, JITRT_BoxDouble, src);
+          auto* slow_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_box);
+          bbb.switchBlock(done_box);
+          auto* phi = bbb.appendInstr(instr->output(), Instruction::kPhi);
+          phi->allocateLabelInput(fast_pred);
+          phi->allocateLinkedInput(result);
+          phi->allocateLabelInput(slow_pred);
+          phi->allocateLinkedInput(boxed);
+          break;
+#else
           func = reinterpret_cast<uint64_t>(JITRT_BoxDouble);
+#endif
         } else if (src_type <= (TCUInt8 | TCUInt16)) {
           src = bbb.appendInstr(
               Instruction::kZext, OutVReg{OperandBase::k32bit}, src);

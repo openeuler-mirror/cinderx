@@ -9,6 +9,7 @@
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <iostream>
 #include <string>
@@ -21,26 +22,8 @@ class FloatPowerStrengthReductionTest : public RuntimeTest {};
 
 namespace {
 
-struct BinaryShape {
-  BinaryOpKind op;
-  std::string_view left;
-  std::string_view right;
-};
-
-struct CompareShape {
-  PrimitiveCompareOp op;
-  std::string_view left;
-  std::string_view right;
-};
-
-struct ExpectedShape {
-  std::string_view exponent;
-  std::vector<BinaryShape> binary_ops;
-  std::vector<CompareShape> compares;
-  std::string_view result;
-};
-
 struct ActualShape {
+  std::vector<const Instr*> instructions;
   std::vector<const PrimitiveUnbox*> unboxes;
   std::vector<const DoubleBinaryOp*> binary_ops;
   std::vector<const PrimitiveCompare*> compares;
@@ -71,6 +54,7 @@ ActualShape collectShape(const Function& func) {
   ActualShape shape;
   for (const auto& block : func.cfg.blocks) {
     for (const auto& instr : block) {
+      shape.instructions.push_back(&instr);
       if (instr.IsPrimitiveUnbox()) {
         shape.unboxes.push_back(static_cast<const PrimitiveUnbox*>(&instr));
       } else if (instr.IsDoubleBinaryOp()) {
@@ -92,127 +76,110 @@ ActualShape collectShape(const Function& func) {
   return shape;
 }
 
-std::string constantName(double value) {
-  if (value == 0.0) {
-    return "0";
-  }
-  if (value == 0.5) {
-    return "0.5";
-  }
-  if (value == 1.0) {
-    return "1";
-  }
-  if (value == DBL_MIN) {
-    return "DBL_MIN";
-  }
-  if (value == DBL_MAX) {
-    return "DBL_MAX";
-  }
-  if (value == -DBL_MAX) {
-    return "-DBL_MAX";
-  }
-  return "unexpected CDouble constant";
-}
-
-std::string operandName(Register* reg, const ActualShape& shape) {
-  if (shape.unboxes.size() == 1 && reg == shape.unboxes.front()->output()) {
-    return "x";
-  }
-  for (std::size_t i = 0; i < shape.binary_ops.size(); i++) {
-    if (reg == shape.binary_ops[i]->output()) {
-      return "d" + std::to_string(i);
-    }
-  }
-  Instr* producer = reg->instr();
-  if (producer != nullptr && producer->IsLoadConst()) {
-    Type type = static_cast<const LoadConst*>(producer)->type();
-    if (type.hasDoubleSpec()) {
-      return constantName(type.doubleSpec());
-    }
-  }
-  return "unexpected operand";
-}
-
-std::unique_ptr<Function> parseAndSimplifyHIR(const char* hir) {
+std::unique_ptr<Function> parseAndSimplifyHIR(
+    const char* hir,
+    FrameState* power_frame = nullptr) {
   auto func = HIRParser{}.ParseHIR(hir);
   if (func != nullptr) {
+    if (power_frame != nullptr) {
+      for (auto& block : func->cfg.blocks) {
+        for (auto& instr : block) {
+          if (!instr.IsFloatBinaryOp()) {
+            continue;
+          }
+          auto& power = static_cast<FloatBinaryOp&>(instr);
+          if (power.op() != BinaryOpKind::kPower) {
+            continue;
+          }
+          // Both input objects must remain available when a guard resumes
+          // the original Power bytecode, including guards after libm pow.
+          *power_frame = FrameState{jit::BCOffset{12}};
+          power_frame->localsplus = {power.left()};
+          power_frame->nlocals = 1;
+          power_frame->stack.push(power.left());
+          power_frame->stack.push(power.right());
+          power.setFrameState(*power_frame);
+          power.setBytecodeOffset(power_frame->cur_instr_offs);
+        }
+      }
+    }
     // HIRParser leaves register types at TTop. Simplify needs the exponent's
-    // object specialization and the refined base type to select this rewrite.
+    // object specialization and refined base type to test Power handling.
     reflowTypes(*func);
     Simplify{}.Run(*func);
   }
   return func;
 }
 
-std::unique_ptr<Function> parseAndSimplify(std::string_view exponent) {
+std::unique_ptr<Function> parseAndSimplify(
+    std::string_view exponent,
+    FrameState* power_frame = nullptr) {
   std::string hir = hirForExponent(exponent);
-  return parseAndSimplifyHIR(hir.c_str());
+  return parseAndSimplifyHIR(hir.c_str(), power_frame);
 }
 
 } // namespace
 
-TEST_F(FloatPowerStrengthReductionTest, RewritesRecognizedConstantExponents) {
-  const std::vector<ExpectedShape> cases{
-      {"0.5",
-       {{BinaryOpKind::kPower, "x", "0.5"}},
-       {{PrimitiveCompareOp::kGreaterThan, "x", "0"}},
-       "d0"},
-      {"1.0", {}, {}, "x"},
-      {"1.5",
-       {{BinaryOpKind::kPower, "x", "0.5"},
-        {BinaryOpKind::kMultiply, "x", "d0"}},
-       {{PrimitiveCompareOp::kGreaterThanEqual, "x", "0"},
-        {PrimitiveCompareOp::kGreaterThan, "d1", "-DBL_MAX"},
-        {PrimitiveCompareOp::kLessThan, "d1", "DBL_MAX"}},
-       "d1"},
-      {"2.0",
-       {{BinaryOpKind::kMultiply, "x", "x"}},
-       {{PrimitiveCompareOp::kLessThan, "d0", "DBL_MAX"}},
-       "d0"},
-      {"3.0",
-       {{BinaryOpKind::kMultiply, "x", "x"},
-        {BinaryOpKind::kMultiply, "d0", "x"}},
-       {{PrimitiveCompareOp::kGreaterThan, "d1", "-DBL_MAX"},
-        {PrimitiveCompareOp::kLessThan, "d1", "DBL_MAX"}},
-       "d1"},
-      {"-0.5",
-       {{BinaryOpKind::kPower, "x", "0.5"},
-        {BinaryOpKind::kTrueDivide, "1", "d0"}},
-       {{PrimitiveCompareOp::kGreaterThan, "x", "0"},
-        {PrimitiveCompareOp::kGreaterThan, "d1", "-DBL_MAX"},
-        {PrimitiveCompareOp::kLessThan, "d1", "DBL_MAX"}},
-       "d1"},
-      {"-1.0",
-       {{BinaryOpKind::kTrueDivide, "1", "x"}},
-       {{PrimitiveCompareOp::kNotEqual, "x", "0"},
-        {PrimitiveCompareOp::kGreaterThan, "d0", "-DBL_MAX"},
-        {PrimitiveCompareOp::kLessThan, "d0", "DBL_MAX"}},
-       "d0"},
-      {"-1.5",
-       {{BinaryOpKind::kPower, "x", "0.5"},
-        {BinaryOpKind::kMultiply, "x", "d0"},
-        {BinaryOpKind::kTrueDivide, "1", "d1"}},
-       {{PrimitiveCompareOp::kGreaterThanEqual, "d1", "DBL_MIN"},
-        {PrimitiveCompareOp::kLessThan, "d1", "DBL_MAX"}},
-       "d2"},
-      {"-2.0",
-       {{BinaryOpKind::kMultiply, "x", "x"},
-        {BinaryOpKind::kTrueDivide, "1", "d0"}},
-       {{PrimitiveCompareOp::kGreaterThanEqual, "d0", "DBL_MIN"},
-        {PrimitiveCompareOp::kLessThan, "d0", "DBL_MAX"}},
-       "d1"},
-  };
-
-  for (const auto& expected : cases) {
-    SCOPED_TRACE("exponent = " + std::string(expected.exponent));
-    auto func = parseAndSimplify(expected.exponent);
+TEST_F(
+    FloatPowerStrengthReductionTest,
+    PreservesExactPowerForConstantExponents) {
+  for (const std::string_view exponent :
+       {"0.5", "1.0", "1.5", "2.0", "3.0", "-0.5", "-1.0", "-1.5", "-2.0"}) {
+    SCOPED_TRACE("exponent = " + std::string(exponent));
+    FrameState power_frame;
+    auto func = parseAndSimplify(exponent, &power_frame);
     ASSERT_NE(func, nullptr);
     ASSERT_TRUE(checkFunc(*func, std::cerr));
-
     ActualShape actual = collectShape(*func);
-#if PY_VERSION_HEX < 0x030C0000
-    // CP311 preserves libm pow rounding for runtime bases, including these
-    // exponents. Verify the retained operation instead of skipping coverage.
+#if PY_VERSION_HEX >= 0x030E0000
+    ASSERT_EQ(actual.unboxes.size(), 1);
+    ASSERT_EQ(actual.binary_ops.size(), 1);
+    ASSERT_EQ(actual.compares.size(), 2);
+    ASSERT_EQ(actual.guards.size(), 2);
+    ASSERT_EQ(actual.boxes.size(), 1);
+    EXPECT_TRUE(actual.float_binary_ops.empty());
+    const auto* power = actual.binary_ops.front();
+    EXPECT_EQ(power->op(), BinaryOpKind::kPower);
+    EXPECT_EQ(power->left(), actual.unboxes.front()->output());
+    EXPECT_EQ(power->output()->type(), TCDouble);
+    ASSERT_TRUE(power->right()->type().hasDoubleSpec());
+    EXPECT_DOUBLE_EQ(
+        power->right()->type().doubleSpec(), std::stod(std::string(exponent)));
+    EXPECT_EQ(actual.boxes.front()->GetOperand(0), power->output());
+    EXPECT_TRUE(actual.boxes.front()->output()->type() <= TFloatExact);
+    ASSERT_NE(actual.boxes.front()->frameState(), nullptr);
+    EXPECT_EQ(*actual.boxes.front()->frameState(), power_frame);
+
+    const std::vector<PrimitiveCompareOp> comparisons = {
+        PrimitiveCompareOp::kGreaterThan, PrimitiveCompareOp::kLessThan};
+    auto position = [&](const Instr* instr) {
+      return std::find(
+          actual.instructions.begin(), actual.instructions.end(), instr);
+    };
+    for (size_t i = 0; i < comparisons.size(); ++i) {
+      SCOPED_TRACE("guard = " + std::to_string(i));
+      const auto* compare = actual.compares[i];
+      const auto* guard = actual.guards[i];
+      EXPECT_EQ(compare->op(), comparisons[i]);
+      EXPECT_EQ(
+          compare->GetOperand(0),
+          i == 0 ? actual.unboxes.front()->output() : power->output());
+      ASSERT_TRUE(compare->GetOperand(1)->type().hasDoubleSpec());
+      EXPECT_DOUBLE_EQ(
+          compare->GetOperand(1)->type().doubleSpec(), i == 0 ? 0.0 : DBL_MAX);
+      EXPECT_EQ(guard->GetOperand(0), compare->output());
+      EXPECT_LT(position(compare), position(guard));
+      if (i == 0) {
+        EXPECT_LT(position(guard), position(power));
+      } else {
+        EXPECT_LT(position(power), position(compare));
+        EXPECT_LT(position(guard), position(actual.boxes.front()));
+      }
+      ASSERT_NE(guard->frameState(), nullptr);
+      EXPECT_EQ(*guard->frameState(), power_frame);
+      EXPECT_EQ(guard->bytecodeOffset(), power_frame.cur_instr_offs);
+    }
+#else
     EXPECT_TRUE(actual.unboxes.empty());
     EXPECT_TRUE(actual.binary_ops.empty());
     EXPECT_TRUE(actual.compares.empty());
@@ -221,49 +188,12 @@ TEST_F(FloatPowerStrengthReductionTest, RewritesRecognizedConstantExponents) {
     ASSERT_EQ(actual.float_binary_ops.size(), 1);
     const auto* power = actual.float_binary_ops.front();
     EXPECT_EQ(power->op(), BinaryOpKind::kPower);
+    EXPECT_EQ(power->output()->type(), TObject);
     ASSERT_TRUE(power->right()->type().hasObjectSpec());
     ASSERT_TRUE(PyFloat_CheckExact(power->right()->type().objectSpec()));
     EXPECT_DOUBLE_EQ(
         PyFloat_AS_DOUBLE(power->right()->type().objectSpec()),
-        std::stod(std::string(expected.exponent)));
-#else
-    ASSERT_EQ(actual.unboxes.size(), 1);
-    EXPECT_EQ(actual.unboxes.front()->type(), TCDouble);
-    ASSERT_EQ(actual.boxes.size(), 1);
-    EXPECT_EQ(actual.boxes.front()->type(), TCDouble);
-    EXPECT_TRUE(actual.float_binary_ops.empty());
-
-    ASSERT_EQ(actual.binary_ops.size(), expected.binary_ops.size());
-    for (std::size_t i = 0; i < expected.binary_ops.size(); i++) {
-      const auto& expected_op = expected.binary_ops[i];
-      const auto* actual_op = actual.binary_ops[i];
-      EXPECT_EQ(actual_op->op(), expected_op.op);
-      EXPECT_EQ(
-          operandName(actual_op->left(), actual),
-          std::string(expected_op.left));
-      EXPECT_EQ(
-          operandName(actual_op->right(), actual),
-          std::string(expected_op.right));
-    }
-
-    ASSERT_EQ(actual.compares.size(), expected.compares.size());
-    ASSERT_EQ(actual.guards.size(), expected.compares.size());
-    for (std::size_t i = 0; i < expected.compares.size(); i++) {
-      const auto& expected_compare = expected.compares[i];
-      const auto* actual_compare = actual.compares[i];
-      EXPECT_EQ(actual_compare->op(), expected_compare.op);
-      EXPECT_EQ(
-          operandName(actual_compare->left(), actual),
-          std::string(expected_compare.left));
-      EXPECT_EQ(
-          operandName(actual_compare->right(), actual),
-          std::string(expected_compare.right));
-      EXPECT_EQ(actual.guards[i]->GetOperand(0), actual_compare->output());
-    }
-
-    EXPECT_EQ(
-        operandName(actual.boxes.front()->value(), actual),
-        std::string(expected.result));
+        std::stod(std::string(exponent)));
 #endif
   }
 }
@@ -283,9 +213,51 @@ TEST_F(FloatPowerStrengthReductionTest, LeavesOtherConstantExponentAsPower) {
   ASSERT_EQ(actual.float_binary_ops.size(), 1);
   const auto* power = actual.float_binary_ops.front();
   EXPECT_EQ(power->op(), BinaryOpKind::kPower);
+  EXPECT_EQ(power->output()->type(), TObject);
   ASSERT_TRUE(power->right()->type().hasObjectSpec());
   ASSERT_TRUE(PyFloat_Check(power->right()->type().objectSpec()));
   EXPECT_DOUBLE_EQ(PyFloat_AS_DOUBLE(power->right()->type().objectSpec()), 2.5);
+}
+
+TEST_F(FloatPowerStrengthReductionTest, PowerConsumerUsesGuardedResultType) {
+  auto func = parseAndSimplifyHIR(R"(
+fun test {
+  bb 0 {
+    v1 = LoadArg<0>
+    v2 = LoadConst<MortalFloatExact[0.5]>
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatBinaryOp<Power> v3 v2
+    v5 = LoadConst<MortalFloatExact[1.0]>
+    v6 = BinaryOp<Add> v4 v5
+    Return v6
+  }
+}
+)");
+  ASSERT_NE(func, nullptr);
+  ASSERT_TRUE(checkFunc(*func, std::cerr));
+  ActualShape actual = collectShape(*func);
+#if PY_VERSION_HEX >= 0x030E0000
+  EXPECT_TRUE(actual.float_binary_ops.empty());
+  ASSERT_EQ(actual.binary_ops.size(), 2);
+  ASSERT_EQ(actual.guards.size(), 2);
+  EXPECT_EQ(actual.binary_ops[0]->op(), BinaryOpKind::kPower);
+  EXPECT_EQ(actual.binary_ops[1]->op(), BinaryOpKind::kAdd);
+  EXPECT_EQ(actual.binary_ops[1]->left(), actual.binary_ops[0]->output());
+  ASSERT_EQ(actual.returns.size(), 1);
+  auto* result = actual.returns.front()->GetOperand(0);
+  EXPECT_TRUE(result->type() <= TFloatExact);
+  ASSERT_TRUE(result->instr()->IsPrimitiveBox());
+  EXPECT_EQ(result->instr()->GetOperand(0), actual.binary_ops[1]->output());
+#else
+  ASSERT_EQ(actual.float_binary_ops.size(), 1);
+  EXPECT_EQ(actual.float_binary_ops.front()->output()->type(), TObject);
+  EXPECT_TRUE(actual.unboxes.empty());
+  EXPECT_TRUE(actual.binary_ops.empty());
+  ASSERT_EQ(actual.returns.size(), 1);
+  auto* consumer = actual.returns.front()->GetOperand(0)->instr();
+  ASSERT_TRUE(consumer->IsBinaryOp());
+  EXPECT_EQ(static_cast<const BinaryOp*>(consumer)->op(), BinaryOpKind::kAdd);
+#endif
 }
 
 TEST_F(FloatPowerStrengthReductionTest, ConstantBaseStillConstantFolds) {

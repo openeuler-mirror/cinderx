@@ -93,6 +93,38 @@ class ExactFloatInPlace311Tests(unittest.TestCase):
                     sys.setprofile(None)
                 return result, list(map(normalized, items)), list(events)
 
+            def reset_execution():
+                cinderjit._jit311_reset_entry_ledger()
+                cinderjit._jit311_reset_transition_ledger()
+
+            def assert_execution(fn, calls, exit_kind=None):
+                def is_target(row):
+                    return (row['qualname'] == fn.__qualname__ and
+                            row['filename'] == fn.__code__.co_filename and
+                            row['firstlineno'] == fn.__code__.co_firstlineno)
+                entries = cinderjit._jit311_entry_ledger()
+                transitions = cinderjit._jit311_transition_ledger()
+                assert entries['dropped'] == transitions['dropped'] == 0
+                rows = [row for row in entries['entries'] if is_target(row)]
+                assert len(rows) == 1 and rows[0]['entries'] == calls, entries
+                exits = [row for row in transitions['rows'] if is_target(row)]
+                if exit_kind is None:
+                    assert not exits, exits
+                else:
+                    assert len(exits) == 1, exits
+                    assert not exits[0]['forced'], exits
+                    if exit_kind == 'instrumentation':
+                        assert exits[0]['instrumentation'], exits
+                    elif exit_kind == 'store_bounds':
+                        assert exits[0]['deopt_reason'] == 'GuardFailure', exits
+                        assert not exits[0]['instrumentation'], exits
+                        store_offset = next(i.offset for i in dis.get_instructions(fn)
+                                            if i.opname == 'STORE_SUBSCR')
+                        assert exits[0]['resume_offset'] == store_offset, exits
+                    else:
+                        assert exits[0]['deopt_reason'] == 'UnhandledException', exits
+                        assert not exits[0]['instrumentation'], exits
+
             checks = 0
             values = (0.0, -0.0, 1.0, -2.5, 1e300,
                       float('inf'), float('nan'))
@@ -105,14 +137,18 @@ class ExactFloatInPlace311Tests(unittest.TestCase):
                     run(fn, 2.0, 1.0)
                 assert any(i.opname == opcode for i in
                            dis.get_instructions(fn, adaptive=True))
+                assert set(fn.__code__.co_freevars) == {'index', 'right_value'}
                 cinderjit.jit_unsuppress(fn)
                 assert cinderjit.force_compile(fn)
                 assert cinderjit.is_jit_compiled(fn)
+                reset_execution()
                 for left in values:
                     for right in values:
                         expected = run(oracle, left, right)
                         assert run(fn, left, right) == expected
                         checks += 1
+                assert_execution(fn, len(values) ** 2)
+                print(fn.__name__, '49 machine-code entries, zero deopts')
                 for left, right, mode in (
                     (Left(2.0), 1.0, None),
                     (2.0, Right(1.0), None),
@@ -130,13 +166,27 @@ class ExactFloatInPlace311Tests(unittest.TestCase):
                         assert cinderjit.force_compile(fn)
                     assert cinderjit.is_jit_compiled(fn)
                     expected = run(oracle, left, right, mode)
+                    reset_execution()
                     actual = run(fn, left, right, mode)
                     assert actual == expected, (fn.__name__, actual, expected)
                     assert actual[2].count('index') == 1
                     assert actual[2].count('rhs') == 1
+                    if mode in ('trace', 'profile'):
+                        assert_execution(fn, 1, 'instrumentation')
+                    elif mode == 'clear':
+                        assert_execution(fn, 1, 'store_bounds')
+                    elif actual[0][0] == 'exception':
+                        assert_execution(fn, 1, 'exception')
+                    else:
+                        assert_execution(fn, 1)
                     checks += 1
             print('inplace checks', checks)
+            print('entry and transition ledgers verified')
         """)
+        # Loop variables and helper state must remain local after compilation.
+        # The tested functions then load index/right_value from closure cells,
+        # so adding a module-global key cannot silently deopt every case.
+        probe = "def exercise():\n" + textwrap.indent(probe, "    ") + "\nexercise()\n"
         env = dict(os.environ)
         env.update(CINDERX_PLUGIN_ENABLE="1", CINDERX_EVAL_MODE="cinder",
                    CINDERX_JIT_MODE="execute", PYTHONJITAUTO="1000000",
@@ -148,8 +198,9 @@ class ExactFloatInPlace311Tests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr[-6000:])
         self.assertIn("inplace checks 116", result.stdout)
+        self.assertIn("entry and transition ledgers verified", result.stdout)
         for name, op in (("step_add", "Add"), ("step_sub", "Subtract")):
-            match = re.search(r"fun [^\n]*:" + name + r" \{(.*?)(?=\nJIT:|\Z)",
+            match = re.search(r"fun [^\n]*:" + r"[^\n]*\b" + name + r" \{(.*?)(?=\nJIT:|\Z)",
                               result.stderr, re.S)
             self.assertIsNotNone(match, result.stderr[-6000:])
             self.assertIn("DoubleBinaryOp<" + op + ">", match.group(1))

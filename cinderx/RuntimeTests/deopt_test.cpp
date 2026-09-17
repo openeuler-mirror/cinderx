@@ -684,7 +684,10 @@ expected = (True, 6.0, 1)
   auto y = Ref<>::steal(PyFloat_FromDouble(3.0));
   PyObject* args[] = {items.get(), x.get(), y.get()};
   auto result = Ref<>::steal(Ci_JitShell311_InvokeArtifact(
-      compiled.get(), reinterpret_cast<PyObject*>(func.get()), args, 3,
+      compiled.get(),
+      reinterpret_cast<PyObject*>(func.get()),
+      args,
+      3,
       nullptr));
   getContext()->clearGuardFailureCallback();
   ASSERT_EQ(failures, 1) << "The intended native guard must actually execute";
