@@ -42,6 +42,7 @@ reasons = [
 supported_opcodes = [
   "BEFORE_WITH",
   "BINARY_OP",
+  "BINARY_SUBSCR",
   "BUILD_CONST_KEY_MAP",
   "BUILD_LIST",
   "BUILD_MAP",
@@ -103,6 +104,7 @@ supported_opcodes = [
   "SET_ADD",
   "STORE_ATTR",
   "STORE_FAST",
+  "STORE_SUBSCR",
   "SWAP",
   "UNARY_INVERT",
   "UNARY_NEGATIVE",
