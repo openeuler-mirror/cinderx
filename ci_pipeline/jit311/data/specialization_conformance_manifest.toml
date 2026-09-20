@@ -14,7 +14,7 @@ name = "BINARY_SUBSCR"
 witness = "binary-subscr-list"
 expected_specialized_opcodes = ["BINARY_SUBSCR_LIST_INT"]
 expected_outcome = "safe-refuse"
-expected_reason = "REFUSE_SHAPE_EXECUTE_SURFACE"
+expected_reason = "REFUSE_SHAPE_SUBSCRIPT_ADMISSION"
 
 [[family]]
 name = "CALL"
@@ -99,7 +99,7 @@ name = "STORE_SUBSCR"
 witness = "store-subscr-list"
 expected_specialized_opcodes = ["STORE_SUBSCR_LIST_INT"]
 expected_outcome = "safe-refuse"
-expected_reason = "REFUSE_SHAPE_EXECUTE_SURFACE"
+expected_reason = "REFUSE_SHAPE_SUBSCRIPT_ADMISSION"
 
 [[family]]
 name = "UNPACK_SEQUENCE"

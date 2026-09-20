@@ -1496,8 +1496,17 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
     // cold numeric kernels with explicit floating-point constants as well.
     bool unprofitable_subscript = !allow_subscripts &&
         (bc_it->opcode() == BINARY_SUBSCR || bc_it->opcode() == STORE_SUBSCR);
-    if (unprofitable_subscript ||
-        !isExecuteOpcodeSupported311(bc_it->opcode())) {
+    // Subscript admission is a policy on top of the whitelist, not a
+    // whitelist gap: the opcodes are translated and reported on the execute
+    // surface, so the refusal must carry its own registered reason instead
+    // of masquerading as REFUSE_SHAPE_EXECUTE_SURFACE.
+    if (unprofitable_subscript) {
+      return {
+          "REFUSE_SHAPE_SUBSCRIPT_ADMISSION",
+          bc_it->opcode(),
+          bc_it->baseOffset().value()};
+    }
+    if (!isExecuteOpcodeSupported311(bc_it->opcode())) {
       return {
           "REFUSE_SHAPE_EXECUTE_SURFACE",
           bc_it->opcode(),

@@ -2005,7 +2005,7 @@ TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
       compileAndGet("def test(values):\n    return values[0]", "test"));
   ASSERT_NE(func, nullptr);
   ExecuteRefusal311 detail = unsupportedExecuteDetail311(func->func_code);
-  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_EXECUTE_SURFACE");
+  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_SUBSCRIPT_ADMISSION");
   EXPECT_EQ(detail.opcode, BINARY_SUBSCR);
   EXPECT_GE(detail.offset, 0);
 #endif

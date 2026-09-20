@@ -136,11 +136,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // codeCompiled() sits between "the compiler produced machine code" and
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
-  // execute refusal all live below it.  Its answer is what lets the
-  // compile entry stop reporting OK for a function that was never
-  // installed.  BINARY_SUBSCR is still off the execute whitelist
-  // (attribute access joined it in MR-09).  An empty data block exercises
-  // the same early-return paths an allocation failure would take.
+  // install.  Its answer is what lets the compile entry stop reporting OK
+  // for a function that was never installed.  BINARY_SUBSCR is on the
+  // execute whitelist but outside the numeric-kernel admission policy, so
+  // obj[0] is still refused before the compiler runs.  An empty data block
+  // exercises the same early-return paths an allocation failure would take.
   Ref<PyFunctionObject> func(
       compileAndGet("def func(obj): return obj[0]", "func"));
   ASSERT_NE(func, nullptr);
