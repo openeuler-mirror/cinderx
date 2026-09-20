@@ -61,6 +61,7 @@ REFUSE_SHAPE_CODEGEN_SPAN = "shadow AArch64 relocation cannot encode the generat
 REFUSE_SHAPE_STATIC_RUNTIME_CACHE = "shadow codegen cannot retain the runtime cache required by a static invoke"
 REFUSE_SHAPE_INVALID_UTF8_NAME = "co_names contains a string that is not valid UTF-8, so eligibility cannot read it"
 REFUSE_SHAPE_EXECUTE_SURFACE = "the code object uses instructions outside the machine-code execution whitelist"
+REFUSE_SHAPE_SUBSCRIPT_ADMISSION = "BINARY_SUBSCR/STORE_SUBSCR are on the execute surface but the code object is outside the numeric-kernel admission policy that scopes their execution"
 REFUSE_SHAPE_VARIADIC_ARGS_UNAUDITED = "retired: generated prologue binds *args and **kwargs (kept for observe id stability)"
 REFUSE_SHAPE_KEYWORD_ARGS_UNAUDITED = "retired: generated prologue binds keyword-only parameters (kept for observe id stability)"
 REFUSE_SHAPE_ARG_DEFAULTS_UNAUDITED = "retired: generated prologue rebinds live defaults (kept for observe id stability)"

@@ -75,7 +75,8 @@ class ExecutionInfra311Test(unittest.TestCase):
                 "offset": None,
             },
         )
-        self.assertEqual(result["subscr"]["reason"], "REFUSE_SHAPE_EXECUTE_SURFACE")
+        self.assertEqual(
+            result["subscr"]["reason"], "REFUSE_SHAPE_SUBSCRIPT_ADMISSION")
         self.assertIsInstance(result["subscr"]["opcode"], int)
         self.assertIsInstance(result["subscr"]["offset"], int)
         self.assertFalse(result["subscr"]["eligible"])
