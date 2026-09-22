@@ -260,6 +260,49 @@ static void expectRegMove(
   EXPECT_EQ(instr->getInput(0)->dataType(), data_type);
 }
 
+TEST_F(LIRPostAllocRewriteTest, VectorCallUsesTheFourArgumentAbi) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  bb->allocateInstr(
+      Instruction::kVectorCall,
+      nullptr,
+      OutPhyReg{X9, DataType::kObject},
+      PhyReg{X10, DataType::k64bit},
+      Imm{0, DataType::k64bit},
+      PhyReg{X11, DataType::kObject},
+      PhyReg{X12, DataType::kObject},
+      Imm{0, DataType::k64bit});
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  Instruction* call = nullptr;
+  bool callable_moved_to_x0 = false;
+  for (auto& instruction : bb->instructions()) {
+    Instruction* instr = instruction.get();
+    EXPECT_FALSE(instr->isVectorCall());
+    if (instr->isCall()) {
+      ASSERT_EQ(call, nullptr);
+      call = instr;
+    }
+    if (instr->isMove() && instr->output()->isReg() &&
+        instr->getInput(0)->isReg() &&
+        instr->output()->getPhyRegister() == X0 &&
+        instr->getInput(0)->getPhyRegister() == X11) {
+      callable_moved_to_x0 = true;
+    }
+  }
+  ASSERT_NE(call, nullptr);
+  ASSERT_EQ(call->getNumInputs(), 1);
+  ASSERT_TRUE(call->getInput(0)->isReg());
+  EXPECT_EQ(call->getInput(0)->getPhyRegister(), X10);
+  EXPECT_TRUE(callable_moved_to_x0);
+  EXPECT_GT(env.max_arg_buffer_size, 0);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
 TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveChainFoldsIntermediateGP) {
   Function func;
   auto* bb = func.allocateBasicBlock();

@@ -96,6 +96,9 @@ struct CodeRuntimeLifetime {
 struct CompiledFunctionData {
   std::span<const std::byte> code;
   vectorcallfunc vectorcall_entry{nullptr};
+#if PY_VERSION_HEX < 0x030C0000
+  vectorcallfunc artifact_guarded_entry{nullptr};
+#endif
   int stack_size{0};
   int spill_stack_size{0};
   std::chrono::nanoseconds compile_time{};
@@ -163,6 +166,12 @@ class CompiledFunction {
   vectorcallfunc vectorcallEntry() const {
     return data_.vectorcall_entry;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  vectorcallfunc artifactGuardedEntry311() const {
+    return data_.artifact_guarded_entry;
+  }
+#endif
 
   void* staticEntry() const;
 
@@ -264,7 +273,13 @@ class CompiledFunction {
 #endif
 
   explicit CompiledFunction(CompiledFunctionData&& data)
-      : data_(std::move(data)) {}
+      : data_(std::move(data)) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (data_.runtime != nullptr) {
+      data_.runtime->setCompiledFunction(this);
+    }
+#endif
+  }
 
   friend Ref<CompiledFunction>;
 

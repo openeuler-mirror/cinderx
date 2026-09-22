@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstring>
 #include <regex>
 #include <string>
@@ -30,35 +31,31 @@ Parser::Token Parser::getNextToken(const char* str) {
   };
 
   static const std::vector<PatternType> patterns{
-      {"Function:.*\n", kFunctionStart},
-      {"BB %(\\d+)( - .*)?\n", kBasicBlockStart},
-      {"\n", kNewLine},
-      {"%(\\d+)", kVReg},
+    {"Function:.*\n", kFunctionStart},
+        {"BB %(\\d+)( - .*)?\n", kBasicBlockStart}, {"\n", kNewLine},
+        {"%(\\d+)", kVReg},
 #if defined(CINDER_X86_64)
-      {"R[A-DS][IPX]", kPhyReg},
-      {"R[0-9]+[BWD]?", kPhyReg},
-      {"E[A-DS][IPX]", kPhyReg},
-      {"[A-D]L", kPhyReg},
-      {"[A-DS][IPX]L?", kPhyReg},
+        {"R[A-DS][IPX]", kPhyReg}, {"R[0-9]+[BWD]?", kPhyReg},
+        {"E[A-DS][IPX]", kPhyReg}, {"[A-D]L", kPhyReg},
+        {"[A-DS][IPX]L?", kPhyReg},
 #elif defined(CINDER_AARCH64)
-      {"[XWD][0-9]+", kPhyReg},
+        {"[XWD][0-9]+", kPhyReg},
 #else
-      {"[RD][0-9]+", kPhyReg},
+        {"[RD][0-9]+", kPhyReg},
 #endif
-      {"XMM[0-9]+", kPhyReg},
-      {R"(\[RBP\((-?\d+)\)\])", kStack},
-      {"\\[(0x[0-9a-fA-F]+)\\]", kAddress},
-      {R"((\d+)(\(0x[0-9a-fA-F]+\))?)", kImmediate},
-      {"BB%(\\d+)", kBasicBlockRef},
-      {"[A-Za-z_][A-Za-z0-9_]+", kId},
-      {"=", kEqual},
-      {",", kComma},
-      {"\\(", kParLeft},
-      {"\\)", kParRight},
-      {"#.*\n", kComment},
-      {":[A-Za-z0-9]+", kDataType},
-      {R"(\[[^\]]*\])", kIndirect},
-      {R"("[^"]+")", kStringLiteral}};
+        {"XMM[0-9]+", kPhyReg},
+#if defined(CINDER_AARCH64)
+        {R"(\[X29\((-?\d+)\)\])", kStack},
+#endif
+        {R"(\[RBP\((-?\d+)\)\])", kStack}, {"\\[(0x[0-9a-fA-F]+)\\]", kAddress},
+        {R"((\d+)(\(0x[0-9a-fA-F]+\))?)", kImmediate},
+        {"BB%(\\d+)", kBasicBlockRef}, {"[A-Za-z_][A-Za-z0-9_]+", kId},
+        {"=", kEqual}, {",", kComma}, {"\\(", kParLeft}, {"\\)", kParRight},
+        {"#.*\n", kComment}, {":[A-Za-z0-9]+", kDataType},
+        {R"(\[[^\]]*\])", kIndirect}, {
+      R"("[^"]+")", kStringLiteral
+    }
+  };
 
   std::cmatch m;
   for (auto& pattern : patterns) {
@@ -67,6 +64,17 @@ Parser::Token Parser::getNextToken(const char* str) {
     }
 
     if (m.size() > 1) {
+      if (pattern.type == kImmediate) {
+        auto text = m.str(1);
+        uint64_t bits;
+        auto result =
+            std::from_chars(text.data(), text.data() + text.size(), bits);
+        if (result.ec != std::errc{} ||
+            result.ptr != text.data() + text.size()) {
+          return {kError};
+        }
+        return {pattern.type, m.length(), static_cast<int64_t>(bits)};
+      }
       return {pattern.type, m.length(), strtoll(m.str(1).c_str(), nullptr, 0)};
     }
     return {pattern.type, m.length()};

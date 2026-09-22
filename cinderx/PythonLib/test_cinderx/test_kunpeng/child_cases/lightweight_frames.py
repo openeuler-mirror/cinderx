@@ -1,7 +1,11 @@
+import dis
+import gc
 import sys
+import weakref
 
 import cinderx
 import cinderx.jit
+import _cinderx
 
 try:
     import cinderjit
@@ -13,13 +17,15 @@ def minimal_jit_target() -> int:
     return 41 + 1
 
 
-def run_case(force_fallback: bool = False) -> None:
+def run_case(force_fallback: bool = False, dump_assembly: bool = True) -> None:
     if not cinderx.is_lightweight_frames_enabled():
         raise RuntimeError("LWF not compiled in")
     if not cinderx.jit.is_enabled():
         raise RuntimeError("JIT not enabled")
     if cinderjit is None:
         raise RuntimeError("cinderjit unavailable")
+    if cinderjit.jit_frame_mode() != 1:
+        raise RuntimeError("lightweight frame mode is not active")
 
     if force_fallback:
         cinderjit._test_set_thread_state_offset(-1)
@@ -29,13 +35,490 @@ def run_case(force_fallback: bool = False) -> None:
     for _ in range(20):
         assert minimal_jit_target() == 42
     print("CASE_RESULT minimal_jit_target OK 42")
-    cinderx.jit.disassemble(minimal_jit_target)
+    if dump_assembly:
+        cinderx.jit.disassemble(minimal_jit_target)
+
+
+def run_localsplus_reuse_case() -> None:
+    if not cinderx.is_lightweight_frames_enabled():
+        raise RuntimeError("LWF not compiled in")
+    if not cinderx.jit.is_enabled():
+        raise RuntimeError("JIT not enabled")
+    if cinderjit is None:
+        raise RuntimeError("cinderjit unavailable")
+    if cinderjit.jit_frame_mode() != 1:
+        raise RuntimeError("lightweight frame mode is not active")
+
+    class Payload:
+        pass
+
+    def identity(value):
+        return value
+
+    assert cinderx.jit.force_compile(identity)
+    assert cinderx.jit.is_jit_compiled(identity)
+    before = (sys.getrefcount(identity), sys.getrefcount(identity.__code__))
+    refs = []
+    for _ in range(100):
+        value = Payload()
+        refs.append(weakref.ref(value))
+        assert identity(value) is value
+        del value
+    gc.collect()
+    assert all(ref() is None for ref in refs), "argument local leaked"
+    after = (sys.getrefcount(identity), sys.getrefcount(identity.__code__))
+    assert after == before, (before, after)
+    print("CASE_RESULT localsplus_reuse OK 100")
+
+
+def run_mode_case() -> None:
+    if cinderjit is None:
+        raise RuntimeError("cinderjit unavailable")
+    mode = cinderjit.jit_frame_mode()
+    if mode != 0:
+        raise RuntimeError(f"expected normal frame mode, got {mode}")
+    print("CASE_RESULT frame_mode OK 0")
+
+
+def run_normal_generator_case() -> None:
+    if not cinderx.jit.is_enabled():
+        raise RuntimeError("JIT not enabled")
+    if cinderjit is None:
+        raise RuntimeError("cinderjit unavailable")
+    if cinderjit.jit_frame_mode() != 0:
+        raise RuntimeError("normal frame mode is not active")
+
+    def gen(limit):
+        for value in range(limit):
+            yield value * 2
+
+    assert cinderx.jit.force_compile(gen)
+    assert cinderx.jit.is_jit_compiled(gen)
+    assert list(gen(5)) == [0, 2, 4, 6, 8]
+    print("CASE_RESULT normal_generator OK 0 2 4 6 8")
+
+
+def run_recursion_case() -> None:
+    if not cinderx.jit.is_enabled():
+        raise RuntimeError("JIT not enabled")
+    if cinderjit is None:
+        raise RuntimeError("cinderjit unavailable")
+
+    def recurse(depth: int) -> int:
+        if depth == 0:
+            return 0
+        return 1 + recurse(depth - 1)
+
+    assert cinderx.jit.force_compile(recurse)
+    assert cinderx.jit.is_jit_compiled(recurse)
+    assert recurse(40) == 40
+
+    old_limit = sys.getrecursionlimit()
+    before = dict(_cinderx._native_recursion_state())
+    try:
+        sys.setrecursionlimit(80)
+        try:
+            recurse(1000)
+        except RecursionError:
+            pass
+        else:
+            raise AssertionError("recursive JIT call did not raise RecursionError")
+        assert recurse(5) == 5
+    finally:
+        sys.setrecursionlimit(old_limit)
+    after = dict(_cinderx._native_recursion_state())
+    for key in (
+        "recursion_remaining",
+        "recursion_headroom",
+        "boundary_active",
+        "jit_entries",
+    ):
+        assert after[key] == before[key], (key, before, after)
+
+    mode = cinderjit.jit_frame_mode()
+    print(f"CASE_RESULT recursion OK mode={mode} shallow=40 recovery=5")
+
+
+def require_lightweight_jit() -> None:
+    if not cinderx.is_lightweight_frames_enabled():
+        raise RuntimeError("LWF not compiled in")
+    if not cinderx.jit.is_enabled():
+        raise RuntimeError("JIT not enabled")
+    if cinderjit is None:
+        raise RuntimeError("cinderjit unavailable")
+    if cinderjit.jit_frame_mode() != 1:
+        raise RuntimeError("lightweight frame mode is not active")
+
+
+def run_materialize_getframe_case() -> None:
+    require_lightweight_jit()
+
+    def f() -> tuple[bool, bool, bool, bool, bool]:
+        frame = sys._getframe(0)
+        builtins = __builtins__
+        expected_builtins = (
+            builtins.__dict__ if hasattr(builtins, "__dict__") else builtins
+        )
+        return (
+            frame.f_globals is globals(),
+            frame.f_builtins is expected_builtins,
+            frame.f_code is f.__code__,
+            isinstance(frame.f_lasti, int),
+            isinstance(frame.f_lineno, int),
+        )
+
+    assert cinderx.jit.force_compile(f)
+    assert f() == (True, True, True, True, True)
+    print("CASE_RESULT materialize_getframe OK mode=1")
+
+
+def run_materialize_traceback_case() -> None:
+    require_lightweight_jit()
+
+    def f() -> None:
+        raise ValueError("from jit")
+
+    assert cinderx.jit.force_compile(f)
+    try:
+        f()
+    except ValueError as caught:
+        tb = caught.__traceback__
+    else:
+        raise AssertionError("ValueError was not raised")
+
+    frames = []
+    while tb is not None:
+        frames.append((tb.tb_frame.f_code.co_name, tb.tb_frame.f_code.co_filename))
+        tb = tb.tb_next
+    assert ("f", __file__) in frames, frames
+    print("CASE_RESULT materialize_traceback OK mode=1")
+
+
+def run_generator_return_cleanup_case() -> None:
+    require_lightweight_jit()
+    events = []
+    holder = {}
+
+    class ReenterOnDel:
+        def __del__(self) -> None:
+            gen = holder["gen"]
+            events.append(("running", gen.gi_running))
+            try:
+                next(gen)
+            except BaseException as exc:
+                events.append(type(exc).__name__)
+
+    def gen(obj):
+        if obj is None:
+            yield obj
+
+    assert cinderx.jit.force_compile(gen)
+    holder["gen"] = gen(ReenterOnDel())
+    try:
+        next(holder["gen"])
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("generator did not finish")
+
+    assert ("running", False) in events, events
+    assert "StopIteration" in events, events
+    assert "ValueError" not in events, events
+    print("CASE_RESULT generator_return_cleanup OK mode=1")
+
+
+def run_generator_argument_lifetime_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        def __del__(self) -> None:
+            events.append("finalized")
+
+    def gen(obj):
+        if obj is None:
+            yield obj
+
+    assert cinderx.jit.force_compile(gen)
+    obj = Marker()
+    suspended = gen(obj)
+    del obj
+    assert events == [], events
+    try:
+        next(suspended)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("generator did not finish")
+    assert events == ["finalized"], events
+    print("CASE_RESULT generator_argument_lifetime OK mode=1")
+
+
+def run_generator_close_gc_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        def __del__(self) -> None:
+            events.append("finalized")
+
+    def gen(obj):
+        try:
+            yield obj
+        finally:
+            events.append("closed")
+
+    assert cinderx.jit.force_compile(gen)
+    obj = Marker()
+    ref = weakref.ref(obj)
+    suspended = gen(obj)
+    yielded = next(suspended)
+    assert yielded is obj
+    del yielded
+    del obj
+    assert ref() is not None
+
+    suspended.close()
+    gc.collect()
+    assert ref() is None
+    assert events == ["closed", "finalized"], events
+    del suspended
+    gc.collect()
+    assert events.count("finalized") == 1, events
+    print("CASE_RESULT generator_close_gc OK mode=1")
+
+
+def run_forced_deopt_restore_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        __slots__ = ("__weakref__",)
+
+        def __del__(self) -> None:
+            events.append("forced")
+
+    def hot(obj, a, b, one):
+        total = a - a
+        i = total
+        while i < b:
+            total = total + a
+            i = i + one
+        if obj is None:
+            return -1
+        return total
+
+    warm = Marker()
+    for _ in range(200):
+        assert hot(warm, 3, 5, 1) == 15
+    assert cinderx.jit.force_compile(hot)
+    instructions = {instr.offset: instr.opname for instr in dis.get_instructions(hot)}
+    forceable = [
+        site
+        for site in cinderjit.deopt_sites(hot)
+        if site["kind"] == "GuardFailure"
+        and site["forceable"]
+        and instructions.get(site["bc_offset"]) == "BINARY_OP"
+    ]
+    assert forceable, cinderjit.deopt_sites(hot)
+    site = max(forceable, key=lambda item: item["bc_offset"])
+
+    obj = Marker()
+    ref = weakref.ref(obj)
+    before = _cinderx._get_trigger_stats()
+    assert cinderjit.force_deopt(hot, site["id"], n=1)
+    assert hot(obj, 3, 5, 1) == 15
+    after = _cinderx._get_trigger_stats()
+    assert after["forced_deopt_hits"] == before["forced_deopt_hits"] + 1
+    assert cinderjit.is_jit_compiled(hot)
+
+    del obj
+    gc.collect()
+    assert ref() is None
+    assert events == ["forced"], events
+    print("CASE_RESULT forced_deopt_restore OK mode=1")
+
+
+def run_exit_ownership_case() -> None:
+    require_lightweight_jit()
+    events = []
+
+    class Marker:
+        __slots__ = ("name", "__weakref__")
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __del__(self) -> None:
+            events.append(self.name)
+
+    def target(obj, should_raise):
+        local = obj
+        if should_raise:
+            raise ValueError("boom")
+        return local is obj
+
+    warm = Marker("warm")
+    for _ in range(200):
+        assert target(warm, False)
+    assert cinderx.jit.force_compile(target)
+
+    normal = Marker("normal")
+    normal_ref = weakref.ref(normal)
+    assert target(normal, False)
+    del normal
+    gc.collect()
+    assert normal_ref() is None
+    assert events == ["normal"], events
+
+    exceptional = Marker("exception")
+    exceptional_ref = weakref.ref(exceptional)
+    try:
+        target(exceptional, True)
+    except ValueError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("ValueError was not raised")
+    del exceptional
+    gc.collect()
+    assert exceptional_ref() is None
+    assert events == ["normal", "exception"], events
+    print("CASE_RESULT exit_ownership OK mode=1")
+
+
+def run_deopt_materialized_frame_case() -> None:
+    require_lightweight_jit()
+
+    def materialize_caller():
+        return sys._getframe(1)
+
+    def target(value):
+        escaped = materialize_caller()
+        try:
+            1 / value
+        except ZeroDivisionError as exc:
+            return escaped, exc.__traceback__.tb_frame
+        raise AssertionError("expected ZeroDivisionError")
+
+    assert cinderx.jit.force_compile(target)
+    escaped, traceback_frame = target(0)
+    assert escaped is traceback_frame, (escaped, traceback_frame)
+    print("CASE_RESULT deopt_materialized_frame OK mode=1")
+
+
+def run_generator_frame_lifecycle_case() -> None:
+    require_lightweight_jit()
+
+    def cyclic(box):
+        yield box
+
+    assert cinderx.jit.force_compile(cyclic)
+    box = []
+    suspended = cyclic(box)
+    box.append(suspended)
+    next(suspended)
+    suspended_ref = weakref.ref(suspended)
+    del suspended, box
+    gc.collect()
+    gc.collect()
+    assert suspended_ref() is None, "generator cycle leaked"
+
+    def finished():
+        value = object()
+        yield value
+
+    assert cinderx.jit.force_compile(finished)
+    completed = finished()
+    next(completed)
+    escaped_frame = completed.gi_frame
+    list(completed)
+    assert "value" in escaped_frame.f_locals, escaped_frame.f_locals
+    print("CASE_RESULT generator_frame_lifecycle OK mode=1")
+
+
+def run_f_locals_ownership_case() -> None:
+    require_lightweight_jit()
+
+    class Marker:
+        __slots__ = ("__weakref__",)
+
+    def target(value):
+        dir()
+        return value is not None
+
+    assert cinderx.jit.force_compile(target)
+    marker = Marker()
+    marker_ref = weakref.ref(marker)
+    for _ in range(5):
+        assert target(marker)
+    del marker
+    gc.collect()
+    assert marker_ref() is None, "f_locals retained the argument"
+    print("CASE_RESULT f_locals_ownership OK mode=1")
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {"fallback", "inline"}:
-        raise SystemExit(f"usage: {sys.argv[0]} <fallback|inline>")
-    run_case(force_fallback=sys.argv[1] == "fallback")
+    cases = {
+        "fallback",
+        "inline",
+        "execute",
+        "localsplus_reuse",
+        "mode",
+        "materialize_getframe",
+        "materialize_traceback",
+        "generator_return_cleanup",
+        "generator_argument_lifetime",
+        "generator_close_gc",
+        "forced_deopt_restore",
+        "exit_ownership",
+        "deopt_materialized_frame",
+        "generator_frame_lifecycle",
+        "f_locals_ownership",
+        "normal_generator",
+        "recursion",
+    }
+    if len(sys.argv) != 2 or sys.argv[1] not in cases:
+        raise SystemExit(
+            f"usage: {sys.argv[0]} "
+            "<fallback|inline|execute|localsplus_reuse|mode|materialize_getframe|"
+            "materialize_traceback|generator_return_cleanup|"
+            "generator_argument_lifetime|generator_close_gc|"
+            "forced_deopt_restore|exit_ownership|deopt_materialized_frame|"
+            "generator_frame_lifecycle|f_locals_ownership|normal_generator|"
+            "recursion>"
+        )
+    if sys.argv[1] == "mode":
+        run_mode_case()
+    elif sys.argv[1] == "localsplus_reuse":
+        run_localsplus_reuse_case()
+    elif sys.argv[1] == "normal_generator":
+        run_normal_generator_case()
+    elif sys.argv[1] == "recursion":
+        run_recursion_case()
+    elif sys.argv[1] == "materialize_getframe":
+        run_materialize_getframe_case()
+    elif sys.argv[1] == "materialize_traceback":
+        run_materialize_traceback_case()
+    elif sys.argv[1] == "generator_return_cleanup":
+        run_generator_return_cleanup_case()
+    elif sys.argv[1] == "generator_argument_lifetime":
+        run_generator_argument_lifetime_case()
+    elif sys.argv[1] == "generator_close_gc":
+        run_generator_close_gc_case()
+    elif sys.argv[1] == "forced_deopt_restore":
+        run_forced_deopt_restore_case()
+    elif sys.argv[1] == "exit_ownership":
+        run_exit_ownership_case()
+    elif sys.argv[1] == "deopt_materialized_frame":
+        run_deopt_materialized_frame_case()
+    elif sys.argv[1] == "generator_frame_lifecycle":
+        run_generator_frame_lifecycle_case()
+    elif sys.argv[1] == "f_locals_ownership":
+        run_f_locals_ownership_case()
+    elif sys.argv[1] == "execute":
+        run_case(dump_assembly=False)
+    else:
+        run_case(force_fallback=sys.argv[1] == "fallback")
     return 0
 
 

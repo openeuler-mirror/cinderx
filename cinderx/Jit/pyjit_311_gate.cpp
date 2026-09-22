@@ -429,22 +429,17 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
       tstate->c_profilefunc != nullptr) {
     return nullptr;
   }
-  // With membership persisting across a deopt, the ledger alone no longer
-  // distinguishes installed from parked; the entry point does.  A parked
-  // function's vectorcall is the interpreter's, so the honest answer to
-  // "will this call run machine code" is null until re-enable installs the
-  // guarded entry again.
-  if (func->vectorcall !=
-      reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry)) {
-    return nullptr;
-  }
   auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
   CodeExtra* extra = codeExtraIfExists(code);
   jit::CompiledFunction* compiled = extra == nullptr
       ? nullptr
       : reinterpret_cast<jit::CompiledFunction*>(
             _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
-  if (compiled == nullptr || extra->jit_globals != func->func_globals ||
+  if (compiled == nullptr ||
+      (func->vectorcall !=
+           reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry) &&
+       func->vectorcall != compiled->artifactGuardedEntry311()) ||
+      extra->jit_globals != func->func_globals ||
       extra->jit_builtins != func->func_builtins ||
       // The artifact must be this function's own.
       !compiled->functions().contains(func)) {
@@ -517,6 +512,56 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
     PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
     return nullptr;
   }
+  Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  InvocationArtifactScope invocation(compiled);
+  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+}
+
+extern "C" PyObject* Ci_JitShell311_ArtifactEntry(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames,
+    void* raw_code_runtime) {
+  auto func = reinterpret_cast<PyFunctionObject*>(func_obj);
+  auto* code_runtime = reinterpret_cast<jit::CodeRuntime*>(raw_code_runtime);
+  auto* compiled =
+      code_runtime == nullptr ? nullptr : code_runtime->compiledFunction();
+  PyThreadState* tstate = PyThreadState_GET();
+
+  // The artifact-specific stub proves association by identity: only
+  // Context::finalizeFunc publishes this exact address.  Re-check every
+  // mutable prerequisite that can redirect execution without a 3.11 function
+  // watcher.  On any mismatch, run the function's current code in stock.
+  //
+  // Do not hash compiled->functions() on this path.  deoptFuncImpl and
+  // forgetCompiledFunction already restore the interpreter vectorcall before
+  // dropping an install, so func->vectorcall identity is the membership
+  // check.  A contains() lookup here is a hot-path hash on every JIT call
+  // and cannot intercept a jump into a freed stub.
+  if (compiled == nullptr || !Ci_EvalHook311_IsInstalled() ||
+      !jit::isJitUsable() || tstate == nullptr ||
+      tstate->c_tracefunc != nullptr || tstate->c_profilefunc != nullptr ||
+      func->vectorcall != compiled->artifactGuardedEntry311() ||
+      func->func_code != code_runtime->code() ||
+      func->func_globals != code_runtime->globals() ||
+      func->func_builtins != code_runtime->builtins()) {
+    return getInterpretedVectorcall(func)(func_obj, args, nargsf, kwnames);
+  }
+  // Release builds trust vectorcall identity as membership.  Debug builds
+  // still prove the claim set agrees, without hashing on the classic18
+  // hot path.
+  JIT_DCHECK(
+      compiled->functions().contains(func),
+      "installed vectorcall must name a claimed member");
+  if (cStackSoftLimitReached311()) {
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+    return nullptr;
+  }
+  // Pin before entering generated code.  The entry stub tail-branched into
+  // this static function, so the final DECREF runs in static text after the
+  // generated body has returned; freeing the artifact at that point cannot
+  // invalidate a return address in its own code buffer.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
   InvocationArtifactScope invocation(compiled);
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);

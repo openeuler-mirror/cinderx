@@ -509,26 +509,7 @@ def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
         env[AUTO_IMPORT_ENABLE_ENV] = "1"
     for key, value in job.get("env", {}).items():
         env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
-    configure_python_test_support(env, job)
     return env
-
-
-def configure_python_test_support(
-    env: dict[str, str], job: dict[str, Any]
-) -> None:
-    if str(job.get("phase", "")) not in {"test_release", "libtest"}:
-        return
-
-    support_paths = [
-        env.get("CINDERX_TEST_PYTHON_STDLIB_DIR", "").strip(),
-        env.get("CINDERX_TEST_PYTHON_EXTENSIONS_DIR", "").strip(),
-    ]
-    existing = env.get("PYTHONPATH", "").strip()
-    if existing:
-        support_paths.append(existing)
-    configured = os.pathsep.join(path for path in support_paths if path)
-    if configured:
-        env["PYTHONPATH"] = configured
 
 
 def coverage_tool_paths() -> dict[str, str]:
@@ -617,15 +598,10 @@ def cinderx_test_python_info(env: dict[str, str]) -> dict[str, Any]:
 def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
     info = cinderx_test_python_info(env)
     py_version = str(info["py_version"])
-    feature_env = dict(env)
-    if py_version == "3.11":
-        # CPython 3.11 only supports materialized interpreter frames.  Do not
-        # forward a 3.14 suite's inherited LWF build option into a 3.11 build.
-        feature_env.pop("ENABLE_LIGHTWEIGHT_FRAMES", None)
     options = cmake_feature_options(
         py_version=py_version,
         python_root=str(info["python_root"]),
-        env=feature_env,
+        env=env,
     )
     options["Python_EXECUTABLE"] = str(info["executable"])
     if info.get("python_library"):
@@ -734,10 +710,7 @@ def runtime_tests_command(
         parallelism,
     ]
     ctest_args = ["ctest", "--output-on-failure", "-C", build_type]
-    if (
-        not is_cp311
-        and truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR"))
-    ):
+    if truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR")):
         osr_regex = env.get("CINDERX_RUNTIME_TEST_OSR_REGEX", "OSR|Osr|osr")
         lightweight_regex = env.get(
             "CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX",
@@ -753,16 +726,15 @@ def runtime_tests_command(
                 osr_regex,
             ]
         )
-        lwf_ctest_command = shell_join(
-            [
-                "env",
-                "PYTHONJITLIGHTWEIGHTFRAME=1",
-                "CINDERX_OSR_ENABLED=0",
-                *ctest_args,
-                "-R",
-                lightweight_regex,
-            ]
-        )
+        lwf_ctest_args = [
+            "env",
+            "PYTHONJITLIGHTWEIGHTFRAME=1",
+            "CINDERX_OSR_ENABLED=0",
+            *ctest_args,
+        ]
+        if not is_cp311:
+            lwf_ctest_args.extend(["-R", lightweight_regex])
+        lwf_ctest_command = shell_join(lwf_ctest_args)
         osr_ctest_command = shell_join(
             [
                 "env",
@@ -773,11 +745,12 @@ def runtime_tests_command(
                 osr_regex,
             ]
         )
+        ctest_commands = [normal_ctest_command, lwf_ctest_command]
+        if not is_cp311:
+            ctest_commands.append(osr_ctest_command)
         ctest_command = (
             f"cd {shlex.quote(str(build_dir))} && "
-            f"{normal_ctest_command} && "
-            f"{lwf_ctest_command} && "
-            f"{osr_ctest_command}"
+            + " && ".join(ctest_commands)
         )
     else:
         ctest_prefix = (

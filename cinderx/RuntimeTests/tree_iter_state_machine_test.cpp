@@ -1,6 +1,10 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/Jit/hir/function.h"
+#include "cinderx/Jit/hir/tree_iter_state_machine_pass.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <unordered_map>
 
 class TreeIterStateMachineRuntimeTest : public RuntimeTest {};
 
@@ -146,4 +150,61 @@ else:
     raise AssertionError("bare yield-from None must keep raising TypeError")
 del MisplacedGuardNode
 )");
+}
+
+TEST_F(TreeIterStateMachineRuntimeTest, PhiCycleInYieldFromTraceTerminates) {
+  // Hand-built HIR that satisfies the matcher's shape requirements (one
+  // InitialYield, LoadArg(0), one plain YieldValue, two yield-from
+  // YieldValues) but routes both yield-from iterables through a self-
+  // referencing Phi.  Before the shared on-path cycle guard, each Phi arm
+  // restarted the trace depth from zero, so a cyclic dataflow region
+  // recursed until the stack overflowed.  The pass must now bail out
+  // conservatively and leave the function unmodified.
+  Ref<> stock = compileStockAndGet(
+      R"(
+class Node:
+    def __iter__(self):
+        yield self.value
+        yield from self.left
+        yield from self.right
+
+target = Node.__iter__
+)",
+      "target");
+
+  jit::hir::Function func;
+  auto b0 = func.cfg.entry_block = func.cfg.AllocateBlock();
+  auto b1 = func.cfg.AllocateBlock();
+  auto v_self = func.env.AllocateRegister();
+  auto v_init = func.env.AllocateRegister();
+  auto v_plain = func.env.AllocateRegister();
+  auto v_yf1 = func.env.AllocateRegister();
+  auto v_yf2 = func.env.AllocateRegister();
+  auto v_phi = func.env.AllocateRegister();
+
+  jit::hir::FrameState frame;
+  b0->append<jit::hir::LoadArg>(v_self, 0);
+  b0->append<jit::hir::InitialYield>(v_init, frame);
+  b0->append<jit::hir::YieldValue>(v_plain, v_self, frame);
+  auto* yf_first = b0->append<jit::hir::YieldValue>(v_yf1, v_self, frame);
+  auto* yf_second = b0->append<jit::hir::YieldValue>(v_yf2, v_self, frame);
+  yf_first->setYieldFromIter(v_phi);
+  yf_second->setYieldFromIter(v_phi);
+  b0->append<jit::hir::Branch>(b1);
+
+  std::unordered_map<jit::hir::BasicBlock*, jit::hir::Register*> phi_args{
+      {b1, v_phi}};
+  b1->append<jit::hir::Phi>(v_phi, phi_args);
+  b1->append<jit::hir::Branch>(b1);
+
+  func.setCode(reinterpret_cast<PyFunctionObject*>(stock.get())->func_code);
+  jit::hir::TreeIterStateMachinePass().Run(func);
+
+  // Conservative exit: the function must not have been rewritten into a
+  // state machine.
+  EXPECT_EQ(
+      func.CountInstrs([](const jit::hir::Instr& instr) {
+        return instr.opcode() == jit::hir::Opcode::kEnsureTreeIterState;
+      }),
+      0);
 }

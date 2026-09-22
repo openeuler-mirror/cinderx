@@ -22,13 +22,6 @@ using namespace jit::hir;
 
 class ASMGeneratorTest : public RuntimeTest {
  public:
-  void SetUp() override {
-    RuntimeTest::SetUp();
-#if PY_VERSION_HEX < 0x030C0000
-    GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
-#endif
-  }
-
   Ref<CompiledFunction> GenerateCode(PyObject* func) {
     auto func_obj = reinterpret_cast<PyFunctionObject*>(func);
 
@@ -322,6 +315,7 @@ for _ in range(100):
 #endif
 
 TEST_F(ASMGeneratorTest, SanityCheck) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def func():
   a = 314159
@@ -341,6 +335,7 @@ def func():
 }
 
 TEST_F(ASMGeneratorTest, Fallthrough) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 def func2(x):
   y = 0
@@ -364,6 +359,7 @@ def func2(x):
 }
 
 TEST_F(ASMGeneratorTest, CondBranchTest) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def func2(x):
     if x:
@@ -392,6 +388,7 @@ def func2(x):
 }
 
 TEST_F(ASMGeneratorTest, UnboundLocalError) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x):
     if x:
@@ -449,6 +446,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, InsertXDecrefForMaybeAssignedRegisters) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x):
     if x:
@@ -473,6 +471,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, LoadAttr) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x):
     return x.denominator
@@ -493,6 +492,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, LoadAttrRaisesError) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x):
     y = 100
@@ -541,6 +541,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, StoreAttr) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* klasscode = R"(
 class TestClass:
   pass
@@ -570,6 +571,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, Compare) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     return a is b;
@@ -597,6 +599,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, LoadGlobalTest) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test():
     return len
@@ -628,6 +631,7 @@ def test():
 }
 
 TEST_F(ASMGeneratorTest, CallCFunction) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x):
   return len(x)
@@ -651,6 +655,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, CallBoundMethod) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(l):
   l.append(123)
@@ -677,6 +682,10 @@ def test(l):
 }
 
 TEST_F(ASMGeneratorTest, DefaultArgTest) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 default-argument JIT call crashes in "
+                  "JITRT_CallWithIncorrectArgcount";
+#endif
   const char* pycode = R"(
 def test(a, b, c=100):
     return a + b + c
@@ -704,6 +713,7 @@ def test(a, b, c=100):
 }
 
 TEST_F(ASMGeneratorTest, KWArgCall) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     return a + b;
@@ -735,6 +745,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, CallPythonFunction) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def meaning_of_life():
   return 42
@@ -761,6 +772,7 @@ def test(f):
 }
 
 TEST_F(ASMGeneratorTest, CallType) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* klasscode = R"(
 class TestClass:
   pass
@@ -787,6 +799,7 @@ def test(f):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryAdd) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a + b
@@ -813,6 +826,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryAnd) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a & b
@@ -839,6 +853,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryFloorDivide) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a // b
@@ -865,6 +880,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryLShift) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a << b
@@ -891,6 +907,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryModulo) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a % b
@@ -917,6 +934,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryMultiply) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a * b
@@ -943,6 +961,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryOr) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a | b
@@ -969,6 +988,9 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinarySubscr) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 binary subscription execution assertion fails";
+#endif
   const char* pycode = R"(
 def test(x):
   l = [1, 2]
@@ -993,6 +1015,7 @@ def test(x):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinarySubtract) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a - b
@@ -1019,6 +1042,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryTrueDivide) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a / b
@@ -1045,6 +1069,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeBinaryXor) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
   return a ^ b
@@ -1071,6 +1096,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, ReplaceReassignedFirstArgInExceptionFrame) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(x, y):
     if x:
@@ -1128,6 +1154,7 @@ def test(x, y):
 }
 
 TEST_F(ASMGeneratorTest, TupleListTest) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test_tuple(a):
     return (a, a, a)
@@ -1207,6 +1234,7 @@ UnaryTest(ASMGeneratorTest* test, const char* pycode, int inp, int expected) {
 }
 
 TEST_F(ASMGeneratorTest, InvokeUnaryNot) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a):
     return not a
@@ -1236,6 +1264,7 @@ def test(a):
 }
 
 TEST_F(ASMGeneratorTest, InvokeUnaryNegative) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a):
     return -a
@@ -1245,6 +1274,7 @@ def test(a):
 }
 
 TEST_F(ASMGeneratorTest, InvokeUnaryPositive) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a):
     return +a
@@ -1254,6 +1284,7 @@ def test(a):
 }
 
 TEST_F(ASMGeneratorTest, InvokeUnaryInvert) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a):
     return ~a
@@ -1263,6 +1294,9 @@ def test(a):
 }
 
 TEST_F(ASMGeneratorTest, StoreSubscr) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 subscription store execution assertion fails";
+#endif
   const char* pycode = R"(
 def test(c, s, v):
   c[s] = v
@@ -1343,6 +1377,7 @@ static void InPlaceOpTest(
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceAdd) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a += b
@@ -1353,6 +1388,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceAnd) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a &= b
@@ -1363,6 +1399,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceFloorDivide) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a //= b
@@ -1373,6 +1410,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceLShift) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a <<= b
@@ -1383,6 +1421,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceRemainder) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a %= b
@@ -1393,6 +1432,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceMatrixMultiply) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a @= b
@@ -1420,6 +1460,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceMultiply) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a *= b
@@ -1430,6 +1471,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceOr) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a |= b
@@ -1440,6 +1482,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlacePower) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a **= b
@@ -1450,6 +1493,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceRShift) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a >>= b
@@ -1460,6 +1504,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceSubtract) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a -= b
@@ -1470,6 +1515,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceTrueDivide) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a /= b
@@ -1508,6 +1554,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceXor) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test(a, b):
     a ^= b
@@ -1518,6 +1565,7 @@ def test(a, b):
 }
 
 TEST_F(ASMGeneratorTest, InvokeInPlaceNotDefined) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* pycode = R"(
 def test():
     a += 1
@@ -1544,6 +1592,7 @@ def test():
 }
 
 TEST_F(ASMGeneratorTest, TestDeepRegUsage) {
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* helpercode = R"(
 def f(*args):
     return sum(args)
@@ -1573,6 +1622,9 @@ def test(a, func):
 // This can't be tested in the pure Python test suite as it messes with
 // __import__.
 TEST_F(ASMGeneratorTest, TestImportNameWithImportOverride) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 overridden import execution assertion fails";
+#endif
   const char* pycode = R"(
 def test_override_builtin_import(locals):
     captured_data = []
@@ -1619,6 +1671,9 @@ def test_override_builtin_import(locals):
 }
 
 TEST_F(ASMGeneratorTest, GetLength) {
+#if PY_VERSION_HEX < 0x030C0000
+  GTEST_SKIP() << "CPython 3.11 GetLength execution assertion fails";
+#endif
   //  0 LOAD_FAST  0
   //  2 GET_LENGTH
   //  4 RETURN_VALUE
@@ -1682,9 +1737,7 @@ class NewASMGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(NewASMGeneratorTest, Linear) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* src = R"(
 def func(x):
@@ -1706,9 +1759,7 @@ def func(x):
 }
 
 TEST_F(NewASMGeneratorTest, DiamondControlBlock) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* src = R"(
 def func(a, b):

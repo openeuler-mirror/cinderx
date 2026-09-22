@@ -75,7 +75,8 @@ class ExecutionInfra311Test(unittest.TestCase):
                 "offset": None,
             },
         )
-        self.assertEqual(result["subscr"]["reason"], "REFUSE_SHAPE_EXECUTE_SURFACE")
+        self.assertEqual(
+            result["subscr"]["reason"], "REFUSE_SHAPE_SUBSCRIPT_ADMISSION")
         self.assertIsInstance(result["subscr"]["opcode"], int)
         self.assertIsInstance(result["subscr"]["offset"], int)
         self.assertFalse(result["subscr"]["eligible"])
@@ -161,6 +162,9 @@ class ExecutionInfra311Test(unittest.TestCase):
             """
         )
         self.assertIn("LOAD_ATTR", result["surface"])
-        self.assertNotIn("BINARY_SUBSCR", result["surface"])
+        # The surface reports backend capability; per-function admission still
+        # rejects unprofitable shapes (covered by compile_diagnostic above).
+        self.assertIn("BINARY_SUBSCR", result["surface"])
+        self.assertIn("STORE_SUBSCR", result["surface"])
         self.assertEqual(result["entries"], 3)
         self.assertEqual(result["dropped"], 0)

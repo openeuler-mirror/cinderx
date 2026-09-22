@@ -6,6 +6,8 @@
 #include "cinderx/RuntimeTests/fixtures.h"
 
 #include <cstring>
+#include <new>
+#include <stdexcept>
 
 namespace {
 
@@ -166,4 +168,93 @@ TEST(SlabArenaTest, FreeIsBestEffortAndReusesTheSlot) {
   EXPECT_TRUE(arena.free(slot));
   BigArray* reused = arena.allocate();
   EXPECT_EQ(reused, slot);
+}
+
+namespace {
+
+class ThrowOnDemand {
+ public:
+  explicit ThrowOnDemand(bool fail = false) {
+    if (fail) {
+      throw std::bad_alloc();
+    }
+  }
+};
+
+} // namespace
+
+TEST(SlabArenaTest, ReuseConstructionFailureAborts) {
+  // A constructor failure in a recycled slot leaves the slot holding a
+  // destructed object with no generic way to rebuild one; iteration and
+  // the slab's teardown would then treat dead storage as a live object.
+  // The invariant must die loudly at the fault site instead.
+  SlabArena<ThrowOnDemand, ObjectSizeTrait<ThrowOnDemand>, 1> arena;
+  ThrowOnDemand* slot = arena.allocate();
+  ASSERT_TRUE(arena.free(slot));
+  EXPECT_DEATH(arena.allocate(true), "exactly one constructed object");
+}
+
+TEST(SlabArenaTest, NewSlotConstructionFailureRollsBackFill) {
+  // PR235 review: the fresh-slot path advanced fill_ before running the
+  // constructor, so a throwing constructor used to leave an unconstructed
+  // slot inside [base_, fill_) that teardown and iteration would treat
+  // as a live object.  The rollback restores the invariant and lets the
+  // exception propagate, unlike the recycled-slot path above where the
+  // dead husk forces a fail-closed abort.
+  SlabArena<ThrowOnDemand, ObjectSizeTrait<ThrowOnDemand>, 1> arena;
+  EXPECT_THROW(arena.allocate(true), std::bad_alloc);
+
+  // The failed slot is invisible to iteration...
+  size_t count = 0;
+  for (UNUSED auto& obj : arena) {
+    count++;
+  }
+  EXPECT_EQ(count, 0);
+
+  // ...and the arena keeps working: the next construction succeeds and
+  // is visible exactly once.
+  ThrowOnDemand* obj = arena.allocate();
+  EXPECT_NE(obj, nullptr);
+  count = 0;
+  for (UNUSED auto& obj2 : arena) {
+    count++;
+  }
+  EXPECT_EQ(count, 1);
+}
+
+TEST(SlabArenaTest, GrowthConstructionFailureRemovesEmptySlab) {
+  // PR235 review: growing the arena entered a brand-new slab; if the very
+  // first construction there throws, rolling fill_ back alone is not
+  // enough.  The now-empty slab must leave slabs_ entirely, or the next
+  // iteration hits the iterator's "Unexpected empty slab" check and
+  // aborts the process even though the caller recovered from the
+  // exception.
+  SlabArena<ThrowOnDemand, ObjectSizeTrait<ThrowOnDemand>, 1> arena;
+
+  // Fill the first slab completely so the next allocate() must grow.
+  const size_t kPerSlab = kPageSize / sizeof(ThrowOnDemand);
+  for (size_t i = 0; i < kPerSlab; i++) {
+    arena.allocate();
+  }
+
+  // First allocation in the fresh slab fails and must unwind the growth.
+  EXPECT_THROW(arena.allocate(true), std::bad_alloc);
+
+  // Iteration sees exactly the first slab's objects and does not abort on
+  // an empty tail slab.
+  size_t count = 0;
+  for (UNUSED auto& obj : arena) {
+    count++;
+  }
+  EXPECT_EQ(count, kPerSlab);
+
+  // The arena still works afterwards: growing again succeeds and the new
+  // object is visible exactly once.
+  ThrowOnDemand* obj = arena.allocate();
+  EXPECT_NE(obj, nullptr);
+  count = 0;
+  for (UNUSED auto& obj2 : arena) {
+    count++;
+  }
+  EXPECT_EQ(count, kPerSlab + 1);
 }

@@ -11,6 +11,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/parser.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/parser.h"
@@ -113,6 +114,189 @@ class LIRGeneratorTest : public RuntimeTest {
 };
 
 #if PY_VERSION_HEX < 0x030C0000
+struct Translated311HIR {
+  std::unique_ptr<hir::Function> hir;
+  std::unique_ptr<jit::lir::Function> lir;
+};
+
+static Translated311HIR translate311HIR(
+    const char* source,
+    jit::Context* context) {
+  auto irfunc = hir::HIRParser{}.ParseHIR(source);
+  if (irfunc == nullptr) {
+    return {};
+  }
+  Compiler::runPasses(
+      *irfunc,
+      static_cast<PassConfig>(
+          PassConfig::kAllExceptInliner & ~PassConfig::kInsertUpdatePrevInstr));
+  jit::codegen::Environ env;
+  jit::CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+  env.ctx = context;
+  env.code_rt = &runtime;
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto lir = lir_gen.TranslateFunction();
+  return {std::move(irfunc), std::move(lir)};
+}
+
+static const Instruction* findOpcode(
+    const jit::lir::Function& function,
+    Instruction::Opcode opcode) {
+  for (const auto& block : function.basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      if (instr->opcode() == opcode) {
+        return instr.get();
+      }
+    }
+  }
+  return nullptr;
+}
+
+static bool hasImmediate(const jit::lir::Function& function, uint64_t value) {
+  for (const auto& block : function.basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      for (size_t i = 0; i < instr->getNumInputs(); ++i) {
+        const OperandBase* input = instr->getInput(i);
+        if (input->isImm() && input->getConstant() == value) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+static size_t countOpcode(
+    const jit::lir::Function& function,
+    Instruction::Opcode opcode) {
+  size_t count = 0;
+  for (const auto& block : function.basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      count += instr->opcode() == opcode;
+    }
+  }
+  return count;
+}
+
+TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
+  const char* exact_source = R"(fun exact_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = RefineType<Func> v0
+    v2 = LoadArg<1>
+    v3 = VectorCall<1> v1 v2
+    Return v3
+  }
+}
+)";
+  auto exact = translate311HIR(exact_source, getContext());
+  ASSERT_NE(exact.lir, nullptr);
+  const Instruction* exact_call =
+      findOpcode(*exact.lir, Instruction::kVectorCall);
+  ASSERT_NE(exact_call, nullptr) << *exact.lir;
+  EXPECT_FALSE(hasImmediate(
+      *exact.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
+      << *exact.lir;
+  ASSERT_GT(exact_call->getNumInputs(), 0u);
+  EXPECT_TRUE(exact_call->getInput(exact_call->getNumInputs() - 1)->isImm());
+  EXPECT_EQ(
+      exact_call->getInput(exact_call->getNumInputs() - 1)->getConstant(), 0);
+
+  const char* generic_source = R"(fun generic_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = VectorCall<1> v0 v1
+    Return v2
+  }
+}
+)";
+  auto generic = translate311HIR(generic_source, getContext());
+  ASSERT_NE(generic.lir, nullptr);
+  EXPECT_TRUE(hasImmediate(
+      *generic.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
+      << *generic.lir;
+  EXPECT_GE(countOpcode(*generic.lir, Instruction::kSelect), 1u)
+      << *generic.lir;
+
+  const char* keyword_source = R"(fun keyword_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = RefineType<Func> v0
+    v2 = LoadArg<1>
+    v3 = VectorCall<1, kwnames> v1 v2
+    Return v3
+  }
+}
+)";
+  auto keyword = translate311HIR(keyword_source, getContext());
+  ASSERT_NE(keyword.lir, nullptr);
+  const Instruction* keyword_call =
+      findOpcode(*keyword.lir, Instruction::kVectorCall);
+  ASSERT_NE(keyword_call, nullptr) << *keyword.lir;
+  ASSERT_GT(keyword_call->getNumInputs(), 0u);
+  EXPECT_FALSE(
+      keyword_call->getInput(keyword_call->getNumInputs() - 1)->isImm())
+      << *keyword.lir;
+}
+
+TEST_F(LIRGeneratorTest, Python311CallMethodKeepsNullReceiverSlowArm) {
+  const char* source = R"(fun method_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = LoadArg<2>
+    v3 = CallMethod<3> v0 v1 v2
+    Return v3
+  }
+}
+)";
+  auto function = translate311HIR(source, getContext());
+  ASSERT_NE(function.lir, nullptr);
+  EXPECT_NE(findOpcode(*function.lir, Instruction::kVectorCall), nullptr)
+      << *function.lir;
+  EXPECT_TRUE(hasImmediate(
+      *function.lir, reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot)))
+      << *function.lir;
+  // The final Select is the receiver-null override of the earlier type-based
+  // fast/slow selection. The preceding Selects make callable loads safe.
+  EXPECT_GE(countOpcode(*function.lir, Instruction::kSelect), 4u)
+      << *function.lir;
+}
+
+TEST_F(LIRGeneratorTest, Python311FrameLocalWriteEliminatesHelperCall) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED)
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def replace_local(value):
+  local = value
+  local = None
+  return local
+)",
+      "replace_local"));
+  ASSERT_NE(func, nullptr);
+
+  State previous_state = getConfig().state;
+  getMutableConfig().state = State::kRunning;
+  std::unique_ptr<hir::Function> irfunc(buildHIR(func));
+  getMutableConfig().state = previous_state;
+  Compiler::runPasses(*irfunc, PassConfig::kAllExceptInliner);
+  jit::codegen::Environ env;
+  env.ctx = getContext();
+  jit::CodeRuntime runtime{func};
+  env.code_rt = &runtime;
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto function = lir_gen.TranslateFunction();
+
+  EXPECT_FALSE(hasImmediate(
+      *function, reinterpret_cast<uint64_t>(JITRT_StoreFrameLocal311)))
+      << *function;
+  EXPECT_GE(countOpcode(*function, Instruction::kMove), 3u) << *function;
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.11 GIL-only fast path";
+#endif
+}
+
 TEST_F(LIRGeneratorTest, PrimitiveBoxBoolSelectUsesVRegInputs) {
   const char* hir_source = R"(fun test {
   bb 0 {
@@ -782,6 +966,51 @@ def func(x):
   parsed_func->sortBasicBlocks();
   ss << *parsed_func;
   ASSERT_EQ(lir_str, removeCommentsAndWhitespace(ss.str()));
+}
+
+#if defined(CINDER_AARCH64)
+TEST(LIRParserTest, AArch64StackSlotsRoundTrip) {
+  const std::string source =
+      "Function:\nBB %0\n"
+      "    %1:Object = Move [X29(-104)]:Object\n"
+      "    %2:Object = Move [X29(-16)]:Object\n"
+      "    Return %1:Object\n";
+  Parser parser;
+  auto function = parser.parse(source);
+  ASSERT_NE(function, nullptr);
+  std::stringstream printed;
+  printed << *function;
+  EXPECT_NE(printed.str().find("[X29(-104)]"), std::string::npos);
+  EXPECT_NE(printed.str().find("[X29(-16)]"), std::string::npos);
+  Parser round_trip_parser;
+  auto round_trip = round_trip_parser.parse(printed.str());
+  ASSERT_NE(round_trip, nullptr);
+  std::stringstream reparsed;
+  reparsed << *round_trip;
+  EXPECT_EQ(printed.str(), reparsed.str());
+}
+#endif
+
+TEST(LIRParserTest, UnsignedImmediateRoundTrip) {
+  for (const auto* literal :
+       {"9223372036854775808(0x8000000000000000)",
+        "18446744073709551608(0xfffffffffffffff8)",
+        "18446744073709551615(0xffffffffffffffff)"}) {
+    const std::string source =
+        std::string{"Function:\nBB %0\n    %1:64bit = Move "} + literal +
+        ":64bit\n    Return %1:64bit\n";
+    Parser parser;
+    auto function = parser.parse(source);
+    ASSERT_NE(function, nullptr);
+    std::stringstream printed;
+    printed << *function;
+    EXPECT_NE(printed.str().find(literal), std::string::npos) << printed.str();
+  }
+  Parser parser;
+  EXPECT_THROW(
+      parser.parse(
+          "Function:\nBB %0\n    %1:64bit = Move 18446744073709551616:64bit\n"),
+      ParserException);
 }
 
 TEST_F(LIRGeneratorTest, ParserSectionTest) {

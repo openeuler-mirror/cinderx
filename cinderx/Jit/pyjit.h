@@ -9,6 +9,8 @@
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/pyjit_result.h"
 
+#include <optional>
+
 namespace jit {
 
 /*
@@ -48,6 +50,14 @@ void finalize();
  * it is already compiled.
  */
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
+
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+// Observe the actual JIT-context resolver boundary. This probe exists only in
+// CMake RuntimeTests builds; production and Buck builds have no counting path.
+void resetJitContextLookupCountForTest();
+void disableJitContextLookupCountingForTest();
+size_t jitContextLookupCountForTest();
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 // CPython 3.11 execute mode: register `outer` as the outer function of the

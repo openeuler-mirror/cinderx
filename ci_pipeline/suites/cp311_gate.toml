@@ -10,14 +10,16 @@ system = "Linux"
 
 # Validate the vendored CPython manifest before compiling one Release
 # RuntimeTests binary.  Census, Green and Canary all consume that binary.
+# Jenkins supplies RT311_BASELINE_BASE for PR self-extension checks; Daily
+# runs the census against the already-reviewed manifests without that input.
 [[jobs]]
 name = "runtime_tests_311"
 phase = "runtime_tests"
-command = "bash -lc ': ${{RT311_BASELINE_BASE:?RT311_BASELINE_BASE must be set to the merge-base SHA by the scheduler}} && cd cinderx/Interpreter/3.11/upstream && sha256sum --check --quiet SHA256SUMS && cd ../../../.. && ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-build\" --census'"
+command = "bash -lc 'cd cinderx/Interpreter/3.11/upstream && sha256sum --check --quiet SHA256SUMS && cd ../../../.. && ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-build\" --census'"
 
-# PR builds one Release wheel.  Daily passes CINDERX_TEST_WHEEL and this job
-# installs that wheel instead.  Both paths provision the same candidate venv
-# and finish with import and dynamic-symbol smoke checks.
+# PR builds one Release wheel.  Daily verifies an optional CINDERX_TEST_WHEEL
+# or builds the normalized Release wheel itself.  Both paths provision the
+# same candidate venv and finish with import and dynamic-symbol smoke checks.
 [[jobs]]
 name = "setup_release_311"
 phase = "setup_release"

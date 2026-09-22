@@ -33,22 +33,13 @@ bool isJitCompiled(const PyFunctionObject* func) {
     return false;
   }
 #if PY_VERSION_HEX < 0x030C0000
-  // On 3.11 the installed entry is the guarded one, which is ordinary
-  // extension code rather than generated code, so the allocator test below
-  // cannot see it.  The question this answers is whether a call will
-  // execute machine code, and for the guarded entry that is exactly
-  // whether the function's current code object still has a published
-  // artifact -- which is also what makes the answer go false again after a
-  // __code__ swap.
-  if (reinterpret_cast<void*>(func->vectorcall) ==
-      reinterpret_cast<void*>(Ci_JitShell311_GuardedEntry)) {
-    // Exactly the predicate the entry uses for function state, so this
-    // cannot report a function as compiled after a __code__ swap that
-    // already sent every call to the interpreter.  Live defaults are
-    // rebound by the generated prologue and do not clear the artifact.
-    return Ci_JitShell311_InstalledArtifact(
-               const_cast<PyFunctionObject*>(func)) != nullptr;
-  }
+  // Both CPython 3.11 publication forms are guarded: the shared extension
+  // entry lives outside the code allocator, while the artifact-specific stub
+  // lives inside it.  Address provenance therefore cannot distinguish a live
+  // installation from a stale stub after __code__ changes.  Use exactly the
+  // predicate the entries use so diagnostics and the next call agree.
+  return Ci_JitShell311_InstalledArtifact(
+             const_cast<PyFunctionObject*>(func)) != nullptr;
 #endif
   jit::ICodeAllocator* code_allocator = mod_state->code_allocator.get();
   return code_allocator != nullptr &&
@@ -200,6 +191,12 @@ Ref<CompiledFunction> CompiledFunction::create(
 }
 
 CompiledFunction::~CompiledFunction() {
+#if PY_VERSION_HEX < 0x030C0000
+  if (data_.runtime != nullptr && runtimeStorageAlive() &&
+      data_.runtime->compiledFunction() == this) {
+    data_.runtime->setCompiledFunction(nullptr);
+  }
+#endif
   clear();
 
   if (data_.code.data() != nullptr) {
@@ -455,6 +452,19 @@ void CompiledFunction::clear(
   // The owner is nulled below, but the runtime hand-back at the bottom
   // still needs it: only the owner knows which slab the storage came from.
   [[maybe_unused]] CompiledFunctionOwner* entry_owner = owner_;
+#if PY_VERSION_HEX < 0x030C0000
+  // Orphaned artifacts skip the owner walk below.  If a caller detached
+  // us without restoring interpreter entries, a later jump through the
+  // artifact stub would enter freed code.  Only rewrite vectorcalls that
+  // still name this stub: a successor may already own the function.
+  if (owner_ == nullptr) {
+    for (PyFunctionObject* func : functions_) {
+      if (func->vectorcall == artifactGuardedEntry311()) {
+        func->vectorcall = getInterpretedVectorcall(func);
+      }
+    }
+  }
+#endif
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {
@@ -510,6 +520,11 @@ void CompiledFunction::clear(
   // registries are gone. Keep these references until that generator converts
   // to stock state and releases the artifact's final owner.
   if (release_runtime_references && data_.runtime != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (data_.runtime->compiledFunction() == this) {
+      data_.runtime->setCompiledFunction(nullptr);
+    }
+#endif
     data_.runtime->releaseReferences();
 #if PY_VERSION_HEX < 0x030C0000
     // The release runs at artifact death, at GC collection of an

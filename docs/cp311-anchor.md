@@ -10,7 +10,7 @@
 | 编译器 | GCC 14.2.0 源码编译，`LDFLAGS=-Wl,-rpath,/usr/local/gcc-14.2.0/lib64` 解决 libstdc++（与 3.14.3 交付 Dockerfile 同方案） |
 | 发行版构建形态 | `--enable-shared --with-computed-gotos=yes --with-dtrace --with-lto --enable-optimizations`；CFLAGS `-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2` |
 | Lib/test | 发行版包自带（regrtest 可列 457 项），双模比对无需额外语料 |
-| 烘焙工具（镜像 v2 起） | `setuptools==80.9.0`（构建要求 ≥77）、`pytest==8.4.1`（差分引擎单测）；git `http.sslVerify=false`（内网 TLS 拦截代理场景；依赖完整性由钉死 commit 与 vendored SHA256SUMS 清单承载，不依赖传输通道） |
+| 烘焙工具（镜像 v2 起） | `ci_pipeline/requirements-cp311-build.txt`：`setuptools==80.9.0`、`wheel==0.45.1`、`build==1.3.0`；`ci_pipeline/requirements-cp311-test.txt`：`pytest==9.0.3`（统一 PR、Daily 与开发/性能镜像口径）；git `http.sslVerify=false`（内网 TLS 拦截代理场景；依赖完整性由钉死 commit 与 vendored SHA256SUMS 清单承载，不依赖传输通道） |
 
 制品 sha256：
 

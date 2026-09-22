@@ -262,7 +262,8 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
     // FrameHeader and contains func_closure with closure cells that may
     // participate in reference cycles. We must visit it explicitly since
     // _PyFrame_Traverse won't see it.
-    if (jit_gen->gi_frame_state < FRAME_CLEARED) {
+    if (getConfig().frame_mode == FrameMode::kLightweight &&
+        jit_gen->gi_frame_state < FRAME_CLEARED) {
       _PyInterpreterFrame* frame = generatorFrame(jit_gen);
       BorrowedRef<PyFunctionObject> func = jitFrameGetFunction(frame);
       Py_VISIT(func.get());
@@ -1055,16 +1056,18 @@ void deopt_jit_gen_object_only(JitGenObject* gen) {
   Py_DECREF(old_type);
   Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), type);
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
-  auto frame = generatorFrame(gen);
-  if (gen->gi_frame_state != FRAME_CLEARED) {
-    jitFrameRemoveReifier(frame);
-  } else if constexpr (PY_VERSION_HEX < 0x030E0000) {
-    // Normally we'll clear the function via jitFrameClearExceptCode. But
-    // a user can call clear on a reified frame object which transfers
-    // ownership of the _PyInterpreterFrame to the PyFrameObject and marks
-    // the generator frame as cleared. In that case we still need to decref
-    // the function which is stored before the _PyInterpreterFrame in 3.12.
-    Py_XDECREF(jitFrameGetFunction(frame));
+  if (getConfig().frame_mode == FrameMode::kLightweight) {
+    auto frame = generatorFrame(gen);
+    if (gen->gi_frame_state != FRAME_CLEARED) {
+      jitFrameRemoveReifier(frame);
+    } else if constexpr (PY_VERSION_HEX < 0x030E0000) {
+      // Normally we'll clear the function via jitFrameClearExceptCode. But
+      // a user can call clear on a reified frame object which transfers
+      // ownership of the _PyInterpreterFrame to the PyFrameObject and marks
+      // the generator frame as cleared. In that case we still need to decref
+      // the function which is stored before the _PyInterpreterFrame in 3.12.
+      Py_XDECREF(jitFrameGetFunction(frame));
+    }
   }
 #endif
 }

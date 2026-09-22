@@ -1017,6 +1017,11 @@ bool parseExceptionTable(
       if (pos >= size) {
         return false;
       }
+      // Refuse varints that would wrap uint32_t; a well-formed
+      // co_exceptiontable entry always fits comfortably in 32 bits.
+      if (value > (std::numeric_limits<uint32_t>::max() >> 6)) {
+        return false;
+      }
       byte = data[pos++];
       value = (value << 6) | (byte & 63);
     }
@@ -1026,6 +1031,13 @@ bool parseExceptionTable(
     uint32_t start = 0, length = 0, target = 0, depth_lasti = 0;
     if (!parse_varint(start) || !parse_varint(length) ||
         !parse_varint(target) || !parse_varint(depth_lasti)) {
+      return false;
+    }
+    // Entries store byte offsets doubled; refuse values whose doubling or
+    // start+length sum would wrap.
+    constexpr uint32_t kMaxOffset = std::numeric_limits<uint32_t>::max() / 2;
+    if (start > kMaxOffset || target > kMaxOffset ||
+        length > kMaxOffset - start) {
       return false;
     }
     entries.push_back(

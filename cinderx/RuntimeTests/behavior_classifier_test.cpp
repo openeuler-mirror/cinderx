@@ -2015,3 +2015,173 @@ assert jit.is_jit_compiled(target)
 
   EXPECT_FALSE(getConfig().auto_classify);
 }
+
+namespace {
+
+// Minimal CPython exception-table varint codec (6 bits per byte, bit 6 set
+// on every byte but the last), mirroring the format consumed by
+// parseExceptionTable in behavior_classifier.cpp.  Groups are emitted most
+// significant first because both parseExceptionTable and
+// decodeExceptionVarint accumulate with value = (value << 6) | group; a
+// least-significant-first encoder would not round-trip multi-byte values
+// and could make wrap-refusal regressions invisible (PR235 review).
+std::string encodeExceptionVarint(uint32_t value) {
+  char groups[6];
+  int n = 0;
+  do {
+    groups[n++] = static_cast<char>(value & 63);
+    value >>= 6;
+  } while (value != 0 && n < 6);
+  std::string out;
+  for (int i = n - 1; i >= 0; i--) {
+    char byte = groups[i];
+    if (i != 0) {
+      byte |= 64;
+    }
+    out.push_back(byte);
+  }
+  return out;
+}
+
+bool decodeExceptionVarint(
+    const uint8_t*& pos,
+    const uint8_t* end,
+    uint32_t& value) {
+  if (pos >= end) {
+    return false;
+  }
+  uint8_t byte = *pos++;
+  value = byte & 63;
+  while (byte & 64) {
+    if (pos >= end) {
+      return false;
+    }
+    byte = *pos++;
+    value = (value << 6) | (byte & 63);
+  }
+  return true;
+}
+
+} // namespace
+
+TEST(BehaviorClassifierVarintCodec, RoundTripsMultiByteValues) {
+  // PR235 review: the encoder used to emit the least significant 6-bit
+  // group first while every decoder accumulates most significant group
+  // first, so multi-byte values silently mis-encoded and the wrap-refusal
+  // regression test below stayed green on the old (buggy) parser.  Pin the
+  // round trip and the exact bytes of the wrapping probe value.
+  for (uint32_t v :
+       {0u,
+        1u,
+        63u,
+        64u,
+        0xFFFu,
+        0x3FFFFFFu,
+        0x4000000u,
+        0x7FFFFFFFu,
+        0xFFFFFFC3u,
+        0xFFFFFFFFu}) {
+    std::string enc = encodeExceptionVarint(v);
+    const uint8_t* pos = reinterpret_cast<const uint8_t*>(enc.data());
+    const uint8_t* end = pos + enc.size();
+    uint32_t decoded = 0;
+    ASSERT_TRUE(decodeExceptionVarint(pos, end, decoded)) << "v=" << v;
+    EXPECT_EQ(pos, end) << "v=" << v;
+    EXPECT_EQ(decoded, v);
+  }
+  // Most-significant-group-first bytes for the wrap probe: exactly what
+  // parseExceptionTable must refuse (by the varint overflow or the
+  // offset-sum check) instead of wrapping.
+  EXPECT_EQ(
+      encodeExceptionVarint(0xFFFFFFFF),
+      std::string("\x43\x7f\x7f\x7f\x7f\x3f", 6));
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 has its own dedicated case because the shared one below cannot run
+// there at all: 3.11 try/except bodies contain opcodes outside opcodeClassOf
+// (e.g. POP_EXC_INFO), so scanCode bails before parseExceptionTable is ever
+// reached and deriveStructureKey returns nullopt for any try/except code,
+// regardless of the exception table's shape.  That early bail is itself the
+// safe outcome on 3.11 -- the parser is unreachable, so a wrapping varint
+// cannot fool it -- and this case pins it.  The wrap-refusal path itself is
+// version-independent C++ and is covered on 3.12+ by the case below.  If
+// opcodeClassOf ever learns the 3.11 exception opcodes, this case should be
+// removed and the 3.12+ case made unconditional.
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    MalformedExceptionTableClassifiesConservatively311) {
+  Ref<> calls_in_region = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache.fetch(key)
+    except KeyError:
+        return None
+target = probe
+)",
+      "target");
+  BorrowedRef<PyCodeObject> code = codeFromFunc(calls_in_region);
+  auto real_key = deriveStructureKey(code);
+  ASSERT_FALSE(real_key.has_value());
+}
+#else
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    MalformedExceptionTableClassifiesConservatively) {
+  // A length varint that accumulates to 0xFFFFFFFF makes
+  // (start + length) * 2 wrap below start * 2, which used to empty the
+  // guarded region and skip the region-contains-call check for a function
+  // that must not be EAFP-benign.  The hardened parser must refuse the
+  // wrapping entry and keep the conservative verdict.
+  Ref<> calls_in_region = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache.fetch(key)
+    except KeyError:
+        return None
+target = probe
+)",
+      "target");
+  BorrowedRef<PyCodeObject> code = codeFromFunc(calls_in_region);
+  auto real_key = deriveStructureKey(code);
+  ASSERT_TRUE(real_key.has_value());
+  EXPECT_FALSE(real_key->is_eafp_benign);
+
+  PyObject* table = code->co_exceptiontable;
+  ASSERT_NE(table, nullptr);
+  ASSERT_TRUE(PyBytes_Check(table));
+  const uint8_t* pos =
+      reinterpret_cast<const uint8_t*>(PyBytes_AS_STRING(table));
+  const uint8_t* end = pos + PyBytes_GET_SIZE(table);
+  uint32_t start = 0, length = 0, target = 0, depth_lasti = 0;
+  ASSERT_TRUE(decodeExceptionVarint(pos, end, start));
+  ASSERT_TRUE(decodeExceptionVarint(pos, end, length));
+  ASSERT_TRUE(decodeExceptionVarint(pos, end, target));
+  ASSERT_TRUE(decodeExceptionVarint(pos, end, depth_lasti));
+
+  // Same start/target/depth but a wrapping 6-group length varint.
+  std::string malformed = encodeExceptionVarint(start);
+  malformed += encodeExceptionVarint(0xFFFFFFFF);
+  malformed += encodeExceptionVarint(target);
+  malformed += encodeExceptionVarint(depth_lasti);
+
+  PyObject* original = code->co_exceptiontable;
+  Py_INCREF(original);
+  auto malformed_table = Ref<>::steal(PyBytes_FromStringAndSize(
+      malformed.data(), static_cast<Py_ssize_t>(malformed.size())));
+  ASSERT_NE(malformed_table.get(), nullptr);
+  code->co_exceptiontable = malformed_table.release();
+  auto malformed_key = deriveStructureKey(code);
+  ASSERT_TRUE(malformed_key.has_value());
+  EXPECT_FALSE(malformed_key->is_eafp_benign);
+  Py_DECREF(code->co_exceptiontable);
+  code->co_exceptiontable = original;
+
+  // The restored real table keeps its original (also non-benign) verdict.
+  auto restored_key = deriveStructureKey(code);
+  ASSERT_TRUE(restored_key.has_value());
+  EXPECT_FALSE(restored_key->is_eafp_benign);
+}
+#endif // PY_VERSION_HEX < 0x030C0000

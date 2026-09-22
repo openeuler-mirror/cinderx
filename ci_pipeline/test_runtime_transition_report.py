@@ -412,6 +412,21 @@ class RuntimeTransitionReportTest(unittest.TestCase):
         self.assertIn("PYTHONJITAUTO=1", diagnostic)
         self.assertNotIn("PYTHONJITALL=1", diagnostic)
 
+    def test_daily_stock_is_forwarded_to_the_shared_acceptance_base(self):
+        runner = RuntimeTransitionAcceptanceRunner(
+            wheel=Path("wheel.whl"),
+            source=ROOT,
+            output=Path("out"),
+            lanes={"autocompile_coverage"},
+            jobs=16,
+            timeout=1200,
+            python=Path("candidate/bin/python"),
+            stock_dir=Path("daily-stock"),
+        )
+
+        self.assertTrue(runner.base.reused_python)
+        self.assertEqual(runner.base.stock_dir, Path("daily-stock").resolve())
+
     def test_penetration_deviation_requires_fingerprint(self):
         testcase = "test.test_dis.DisTests.test_super_instructions"
         stock = {

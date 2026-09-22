@@ -1185,12 +1185,7 @@ closure_baseline_error = capture_error(closure_baseline, closure_missing)
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
-#if PY_VERSION_HEX < 0x030C0000
-  if (jit::getConfig().state != jit::State::kRunning) {
-    GTEST_SKIP() << "3.11 executes machine code only in canary mode; "
-                    "set CINDERX_JIT_MODE=canary to run this";
-  }
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class YieldBox:
     def values(self):
@@ -2003,15 +1998,85 @@ def make_arange(n):
 TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
 #if PY_VERSION_HEX < 0x030C0000
   EXPECT_TRUE(isExecuteOpcodeSupported311(LOAD_ATTR));
-  EXPECT_FALSE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
+  // Backend support does not imply profitable admission for every function.
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
 
   Ref<PyFunctionObject> func(
       compileAndGet("def test(values):\n    return values[0]", "test"));
   ASSERT_NE(func, nullptr);
   ExecuteRefusal311 detail = unsupportedExecuteDetail311(func->func_code);
-  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_EXECUTE_SURFACE");
+  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_SUBSCRIPT_ADMISSION");
   EXPECT_EQ(detail.opcode, BINARY_SUBSCR);
   EXPECT_GE(detail.offset, 0);
+#endif
+}
+
+// PR235 review feedback: a saturating EXTENDED_ARG accumulator produces
+// oparg() == INT_MAX, which is non-negative but still an illegal index.
+// Admission (unsupportedExecuteDetail311) indexes co_consts with the
+// LOAD_CONST oparg directly, so a malformed chain over a one-element
+// co_consts must be refused there instead of reading out of bounds.
+TEST_F(HIRBuildTest, ExecuteSurface311RefusesSaturatedExtendedArg) {
+#if PY_VERSION_HEX < 0x030C0000
+  //  0 EXTENDED_ARG 1  (x5: accumulator passes INT_MAX >> 8, saturates)
+  // 10 LOAD_CONST     6  (saturated oparg; co_consts has length 1)
+  // 12 RETURN_VALUE  0
+  const unsigned char bc[] = {
+      EXTENDED_ARG,
+      1,
+      EXTENDED_ARG,
+      2,
+      EXTENDED_ARG,
+      3,
+      EXTENDED_ARG,
+      4,
+      EXTENDED_ARG,
+      5,
+      LOAD_CONST,
+      6,
+      RETURN_VALUE,
+      0};
+  auto bytecode = Ref<>::steal(
+      PyBytes_FromStringAndSize(reinterpret_cast<const char*>(bc), sizeof(bc)));
+  ASSERT_NE(bytecode.get(), nullptr);
+  auto filename = Ref<>::steal(PyUnicode_FromString("filename"));
+  auto funcname = Ref<>::steal(PyUnicode_FromString("funcname"));
+  auto consts = Ref<>::steal(PyTuple_New(1));
+  Py_INCREF(Py_None);
+  PyTuple_SET_ITEM(consts.get(), 0, Py_None);
+  auto empty_tuple = Ref<>::steal(PyTuple_New(0));
+  auto empty_bytes = Ref<>::steal(PyBytes_FromString(""));
+  auto code = Ref<PyCodeObject>::steal(PyUnstable_Code_New(
+      /*argcount=*/0,
+      /*kwonlyargcount=*/0,
+      /*nlocals=*/0,
+      /*stacksize=*/0,
+      /*flags=*/0,
+      bytecode,
+      consts,
+      /*names=*/empty_tuple,
+      /*varnames=*/empty_tuple,
+      /*freevars=*/empty_tuple,
+      /*cellvars=*/empty_tuple,
+      filename,
+      funcname,
+      /*_unused_qualname=*/funcname,
+      /*firstlineno=*/0,
+      /*linetable=*/empty_bytes,
+      /*_unused_exceptiontable=*/empty_bytes));
+  ASSERT_NE(code.get(), nullptr);
+
+  // The saturated oparg must be observable on the instruction itself...
+  jit::BytecodeInstructionBlock bc_block{code};
+  auto it = bc_block.begin();
+  ASSERT_EQ(it->opcode(), LOAD_CONST);
+  ASSERT_TRUE(it->opargOverflowed());
+
+  // ...and admission must refuse the malformed code object outright
+  // instead of indexing co_consts with INT_MAX.  This used to read past
+  // the one-element tuple.
+  ExecuteRefusal311 detail = unsupportedExecuteDetail311(code);
+  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_EXECUTE_SURFACE");
 #endif
 }
 
@@ -2911,9 +2976,7 @@ def test(value):
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2955,10 +3018,7 @@ def replace_descriptor():
 }
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SplitDictLoadFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 attribute invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 class Vector:
     def __init__(self, x, y, z):
@@ -3008,9 +3068,7 @@ def replace_descriptor():
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
-#endif
+  SKIP_311_EXECUTABLE_COMPILE();
   const char* src = R"(
 events = []
 
@@ -3344,6 +3402,22 @@ TEST_F(HIRBuildTest, SetUpdate) {
 }
 
 class EdgeCaseTest : public RuntimeTest {};
+
+TEST_F(EdgeCaseTest, InitListElementsRejectsUnreasonableCount) {
+  // A negative (or near-INT_MAX) element count in HIR text used to reach
+  // nvalues + 1 unchecked, overflowing or requesting an absurd vector
+  // before the operand list could possibly match.  The parser must abort
+  // with a clear message instead.
+  const char* hir = R"(fun jittestmodule:test {
+  bb 0 {
+    v0 = InitListElements<-1>
+  }
+}
+)";
+  EXPECT_DEATH(
+      std::unique_ptr<Function>(HIRParser().ParseHIR(hir)),
+      "Unreasonable element count");
+}
 
 TEST_F(EdgeCaseTest, IgnoreUnreachableLoops) {
   //  0 LOAD_CONST    0

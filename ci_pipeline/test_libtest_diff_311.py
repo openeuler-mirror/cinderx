@@ -103,6 +103,32 @@ def test_reuse_stock_result_extracts_execute_surface_and_requires_purity(
     assert set(subset["diagnostics"]) == {"test.test_c.T.test_skip"}
     assert subset["meta"]["argv_tests"] == 2
     assert subset["meta"]["original_argv_tests"] == 3
+    assert (tmp_path / "execute" / "stock" / "result.json").is_file()
+
+
+def test_reuse_stock_result_can_name_the_acceptance_arm(tmp_path, monkeypatch):
+    stock_dir = tmp_path / "stock"
+    stock_dir.mkdir()
+    result = {
+        "meta": {"python": "/venv/bin/python", "argv_tests": 1},
+        "modules": {"test_a": "pass"},
+        "cases": {},
+        "diagnostics": {},
+    }
+    (stock_dir / "result.json").write_text(json.dumps(result))
+    (stock_dir / "attest-stock.log").write_text("clean\nclean\n")
+    monkeypatch.setattr(libtest_diff, "load_target_manifest", lambda: ["test_a"])
+
+    libtest_diff.reuse_stock_result(
+        stock_dir,
+        tmp_path / "acceptance",
+        ["test_a"],
+        "/venv/bin/python",
+        target_name="c0",
+    )
+
+    assert (tmp_path / "acceptance" / "c0" / "result.json").is_file()
+    assert not (tmp_path / "acceptance" / "stock").exists()
 
 
 def test_reuse_stock_result_resolves_cpython_junit_aliases(tmp_path, monkeypatch):
@@ -395,26 +421,6 @@ def test_arm_environment_is_sanitized():
     env = libtest_diff.arm_environment(dirty)
     # The inherited random hash seed is REPLACED, not merely defaulted.
     assert env == {"PATH": "/bin", "PYTHONHASHSEED": "0"}, env
-
-
-def test_arm_environment_preserves_scheduler_test_support_paths():
-    env = libtest_diff.arm_environment(
-        {
-            "PATH": "/bin",
-            "PYTHONPATH": "/somewhere/evil",
-            "CINDERX_TEST_PYTHON_STDLIB_DIR": "/opt/python/lib/python3.11",
-            "CINDERX_TEST_PYTHON_EXTENSIONS_DIR": (
-                "/opt/python/lib/python3.11/lib-dynload"
-            ),
-        }
-    )
-
-    assert env["PYTHONPATH"].split(libtest_diff.os.pathsep) == [
-        "/opt/python/lib/python3.11",
-        "/opt/python/lib/python3.11/lib-dynload",
-    ]
-    assert "CINDERX_TEST_PYTHON_STDLIB_DIR" not in env
-    assert "CINDERX_TEST_PYTHON_EXTENSIONS_DIR" not in env
 
 
 def test_stock_startup_attests_purity(tmp_path):

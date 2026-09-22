@@ -314,6 +314,7 @@ bool Instruction::isCallLike() const {
     case kStoreAttrCachedFastPath:
     case kBinaryOpExactLongAddSubFastPath:
     case kVarArgCall:
+    case kVectorCall:
     case kVectorCallTstate:
       return true;
     default:

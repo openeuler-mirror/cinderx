@@ -159,6 +159,18 @@ consteval FrameInitTable buildFrameInitTable() {
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
       FrameFieldKind::kBuiltins,
       DataType::kObject);
+  // CPython 3.11's lightweight frame lives in uninitialized native stack
+  // storage. The fast unlink path reads frame_obj, and deopt/inspection paths
+  // consume is_entry and stacktop, so none of them may inherit stale bytes.
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
+      FrameFieldKind::kZero,
+      DataType::kObject);
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
+      FrameFieldKind::kZero,
+      DataType::k8bit);
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
+      FrameFieldKind::kStackPointer,
+      DataType::k32bit);
 #endif
 
 #ifndef ENABLE_LIGHTWEIGHT_FRAMES

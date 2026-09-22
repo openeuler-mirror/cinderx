@@ -1134,7 +1134,7 @@ static bool hasIntConstLocalBinaryAccumulator311(
       return false;
     }
     BytecodeInstruction load_const = *const_it;
-    if (load_const.opcode() != LOAD_CONST ||
+    if (load_const.opcode() != LOAD_CONST || load_const.oparg() < 0 ||
         load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
       continue;
     }
@@ -1338,6 +1338,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
   switch (opcode) {
     case BEFORE_WITH:
     case BINARY_OP:
+    case BINARY_SUBSCR:
     case BUILD_CONST_KEY_MAP:
     case BUILD_LIST:
     case BUILD_MAP:
@@ -1399,6 +1400,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case SET_ADD:
     case STORE_ATTR:
     case STORE_FAST:
+    case STORE_SUBSCR:
     case SWAP:
     case UNARY_INVERT:
     case UNARY_NEGATIVE:
@@ -1439,7 +1441,7 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // executes in the interpreter after the deopt regardless of what it
   // is, so holding it to the machine-code whitelist would refuse
   // functions this milestone fully supports.  Still out (on the
-  // reachable surface): subscripts, DELETE_ATTR, STORE_DEREF, except*
+  // reachable surface): DELETE_ATTR, STORE_DEREF, except*
   // and pattern matching (the latter two refused earlier by the
   // whole-code translate scan, keeping their audited refusals).  The
   // decoder yields unspecialized opcodes, so quickened forms cannot
@@ -1449,9 +1451,76 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
     return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
   }
   BytecodeInstructionBlock bc_instrs{code};
+  // Subscript execution uses a conservative performance-admission heuristic:
+  // a normal-flow loop or subscript update plus float specialization, or an
+  // exact-float constant and a BINARY_OP for cold code. The latter is only
+  // function-level evidence: the constant need not feed that arithmetic, so
+  // some nonnumeric cache updates can still qualify. This does not predict
+  // profitability or prove operand types. HIR guards and generic slow paths
+  // must still handle changing inputs.
+  bool has_float_arithmetic = false;
+  bool has_float_constant = false;
+  bool has_arithmetic = false;
+  bool has_numeric_kernel_shape = false;
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
+    }
+    // Malformed bytecode admission: an EXTENDED_ARG chain whose accumulator
+    // saturated produces oparg() == INT_MAX.  That value is non-negative but
+    // is never a legal tuple index or jump target, so refuse the whole code
+    // object here instead of letting any downstream consumer read out of
+    // bounds.  Review feedback on PR235: saturating alone does not make the
+    // instruction safe; the admission path must reject it outright.
+    if (bc_it->opargOverflowed()) {
+      return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
+    }
+    if (bc_it->opcode() == LOAD_CONST) {
+      // Bound the const index before PyTuple_GET_ITEM: a well-formed
+      // LOAD_CONST always indexes inside co_consts, but admission runs on
+      // possibly malformed bytecode where nothing guarantees that.
+      int const_idx = bc_it->oparg();
+      if (const_idx < 0 || const_idx >= PyTuple_GET_SIZE(code->co_consts)) {
+        return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
+      }
+      has_float_constant |=
+          PyFloat_CheckExact(PyTuple_GET_ITEM(code->co_consts, const_idx));
+    }
+    has_arithmetic |= bc_it->opcode() == BINARY_OP;
+    has_numeric_kernel_shape |=
+        bc_it->isBackwardBranch() || bc_it->opcode() == STORE_SUBSCR;
+    switch (bc_it->specializedOpcode()) {
+      case BINARY_OP_ADD_FLOAT:
+      case BINARY_OP_SUBTRACT_FLOAT:
+      case BINARY_OP_MULTIPLY_FLOAT:
+        has_float_arithmetic = true;
+        break;
+      default:
+        break;
+    }
+  }
+  // A timestamp calculation in an otherwise generic constructor is not a
+  // numeric kernel. Scope the extension to repeated work or container updates.
+  // All evidence comes from normal-flow-reachable instructions.
+  bool allow_subscripts = has_numeric_kernel_shape &&
+      (has_float_arithmetic || (has_float_constant && has_arithmetic));
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    if (!reachable.contains(bc_it->baseIndex().value())) {
+      continue;
+    }
+    // AutoJIT can request compilation before bytecode quickening. Preserve
+    // cold numeric kernels with explicit floating-point constants as well.
+    bool unprofitable_subscript = !allow_subscripts &&
+        (bc_it->opcode() == BINARY_SUBSCR || bc_it->opcode() == STORE_SUBSCR);
+    // Subscript admission is a policy on top of the whitelist, not a
+    // whitelist gap: the opcodes are translated and reported on the execute
+    // surface, so the refusal must carry its own registered reason instead
+    // of masquerading as REFUSE_SHAPE_EXECUTE_SURFACE.
+    if (unprofitable_subscript) {
+      return {
+          "REFUSE_SHAPE_SUBSCRIPT_ADMISSION",
+          bc_it->opcode(),
+          bc_it->baseOffset().value()};
     }
     if (!isExecuteOpcodeSupported311(bc_it->opcode())) {
       return {
@@ -3130,14 +3199,15 @@ void HIRBuilder::emitBinaryOp(
 
 #if PY_VERSION_HEX < 0x030C0000
   // CPython 3.11 reuses the same quickened BINARY_OP_* opcode for normal and
-  // in-place opargs. The typed fast paths below are only valid for normal
-  // binary operations; in-place operations must keep the generic semantics.
+  // in-place opargs. In-place feedback is a fast-path hint, not a reason
+  // to deopt: a non-float input must retain the generic in-place operation.
   bool use_binary_op_type_guards =
       opcode != BINARY_OP || getBinaryOpKindFromOparg(oparg).has_value();
 #else
   constexpr bool use_binary_op_type_guards = true;
 #endif
 
+  bool float_inplace_fast_path = false;
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
@@ -3154,12 +3224,21 @@ void HIRBuilder::emitBinaryOp(
         break;
       case BINARY_OP_ADD_FLOAT:
       case BINARY_OP_MULTIPLY_FLOAT:
-      case BINARY_OP_SUBTRACT_FLOAT:
+      case BINARY_OP_SUBTRACT_FLOAT: {
+#if PY_VERSION_HEX < 0x030C0000
+        int specialized_opcode = bc_instr.specializedOpcode();
+        float_inplace_fast_path = opcode == BINARY_OP &&
+            ((specialized_opcode == BINARY_OP_ADD_FLOAT &&
+              oparg == NB_INPLACE_ADD) ||
+             (specialized_opcode == BINARY_OP_SUBTRACT_FLOAT &&
+              oparg == NB_INPLACE_SUBTRACT));
+#endif
         if (use_binary_op_type_guards) {
           tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
           tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
         }
         break;
+      }
       case BINARY_OP_ADD_UNICODE:
         if (use_binary_op_type_guards) {
           tc.emit<GuardType>(left, TUnicodeExact, left, tc.frame);
@@ -3198,7 +3277,13 @@ void HIRBuilder::emitBinaryOp(
           "Unrecognized oparg for BINARY_OP: {}",
           oparg);
       InPlaceOpKind inplace_op_kind = *inplace_opt_op_kind;
-      tc.emit<InPlaceOp>(result, inplace_op_kind, left, right, tc.frame);
+      tc.emit<InPlaceOp>(
+          result,
+          inplace_op_kind,
+          left,
+          right,
+          tc.frame,
+          float_inplace_fast_path);
       stack.push(result);
       return;
     }
@@ -5399,6 +5484,19 @@ void HIRBuilder::emitBuildCheckedList(
   BorrowedRef<> arg = constArg(bc_instr);
   BorrowedRef<> descr = PyTuple_GET_ITEM(arg.get(), 0);
   Py_ssize_t list_size = PyLong_AsLong(PyTuple_GET_ITEM(arg.get(), 1));
+  if (PyErr_Occurred()) {
+    PyErr_Clear();
+    BUILDER_THROW("BUILD_CHECKED_LIST: list size must be an int");
+  }
+  // The fill instruction takes list_size + 1 operands, so list_size must
+  // stay strictly below PY_SSIZE_T_MAX to keep the sum from overflowing.
+  if (list_size < 0 || list_size >= PY_SSIZE_T_MAX) {
+    BUILDER_THROW("BUILD_CHECKED_LIST: list size out of range: {}", list_size);
+  }
+  if (tc.frame.stack.size() < static_cast<std::size_t>(list_size)) {
+    BUILDER_THROW(
+        "BUILD_CHECKED_LIST: stack underflow, expected {} elements", list_size);
+  }
 
   const OwnedType* type = preloader_.preloadedType(descr);
   if (type == nullptr) {
@@ -5820,7 +5918,8 @@ Register* HIRBuilder::emitArrayIndexGuard(
   tc.block = idx_ok;
   tc.emit<RefineType>(sub, TLongExact, sub);
   Register* unboxed_idx = temps_.AllocateStack();
-  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
+  // Sequence indices overflow with IndexError, not numeric OverflowError.
+  tc.emit<IndexUnbox>(unboxed_idx, sub);
   Register* neg_check = temps_.AllocateStack();
   tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
   return unboxed_idx;

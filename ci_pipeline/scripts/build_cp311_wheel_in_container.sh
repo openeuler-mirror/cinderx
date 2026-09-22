@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Build the ordinary CPython 3.11 CinderX wheel inside the release builder
-# image (cinderx-cp311-builder, gcc-toolset-14 based).
+# Build the ordinary CPython 3.11 CinderX wheel inside the repository's
+# CPython 3.11 development image (cinderx-dev:py311).
 #
 # Deliberately NOT a fat/manylinux wheel: the 3.11 product targets exactly
-# the anchored openEuler 24.03-LTS-SP3 environment (distro python3-3.11.6
-# rpm), so one plain cp311-cp311-linux_aarch64 wheel built against the
-# distro python is the whole contract.  Runnability on a stock openEuler
-# image is proven by scripts/smoke_cp311_wheel_in_runtime.sh, and the
-# normalize step enforces the deterministic-zip and dependency contracts.
+# the anchored openEuler 24.03-LTS-SP3 environment. The build image uses
+# the anchored openEuler CPython 3.11.6 packages, and runnability is proven
+# against the same distribution runtime in a stock openEuler image by
+# scripts/smoke_cp311_wheel_in_runtime.sh. The normalize step enforces the
+# deterministic-zip and dependency contracts.
 #
-# Mounts (provided by ci_pipeline/build_cp311_wheel.py):
-#   /src  read-only source checkout
-#   /out  wheel output directory (logs land in /out/logs)
+# Mounts (provided by ci_pipeline/build_cp311_wheel.py) default to /src,
+# /out and /work.  Daily runs the same builder in-place and overrides those
+# directories with CINDERX_CP311_WHEEL_{SOURCE,OUTPUT,WORK}_DIR.
 set -Eeuo pipefail
 set -x
 
@@ -20,6 +20,11 @@ export PYTHONUNBUFFERED=1
 export CMAKE_BUILD_TYPE=Release
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 export CINDERX_VERSION_PATCH="${CINDERX_VERSION_PATCH:-0}"
+
+SOURCE_DIR=${CINDERX_CP311_WHEEL_SOURCE_DIR:-/src}
+OUTPUT_DIR=${CINDERX_CP311_WHEEL_OUTPUT_DIR:-/out}
+WORK_DIR=${CINDERX_CP311_WHEEL_WORK_DIR:-/work}
+BUILD_REQUIREMENTS="$SOURCE_DIR/ci_pipeline/requirements-cp311-build.txt"
 
 resolve_executable() {
   local candidate=$1
@@ -58,12 +63,19 @@ else
   git config --system http.sslVerify true
 fi
 
-test -d /src
-mkdir -p /out /out/logs /work
+test -d "$SOURCE_DIR"
+test -f "$BUILD_REQUIREMENTS"
+mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/logs" "$WORK_DIR"
+
+BUILD_PIP_ARGS=(--disable-pip-version-check --no-cache-dir)
+if [ -n "${CINDERX_PIP_WHEELHOUSE:-}" ]; then
+  BUILD_PIP_ARGS+=(--no-index --find-links "$CINDERX_PIP_WHEELHOUSE")
+fi
+"$PYTHON" -m pip install "${BUILD_PIP_ARGS[@]}" -r "$BUILD_REQUIREMENTS"
 
 # The checked-out tree's preflight is authoritative -- the copy baked into
 # the image only guards image builds and goes stale as the tree evolves.
-bash /src/ci_pipeline/scripts/check_cpython_311_build.sh
+bash "$SOURCE_DIR/ci_pipeline/scripts/check_cpython_311_build.sh"
 
 {
   printf 'python=%s\n' "$PYTHON"
@@ -72,10 +84,10 @@ bash /src/ci_pipeline/scripts/check_cpython_311_build.sh
   "$CC" --version | sed -n '1p'
   printf 'cxx=%s\n' "$CXX"
   "$CXX" --version | sed -n '1p'
-} > /out/logs/toolchain-311.txt
+} > "$OUTPUT_DIR/logs/toolchain-311.txt"
 
 # Interpreter build-config snapshot, mirroring the cp314 flow's evidence.
-"$PYTHON" - <<'PY' > /out/logs/cpython-311-build.jsonl
+"$PYTHON" - <<'PY' > "$OUTPUT_DIR/logs/cpython-311-build.jsonl"
 import json
 import sys
 import sysconfig
@@ -88,27 +100,33 @@ print(json.dumps({
 }, sort_keys=True))
 PY
 
-# /src stays pristine: build from a copy, with any stray local build state
+# The source stays pristine: build from a copy, with any stray local build state
 # from the shipped tree dropped before it can leak into the wheel.
-rm -rf /work/src
-mkdir -p /work/src
-cp -a /src/. /work/src/
-cd /work/src
+BUILD_SOURCE="$WORK_DIR/src"
+rm -rf "$BUILD_SOURCE"
+mkdir -p "$BUILD_SOURCE"
+if [ "${CINDERX_CP311_WHEEL_TRACKED_SOURCE:-0}" = "1" ]; then
+  git -C "$SOURCE_DIR" archive --format=tar HEAD | tar -xf - -C "$BUILD_SOURCE"
+else
+  cp -a "$SOURCE_DIR"/. "$BUILD_SOURCE"/
+fi
+cd "$BUILD_SOURCE"
 rm -rf scratch build dist wheelhouse ./*.egg-info
 
-"$PYTHON" -m pip wheel --no-build-isolation --no-deps --no-cache-dir -w /out .
+"$PYTHON" -m pip wheel --no-build-isolation --no-deps --no-cache-dir -w "$OUTPUT_DIR" .
 
 # Scoped to the cp311 tag: /out is the shared release wheelhouse and may
 # already hold the cp314 fat wheel.
-wheel=$(find /out -maxdepth 1 -type f -name 'cinderx-*-cp311-*.whl' | sort | tail -n 1)
+wheel=$(find "$OUTPUT_DIR" -maxdepth 1 -type f -name 'cinderx-*-cp311-*.whl' | sort | tail -n 1)
 test -n "$wheel"
 echo "[cp311-wheel] BUILT ${wheel}"
-sha256sum "$wheel" | tee /out/logs/ordinary.sha256
+sha256sum "$wheel" | tee "$OUTPUT_DIR/logs/ordinary.sha256"
 
-"$PYTHON" /src/ci_pipeline/scripts/normalize_cp311_wheel.py \
+"$PYTHON" "$SOURCE_DIR/ci_pipeline/scripts/normalize_cp311_wheel.py" \
   --wheel "$wheel" \
   --git-sha "${CINDERX_GIT_SHA:-unknown}" \
-  --builder-image "${CINDERX_BUILDER_IMAGE:-unknown}"
+  --builder-image "${CINDERX_BUILDER_IMAGE:-unknown}" \
+  --source-dir "$BUILD_SOURCE"
 
 echo "[cp311-wheel] NORMALIZED ${wheel}"
-sha256sum "$wheel" | tee /out/logs/normalized.sha256
+sha256sum "$wheel" | tee "$OUTPUT_DIR/logs/normalized.sha256"

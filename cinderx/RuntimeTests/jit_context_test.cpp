@@ -28,25 +28,6 @@
 #include <pthread.h>
 #endif
 
-#if PY_VERSION_HEX < 0x030C0000
-// A mode gate, not a version gate.  These cases compile and install
-// machine code, which on 3.11 the executing (canary) mode does and the
-// shadow mode does not -- so what decides is the mode the binary was
-// started in, not the version it was built for.  Left as a version gate
-// they skipped on every 3.11 build, including the sanitized one, which is
-// the only place a use-after-free in the install and lifecycle paths would
-// actually be caught.  Run the binary with CINDERX_JIT_MODE=canary to
-// execute them.
-#define SKIP_311_EXECUTABLE_COMPILE()                                    \
-  do {                                                                   \
-    if (jit::getConfig().state != jit::State::kRunning) {                \
-      GTEST_SKIP() << "3.11 executes machine code only in canary mode; " \
-                      "set CINDERX_JIT_MODE=canary to run this";         \
-    }                                                                    \
-  } while (0)
-#else
-#define SKIP_311_EXECUTABLE_COMPILE() static_cast<void>(0)
-#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 // A milestone gate, not a mode gate.  These cases assert a surface the 3.11
@@ -155,11 +136,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // codeCompiled() sits between "the compiler produced machine code" and
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
-  // execute refusal all live below it.  Its answer is what lets the
-  // compile entry stop reporting OK for a function that was never
-  // installed.  BINARY_SUBSCR is still off the execute whitelist
-  // (attribute access joined it in MR-09).  An empty data block exercises
-  // the same early-return paths an allocation failure would take.
+  // install.  Its answer is what lets the compile entry stop reporting OK
+  // for a function that was never installed.  BINARY_SUBSCR is on the
+  // execute whitelist but outside the numeric-kernel admission policy, so
+  // obj[0] is still refused before the compiler runs.  An empty data block
+  // exercises the same early-return paths an allocation failure would take.
   Ref<PyFunctionObject> func(
       compileAndGet("def func(obj): return obj[0]", "func"));
   ASSERT_NE(func, nullptr);
@@ -507,6 +488,19 @@ def replacement(a, b):
   EXPECT_TRUE(new_art->functions().contains(func.get()));
   EXPECT_FALSE(prior_art->functions().contains(func.get()))
       << "the settled takeover left the prior claim standing";
+#if PY_VERSION_HEX < 0x030C0000
+  if (new_art->artifactGuardedEntry311() != nullptr) {
+    EXPECT_EQ(func->vectorcall, new_art->artifactGuardedEntry311())
+        << "takeover left the function on the prior stub";
+    if (prior_art->artifactGuardedEntry311() != nullptr) {
+      EXPECT_NE(func->vectorcall, prior_art->artifactGuardedEntry311());
+    }
+  } else {
+    EXPECT_EQ(
+        func->vectorcall,
+        reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry));
+  }
+#endif
   EXPECT_EQ(
       PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
       reinterpret_cast<PyObject*>(new_art));
@@ -1093,8 +1087,14 @@ TEST_F(JITConfigTest, DefaultFrameMode) {
 }
 
 TEST_F(JITConfigTest, DefaultAttrCachesEnabled) {
-  bool attr_caches = jit::getConfig().attr_caches;
-  EXPECT_TRUE(attr_caches || !attr_caches);
+  // The default must be pinned per build flavor: inline caches are disabled
+  // under free-threading (T250369692) and enabled everywhere else.  A tautology
+  // here would let a default flip regress unnoticed.
+#ifdef Py_GIL_DISABLED
+  EXPECT_FALSE(jit::getConfig().attr_caches);
+#else
+  EXPECT_TRUE(jit::getConfig().attr_caches);
+#endif
 }
 
 TEST_F(JITConfigTest, DefaultSpecializedOpcodes) {
@@ -3372,8 +3372,7 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledArithmeticUnaryModAndPower) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def kernel(a, b):
@@ -3398,8 +3397,7 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGlobalNameLoad) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 ANSWER = 321
@@ -3457,8 +3455,7 @@ def drive():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledVectorcallEntry) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 def callee(a, b, c):
@@ -3512,8 +3509,7 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledAttributesMethodsAndLoops) {
-  SKIP_311_UNTIL_SURFACE(
-      "calls, attribute loads and global loads in the execute whitelist");
+  SKIP_311_EXECUTABLE_COMPILE();
 
   const char* py_src = R"(
 class Box:

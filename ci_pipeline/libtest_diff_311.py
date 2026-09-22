@@ -439,17 +439,6 @@ def arm_environment(base: dict) -> dict:
     # Unconditional: an inherited PYTHONHASHSEED=random would make the two
     # arms diverge for reasons that have nothing to do with the evaluator.
     env["PYTHONHASHSEED"] = "0"
-    # Some minimal CPython installations omit Lib/test while the matching
-    # test support tree lives beside the explicitly selected interpreter.
-    # These two scheduler-owned paths are control-plane inputs, not CinderX
-    # activation knobs, and both differential arms must see the same tree.
-    test_support = [
-        base.get("CINDERX_TEST_PYTHON_STDLIB_DIR", "").strip(),
-        base.get("CINDERX_TEST_PYTHON_EXTENSIONS_DIR", "").strip(),
-    ]
-    configured = os.pathsep.join(path for path in test_support if path)
-    if configured:
-        env["PYTHONPATH"] = configured
     return env
 
 
@@ -925,7 +914,12 @@ def load_stdlib72_modules() -> list[str]:
 
 
 def reuse_stock_result(
-    stock_dir: Path, out: Path, modules: list[str], python: str
+    stock_dir: Path,
+    out: Path,
+    modules: list[str],
+    python: str,
+    *,
+    target_name: str = "stock",
 ) -> dict:
     """Extract the execute surface from a completed frozen stock arm."""
     result_path = stock_dir / "result.json"
@@ -981,7 +975,7 @@ def reuse_stock_result(
             if resolve(key) in wanted
         },
     }
-    target = out / "stock"
+    target = out / target_name
     target.mkdir(parents=True, exist_ok=True)
     (target / "result.json").write_text(
         json.dumps(subset, indent=1, sort_keys=True) + "\n"
@@ -991,6 +985,17 @@ def reuse_stock_result(
         f"{result_path}; no second stock arm was run"
     )
     return subset
+
+
+def cmd_reuse_stock(args: argparse.Namespace) -> int:
+    reuse_stock_result(
+        Path(args.stock_dir),
+        Path(args.out),
+        args.tests,
+        args.python,
+        target_name=args.target_name,
+    )
+    return 0
 
 
 def read_trigger_ledger(path: Path) -> dict:
@@ -1373,6 +1378,17 @@ def main(argv: list[str] | None = None) -> int:
     common(p_off)
     p_off.add_argument("--out", required=True)
     p_off.set_defaults(func=cmd_off_gate)
+
+    p_reuse = sub.add_parser(
+        "reuse-stock",
+        help="extract an attested module subset from a frozen Stock arm",
+    )
+    p_reuse.add_argument("--stock-dir", required=True)
+    p_reuse.add_argument("--out", required=True)
+    p_reuse.add_argument("--python", required=True)
+    p_reuse.add_argument("--target-name", required=True)
+    p_reuse.add_argument("--tests", nargs="+", required=True)
+    p_reuse.set_defaults(func=cmd_reuse_stock)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -47,6 +47,7 @@
 #include "cinderx/Jit/mmap_file.h"
 #include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
+#include "cinderx/Jit/roi_backoff_aging.h"
 #include "cinderx/module_state.h"
 
 #ifndef WIN32
@@ -101,6 +102,8 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_uncompile{0};
   std::atomic<uint64_t> roi_recompile{0};
   std::atomic<uint64_t> roi_frozen{0};
+  std::atomic<uint64_t> roi_aging_events{0};
+  std::atomic<uint64_t> roi_aging_count_reduced{0};
 };
 
 struct AutoJitGateState {
@@ -109,12 +112,71 @@ struct AutoJitGateState {
   GateContext context;
 };
 
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+thread_local bool s_count_jit_context_lookups{false};
+thread_local size_t s_jit_context_lookup_count{0};
+#endif
+
+CompilerContext<Compiler>* jitCtx();
+
+// Resolve a code object's CodeExtra at most once after it has been found or
+// created during one scheduleJitCompile() call. A miss from the non-allocating
+// lookup may still be followed by one allocating lookup, preserving the
+// existing lazy-creation behavior.
+class ScheduleJitCompileState {
+ public:
+  explicit ScheduleJitCompileState(PyCodeObject* code) : code_(code) {}
+
+  CodeExtra* getIfExists() {
+    if (!looked_up_) {
+      extra_ = codeExtraIfExists(code_);
+      looked_up_ = true;
+    }
+    return extra_;
+  }
+
+  CodeExtra* getOrCreate() {
+    if (!looked_up_ || extra_ == nullptr) {
+      extra_ = codeExtra(code_);
+      // If allocation or module-state access failed, let a later
+      // non-allocating lookup retain the old behavior of checking again.
+      looked_up_ = extra_ != nullptr;
+    }
+    return extra_;
+  }
+
+  CompilerContext<Compiler>* context() {
+    if (!context_looked_up_) {
+      context_ = jitCtx();
+      context_looked_up_ = true;
+    }
+    return context_;
+  }
+
+ private:
+  PyCodeObject* code_;
+  CodeExtra* extra_{nullptr};
+  bool looked_up_{false};
+  CompilerContext<Compiler>* context_{nullptr};
+  bool context_looked_up_{false};
+};
+
 AutoJitGateStats g_auto_jit_gate_stats;
 std::atomic<bool> g_auto_jit_gate_stats_enabled{false};
 
 void incAutoJitGateStat(std::atomic<uint64_t>& stat) {
   if (g_auto_jit_gate_stats_enabled.load(std::memory_order_relaxed)) {
     stat.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void recordAutoJitAgingStats(uint32_t count_reduced) {
+  if (count_reduced != 0 &&
+      g_auto_jit_gate_stats_enabled.load(std::memory_order_relaxed)) {
+    g_auto_jit_gate_stats.roi_aging_events.fetch_add(
+        1, std::memory_order_relaxed);
+    g_auto_jit_gate_stats.roi_aging_count_reduced.fetch_add(
+        count_reduced, std::memory_order_relaxed);
   }
 }
 
@@ -135,6 +197,9 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_uncompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_recompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_frozen.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_aging_events.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_aging_count_reduced.store(
+      0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -330,6 +395,11 @@ class DisableGilCheck {
 };
 
 CompilerContext<Compiler>* jitCtx() {
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+  if (s_count_jit_context_lookups) {
+    s_jit_context_lookup_count++;
+  }
+#endif
   auto state = cinderx::getModuleState();
   if (state != nullptr) {
     return static_cast<CompilerContext<Compiler>*>(state->jit_context.get());
@@ -463,7 +533,8 @@ bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
 }
 
 bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
-    BorrowedRef<PyFunctionObject> func) {
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
   if (!getConfig().roi_backoff_enabled ||
       cinderx::getModuleState()->jit_list != nullptr) {
     return false;
@@ -471,8 +542,7 @@ bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
   if (shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject>{func->func_code})) {
     return false;
   }
-  CodeExtra* extra =
-      codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+  CodeExtra* extra = state.getIfExists();
   if (extra == nullptr) {
     return false;
   }
@@ -876,6 +946,26 @@ FlagProcessor initFlagProcessor() {
       "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
       getMutableConfig().roi_rewarm_factor,
       "Multiplier for AutoJIT ROI backoff recompile floor");
+
+  flag_processor
+      .addOption(
+          "jit-auto-roi-aging-interval-ms",
+          "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS",
+          [](const std::string& value) {
+            uint32_t interval_ms;
+            if (!parse_uint32_arg(value, &interval_ms)) {
+              JIT_LOG(
+                  "Invalid uint32 value for jit-auto-roi-aging-interval-ms/"
+                  "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS: {}",
+                  value);
+              return;
+            }
+            getMutableConfig().roi_aging_interval_ms = interval_ms;
+          },
+          "Halve unfrozen AutoJIT deopt history per elapsed steady-clock "
+          "interval (default 60000 milliseconds; 0 disables aging). "
+          "Does not revive frozen code")
+      .withFlagParamName("MS");
 
   flag_processor.addOption(
       "jit-auto-code-dedup",
@@ -1397,7 +1487,11 @@ FlagProcessor initFlagProcessor() {
   // inliner disabled for normal-frame runs so tests and explicit normal-mode
   // configurations do not build inline frames that cannot be safely unlinked.
   bool force_disable_inliner_for_normal_frame =
+#if PY_VERSION_HEX < 0x030C0000
+      true;
+#else
       getConfig().frame_mode != FrameMode::kLightweight;
+#endif
   if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
   }
@@ -1428,10 +1522,12 @@ FlagProcessor initFlagProcessor() {
  * Return true if the function was successfully reopted, false if nothing
  * happened.
  */
-bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
-  if (jitCtx() == nullptr) {
+bool reoptFuncWithContext(
+    BorrowedRef<PyFunctionObject> func,
+    CompilerContext<Compiler>* ctx) {
+  if (ctx == nullptr) {
     return false;
-  } else if (jitCtx()->didCompile(func)) {
+  } else if (ctx->didCompile(func)) {
     return true;
   }
 
@@ -1440,7 +1536,7 @@ bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-  if (CompiledFunction* compiled = jitCtx()->lookupFunc(func)) {
+  if (CompiledFunction* compiled = ctx->lookupFunc(func)) {
 #if PY_VERSION_HEX < 0x030C0000
     // finalizeFunc() reports a refusal as "nothing to do", which is right
     // for it -- nothing was installed and nothing is half-built -- but
@@ -1455,13 +1551,17 @@ bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
 #endif
     // finalizeFunc() unparks on success; a failed publication leaves the
     // entry parked so a later enable() can retry it.
-    return jitCtx()->finalizeFunc(func, compiled);
+    return ctx->finalizeFunc(func, compiled);
   }
   // No artifact remains for this function, so nothing will ever reattach
   // it: drop the parked entry (a no-op for a nested function that was
   // never explicitly deopted).
-  jitCtx()->removeDeoptedFunc(func);
+  ctx->removeDeoptedFunc(func);
   return false;
+}
+
+bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
+  return reoptFuncWithContext(func, jitCtx());
 }
 
 // Check if we have exceeded the max code size limit.
@@ -4293,7 +4393,14 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats, "roi_recompile", g_auto_jit_gate_stats.roi_recompile) != 0 ||
       setAutoJitGateStat(
-          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0) {
+          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0 ||
+      setAutoJitGateStat(
+          stats, "roi_aging_events", g_auto_jit_gate_stats.roi_aging_events) !=
+          0 ||
+      setAutoJitGateStat(
+          stats,
+          "roi_aging_count_reduced",
+          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0) {
     return nullptr;
   }
 
@@ -5039,6 +5146,15 @@ PyMethodDef jit_methods_311_canary[] = {
      is_enabled,
      METH_NOARGS,
      PyDoc_STR("Check whether the JIT is enabled and usable")},
+    {"jit_frame_mode",
+     jit_frame_mode,
+     METH_NOARGS,
+     PyDoc_STR(
+         "Get JIT frame mode (0 = normal frames, 1 = lightweight frames).")},
+    {"is_lightweight_frames_enabled",
+     is_lightweight_frames_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True when JIT lightweight frames are compiled in.")},
     {"is_attr_caches_enabled",
      is_attr_caches_enabled,
      METH_NOARGS,
@@ -5621,6 +5737,21 @@ extern "C" int Ci_QuickenWarmupStep_311;
 
 namespace jit {
 
+#if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
+void resetJitContextLookupCountForTest() {
+  s_jit_context_lookup_count = 0;
+  s_count_jit_context_lookups = true;
+}
+
+void disableJitContextLookupCountingForTest() {
+  s_count_jit_context_lookups = false;
+}
+
+size_t jitContextLookupCountForTest() {
+  return s_jit_context_lookup_count;
+}
+#endif
+
 void setUncompileMidpointHookForTest(void (*hook)()) {
   s_uncompile_midpoint_hook_for_test = hook;
 }
@@ -5711,6 +5842,7 @@ void triggerRoiBackoff(
   }
 
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+  extra->roi_aging_epoch_ms = 0;
   if (frozen) {
     Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
     Ci_code_extra_or_skey_release(extra, kSkeyDecidedColdBit);
@@ -5745,6 +5877,16 @@ void recordDeoptForRoiBackoff(
     return;
   }
 
+  const uint32_t interval_ms = getConfig().roi_aging_interval_ms;
+  // Count, epoch, and the possible pending/frozen transition form one update.
+  // The existing FT entrypoint mutex is recursive, so triggerRoiBackoff can
+  // retain its own guard. Disabled aging takes neither this lock nor a clock
+  // sample and keeps the original atomic-counter path.
+  std::optional<FreeThreadedJITEntrypointGuard> aging_guard;
+  if (interval_ms != 0) {
+    aging_guard.emplace();
+  }
+
   BorrowedRef<PyCodeObject> code = code_runtime->code();
   CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
@@ -5758,7 +5900,23 @@ void recordDeoptForRoiBackoff(
 
   uint32_t round = roiBackoffRound(ctl);
   uint32_t budget = roiBackoffBudgetForRound(round);
-  uint32_t count = Ci_code_extra_incr_roi_deopt_count(extra);
+  uint32_t count;
+  if (interval_ms == 0) {
+    count = Ci_code_extra_incr_roi_deopt_count(extra);
+  } else {
+    const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
+    const uint64_t now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    const auto update = advanceRoiAging(
+        Ci_code_extra_load_roi_deopt_count_relaxed(extra),
+        extra->roi_aging_epoch_ms,
+        now_ms,
+        interval_ms);
+    extra->roi_aging_epoch_ms = update.epoch_ms;
+    Ci_code_extra_store_roi_deopt_count_relaxed(extra, update.count);
+    recordAutoJitAgingStats(update.count_reduced);
+    count = update.count;
+  }
   if (count < budget) {
     return;
   }
@@ -6137,6 +6295,9 @@ void finalize() {
     mod_state->jit_context.reset();
     mod_state->code_allocator.reset();
     setCodeDestroyedHook(nullptr);
+#if PY_VERSION_HEX < 0x030C0000
+    Ci_QuickenWarmupStep_311 = 1;
+#endif
     getMutableConfig().state = State::kNotInitialized;
     return;
   }
@@ -6228,6 +6389,9 @@ void finalize() {
   // Past this point nothing can service a code-death notification.
   setCodeDestroyedHook(nullptr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_QuickenWarmupStep_311 = 1;
+#endif
   getMutableConfig().state = State::kNotInitialized;
   getMutableConfig().osr_capable = false;
   syncOSRFlags();
@@ -6240,7 +6404,8 @@ bool shouldScheduleCompile(BorrowedRef<PyFunctionObject> func) {
 }
 
 bool shouldSkipAutoJitScheduleForSteadyColdCode(
-    BorrowedRef<PyFunctionObject> func) {
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
   if (!getConfig().auto_classify ||
       !getConfig().compile_after_n_calls.has_value() ||
       cinderx::getModuleState()->jit_list != nullptr) {
@@ -6251,7 +6416,7 @@ bool shouldSkipAutoJitScheduleForSteadyColdCode(
   if (shouldAlwaysScheduleCompile(code)) {
     return false;
   }
-  CodeExtra* extra = codeExtraIfExists(code);
+  CodeExtra* extra = state.getIfExists();
   if (extra == nullptr) {
     return false;
   }
@@ -6279,8 +6444,11 @@ bool shouldSkipAutoJitScheduleForSteadyColdCode(
 // hands off to the normal finalizeFunc() so the function is fully tracked for
 // deopt and the CompiledFunction's lifetime is anchored exactly as on the slow
 // path. Returns true if the function was attached.
-bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
-  if (jitCtx() == nullptr) {
+bool tryAttachCachedCompiledEntry(
+    BorrowedRef<PyFunctionObject> func,
+    ScheduleJitCompileState& state) {
+  auto* ctx = state.context();
+  if (ctx == nullptr) {
     return false;
   }
 #if PY_VERSION_HEX < 0x030C0000
@@ -6300,8 +6468,7 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   if (cinderx::getModuleState()->jit_list != nullptr) {
     return false;
   }
-  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
-  CodeExtra* extra = codeExtra(code);
+  CodeExtra* extra = state.getOrCreate();
   if (extra == nullptr) {
     return false;
   }
@@ -6327,7 +6494,7 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   // finalizeFunc() does the full association (compiled_funcs_ tracking,
   // CompiledFunction function set, func_dict strong ref, vectorcall + static
   // entry), so deopt and GC behave identically to the slow path.
-  return jitCtx()->finalizeFunc(func, compiled);
+  return ctx->finalizeFunc(func, compiled);
 #endif
 }
 
@@ -6358,15 +6525,18 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-  if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func)) {
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  ScheduleJitCompileState state{code};
+
+  if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func, state)) {
     return true;
   }
 
-  if (tryAttachCachedCompiledEntry(func)) {
+  if (tryAttachCachedCompiledEntry(func, state)) {
     return true;
   }
 
-  if (shouldSkipAutoJitScheduleForSteadyColdCode(func)) {
+  if (shouldSkipAutoJitScheduleForSteadyColdCode(func, state)) {
     incAutoJitGateStat(g_auto_jit_gate_stats.classified_schedule_cold_skip);
     return true;
   }
@@ -6397,7 +6567,8 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   // functions if the user had disabled the JIT without selecting to deopt
   // everything.  This is a weird behavior though, to have "new" functions get
   // JIT-compiled code despite the JIT being disabled.
-  if (!isInstrumentationActive() && reoptFunc(func)) {
+  if (!isInstrumentationActive() &&
+      reoptFuncWithContext(func, state.context())) {
     return true;
   }
 

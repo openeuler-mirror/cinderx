@@ -311,6 +311,16 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
       expect("<");
       int nvalues = GetNextInteger();
       expect(">");
+      // The element count is attacker-shaped only in the sense that HIR text
+      // is hand-editable test/diagnostic input; a negative or near-INT_MAX
+      // value would overflow nvalues + 1 or request an absurd vector before
+      // the operand list has any chance of matching.  Refuse it as a parse
+      // error instead.
+      constexpr int kMaxParsedElementCount = 1 << 20;
+      JIT_CHECK(
+          nvalues >= 0 && nvalues <= kMaxParsedElementCount,
+          "Unreasonable element count {} in InitList/InitTupleElements text",
+          nvalues);
       int total = nvalues + 1;
       std::vector<Register*> args(total);
       std::generate(
@@ -677,10 +687,17 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
     case Opcode::kInPlaceOp: {
       expect("<");
       InPlaceOpKind op = ParseInPlaceOpName(GetNextToken());
+      bool float_fast_path = false;
+      if (peekNextToken() == ",") {
+        expect(",");
+        expect("FloatFastPath");
+        float_fast_path = true;
+      }
       expect(">");
       auto left = ParseRegister();
       auto right = ParseRegister();
       instruction = newInstr<InPlaceOp>(dst, op, left, right);
+      static_cast<InPlaceOp*>(instruction)->setFloatFastPath(float_fast_path);
       break;
     }
     case Opcode::kUnaryOp: {

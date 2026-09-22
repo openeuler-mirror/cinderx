@@ -103,6 +103,17 @@ class Slab {
     return ptr;
   }
 
+  // Undo the most recent successful allocate() after the caller failed to
+  // construct an object in the returned slot, so the raw slot is no longer
+  // inside [base_, fill_) and neither teardown nor iteration will treat
+  // uninitialized storage as a live T.  Must be called immediately after
+  // that allocate() returned non-null and before any other allocation in
+  // this slab.
+  void rollbackLastAllocate() {
+    JIT_CHECK(fill_ > base_.get(), "no allocation to roll back");
+    fill_ -= increment_;
+  }
+
   // Whether the pointer names an allocated slot of this slab.  Exact slot
   // addresses only: the ownership checks built on this decide whether a
   // runtime pointer may be dereferenced, and an interior pointer must
