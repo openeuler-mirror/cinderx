@@ -1087,8 +1087,14 @@ TEST_F(JITConfigTest, DefaultFrameMode) {
 }
 
 TEST_F(JITConfigTest, DefaultAttrCachesEnabled) {
-  bool attr_caches = jit::getConfig().attr_caches;
-  EXPECT_TRUE(attr_caches || !attr_caches);
+  // The default must be pinned per build flavor: inline caches are disabled
+  // under free-threading (T250369692) and enabled everywhere else.  A tautology
+  // here would let a default flip regress unnoticed.
+#ifdef Py_GIL_DISABLED
+  EXPECT_FALSE(jit::getConfig().attr_caches);
+#else
+  EXPECT_TRUE(jit::getConfig().attr_caches);
+#endif
 }
 
 TEST_F(JITConfigTest, DefaultSpecializedOpcodes) {

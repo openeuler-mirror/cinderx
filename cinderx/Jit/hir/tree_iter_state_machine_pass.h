@@ -2,15 +2,16 @@
 
 #pragma once
 
+#include <Python.h>
+
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/hir/type.h"
 
-#include <Python.h>
-
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 namespace jit::hir {
 
@@ -145,6 +146,14 @@ class TreeIterStateMachinePass : public Pass {
   // LoadField instruction that produces the iterable.  Returns nullptr if
   // the chain does not end at a LoadField.
   const LoadField* traceYieldFromIterable(const Register* iter_reg) const;
+
+  // Same, but shares an on-path set of Phi registers across recursive
+  // calls so a Phi cycle (HIR loop back-edge between mutually-referencing
+  // Phis) terminates with a conservative nullptr instead of recursing
+  // forever.
+  const LoadField* traceYieldFromIterable(
+      const Register* iter_reg,
+      std::unordered_set<const Register*>& on_path) const;
 
   // Rewrite func's CFG to implement the in-order state machine described by
   // match.  The original recursive yield-from body becomes unreachable and is

@@ -106,6 +106,13 @@ static bool blockCanReach(const BasicBlock* start, const BasicBlock* target) {
 
 const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
     const Register* iter_reg) const {
+  std::unordered_set<const Register*> on_path;
+  return traceYieldFromIterable(iter_reg, on_path);
+}
+
+const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
+    const Register* iter_reg,
+    std::unordered_set<const Register*>& on_path) const {
   if (iter_reg == nullptr) {
     return nullptr;
   }
@@ -155,31 +162,46 @@ const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
         // path goes through GetIter.  Split-dict LoadAttr lowering also emits
         // a Phi(fast LoadField/CheckField, already-optimized LoadAttr
         // fallback); accept that shape when the fallback reads the same field.
+        //
+        // Each arm is traced by a recursive call that restarts the depth
+        // budget from zero, so a Phi cycle (e.g. two basic blocks whose Phis
+        // reference each other over an HIR loop back-edge) would recurse
+        // forever.  Track the Phis on the current trace path and bail out
+        // conservatively when one repeats.  Each visited Phi is erased again
+        // before returning so sibling arms that share a downstream Phi are
+        // not misread as a cycle.
         const auto* phi = static_cast<const Phi*>(def);
+        if (!on_path.emplace(cur).second) {
+          return nullptr;
+        }
+        auto finish = [&](const LoadField* result) -> const LoadField* {
+          on_path.erase(cur);
+          return result;
+        };
         const LoadField* result = nullptr;
         for (std::size_t i = 0; i < phi->NumOperands(); i++) {
           const Register* arm = phi->GetOperand(i);
-          const LoadField* arm_lf = traceYieldFromIterable(arm);
+          const LoadField* arm_lf = traceYieldFromIterable(arm, on_path);
           if (arm_lf != nullptr && result == nullptr) {
             result = arm_lf;
           } else if (arm_lf != nullptr && result != arm_lf) {
-            return nullptr;
+            return finish(nullptr);
           }
         }
         if (result == nullptr) {
-          return nullptr;
+          return finish(nullptr);
         }
         for (std::size_t i = 0; i < phi->NumOperands(); i++) {
           const Register* arm = phi->GetOperand(i);
-          if (traceYieldFromIterable(arm) != nullptr) {
+          if (traceYieldFromIterable(arm, on_path) != nullptr) {
             continue;
           }
           const Instr* arm_def = arm->instr();
           if (!loadAttrFallbackMatchesField(arm_def, result)) {
-            return nullptr;
+            return finish(nullptr);
           }
         }
-        return result;
+        return finish(result);
       }
 
       default:

@@ -38,6 +38,18 @@ std::string_view trimSourcePath(std::string_view path) {
 
 } // namespace
 
+void abortNoAlloc(const char* msg) noexcept {
+  // Deliberately bypasses abortImpl(): this path may be reached from a
+  // catch (...) while the allocator itself is failing (sustained OOM),
+  // where even building the diagnostic std::string can throw and escape
+  // the handler.  Only allocation-free C facilities here; if fputs fails
+  // we still terminate unconditionally.
+  std::fputs(msg, stderr);
+  std::fputs("\n", stderr);
+  std::fflush(stderr);
+  std::abort();
+}
+
 void shadowCompileEnter() {
   g_shadow_compile_depth++;
 }

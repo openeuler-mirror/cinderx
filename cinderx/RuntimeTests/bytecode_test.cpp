@@ -6,6 +6,8 @@
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <limits>
+
 using BytecodeInstructionIteratorTest = RuntimeTest;
 
 TEST_F(BytecodeInstructionIteratorTest, ConsumesExtendedArgs) {
@@ -71,4 +73,114 @@ TEST_F(BytecodeInstructionIteratorTest, ConsumesExtendedArgs) {
 
   ++it;
   EXPECT_EQ(it, bc_block.end());
+}
+
+TEST_F(BytecodeInstructionIteratorTest, ExtendedArgOverflowSaturates) {
+  //  0  EXTENDED_ARG  1
+  //  2  EXTENDED_ARG  2
+  //  4  EXTENDED_ARG  3
+  //  6  EXTENDED_ARG  4
+  //  8  EXTENDED_ARG  5
+  // 10  LOAD_CONST    6
+  // Five accumulated EXTENDED_ARG bytes would push the oparg accumulator
+  // past INT_MAX; it must saturate at a non-negative value instead of
+  // wrapping negative (a negative oparg would index before the co_consts
+  // tuple in LOAD_CONST handling).
+  const unsigned char bc[] = {
+      EXTENDED_ARG,
+      1,
+      EXTENDED_ARG,
+      2,
+      EXTENDED_ARG,
+      3,
+      EXTENDED_ARG,
+      4,
+      EXTENDED_ARG,
+      5,
+      LOAD_CONST,
+      6};
+  auto bytecode = Ref<>::steal(
+      PyBytes_FromStringAndSize(reinterpret_cast<const char*>(bc), sizeof(bc)));
+  ASSERT_NE(bytecode.get(), nullptr);
+  auto filename = Ref<>::steal(PyUnicode_FromString("filename"));
+  auto funcname = Ref<>::steal(PyUnicode_FromString("funcname"));
+  auto consts = Ref<>::steal(PyTuple_New(1));
+  Py_INCREF(Py_None);
+  PyTuple_SET_ITEM(consts.get(), 0, Py_None);
+  auto empty_tuple = Ref<>::steal(PyTuple_New(0));
+  auto empty_bytes = Ref<>::steal(PyBytes_FromString(""));
+  auto code = Ref<PyCodeObject>::steal(PyUnstable_Code_New(
+      /*argcount=*/0,
+      /*kwonlyargcount=*/0,
+      /*nlocals=*/0,
+      /*stacksize=*/0,
+      /*flags=*/0,
+      bytecode,
+      consts,
+      /*names=*/empty_tuple,
+      /*varnames=*/empty_tuple,
+      /*freevars=*/empty_tuple,
+      /*cellvars=*/empty_tuple,
+      filename,
+      funcname,
+      /*_unused_qualname=*/funcname,
+      /*firstlineno=*/0,
+      /*linetable=*/empty_bytes,
+      /*_unused_exceptiontable=*/empty_bytes));
+  ASSERT_NE(code.get(), nullptr);
+
+  jit::BytecodeInstructionBlock bc_block{code};
+  auto it = bc_block.begin();
+  EXPECT_EQ(it->opcode(), LOAD_CONST);
+  EXPECT_EQ(it->oparg(), std::numeric_limits<int>::max());
+  // Saturation must be observable so admission paths can refuse the
+  // instruction: the clamped value is non-negative but still an illegal
+  // tuple index / jump target.
+  EXPECT_TRUE(it->opargOverflowed());
+}
+
+TEST_F(BytecodeInstructionIteratorTest, NormalOpargDoesNotOverflow) {
+  // Well-formed bytecode must never report overflow, otherwise admission
+  // would start refusing legitimate code.
+  const unsigned char bc[] = {
+      EXTENDED_ARG, 1, EXTENDED_ARG, 2, LOAD_CONST, 3, LOAD_CONST, 0};
+  auto bytecode = Ref<>::steal(
+      PyBytes_FromStringAndSize(reinterpret_cast<const char*>(bc), sizeof(bc)));
+  ASSERT_NE(bytecode.get(), nullptr);
+  auto filename = Ref<>::steal(PyUnicode_FromString("filename"));
+  auto funcname = Ref<>::steal(PyUnicode_FromString("funcname"));
+  auto consts = Ref<>::steal(PyTuple_New(1));
+  Py_INCREF(Py_None);
+  PyTuple_SET_ITEM(consts.get(), 0, Py_None);
+  auto empty_tuple = Ref<>::steal(PyTuple_New(0));
+  auto empty_bytes = Ref<>::steal(PyBytes_FromString(""));
+  auto code = Ref<PyCodeObject>::steal(PyUnstable_Code_New(
+      /*argcount=*/0,
+      /*kwonlyargcount=*/0,
+      /*nlocals=*/0,
+      /*stacksize=*/0,
+      /*flags=*/0,
+      bytecode,
+      consts,
+      /*names=*/empty_tuple,
+      /*varnames=*/empty_tuple,
+      /*freevars=*/empty_tuple,
+      /*cellvars=*/empty_tuple,
+      filename,
+      funcname,
+      /*_unused_qualname=*/funcname,
+      /*firstlineno=*/0,
+      /*linetable=*/empty_bytes,
+      /*_unused_exceptiontable=*/empty_bytes));
+  ASSERT_NE(code.get(), nullptr);
+
+  jit::BytecodeInstructionBlock bc_block{code};
+  auto it = bc_block.begin();
+  EXPECT_EQ(it->opcode(), LOAD_CONST);
+  EXPECT_EQ(it->oparg(), 0x010203);
+  EXPECT_FALSE(it->opargOverflowed());
+  ++it;
+  EXPECT_EQ(it->opcode(), LOAD_CONST);
+  EXPECT_EQ(it->oparg(), 0);
+  EXPECT_FALSE(it->opargOverflowed());
 }
