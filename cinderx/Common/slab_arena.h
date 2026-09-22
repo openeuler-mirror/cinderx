@@ -145,20 +145,65 @@ class SlabArena {
       T* slot = free_list_.back();
       free_list_.pop_back();
       slot->~T();
-      return new (slot) T(std::forward<Args>(args)...);
+      try {
+        return new (slot) T(std::forward<Args>(args)...);
+      } catch (...) {
+        // The slot no longer holds a constructed object and T offers no
+        // generic way to rebuild one after a failed construction.  Every
+        // later iteration and the slab's teardown would treat this dead
+        // storage as a live T, so fail closed at the fault site instead
+        // of amplifying downstream, exactly like the double-recycle
+        // check in free().
+        //
+        // abortNoAlloc, not JIT_ABORT: we are inside a catch handler, and
+        // the throwing constructor may have been failing to allocate in
+        // the first place (sustained OOM).  JIT_ABORT formats a heap
+        // std::string before aborting; if that allocation throws here the
+        // new exception escapes this handler, the corrupted slot survives
+        // in the arena, and teardown hits UB anyway.  This termination
+        // path must never allocate and never throw.
+        abortNoAlloc(
+            "JIT: construction in a recycled arena slot threw; the arena "
+            "can no longer guarantee exactly one constructed object per "
+            "slot\n");
+      }
     }
 
     void* mem = slabs_.back().allocate();
+    bool grew = false;
     if (mem == nullptr) {
       mem = slabs_.emplace_back(SizeTrait::size()).allocate();
       JIT_CHECK(mem != nullptr, "Empty slab failed to allocate");
+      grew = true;
 #ifndef WIN32
       if (mlocked_) {
         slabs_.back().mlock();
       }
 #endif
     }
-    return new (mem) T(std::forward<Args>(args)...);
+    try {
+      return new (mem) T(std::forward<Args>(args)...);
+    } catch (...) {
+      // Unlike a recycled slot, this slot never held a constructed object,
+      // so un-advancing fill_ fully restores the one-constructed-object-
+      // per-slot invariant and the exception can propagate safely to the
+      // caller (callers such as forcedJitVectorcall() already handle it
+      // by falling back to interpretation).  Without the rollback the
+      // dead slot would sit inside [base_, fill_) and both teardown and
+      // iteration would treat uninitialized storage as a live T.
+      slabs_.back().rollbackLastAllocate();
+      // If this allocation grew the arena, the rolled-back slab is now
+      // completely empty and must also leave slabs_: the arena iterator
+      // asserts non-empty slabs, so an empty tail slab would abort the
+      // next iteration (Context::releaseReferences(),
+      // lifecycleSnapshot311()) even though the caller already recovered
+      // from the exception.  It is necessarily empty: grew means this was
+      // the very first allocate() on it.
+      if (grew) {
+        slabs_.pop_back();
+      }
+      throw;
+    }
   }
 
   // Whether the pointer names an allocated slot in this arena.

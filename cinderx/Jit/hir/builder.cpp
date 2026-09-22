@@ -1134,7 +1134,7 @@ static bool hasIntConstLocalBinaryAccumulator311(
       return false;
     }
     BytecodeInstruction load_const = *const_it;
-    if (load_const.opcode() != LOAD_CONST ||
+    if (load_const.opcode() != LOAD_CONST || load_const.oparg() < 0 ||
         load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
       continue;
     }
@@ -1466,9 +1466,25 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
     }
+    // Malformed bytecode admission: an EXTENDED_ARG chain whose accumulator
+    // saturated produces oparg() == INT_MAX.  That value is non-negative but
+    // is never a legal tuple index or jump target, so refuse the whole code
+    // object here instead of letting any downstream consumer read out of
+    // bounds.  Review feedback on PR235: saturating alone does not make the
+    // instruction safe; the admission path must reject it outright.
+    if (bc_it->opargOverflowed()) {
+      return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
+    }
     if (bc_it->opcode() == LOAD_CONST) {
+      // Bound the const index before PyTuple_GET_ITEM: a well-formed
+      // LOAD_CONST always indexes inside co_consts, but admission runs on
+      // possibly malformed bytecode where nothing guarantees that.
+      int const_idx = bc_it->oparg();
+      if (const_idx < 0 || const_idx >= PyTuple_GET_SIZE(code->co_consts)) {
+        return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
+      }
       has_float_constant |=
-          PyFloat_CheckExact(PyTuple_GET_ITEM(code->co_consts, bc_it->oparg()));
+          PyFloat_CheckExact(PyTuple_GET_ITEM(code->co_consts, const_idx));
     }
     has_arithmetic |= bc_it->opcode() == BINARY_OP;
     has_numeric_kernel_shape |=
@@ -5468,6 +5484,19 @@ void HIRBuilder::emitBuildCheckedList(
   BorrowedRef<> arg = constArg(bc_instr);
   BorrowedRef<> descr = PyTuple_GET_ITEM(arg.get(), 0);
   Py_ssize_t list_size = PyLong_AsLong(PyTuple_GET_ITEM(arg.get(), 1));
+  if (PyErr_Occurred()) {
+    PyErr_Clear();
+    BUILDER_THROW("BUILD_CHECKED_LIST: list size must be an int");
+  }
+  // The fill instruction takes list_size + 1 operands, so list_size must
+  // stay strictly below PY_SSIZE_T_MAX to keep the sum from overflowing.
+  if (list_size < 0 || list_size >= PY_SSIZE_T_MAX) {
+    BUILDER_THROW("BUILD_CHECKED_LIST: list size out of range: {}", list_size);
+  }
+  if (tc.frame.stack.size() < static_cast<std::size_t>(list_size)) {
+    BUILDER_THROW(
+        "BUILD_CHECKED_LIST: stack underflow, expected {} elements", list_size);
+  }
 
   const OwnedType* type = preloader_.preloadedType(descr);
   if (type == nullptr) {

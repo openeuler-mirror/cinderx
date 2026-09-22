@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include <cstddef>
+#include <limits>
 
 namespace jit {
 
@@ -121,11 +122,28 @@ void BytecodeInstruction::calcOpcodeOffsetAndOparg() const {
   }
 
   // Consume all EXTENDED_ARG opcodes until we get to something else.
+  // The accumulator saturates at INT_MAX so a malformed EXTENDED_ARG chain
+  // can never produce a negative oparg (which would turn into an
+  // out-of-bounds index for callers that use oparg() to index tuples).
+  // Well-formed bytecode never accumulates anywhere near this many bits.
+  // Saturation is recorded in opargOverflowed_ so admission paths can
+  // refuse the instruction outright: INT_MAX is non-negative but still an
+  // illegal operand (tuple index / jump target), so callers that index
+  // arrays must check opargOverflowed() rather than trusting the clamped
+  // value to be in range.
+  auto accumulate_oparg = [&] {
+    if (extendedOparg_ > (std::numeric_limits<int>::max() >> 8)) {
+      extendedOparg_ = std::numeric_limits<int>::max();
+      opargOverflowed_ = true;
+      return;
+    }
+    extendedOparg_ = (extendedOparg_ << 8) | _Py_OPARG(word());
+  };
   auto consume_extended_args = [&] {
     while (_Py_OPCODE(word()) == EXTENDED_ARG) {
       JIT_DCHECK(
           opcodeIndex_.value() < end_idx, "EXTENDED_ARG at end of bytecode");
-      extendedOparg_ = (extendedOparg_ << 8) | _Py_OPARG(word());
+      accumulate_oparg();
       opcodeIndex_++;
     }
   };
@@ -143,7 +161,7 @@ void BytecodeInstruction::calcOpcodeOffsetAndOparg() const {
   // EXTENDED_ARGS.
   consume_extended_args();
 
-  extendedOparg_ = (extendedOparg_ << 8) | _Py_OPARG(word());
+  accumulate_oparg();
 }
 
 int BytecodeInstruction::uninstrumentedOpcode() const {
@@ -205,6 +223,11 @@ int BytecodeInstruction::specializedOpcode() const {
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;
+}
+
+bool BytecodeInstruction::opargOverflowed() const {
+  calcOpcodeOffsetAndOparg();
+  return opargOverflowed_;
 }
 
 uint16_t BytecodeInstruction::cacheU16(int instruction_offset) const {

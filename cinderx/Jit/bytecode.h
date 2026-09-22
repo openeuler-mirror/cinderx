@@ -46,6 +46,12 @@ class BytecodeInstruction {
   int opcode() const;
   int specializedOpcode() const;
   int oparg() const;
+  // True when the EXTENDED_ARG accumulator saturated while decoding this
+  // instruction.  The saturated oparg() value (INT_MAX) is not a legal
+  // operand for any consumer that indexes a tuple or computes a jump
+  // target; callers must refuse such instructions instead of using the
+  // value (fail closed on malformed bytecode).
+  bool opargOverflowed() const;
   uint16_t cacheU16(int instruction_offset) const;
   uint32_t cacheU32(int instruction_offset) const;
   uint32_t attrCacheTypeVersion() const;
@@ -94,6 +100,7 @@ class BytecodeInstruction {
   mutable BCIndex opcodeIndex_{std::numeric_limits<int>::min()};
   mutable int extendedOparg_{0};
   mutable bool extendedOpcode_{false};
+  mutable bool opargOverflowed_{false};
 };
 
 // A half open block of bytecode [start, end) viewed as a sequence of

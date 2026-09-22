@@ -311,6 +311,16 @@ HIRParser::parseInstr(std::string_view opcode, Register* dst, int bb_index) {
       expect("<");
       int nvalues = GetNextInteger();
       expect(">");
+      // The element count is attacker-shaped only in the sense that HIR text
+      // is hand-editable test/diagnostic input; a negative or near-INT_MAX
+      // value would overflow nvalues + 1 or request an absurd vector before
+      // the operand list has any chance of matching.  Refuse it as a parse
+      // error instead.
+      constexpr int kMaxParsedElementCount = 1 << 20;
+      JIT_CHECK(
+          nvalues >= 0 && nvalues <= kMaxParsedElementCount,
+          "Unreasonable element count {} in InitList/InitTupleElements text",
+          nvalues);
       int total = nvalues + 1;
       std::vector<Register*> args(total);
       std::generate(

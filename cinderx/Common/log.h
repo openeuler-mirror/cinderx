@@ -47,6 +47,13 @@ auto format_to(
 // Print the current Python exception to stderr, if it exists.
 void printPythonException();
 
+// Unconditional, allocation-free, non-throwing abort.  Use from exception
+// handlers that must terminate the process even when the allocator itself
+// is failing (e.g. sustained OOM inside a catch block): unlike JIT_ABORT,
+// this never formats, never allocates, and never converts to an exception
+// under shadow compilation.
+[[noreturn]] void abortNoAlloc(const char* msg) noexcept;
+
 // Use PyObject_Repr() to get a string representation of a PyObject. Use with
 // caution - this can end up executing arbitrary Python code. Always succeeds
 // but may return a description of an error in string e.g.
