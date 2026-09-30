@@ -9,6 +9,8 @@
 
 import datetime
 import glob
+import hashlib
+import json
 import os
 import os.path
 import platform
@@ -162,6 +164,201 @@ class PgoStage(Enum):
     USE = 3
 
 
+def resolve_pgo_workload(
+    custom_workload: str | None,
+    executable: str,
+    py_version: str,
+    checkout_root: str,
+    build_lib: str,
+) -> list[str] | None:
+    if custom_workload is None and py_version != "3.11":
+        return None
+    if custom_workload is None:
+        workload_path = os.path.join(
+            checkout_root,
+            "cinderx",
+            "TestScripts",
+            "pgo_train_workloads.py",
+        )
+    else:
+        workload_path = os.path.abspath(os.path.expanduser(custom_workload))
+    if not os.path.isfile(workload_path):
+        raise FileNotFoundError(f"PGO workload does not exist: {workload_path}")
+    command = [executable]
+    if py_version == "3.11":
+        command.append("-S")
+    command.append(workload_path)
+    if custom_workload is None:
+        command.extend(["--build-lib", os.path.abspath(build_lib)])
+    return command
+
+
+def pgo_workload_timeout(
+    env: dict[str, str],
+    workload_kind: str,
+    workload_path: str | None,
+) -> int:
+    """Outer wall-clock budget for the CPython 3.11 PGO workload subprocess.
+
+    For the repository trainer the budget is derived from the trainer's own
+    worst case (every scenario may use its full per-scenario timeout), so the
+    outer timeout can never kill a healthy run on a slow or loaded host.  An
+    explicit ``CINDERX_PGO_WORKLOAD_TIMEOUT`` is honored but is raised to at
+    least that worst case to keep the outer and per-scenario budgets
+    consistent.  Non-repository workloads keep the historical fixed default.
+    """
+    override = env.get("CINDERX_PGO_WORKLOAD_TIMEOUT")
+    if workload_kind == "repository" and workload_path:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "cinderx_pgo_train_workloads_budget", workload_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        scenario_timeout = int(
+            env.get(
+                "CINDERX_PGO_SCENARIO_TIMEOUT",
+                str(module.DEFAULT_SCENARIO_TIMEOUT),
+            )
+        )
+        worst_case = module.total_training_timeout(scenario_timeout)
+        if override is not None:
+            return max(int(override), worst_case)
+        return worst_case
+    if override is not None:
+        return int(override)
+    return 600
+
+
+def ensure_cinderx_not_loaded(modules: dict[str, object]) -> None:
+    if "_cinderx" in modules:
+        raise RuntimeError(
+            "_cinderx is already loaded in the build process; start the PGO "
+            "build from a clean Python process"
+        )
+
+
+def pgo_workload_environment(
+    source: dict[str, str],
+    build_lib: str,
+) -> dict[str, str]:
+    environment = dict(source)
+    for name in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONUSERBASE",
+        "CINDERX_DISABLE",
+        "CINDERX_JIT_DISABLE",
+        "PYTHONJITDISABLE",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "PYTHONPATH": os.path.abspath(build_lib),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+            "CINDERX_PLUGIN_ENABLE": "0",
+        }
+    )
+    return environment
+
+
+def is_env_flag_enabled(value: str | None) -> bool:
+    return value not in (None, "", "0")
+
+
+def pgo_cmake_options(
+    generate: bool,
+    use: bool,
+    profile_path: str | None = None,
+) -> list[str]:
+    if generate and use:
+        raise ValueError("PGO generate and use stages are mutually exclusive")
+    options = [
+        f"-DENABLE_PGO_GENERATE={'ON' if generate else 'OFF'}",
+        f"-DENABLE_PGO_USE={'ON' if use else 'OFF'}",
+    ]
+    if use and profile_path:
+        options.append(f"-DPGO_PROFILE_FILE={profile_path}")
+    return options
+
+
+def remove_stale_pgo_profiles(root: str, suffixes: tuple[str, ...]) -> list[str]:
+    removed = []
+    if not os.path.isdir(root):
+        return removed
+    for directory, _subdirectories, files in os.walk(root):
+        for filename in files:
+            if not filename.endswith(suffixes):
+                continue
+            path = os.path.join(directory, filename)
+            os.remove(path)
+            removed.append(path)
+    return removed
+
+
+def require_nonempty_pgo_profiles(
+    profile_files: list[str],
+    description: str,
+) -> list[str]:
+    if not profile_files:
+        raise RuntimeError(f"No PGO profile data generated ({description})")
+
+    missing = [path for path in profile_files if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(
+            f"PGO profile data is missing ({description}): "
+            f"{', '.join(sorted(missing))}"
+        )
+
+    empty = [path for path in profile_files if os.path.getsize(path) == 0]
+    if empty:
+        raise RuntimeError(
+            f"PGO profile data is empty ({description}): "
+            f"{', '.join(sorted(empty))}"
+        )
+    return profile_files
+
+
+def pgo_profile_records(
+    profile_files: list[str],
+    root: str,
+) -> list[dict[str, object]]:
+    root_path = os.path.abspath(root)
+    records = []
+    for path in sorted(os.path.abspath(path) for path in profile_files):
+        digest = hashlib.sha256()
+        with open(path, "rb") as profile:
+            for block in iter(lambda: profile.read(1024 * 1024), b""):
+                digest.update(block)
+        records.append(
+            {
+                "path": os.path.relpath(path, root_path),
+                "size": os.path.getsize(path),
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return records
+
+
+def write_pgo_profile_manifest(
+    profile_files: list[str],
+    root: str,
+    manifest_path: str,
+    metadata: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    records = pgo_profile_records(profile_files, root)
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    contents = dict(metadata or {})
+    contents["profiles"] = records
+    with open(manifest_path, "w", encoding="utf-8") as manifest:
+        json.dump(contents, manifest, indent=2, sort_keys=True)
+        manifest.write("\n")
+    return records
+
+
 def should_enable_lightweight_frames(
     py_version: str,
     meta_python: bool,
@@ -205,10 +402,12 @@ class BuildCommand(build):
         return build_ext_cmd
 
     def run(self) -> None:
-        enable_pgo = os.environ.get("CINDERX_ENABLE_PGO", None) is not None
+        enable_pgo = is_env_flag_enabled(os.environ.get("CINDERX_ENABLE_PGO"))
         self._apply_local_to_build_ext()
 
         if enable_pgo:
+            if compute_py_version() == "3.11":
+                ensure_cinderx_not_loaded(sys.modules)
             self._run_with_pgo()
         else:
             super().run()
@@ -222,6 +421,8 @@ class BuildCommand(build):
 
         cc, _ = get_compiler()
         is_clang = "clang" in cc
+        py_version = compute_py_version()
+        is_cp311 = py_version == "3.11"
 
         print_section("PGO STAGE 1/3: Building with profile generation instrumentation")
 
@@ -233,27 +434,45 @@ class BuildCommand(build):
 
         print_section("PGO STAGE 2/3: Running profiling workload")
 
-        workload_env = os.environ.copy()
+        cinderx_so_dir = os.path.abspath(os.path.join(os.getcwd(), self.build_lib))
+        if is_cp311:
+            workload_env = pgo_workload_environment(os.environ, cinderx_so_dir)
+            pgo_metadata_dir = os.path.join(self.build_temp, "pgo_data")
+            os.makedirs(pgo_metadata_dir, exist_ok=True)
+        else:
+            workload_env = os.environ.copy()
+            existing_pythonpath = workload_env.get("PYTHONPATH")
+            workload_env["PYTHONPATH"] = (
+                cinderx_so_dir
+                if not existing_pythonpath
+                else os.pathsep.join((cinderx_so_dir, existing_pythonpath))
+            )
 
         if is_clang:
             clang_pgo_dir = os.path.join(
                 os.getcwd(), os.path.join(self.build_temp, "pgo_data")
             )
             os.makedirs(clang_pgo_dir, exist_ok=True)
-            raw_profile_pattern = os.path.join(clang_pgo_dir, "code-%p.profraw")
+            removed_profiles = remove_stale_pgo_profiles(
+                clang_pgo_dir,
+                (".profraw", ".profdata"),
+            )
+            raw_profile_pattern = os.path.join(
+                clang_pgo_dir,
+                "code-%p-%m.profraw" if is_cp311 else "code-%p.profraw",
+            )
             clang_merged_profile = os.path.join(clang_pgo_dir, "code.profdata")
             workload_env["LLVM_PROFILE_FILE"] = raw_profile_pattern
-
-        # Add build output to PYTHONPATH so workload can import cinderx
-        cinderx_so_dir = os.path.join(os.getcwd(), self.build_lib)
-        if "PYTHONPATH" in workload_env:
-            workload_env["PYTHONPATH"] = (
-                f"{cinderx_so_dir}:{workload_env['PYTHONPATH']}"
-            )
         else:
-            workload_env["PYTHONPATH"] = cinderx_so_dir
+            removed_profiles = remove_stale_pgo_profiles(
+                self.build_temp,
+                (".gcda",),
+            )
 
-        # Uses the same default workload as CPython's PGO
+        if removed_profiles:
+            print(f"Removed {len(removed_profiles)} stale PGO profile files")
+
+        # CPython versions other than 3.11 keep the existing CPython workload.
         workload_cmd = [
             sys.executable,
             "-c",
@@ -273,12 +492,35 @@ if __name__ == "__main__":
     main()
             """,
         ]
+        custom_workload_cmd = resolve_pgo_workload(
+            os.environ.get("CINDERX_PGO_WORKLOAD"),
+            sys.executable,
+            py_version,
+            CHECKOUT_ROOT_DIR,
+            cinderx_so_dir,
+        )
+        workload_kind = "cpython"
+        if custom_workload_cmd is not None:
+            workload_cmd = custom_workload_cmd
+            if os.environ.get("CINDERX_PGO_WORKLOAD"):
+                workload_kind = "custom"
+                print("Using the explicitly configured PGO workload")
+            else:
+                workload_kind = "repository"
+                print("Using the repository CPython 3.11 PGO workloads")
 
         print(f"Running workload with PYTHONPATH={workload_env['PYTHONPATH']}")
         workload_args = {
             "env": workload_env,
             "check": True,
         }
+        if is_cp311:
+            repository_workload_path = (
+                workload_cmd[2] if workload_kind == "repository" else None
+            )
+            workload_args["timeout"] = pgo_workload_timeout(
+                os.environ, workload_kind, repository_workload_path
+            )
         if is_clang:
             workload_args["cwd"] = clang_pgo_dir
         subprocess.run(workload_cmd, **workload_args)
@@ -290,12 +532,10 @@ if __name__ == "__main__":
             if not llvm_profdata:
                 raise RuntimeError("Cannot find llvm-profdata")
             glob_path = os.path.join(clang_pgo_dir, "*.profraw")
-            profraw_files = glob.glob(os.path.join(clang_pgo_dir, "*.profraw"))
-
-            if not profraw_files:
-                raise RuntimeError(
-                    f"No profile data generated when searching {glob_path}"
-                )
+            profraw_files = require_nonempty_pgo_profiles(
+                glob.glob(os.path.join(clang_pgo_dir, "*.profraw")),
+                f"Clang raw profile data when searching {glob_path}",
+            )
 
             print(f"Found {len(profraw_files)} profile files to merge")
             merge_cmd = [
@@ -304,7 +544,56 @@ if __name__ == "__main__":
                 "-output=" + clang_merged_profile,
             ] + profraw_files
             subprocess.run(merge_cmd, check=True)
+            require_nonempty_pgo_profiles(
+                [clang_merged_profile],
+                "merged Clang profile",
+            )
+            profile_files = profraw_files + [clang_merged_profile]
             print(f"Merged profile written to {clang_merged_profile}")
+        else:
+            gcc_profile_glob = os.path.join(self.build_temp, "**", "*.gcda")
+            gcc_profile_files = require_nonempty_pgo_profiles(
+                glob.glob(gcc_profile_glob, recursive=True),
+                f"GCC profile data when searching {gcc_profile_glob}",
+            )
+            print(f"Found {len(gcc_profile_files)} GCC profile files")
+            profile_files = gcc_profile_files
+
+        if is_cp311:
+            manifest_path = os.path.join(
+                pgo_metadata_dir, "pgo-profile-manifest.json"
+            )
+            profile_records = write_pgo_profile_manifest(
+                profile_files,
+                self.build_temp,
+                manifest_path,
+                {
+                    "compiler": cc,
+                    "python": sys.version,
+                    "workload_kind": workload_kind,
+                    "workload_command": workload_cmd,
+                    "training_environment": {
+                        name: workload_env[name]
+                        for name in (
+                            "PYTHONHASHSEED",
+                            "PYTHONNOUSERSITE",
+                            "CINDERX_PLUGIN_ENABLE",
+                        )
+                    },
+                    "repository_jit_environment": (
+                        {
+                            "CINDERX_EVAL_MODE": "cinder",
+                            "CINDERX_JIT_MODE": "execute",
+                            "PYTHONJITAUTO": "2",
+                            "PYTHONJITGENERATOR": "1",
+                            "CINDERX_OSR_ENABLED": "0",
+                        }
+                        if workload_kind == "repository"
+                        else None
+                    ),
+                },
+            )
+            print(f"Recorded PGO profile files in {manifest_path}")
 
         print_section("PGO STAGE 3/3: Rebuilding with profile-guided optimizations")
 
@@ -368,6 +657,13 @@ if __name__ == "__main__":
             stage3_build_ext_cmd.cinderx_pgo_profile_path = clang_merged_profile
         stage3_build_ext_cmd.finalize_options()
         stage3_build_ext_cmd.run()
+
+        if is_cp311 and (
+            pgo_profile_records(profile_files, self.build_temp) != profile_records
+        ):
+            raise RuntimeError(
+                "PGO profile data changed after the training processes exited"
+            )
 
         print_section("PGO BUILD COMPLETE!")
 
@@ -512,18 +808,17 @@ class BuildExt(build_ext):
         if self.local:
             cmake_args.append(f"-DCINDERX_LOCAL_DEPS_DIR={self.local}")
 
-        if self.cinderx_pgo_stage == PgoStage.GENERATE:
-            cmake_args.append("-DENABLE_PGO_GENERATE=ON")
-            cmake_args.append("-DENABLE_PGO_USE=OFF")
-        elif self.cinderx_pgo_stage == PgoStage.USE:
-            cmake_args.append("-DENABLE_PGO_GENERATE=OFF")
-            cmake_args.append("-DENABLE_PGO_USE=ON")
-            if self.cinderx_pgo_profile_path:
-                cmake_args.append(f"-DPGO_PROFILE_FILE={self.cinderx_pgo_profile_path}")
+        cmake_args.extend(
+            pgo_cmake_options(
+                generate=self.cinderx_pgo_stage == PgoStage.GENERATE,
+                use=self.cinderx_pgo_stage == PgoStage.USE,
+                profile_path=self.cinderx_pgo_profile_path,
+            )
+        )
 
         # LTO configuration
-        enable_lto = os.environ.get("CINDERX_ENABLE_LTO", None)
-        if enable_lto is not None:
+        enable_lto = is_env_flag_enabled(os.environ.get("CINDERX_ENABLE_LTO"))
+        if enable_lto:
             cmake_args.append("-DENABLE_LTO=ON")
             print("Building with LTO enabled (full LTO)")
         else:
