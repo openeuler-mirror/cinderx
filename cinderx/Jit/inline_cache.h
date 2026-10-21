@@ -538,6 +538,8 @@ struct CacheStats {
   std::unordered_map<std::string, CacheMiss> misses;
 };
 
+class LoadTypeMethodCache;
+
 class LoadMethodCache {
  public:
   struct Entry {
@@ -547,18 +549,34 @@ class LoadMethodCache {
 #if PY_VERSION_HEX < 0x030C0000
     // Pull-based validity (see AttributeMutator::typeVersionMatches).
     uint32_t type_version{0};
+    // the shared-keys version could not prove the instance
+    // dict never shadows this name (dk_version == 0 after late-attr
+    // growth); a hit must peek the instance storage instead.
     bool peek_shadow{false};
+    // memo for the values-form peek.  peek_keys is
+    // compared against the LIVE type's cached keys (never dereferenced
+    // stale); while identical and dk_nentries == peek_nentries the name
+    // membership answer is pinned: peek_hint >= 0 gives the entry index
+    // (me_key-validated at hit), kPeekAbsent pins non-membership, and a
+    // shadow answer still takes the slow path.
     static constexpr Py_ssize_t kPeekAbsent = -2;
-    // Borrowed shape data for inline values only.
     PyDictKeysObject* peek_keys{nullptr};
     Py_ssize_t peek_nentries{0};
     Py_ssize_t peek_hint{-1};
+    // For a materialized combined-keys receiver (anchor) the
+    // keys table is owned by the dict alone: dict.clear() frees it and the
+    // next insert can allocate a new table at the same address with the
+    // same dk_nentries, so the pointer-and-count memo would pin a stale
+    // absence.  The anchor therefore also records the table's keys
+    // version, which a fresh table does not have (dk_version == 0) and
+    // which every key-set change resets.  Value replacement keeps it.
+    uint32_t peek_keys_version{0};
+    // the name is an INSTANCE attribute callable (bound
+    // method stored in __init__, the _Unpickler.read pattern) -- the
+    // class side has no such attribute at all (pinned by type_version),
+    // so the hit caches the lookup SHAPE, not the per-instance value:
+    // slot non-null -> {Py_None, slot}.  value stays null for this form.
     bool inst_attr{false};
-    // A nonzero version records verified absence in that globally unique
-    // dict content state.  No combined keys pointer is retained.
-    uint64_t peek_dict_version{0};
-
-    void setInlinePeekKeys(PyDictKeysObject* keys);
     void clearPeekKeys();
 #endif
 
@@ -576,6 +594,29 @@ class LoadMethodCache {
   void clearCacheStats();
   const CacheStats* cacheStats();
 
+ private:
+  LoadMethodResult lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
+  void
+  fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, BorrowedRef<> name);
+
+  std::array<Entry, 4> entries_;
+  std::unique_ptr<CacheStats> cache_stats_;
+#if PY_VERSION_HEX < 0x030C0000
+  // a class receiver (Cls.method / cls.method inside a
+  // classmethod) can never match the per-metatype entries above, so every
+  // such load fell through to PyObject_GetAttr and a fresh bound method.
+  // Lazily hold the pull-validated type-receiver cache for it instead.
+  std::unique_ptr<LoadTypeMethodCache> type_recv_311_;
+  void absorbTypeRecvStats311();
+  // Misses since the last hit; a site whose class receivers keep changing
+  // (many classes through one call site) would only thrash the single
+  // entry, so it falls back to the generic path once this trips.
+  uint16_t type_recv_misses_311_{0};
+  bool type_recv_off_311_{false};
+#endif
+
+ public:
+  // layout accessors for the 3.11 aarch64 inline stub.
   static constexpr size_t numEntries() {
     return 4;
   }
@@ -601,15 +642,22 @@ class LoadMethodCache {
   static constexpr size_t entryPeekShadowOffset() {
     return offsetof(Entry, peek_shadow);
   }
+  static constexpr size_t entryPeekKeysOffset() {
+    return offsetof(Entry, peek_keys);
+  }
+  static constexpr size_t entryPeekNentriesOffset() {
+    return offsetof(Entry, peek_nentries);
+  }
+  static constexpr size_t entryPeekKeysVersionOffset() {
+    return offsetof(Entry, peek_keys_version);
+  }
+  static constexpr size_t entryPeekHintOffset() {
+    return offsetof(Entry, peek_hint);
+  }
+  static constexpr size_t entryInstAttrOffset() {
+    return offsetof(Entry, inst_attr);
+  }
 #endif
-
- private:
-  LoadMethodResult lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
-  void
-  fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, BorrowedRef<> name);
-
-  std::array<Entry, 4> entries_;
-  std::unique_ptr<CacheStats> cache_stats_;
 };
 
 // A cache for LoadMethodCached instructions where we expect the receiver to be
@@ -634,6 +682,15 @@ class LoadTypeMethodCache {
   static LoadMethodResult getValueHelper(
       LoadTypeMethodCache* cache,
       PyObject* obj);
+#if PY_VERSION_HEX < 0x030C0000
+  // Validated hit when the receiver is the cached type, full lookup (and
+  // fill) otherwise.  Exceptions propagate as {NULL, NULL}; the caller is
+  // a deopt-checked instruction.
+  static LoadMethodResult lookupOrHitHelper311(
+      LoadTypeMethodCache* cache,
+      PyTypeObject* obj,
+      PyObject* name);
+#endif
 
   LoadMethodResult lookup(BorrowedRef<PyTypeObject> obj, BorrowedRef<> name);
 
@@ -650,8 +707,17 @@ class LoadTypeMethodCache {
   const CacheStats* cacheStats();
 
  private:
+#if PY_VERSION_HEX < 0x030C0000
+  enum class WrapperForm : uint8_t { kPlain, kClassMethod, kStaticMethod };
+  void fill(
+      BorrowedRef<PyTypeObject> type,
+      BorrowedRef<> value,
+      bool is_bound_meth,
+      WrapperForm form = WrapperForm::kPlain);
+#else
   void
   fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, bool is_bound_meth);
+#endif
 
   // Borrowed, but uses a raw pointer as typeAddr() will return the address of
   // this field for codegen purposes.
@@ -676,6 +742,13 @@ class LoadTypeMethodCache {
   BorrowedRef<> name_;
   PyTypeObject* metatype_{nullptr};
   uint32_t metatype_version_{0};
+  // What value_ is on 3.11: the method itself, or the classmethod /
+  // staticmethod object found in the class dict (pinned there by the
+  // receiver version).  The wrapper's callable is read on every hit:
+  // classmethod.__init__ / staticmethod.__init__ replace it in place
+  // without any version moving, so a cached inner callable would go stale
+  // or dangle.
+  WrapperForm wrapper_form_{WrapperForm::kPlain};
 #endif
 };
 
@@ -764,16 +837,14 @@ AttrCacheStats311& attrCacheStats311();
 
 // Replace an existing value of a materialized instance dict in place: the
 // new value is owned before the old one is released (storing the same object
-// back is safe), the dict's PEP 509 version advances exactly as stock's
-// STORE_ATTR_WITH_HINT / insertdict do, and for a combined table the
-// value-only transition is recorded so a negative method-cache anchor taken
-// at the previous version stays valid (no key was added or removed).
+// back is safe) and the dict's PEP 509 version advances exactly as stock's
+// STORE_ATTR_WITH_HINT / insertdict do.  The method cache's negative anchors
+// are keyed on the keys table version, which a value replacement leaves
+// untouched.
 void replaceMaterializedDictValue311(
     PyDictObject* dict,
     PyObject** slot,
-    PyObject* value,
-    bool combined);
-void resetDictValueTransition311();
+    PyObject* value);
 #endif
 
 } // namespace jit

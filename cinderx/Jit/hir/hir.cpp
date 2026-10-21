@@ -685,6 +685,12 @@ bool isAnyLoadMethod(const Instr& instr) {
   if (isLoadMethodBase(instr)) {
     return true;
   }
+  // The 3.11 type-method load is the fill instruction on its own (no
+  // entry-value arm); its output is a LoadMethod result pair like the Phi
+  // form below, and a deopt between it and the call must reify it as one.
+  if (instr.IsFillTypeMethodCache()) {
+    return true;
+  }
   if (!instr.IsPhi() || instr.NumOperands() != 2) {
     return false;
   }

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 
 namespace jit {
 
@@ -240,7 +241,7 @@ void maybeCollectCacheStats(
     BorrowedRef<PyTypeObject> tp,
     BorrowedRef<> name,
     CacheMissReason reason) {
-  if (!getConfig().collect_attr_cache_stats) {
+  if (!getConfig().collect_attr_cache_stats || stat == nullptr) {
     return;
   }
   std::string key =
@@ -785,7 +786,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
         // ma_used bookkeeping of the generic path.  The dict's version
         // advances as stock's PyDict_SetItem would advance it.
         replaceMaterializedDictValue311(
-            dict, &dict->ma_values->values[val_offset], value, false);
+            dict, &dict->ma_values->values[val_offset], value);
         return 0;
       }
     }
@@ -960,15 +961,14 @@ int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
                 reinterpret_cast<const uint8_t*>(mdict->ma_values)[-1]) {
               if (mdict->ma_values->values[hint] != nullptr) {
                 replaceMaterializedDictValue311(
-                    mdict, &mdict->ma_values->values[hint], value, false);
+                    mdict, &mdict->ma_values->values[hint], value);
                 return 0;
               }
             }
           } else {
             PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[hint];
             if (ep->me_value != nullptr) {
-              replaceMaterializedDictValue311(
-                  mdict, &ep->me_value, value, true);
+              replaceMaterializedDictValue311(mdict, &ep->me_value, value);
               return 0;
             }
           }
@@ -1549,11 +1549,41 @@ struct MegaEntry311 {
   PyObject* name{nullptr};
 };
 
+// Slots compare names by identity, so a slot's name object must stay alive
+// for as long as the slot can be read, or its address could be reused by
+// another string the comparison would then accept.  Holding a reference per
+// slot made the held count grow with every newly occupied (type, name) slot:
+// bounded by the tables, but regrtest's reference-leak hunt, which empties
+// CPython's own type attribute cache between repetitions and cannot reach
+// these tables, reads that growth as a leak.  Every distinct name is held
+// once instead, in a registry keyed by content, and the slots borrow the
+// registered object.  A name that dies (code built by eval) and comes back
+// as a new object with the same content maps to the registered one; the
+// identity compare then misses for it, which only costs the slow path.
+UnorderedMap<std::string, PyObject*> s_mega_names_311;
+
+PyObject* megaRegisteredName311(PyObject* name) {
+  Py_ssize_t size = 0;
+  const char* utf8 = PyUnicode_AsUTF8AndSize(name, &size);
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  try {
+    auto [it, inserted] = s_mega_names_311.try_emplace(
+        std::string(utf8, static_cast<size_t>(size)), nullptr);
+    if (inserted) {
+      Py_INCREF(name);
+      it->second = name;
+    }
+    return it->second;
+  } catch (const std::bad_alloc&) {
+    return nullptr;
+  }
+}
+
 inline void megaSetName311(PyObject*& slot, PyObject* name) {
-  Py_XINCREF(name);
-  PyObject* old = slot;
-  slot = name;
-  Py_XDECREF(old);
+  slot = name == nullptr ? nullptr : megaRegisteredName311(name);
 }
 constexpr size_t kMegaEntries311 = 2048;
 MegaEntry311 s_mega_load_311[kMegaEntries311];
@@ -1587,6 +1617,48 @@ megaLookup311(bool is_set, PyTypeObject* tp, PyObject* name) {
   return &me.mut;
 }
 
+// Method sites: the four per-site entries are filled first come, and a
+// receiver type arriving after that ran the full lookup on every call
+// (sqlglot: Expression._set_parent over the subclass population, 217K
+// refused fills over four iterations).  The overflow population lives in a
+// global (type, name) table of the same Entry shape; a site miss that finds
+// its type there copies the entry into a round-robin site slot and looks up
+// again, so the inline peek path serves the type until it is evicted.
+// The name is registered (see megaSetName311).
+struct MegaMethodEntry311 {
+  LoadMethodCache::Entry entry;
+  PyObject* name{nullptr};
+};
+MegaMethodEntry311 s_mega_method_311[kMegaEntries311];
+uint8_t s_mega_method_rr_311 = 0;
+
+inline MegaMethodEntry311& megaMethodEntry311(
+    PyTypeObject* type,
+    PyObject* name) {
+  return s_mega_method_311[megaIndex311(type, name)];
+}
+
+// The two site fill forms for an entry outside the site (no watch; 3.11
+// validates the type version on every hit): the keys-version proof when
+// the type's shared keys can give one, else the per-hit shadow peek.
+bool fillMethodEntry311(
+    LoadMethodCache::Entry& entry,
+    PyTypeObject* type,
+    PyObject* value,
+    PyObject* name) {
+  uint32_t keys_version = 0;
+  bool cacheable = canCacheAttribute(type, name, keys_version);
+  entry.type = type;
+  entry.value = value;
+  entry.keys_version = cacheable ? keys_version : 0;
+  entry.type_version = type->tp_version_tag;
+  entry.peek_shadow = !cacheable;
+  entry.inst_attr = false;
+  entry.peek_keys = nullptr;
+  entry.peek_nentries = 0;
+  entry.peek_hint = -1;
+  return true;
+}
 } // namespace
 #endif
 
@@ -2424,29 +2496,15 @@ std::string_view cacheMissReason(CacheMissReason reason) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-struct DictValueTransition311 {
-  uint64_t before{0};
-  uint64_t after{0};
-};
-
-// Under the 3.11 GIL, a value-only replacement preserves every absent key.
-// Remember only the most recent transition; no dict or keys pointer is held.
-static DictValueTransition311 last_dict_value_transition;
-
 void replaceMaterializedDictValue311(
     PyDictObject* dict,
     PyObject** slot,
-    PyObject* value,
-    bool combined) {
+    PyObject* value) {
   PyObject* old_value = *slot;
   JIT_DCHECK(old_value != nullptr, "Only existing values may be overwritten");
-  uint64_t old_version = dict->ma_version_tag;
   Py_INCREF(value);
   *slot = value;
   dict->ma_version_tag = Cix_PyDict_NextVersion();
-  if (combined) {
-    last_dict_value_transition = {old_version, dict->ma_version_tag};
-  }
   // Mirror insertdict's MAINTAIN_TRACKING: a container stored into a
   // so-far-untracked dict must make the dict visible to the cycle collector.
   if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
@@ -2459,9 +2517,6 @@ void replaceMaterializedDictValue311(
 
 LoadMethodCache::~LoadMethodCache() {
   for (auto& entry : entries_) {
-#if PY_VERSION_HEX < 0x030C0000
-    entry.clearPeekKeys();
-#endif
     if (entry.type != nullptr) {
       lm_watcher.unwatch(entry.type, this);
       entry.type.reset();
@@ -2471,19 +2526,11 @@ LoadMethodCache::~LoadMethodCache() {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-void LoadMethodCache::Entry::setInlinePeekKeys(PyDictKeysObject* keys) {
-  if (peek_keys == keys && peek_dict_version == 0) {
-    return;
-  }
-  clearPeekKeys();
-  peek_keys = keys;
-}
-
 void LoadMethodCache::Entry::clearPeekKeys() {
   peek_keys = nullptr;
-  peek_dict_version = 0;
   peek_nentries = 0;
   peek_hint = -1;
+  peek_keys_version = 0;
 }
 #endif
 
@@ -2569,125 +2616,286 @@ LoadMethodResult LoadMethodCache::lookup(
     BorrowedRef<> obj,
     BorrowedRef<> name) {
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
+  // a live same-type entry that declines (shadow, keys
+  // era) must keep taking the full protocol; only a receiver type absent
+  // from the site consults the global table below.
+  bool matched = false;
 
   for (auto& entry : entries_) {
     if (entry.type == tp) {
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11.
       if (tp->tp_version_tag != entry.type_version) {
-        entry.clearPeekKeys();
         entry.type.reset();
         entry.value.reset();
+        entry.clearPeekKeys();
         attrCacheStats311().load_method.invalidations++;
         continue;
       }
-
+      matched = true;
+#endif
+#if PY_VERSION_HEX < 0x030C0000
       if (entry.peek_shadow) {
+        // instance-attribute callable -- read the slot
+        // through the memo and hand it back unbound ({Py_None, slot}),
+        // exactly what the slow path returns for a shadowed name.
+        if (entry.inst_attr) {
+          if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+            PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
+            if (values != nullptr) {
+              PyDictKeysObject* live_keys = getSplitKeys(tp);
+              if (live_keys != nullptr && live_keys == entry.peek_keys &&
+                  live_keys->dk_nentries == entry.peek_nentries &&
+                  entry.peek_hint >= 0 &&
+                  DK_UNICODE_ENTRIES(live_keys)[entry.peek_hint].me_key ==
+                      name.get() &&
+                  static_cast<size_t>(entry.peek_hint) + 2 <
+                      reinterpret_cast<const uint8_t*>(values)[-1]) {
+                PyObject* slot = values->values[entry.peek_hint];
+                if (slot != nullptr) {
+                  attrCacheStats311().load_method.hits++;
+                  Py_INCREF(Py_None);
+                  Py_INCREF(slot);
+                  return {Py_None, slot};
+                }
+              }
+            }
+          }
+          break; // anything else: full protocol (which also re-fills)
+        }
+        // values-form receivers answer the no-shadow
+        // question from the memo -- three loads and two compares instead
+        // of a keys hash probe per call.
         if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
           PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
           if (values != nullptr) {
             PyDictKeysObject* live_keys = getSplitKeys(tp);
-            if (live_keys != nullptr && entry.peek_dict_version == 0 &&
-                live_keys == entry.peek_keys &&
+            if (live_keys != nullptr && live_keys == entry.peek_keys &&
                 live_keys->dk_nentries == entry.peek_nentries) {
-              if (entry.peek_hint == Entry::kPeekAbsent ||
-                  (entry.peek_hint >= 0 &&
-                   DK_UNICODE_ENTRIES(live_keys)[entry.peek_hint].me_key ==
-                       name.get() &&
-                   static_cast<size_t>(entry.peek_hint) + 2 <
-                       reinterpret_cast<const uint8_t*>(values)[-1] &&
-                   values->values[entry.peek_hint] == nullptr)) {
+              if (entry.peek_hint == Entry::kPeekAbsent) {
                 attrCacheStats311().load_method.hits++;
-                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+                PyObject* result = entry.value;
+                Py_INCREF(result);
+                Py_INCREF(obj.get());
+                return {result, obj.get()};
               }
-            }
-          } else {
-            PyDictObject* materialized = reinterpret_cast<PyDictObject*>(
-                *_PyObject_ManagedDictPointer(obj.get()));
-            if (materialized != nullptr && materialized->ma_values == nullptr) {
-              uint64_t version = materialized->ma_version_tag;
-              // Dict creation/copy and content changes use the real libpython
-              // version stream.  Equality alone proves the negative lookup
-              // remains valid, including across keys-table address reuse.
-              if (version != 0 && version == entry.peek_dict_version) {
-                attrCacheStats311().load_method.hits++;
-                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
-              }
-              if (version != 0 && entry.peek_dict_version != 0 &&
-                  entry.peek_dict_version ==
-                      last_dict_value_transition.before &&
-                  version == last_dict_value_transition.after) {
-                // The only intervening change replaced an existing non-null
-                // value.  Its old-value destructor may run Python, but any
-                // content change then produces a different live dict version.
-                entry.peek_dict_version = version;
-                attrCacheStats311().load_method.hits++;
-                return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
-              }
-              // With exact Unicode names and keys, a miss can be refreshed
-              // here without running Python.  Avoid the generic peek's
-              // temporary ownership and second lookup after value-only writes.
-              PyDictKeysObject* keys = materialized->ma_keys;
-              if (PyUnicode_CheckExact(name.get()) &&
-                  _PyASCIIObject_CAST(name.get())->hash != -1 &&
-                  DK_IS_UNICODE(keys)) {
-                Py_ssize_t index = Cix_PyDictKeys_StringLookup(keys, name);
-                if (index >= 0) {
-                  break;
-                }
-                if (index == DKIX_EMPTY) {
-                  if (version != 0) {
-                    entry.peek_dict_version = version;
-                  }
+              if (entry.peek_hint >= 0 &&
+                  DK_UNICODE_ENTRIES(live_keys)[entry.peek_hint].me_key ==
+                      name.get() &&
+                  static_cast<size_t>(entry.peek_hint) + 2 <
+                      reinterpret_cast<const uint8_t*>(values)[-1]) {
+                if (values->values[entry.peek_hint] == nullptr) {
                   attrCacheStats311().load_method.hits++;
-                  return {Py_NewRef(entry.value.get()), Py_NewRef(obj.get())};
+                  PyObject* result = entry.value;
+                  Py_INCREF(result);
+                  Py_INCREF(obj.get());
+                  return {result, obj.get()};
                 }
-                // The exact-name, cached-hash and Unicode-keys checks prevent
-                // the specializer lookup's error-clearing hash path.  An
-                // unsupported result still falls back without caching.
+                break; // shadowed: full protocol
               }
             }
           }
         }
-
-        // Generic dict lookup may run arbitrary __eq__ code. Match stock by
-        // pinning the descriptor selected before the callback, and never use
-        // an obj.__dict__ pointer captured before the callback returns.
-        Ref<> selected = Ref<>::create(entry.value);
+        // materialized receivers get the same anchored
+        // no-shadow memo, keyed on the receiver dict's own keys table.
+        // {keys ptr, dk_nentries} is a sound absence anchor: an insert
+        // grows dk_nentries, a re-insert of a deleted name appends a new
+        // entry, and a resize replaces the keys object; deleting other
+        // keys cannot create a shadow.  A present name is re-proved live
+        // per call (me_value / ma_values slot), so a deleted shadow
+        // falls back to the fast return naturally.  Split-materialized
+        // dicts (ma_values set) keep the probing path below.
+        PyDictObject* lm_mdict = nullptr;
+        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT) &&
+            *_PyObject_ValuesPointer(obj.get()) == nullptr) {
+          lm_mdict = reinterpret_cast<PyDictObject*>(
+              *_PyObject_ManagedDictPointer(obj.get()));
+          // A split-materialized dict (ma_values set, ma_keys still the
+          // shared table) carries the same absence anchor: a name outside
+          // the keys table can only enter it by append (dk_nentries grows)
+          // or by a table swap.  The present-name (hint >= 0) memo below
+          // reads me_value, which is only meaningful for combined dicts.
+          if (lm_mdict != nullptr) {
+            PyDictKeysObject* mkeys = lm_mdict->ma_keys;
+            // A combined-keys table must also carry the recorded keys
+            // version: the pointer and dk_nentries alone are satisfied
+            // by a table reallocated at the same address after
+            // dict.clear() (see Entry::peek_keys_version).
+            // The keys version is required for every anchor, combined or
+            // shared: it is unique for the life of the process, so a
+            // table of another origin reallocated at the anchor's address
+            // (a freed combined table reused for a class's shared keys)
+            // cannot satisfy it.  The AArch64 stub checks the same three.
+            if (DK_IS_UNICODE(mkeys) && mkeys == entry.peek_keys &&
+                mkeys->dk_nentries == entry.peek_nentries &&
+                mkeys->dk_version != 0 &&
+                mkeys->dk_version == entry.peek_keys_version) {
+              if (entry.peek_hint == Entry::kPeekAbsent) {
+                attrCacheStats311().load_method.hits++;
+                PyObject* result = entry.value;
+                Py_INCREF(result);
+                Py_INCREF(obj.get());
+                return {result, obj.get()};
+              }
+              if (entry.peek_hint >= 0 &&
+                  DK_UNICODE_ENTRIES(mkeys)[entry.peek_hint].me_key ==
+                      name.get()) {
+                // A split-materialized dict keeps its values in ma_values,
+                // not in the shared table's me_value (always NULL there).
+                PyObject* slot_value = lm_mdict->ma_values != nullptr
+                    ? lm_mdict->ma_values->values[entry.peek_hint]
+                    : DK_UNICODE_ENTRIES(mkeys)[entry.peek_hint].me_value;
+                if (slot_value == nullptr) {
+                  attrCacheStats311().load_method.hits++;
+                  PyObject* result = entry.value;
+                  Py_INCREF(result);
+                  Py_INCREF(obj.get());
+                  return {result, obj.get()};
+                }
+                break; // shadowed: full protocol
+              }
+            }
+          }
+        }
+        // values-form receiver whose memo did not answer
+        // (a fresh or adopted entry, or the shared keys grew): one scan of
+        // the shared keys settles the shadow question and refreshes the
+        // memo, and the refreshed entry is published to the global table so
+        // that a later adoption of this (type, name) pair starts with a
+        // memo that the three-load path above can answer.  The former
+        // order scanned twice per hit (peek, then refresh) and every
+        // adoption arrived without a memo.
+        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT) &&
+            *_PyObject_ValuesPointer(obj.get()) != nullptr) {
+          PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
+          PyDictKeysObject* live_keys = getSplitKeys(tp);
+          if (live_keys != nullptr && DK_IS_UNICODE(live_keys)) {
+            Py_ssize_t idx = getDictKeysIndex(live_keys, name);
+            if (idx >= 0 && idx < live_keys->dk_nentries &&
+                values->values[idx] != nullptr) {
+              break; // shadowed: full protocol
+            }
+            entry.peek_keys = live_keys;
+            entry.peek_nentries = live_keys->dk_nentries;
+            entry.peek_hint = idx >= 0 ? idx : Entry::kPeekAbsent;
+            entry.peek_keys_version =
+                dictGetKeysVersion(PyInterpreterState_Get(), live_keys);
+            MegaMethodEntry311& me = megaMethodEntry311(tp, name);
+            if (me.name == nullptr ||
+                (me.name == name && me.entry.type == tp)) {
+              me.entry = entry;
+              megaSetName311(me.name, name);
+            }
+            attrCacheStats311().load_method.hits++;
+            PyObject* result = entry.value;
+            Py_INCREF(result);
+            Py_INCREF(obj.get());
+            return {result, obj.get()};
+          }
+        }
+        // prove per hit that the instance does not shadow the
+        // method; a shadow (or a peek error) takes the full slow path.
+        // The probe can run user code (a non-unicode key's __eq__) that
+        // rebinds the class attribute and drops the cached value's last
+        // reference; stock holds the descriptor it looked up before
+        // probing the instance dict and returns that one.  Pin it the
+        // same way.
+        auto pinned_value = Ref<>::create(entry.value.get());
         PyObject* shadow = nullptr;
         int found = peekInstanceAttr311(obj, name, &shadow);
         if (found < 0) {
+          // The probe ran user code that raised (a non-unicode key's
+          // __eq__).  Stock's _PyObject_GetMethod propagates that error
+          // from its single dict lookup; clearing it and re-probing on
+          // the slow path would run the comparison a second time.
           return {nullptr, nullptr};
         }
         if (found != 0) {
-          Py_DECREF(shadow);
-          break;
+          // The instance shadows the method: the probe already found the
+          // attribute (strengthened), which is exactly the slow path's
+          // unbound answer -- re-probing there would compare a non-unicode
+          // key's __eq__ a second time.
+          Py_INCREF(Py_None);
+          return {Py_None, shadow};
         }
-
-        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
-          PyDictValues* values = *_PyObject_ValuesPointer(obj.get());
-          if (values != nullptr) {
-            // Re-entrant user code may have reset or refilled this entry.
-            // Only refresh an anchorable shape when this is still the same
-            // cache entry and type era; the pinned result remains valid either
-            // way.
-            if (entry.type == tp && entry.value == selected.get() &&
-                entry.type_version == tp->tp_version_tag) {
-              PyDictKeysObject* keys = getSplitKeys(tp);
-              if (keys != nullptr && DK_IS_UNICODE(keys)) {
-                Py_ssize_t index = getDictKeysIndex(keys, name);
-                entry.setInlinePeekKeys(keys);
-                entry.peek_nentries = keys->dk_nentries;
-                entry.peek_hint = index >= 0 ? index : Entry::kPeekAbsent;
-              }
-            }
+        // The probe may have run user code (a non-unicode key's __eq__)
+        // that replaced the receiver's __dict__: the dict captured before
+        // the probe can be freed by now.  Re-read it for the memo refresh
+        // below.  The class-side answer stays the pre-probe entry value,
+        // as stock returns the descriptor it looked up before probing the
+        // instance dict; the next call re-validates the type version.
+        if (lm_mdict != nullptr) {
+          lm_mdict = *_PyObject_ValuesPointer(obj.get()) == nullptr
+              ? reinterpret_cast<PyDictObject*>(
+                    *_PyObject_ManagedDictPointer(obj.get()))
+              : nullptr;
+        }
+        // Refresh the memo for values-form receivers.
+        if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT) &&
+            *_PyObject_ValuesPointer(obj.get()) != nullptr) {
+          PyDictKeysObject* live_keys = getSplitKeys(tp);
+          if (live_keys != nullptr && DK_IS_UNICODE(live_keys)) {
+            Py_ssize_t idx = getDictKeysIndex(live_keys, name);
+            entry.peek_keys = live_keys;
+            entry.peek_nentries = live_keys->dk_nentries;
+            entry.peek_hint = idx >= 0 ? idx : Entry::kPeekAbsent;
+            entry.peek_keys_version =
+                dictGetKeysVersion(PyInterpreterState_Get(), live_keys);
+          }
+        } else if (
+            lm_mdict != nullptr && lm_mdict->ma_values == nullptr &&
+            DK_IS_UNICODE(lm_mdict->ma_keys) &&
+            (entry.peek_keys == nullptr ||
+             entry.peek_keys == lm_mdict->ma_keys)) {
+          // refresh the materialized-receiver anchor.
+          // First-claim sticky: only an empty anchor or the same keys
+          // table refreshes.  A foreign keys object (a different
+          // receiver instance at a multi-instance site) keeps the probing
+          // path -- refreshing would pay a full linear keys scan
+          // (getDictKeysIndex) per alternation, which regressed go by
+          // 29% in the first version.
+          PyDictKeysObject* mkeys = lm_mdict->ma_keys;
+          // The anchor needs a keys version; a table that cannot be
+          // versioned (allocator exhausted) is not anchored.
+          uint32_t keys_version =
+              dictGetKeysVersion(PyInterpreterState_Get(), mkeys);
+          if (keys_version != 0) {
+            Py_ssize_t idx = getDictKeysIndex(mkeys, name);
+            entry.peek_keys = mkeys;
+            entry.peek_nentries = mkeys->dk_nentries;
+            entry.peek_hint = idx >= 0 ? idx : Entry::kPeekAbsent;
+            entry.peek_keys_version = keys_version;
           }
         }
         attrCacheStats311().load_method.hits++;
-        return {selected.release(), Py_NewRef(obj.get())};
+        PyObject* result = pinned_value.release();
+        Py_INCREF(obj);
+        return {result, obj};
       }
 #endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
+#if PY_VERSION_HEX < 0x030C0000
+        // the keys-version proof has lapsed (the type's
+        // shared keys grew since the fill) while the entry itself is still
+        // valid -- its type version was checked above.  Convert it to the
+        // per-hit shadow peek in place, the same conversion the fill makes
+        // after a full slow-path lookup, publish that form to the global
+        // table so that a later adoption does not bring the lapsed proof
+        // back (docutils: every re-adoption of a node class at
+        // _fast_findall ran the full protocol, 133K times per iteration),
+        // and take the hit path.
+        if (!entry.inst_attr) {
+          entry.keys_version = 0;
+          entry.peek_shadow = true;
+          entry.peek_keys = nullptr;
+          entry.peek_nentries = 0;
+          entry.peek_hint = -1;
+          MegaMethodEntry311& me = megaMethodEntry311(tp, name);
+          me.entry = entry;
+          megaSetName311(me.name, name);
+          return lookup(obj, name);
+        }
+#endif
         continue;
       }
 
@@ -2701,15 +2909,31 @@ LoadMethodResult LoadMethodCache::lookup(
     }
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (!matched) {
+    MegaMethodEntry311& me = megaMethodEntry311(tp, name);
+    if (me.name == name && me.entry.type == tp) {
+      if (tp->tp_version_tag == me.entry.type_version) {
+        // Adopt into a site slot and take the regular hit path (the
+        // adopted entry now matches, so this recursion ends there or in
+        // the slow path).
+        Entry& victim = entries_[s_mega_method_rr_311 & 3];
+        s_mega_method_rr_311++;
+        victim = me.entry;
+        attrCacheStats311().load_method.hits++;
+        return lookup(obj, name);
+      }
+      me.entry = Entry{};
+      megaSetName311(me.name, nullptr);
+    }
+  }
+#endif
   return lookupSlowPath(obj, name);
 }
 
 void LoadMethodCache::typeChanged(PyTypeObject* type) {
   for (auto& entry : entries_) {
     if (entry.type == type) {
-#if PY_VERSION_HEX < 0x030C0000
-      entry.clearPeekKeys();
-#endif
       entry.type.reset();
       entry.value.reset();
     }
@@ -2724,17 +2948,42 @@ void LoadMethodCache::initCacheStats(
   cache_stats_->method_name = method_name;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Fold the lazily created class-receiver cache's miss records into the
+// site's own, so that the public collection sees them and the clear reaches
+// them; called before the child is read, cleared or dropped.
+void LoadMethodCache::absorbTypeRecvStats311() {
+  if (type_recv_311_ == nullptr || cache_stats_ == nullptr) {
+    return;
+  }
+  const CacheStats* child = type_recv_311_->cacheStats();
+  if (child == nullptr) {
+    return;
+  }
+  for (const auto& [key, miss] : child->misses) {
+    auto it = cache_stats_->misses.insert({key, CacheMiss{0, miss.reason}});
+    it.first->second.count += miss.count;
+  }
+  type_recv_311_->clearCacheStats();
+}
+#endif
+
 void LoadMethodCache::clearCacheStats() {
+#if PY_VERSION_HEX < 0x030C0000
+  absorbTypeRecvStats311();
+#endif
   cache_stats_->misses.clear();
 }
 
 const CacheStats* LoadMethodCache::cacheStats() {
+#if PY_VERSION_HEX < 0x030C0000
+  absorbTypeRecvStats311();
+#endif
   return cache_stats_.get();
 }
 
-LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
-    BorrowedRef<> obj,
-    BorrowedRef<> name) {
+LoadMethodResult __attribute__((noinline))
+LoadMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
   PyTypeObject* tp = Py_TYPE(obj);
   PyObject* descr;
   descrgetfunc f = nullptr;
@@ -2742,6 +2991,44 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
   bool is_method = false;
 #if PY_VERSION_HEX < 0x030C0000
   attrCacheStats311().load_method.misses++;
+  {
+    if (PyType_Check(obj) && !type_recv_off_311_) {
+      // serve class receivers from the type-receiver cache
+      // (classmethod -> {function, cls}, plain function/staticmethod ->
+      // {None, callable}), pull-validated on the class and metaclass
+      // version tags exactly as the compile-time-typed site form is.
+      if (type_recv_311_ == nullptr) {
+        // Allocated on the call path, where a C++ exception has no
+        // handler: without the child the class receiver takes the generic
+        // path below, which is only slower.
+        type_recv_311_.reset(new (std::nothrow) LoadTypeMethodCache());
+        if (type_recv_311_ != nullptr && cache_stats_ != nullptr) {
+          try {
+            type_recv_311_->initCacheStats(
+                cache_stats_->filename.c_str(),
+                cache_stats_->method_name.c_str());
+          } catch (const std::bad_alloc&) {
+            // Statistics only; the child serves without them.
+          }
+        }
+      }
+      if (type_recv_311_ == nullptr) {
+        type_recv_off_311_ = true;
+      } else if (
+          *type_recv_311_->typeAddr() ==
+          reinterpret_cast<PyTypeObject*>(obj.get())) {
+        type_recv_misses_311_ = 0;
+        return LoadTypeMethodCache::getValueHelper(type_recv_311_.get(), obj);
+      } else if (++type_recv_misses_311_ > 8) {
+        // Polymorphic class receivers: stop refilling, use the generic path.
+        type_recv_off_311_ = true;
+        absorbTypeRecvStats311();
+        type_recv_311_.reset();
+      } else {
+        return type_recv_311_->lookup(BorrowedRef<PyTypeObject>{obj}, name);
+      }
+    }
+  }
 #endif
 
   if ((tp->tp_getattro != PyObject_GenericGetAttr)) {
@@ -2792,6 +3079,40 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
       return {nullptr, nullptr};
     }
     if (found != 0) {
+      // cache the lookup shape when nothing on the class
+      // side can ever take precedence (descr == NULL, pinned by the
+      // receiver type version) and the receiver is values-form.
+      if (descr == nullptr && PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT) &&
+          Ci_Type_HasValidVersionTag(tp) &&
+          *_PyObject_ValuesPointer(obj.get()) != nullptr) {
+        PyDictKeysObject* live_keys = getSplitKeys(tp);
+        if (live_keys != nullptr && DK_IS_UNICODE(live_keys)) {
+          Py_ssize_t idx = getDictKeysIndex(live_keys, name);
+          if (idx >= 0) {
+            for (auto& entry : entries_) {
+              bool same = entry.type == tp;
+              if (entry.type != nullptr && !same) {
+                continue;
+              }
+              if (same && !entry.inst_attr) {
+                break; // slot owned by a real method entry; leave it
+              }
+              lm_watcher.watch(tp, this);
+              entry.type = tp;
+              entry.value = nullptr;
+              entry.keys_version = 0;
+              entry.type_version = tp->tp_version_tag;
+              entry.peek_shadow = true;
+              entry.inst_attr = true;
+              entry.peek_keys = live_keys;
+              entry.peek_nentries = live_keys->dk_nentries;
+              entry.peek_hint = idx;
+              attrCacheStats311().load_method.fills++;
+              break;
+            }
+          }
+        }
+      }
       maybeCollectCacheStats(
           cache_stats_, tp, name, CacheMissReason::kUncategorized);
       Py_XDECREF(descr);
@@ -2859,19 +3180,29 @@ void LoadMethodCache::fill(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  for (auto& entry : entries_) {
-    if (entry.type == type) {
-      lm_watcher.watch(type, this);
-#if PY_VERSION_HEX < 0x030C0000
-      entry.clearPeekKeys();
-#endif
-      entry.value = value;
-      entry.keys_version = 0;
-      entry.type_version = type->tp_version_tag;
-      entry.peek_shadow = true;
-      entry.inst_attr = false;
-      attrCacheStats311().load_method.fills++;
-      return;
+  {
+    // this fill only runs after a slow-path lookup, so a
+    // same-type entry that is still here serves only part of the receiver
+    // population (its keys-version era).  Upgrade it to the per-hit
+    // shadow peek, which serves values-form and dict-form instances
+    // alike, instead of leaving four stale eras pinned in the slots.
+    for (auto& entry : entries_) {
+      if (entry.type == type) {
+        lm_watcher.watch(type, this);
+        entry.value = value;
+        entry.keys_version = 0;
+        entry.type_version = type->tp_version_tag;
+        entry.peek_shadow = true;
+        entry.inst_attr = false;
+        attrCacheStats311().load_method.fills++;
+        // publish the upgraded form; the global entry
+        // for this pair still carries the keys-version proof that just
+        // failed, and every adoption of it would repeat this slow path.
+        MegaMethodEntry311& me = megaMethodEntry311(type, name);
+        me.entry = entry;
+        megaSetName311(me.name, name);
+        return;
+      }
     }
   }
 #endif
@@ -2881,18 +3212,22 @@ void LoadMethodCache::fill(
       uint32_t keys_version = 0;
       if (!canCacheAttribute(type, name, keys_version)) {
 #if PY_VERSION_HEX < 0x030C0000
+        // dk_version == 0 (late-attr keys growth) blocks the
+        // no-shadow proof; cache anyway and peek the instance storage on
+        // every hit (go: Square.find alone was 2.8M slow lookups).
         lm_watcher.watch(type, this);
-        entry.clearPeekKeys();
         entry.type = type;
         entry.value = value;
         entry.keys_version = 0;
         entry.type_version = type->tp_version_tag;
         entry.peek_shadow = true;
         entry.inst_attr = false;
+        entry.clearPeekKeys();
         attrCacheStats311().load_method.fills++;
         return;
-#endif
+#else
         break;
+#endif
       }
 
       lm_watcher.watch(type, this);
@@ -2900,15 +3235,26 @@ void LoadMethodCache::fill(
       entry.value = value;
       entry.keys_version = keys_version;
 #if PY_VERSION_HEX < 0x030C0000
-      entry.clearPeekKeys();
       entry.type_version = type->tp_version_tag;
       entry.peek_shadow = false;
       entry.inst_attr = false;
+      entry.clearPeekKeys();
       attrCacheStats311().load_method.fills++;
 #endif
       return;
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // no free site slot -- keep the resolution in the
+  // global (type, name) table for the next miss to adopt.
+  MegaMethodEntry311& me = megaMethodEntry311(type, name);
+  me.entry = Entry{};
+  megaSetName311(me.name, nullptr);
+  if (fillMethodEntry311(me.entry, type, value, name)) {
+    megaSetName311(me.name, name);
+    attrCacheStats311().load_method.fills++;
+  }
+#endif
 }
 
 LoadTypeMethodCache::~LoadTypeMethodCache() {
@@ -2950,6 +3296,31 @@ LoadMethodResult LoadTypeMethodCache::getValueHelper(
     attrCacheStats311().load_type_method.invalidations++;
     return cache->lookup(receiver, cache->name_);
   }
+  if (cache->wrapper_form_ != WrapperForm::kPlain) {
+    // The classmethod / staticmethod object is the cached value; its
+    // callable is read now.  An uninitialised wrapper or one re-bound to
+    // something that is not a plain function takes the full protocol.
+    PyObject* callable = cache->wrapper_form_ == WrapperForm::kClassMethod
+        ? Ci_PyClassMethod_GetFunc(cache->value_)
+        : Ci_PyStaticMethod_GetFunc(cache->value_);
+    if (callable == nullptr ||
+        (cache->wrapper_form_ == WrapperForm::kClassMethod &&
+         Py_TYPE(callable) != &PyFunction_Type)) {
+      cache->type_ = nullptr;
+      cache->value_.reset();
+      cache->wrapper_form_ = WrapperForm::kPlain;
+      attrCacheStats311().load_type_method.invalidations++;
+      return cache->lookup(receiver, cache->name_);
+    }
+    attrCacheStats311().load_type_method.hits++;
+    Py_INCREF(callable);
+    if (cache->wrapper_form_ == WrapperForm::kClassMethod) {
+      Py_INCREF(obj);
+      return {callable, obj};
+    }
+    Py_INCREF(Py_None);
+    return {Py_None, callable};
+  }
   attrCacheStats311().load_type_method.hits++;
 #endif
   PyObject* result = cache->value_;
@@ -2961,6 +3332,18 @@ LoadMethodResult LoadTypeMethodCache::getValueHelper(
   Py_INCREF(Py_None);
   return {Py_None, result};
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+LoadMethodResult LoadTypeMethodCache::lookupOrHitHelper311(
+    LoadTypeMethodCache* cache,
+    PyTypeObject* obj,
+    PyObject* name) {
+  if (cache->type_ == obj) {
+    return getValueHelper(cache, reinterpret_cast<PyObject*>(obj));
+  }
+  return cache->lookup(obj, name);
+}
+#endif
 
 // This needs to be kept in sync with PyType_Type.tp_getattro.
 LoadMethodResult LoadTypeMethodCache::lookup(
@@ -2977,6 +3360,9 @@ LoadMethodResult LoadTypeMethodCache::lookup(
     maybeCollectCacheStats(
         cache_stats_, metatype, name, CacheMissReason::kWrongTpGetAttro);
     PyObject* res = PyObject_GetAttr(obj, name);
+    if (res == nullptr) {
+      return {nullptr, nullptr};
+    }
     Py_INCREF(Py_None);
     return {Py_None, res};
   }
@@ -2987,6 +3373,25 @@ LoadMethodResult LoadTypeMethodCache::lookup(
   }
 
   descrgetfunc meta_get = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  // The two MRO lookups below follow type_getattro's own order and can run
+  // Python (a non-str key of equal hash in a class namespace compares with
+  // __eq__), changing either type or giving the receiver another metatype in
+  // the middle; an entry filled from their answer would then pin versions
+  // the answer was not computed under.  Both tags are snapshotted here and
+  // the answer is cached only when both were valid on entry, still hold
+  // their snapshot afterwards, and the receiver still has this metatype: a
+  // change zeroes a tag, and a reassigned tag is never an earlier value.
+  // 3.11 assigns tags only inside _PyType_Lookup, so a type without one is
+  // served without a fill and the lookups below tag it for the next visit;
+  // no lookup is added for that, since an extra owner probe would run such
+  // an __eq__ before the metatype's data descriptor is consulted.  A name
+  // the type cache refuses (over 100 characters) is never cached here.
+  const bool name_cacheable = PyUnicode_CheckExact(name) &&
+      PyUnicode_IS_READY(name) && PyUnicode_GET_LENGTH(name) <= 100;
+  const unsigned int meta_version = metatype->tp_version_tag;
+  const unsigned int obj_version = obj->tp_version_tag;
+#endif
   PyObject* meta_attribute = _PyType_Lookup(metatype, name);
   if (meta_attribute != nullptr) {
     Py_INCREF(meta_attribute);
@@ -3002,57 +3407,83 @@ LoadMethodResult LoadTypeMethodCache::lookup(
       PyObject* res =
           meta_get(meta_attribute, obj, reinterpret_cast<PyObject*>(metatype));
       Py_DECREF(meta_attribute);
+      if (res == nullptr) {
+        return {nullptr, nullptr};
+      }
       Py_INCREF(Py_None);
       return {Py_None, res};
     }
   }
+  // A same-named metatype candidate that is not a data descriptor now may
+  // become one later without the metatype or the receiver class changing
+  // version: its heap type gains __set__, or the object takes another type
+  // through __class__ assignment (mutable types, and module objects even
+  // though their type is immutable).  Nothing found below is cached while
+  // such a candidate exists.
+#if PY_VERSION_HEX < 0x030C0000
+  const bool fillable_candidate = meta_attribute == nullptr ||
+      (PyType_HasFeature(Py_TYPE(meta_attribute), Py_TPFLAGS_IMMUTABLETYPE) &&
+       !PyModule_Check(meta_attribute));
+#else
+  const bool fillable_candidate = true;
+#endif
 
   /* No data descriptor found on metatype. Look in tp_dict of this
    * type and its bases */
   PyObject* attribute = _PyType_Lookup(obj, name);
+#if PY_VERSION_HEX < 0x030C0000
+  const bool fillable = fillable_candidate && name_cacheable &&
+      meta_version != 0 && obj_version != 0 &&
+      metatype->tp_version_tag == meta_version &&
+      obj->tp_version_tag == obj_version && Py_TYPE(obj) == metatype;
+#else
+  const bool fillable = fillable_candidate;
+#endif
   if (attribute != nullptr) {
+    // Releasing the metatype candidate can run its __del__, which can
+    // remove the owner attribute: hold the owner attribute first.
+    auto attribute_owner = Ref<>::create(attribute);
     Py_XDECREF(meta_attribute);
     BorrowedRef<PyTypeObject> attribute_type = Py_TYPE(attribute);
     if (attribute_type == &PyClassMethod_Type) {
-      BorrowedRef<> cm_callable = Ci_PyClassMethod_GetFunc(attribute);
-      if (Py_TYPE(cm_callable) == &PyFunction_Type) {
+      // Only an initialised classmethod over a plain function is served
+      // directly: the callable is read from the wrapper on every hit, so an
+      // in-place __init__ is seen and nothing is borrowed past the class
+      // dict.  Everything else (uninitialised, a callable with its own
+      // __get__, a non-function) is the descriptor's own business below.
+      PyObject* cm_callable = Ci_PyClassMethod_GetFunc(attribute);
+      if (cm_callable != nullptr && Py_TYPE(cm_callable) == &PyFunction_Type) {
         Py_INCREF(obj);
         Py_INCREF(cm_callable);
-
-        // Get the underlying callable from classmethod and return the
-        // callable alongside the class object, allowing the runtime to call
-        // the method as an unbound method.
+#if PY_VERSION_HEX < 0x030C0000
+        if (fillable) {
+          fill(obj, attribute, true, WrapperForm::kClassMethod);
+        }
+#else
         fill(obj, cm_callable, true);
+#endif
         return {cm_callable, obj};
-      } else if (Py_TYPE(cm_callable)->tp_descr_get != nullptr) {
-        // cm_callable has custom tp_descr_get that can run arbitrary
-        // user code. Do not cache in this instance.
-        maybeCollectCacheStats(
-            cache_stats_, metatype, name, CacheMissReason::kUncategorized);
-        Py_INCREF(Py_None);
-        return {
-            Py_None, Py_TYPE(cm_callable)->tp_descr_get(cm_callable, obj, obj)};
-      } else {
-        // It is not safe to cache custom objects decorated with classmethod
-        // as they can be modified later
-        maybeCollectCacheStats(
-            cache_stats_, metatype, name, CacheMissReason::kUncategorized);
-        BorrowedRef<> py_meth = PyMethod_New(cm_callable, obj);
-        Py_INCREF(Py_None);
-        return {Py_None, py_meth};
       }
-    }
-    if (attribute_type == &PyStaticMethod_Type) {
-      BorrowedRef<> cm_callable = Ci_PyStaticMethod_GetFunc(attribute);
-      Py_INCREF(cm_callable);
-      Py_INCREF(Py_None);
-      fill(obj, cm_callable, false);
-      return {Py_None, cm_callable};
-    }
-    if (PyFunction_Check(attribute)) {
+    } else if (attribute_type == &PyStaticMethod_Type) {
+      PyObject* sm_callable = Ci_PyStaticMethod_GetFunc(attribute);
+      if (sm_callable != nullptr) {
+        Py_INCREF(sm_callable);
+        Py_INCREF(Py_None);
+#if PY_VERSION_HEX < 0x030C0000
+        if (fillable) {
+          fill(obj, attribute, false, WrapperForm::kStaticMethod);
+        }
+#else
+        fill(obj, sm_callable, false);
+#endif
+        return {Py_None, sm_callable};
+      }
+    } else if (PyFunction_Check(attribute)) {
       Py_INCREF(attribute);
       Py_INCREF(Py_None);
-      fill(obj, attribute, false);
+      if (fillable) {
+        fill(obj, attribute, false);
+      }
       return {Py_None, attribute};
     }
     Py_INCREF(attribute);
@@ -3065,6 +3496,9 @@ LoadMethodResult LoadTypeMethodCache::lookup(
           cache_stats_, metatype, name, CacheMissReason::kUncategorized);
       PyObject* res = local_get(attribute, nullptr, obj);
       Py_DECREF(attribute);
+      if (res == nullptr) {
+        return {nullptr, nullptr};
+      }
       Py_INCREF(Py_None);
       return {Py_None, res};
     }
@@ -3082,6 +3516,9 @@ LoadMethodResult LoadTypeMethodCache::lookup(
     PyObject* res;
     res = meta_get(meta_attribute, obj, reinterpret_cast<PyObject*>(metatype));
     Py_DECREF(meta_attribute);
+    if (res == nullptr) {
+      return {nullptr, nullptr};
+    }
     Py_INCREF(Py_None);
     return {Py_None, res};
   }
@@ -3109,6 +3546,9 @@ BorrowedRef<> LoadTypeMethodCache::value() {
 void LoadTypeMethodCache::typeChanged(BorrowedRef<PyTypeObject> /* type */) {
   type_ = nullptr;
   value_.reset();
+#if PY_VERSION_HEX < 0x030C0000
+  wrapper_form_ = WrapperForm::kPlain;
+#endif
 }
 
 void LoadTypeMethodCache::initCacheStats(
@@ -3130,7 +3570,12 @@ const CacheStats* LoadTypeMethodCache::cacheStats() {
 void LoadTypeMethodCache::fill(
     BorrowedRef<PyTypeObject> type,
     BorrowedRef<> value,
-    bool is_unbound_meth) {
+    bool is_unbound_meth
+#if PY_VERSION_HEX < 0x030C0000
+    ,
+    WrapperForm form
+#endif
+) {
 #if PY_VERSION_HEX < 0x030C0000
   // The metaclass fact must be pinnable too, or the entry is not filled:
   // a half-guarded entry is worse than the generic path.  Tags are lazy,
@@ -3151,6 +3596,7 @@ void LoadTypeMethodCache::fill(
   value_ = value;
   is_unbound_meth_ = is_unbound_meth;
 #if PY_VERSION_HEX < 0x030C0000
+  wrapper_form_ = form;
   type_version_ = type->tp_version_tag;
   metatype_ = Py_TYPE(type.get());
   metatype_version_ = metatype_->tp_version_tag;
@@ -3346,9 +3792,6 @@ LoadModuleMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-void resetDictValueTransition311() {
-  last_dict_value_transition = {};
-}
 
 AttrCacheStats311& attrCacheStats311() {
   static AttrCacheStats311 stats;

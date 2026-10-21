@@ -1260,7 +1260,19 @@ TEST_F(AttrCache311Test, TypeMethodCacheRetiresOnMetaclassDataDescriptor) {
   jit::LoadTypeMethodCache cache;
   const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
 
+  // A class without a version tag is served without a fill: the entry
+  // can only pin versions that were valid before the lookups ran, and
+  // 3.11 assigns tags inside _PyType_Lookup itself.  The first lookup
+  // tags the class and its metaclass; the second fills.
   uint64_t fills = stats.load_type_method.fills;
+  ASSERT_FALSE(Ci_Type_HasValidVersionTag(f.type.get()));
+  auto untagged = jit::LoadTypeMethodCache::lookupHelper(&cache, f.type, name);
+  ASSERT_NE(untagged.callable, nullptr);
+  Py_XDECREF(untagged.callable);
+  Py_XDECREF(untagged.self_or_null);
+  ASSERT_EQ(stats.load_type_method.fills, fills)
+      << "an untagged class was cached";
+  ASSERT_TRUE(Ci_Type_HasValidVersionTag(f.type.get()));
   auto filled = jit::LoadTypeMethodCache::lookupHelper(&cache, f.type, name);
   ASSERT_NE(filled.callable, nullptr);
   Py_XDECREF(filled.callable);

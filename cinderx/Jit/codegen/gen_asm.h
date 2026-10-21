@@ -152,7 +152,7 @@ class NativeGenerator {
   void generateDeoptExits(const asmjit::CodeHolder& code);
   void emitAarch64LoadAttrInvokeStub(const asmjit::CodeHolder& code);
   void emitAarch64LoadAttrInvokeStub311(const asmjit::CodeHolder& code);
-  void emitAarch64LoadMethodStub311(const asmjit::CodeHolder& code);
+  void emitAarch64LoadMethodInvokeStub311(const asmjit::CodeHolder& code);
   void emitAarch64StoreAttrInvokeStub311(const asmjit::CodeHolder& code);
   void emitAarch64ExactLongAddSubStubs(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);

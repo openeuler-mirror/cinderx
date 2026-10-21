@@ -7497,14 +7497,13 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
-    def test_type_receiver_method_stays_on_the_generic_path(self):
+    def test_type_receiver_method_follows_a_metaclass_takeover(self):
         # Type-receiver loads must stay correct under a metaclass
-        # takeover.  The type caches are pull-validated for exactly this
-        # (owner version + metaclass identity/version), and on 3.11 no IR
-        # shape reaches them anyway -- guarded global/builtin loads carry
-        # no object spec, so type(obj) never yields a static TType.  Both
-        # facts are asserted: the metaclass descriptor wins on the very
-        # next call, and the type-cache counters stay at zero.
+        # takeover.  A class receiver at a LOAD_METHOD site is served by the
+        # pull-validated type-method cache (owner version + metaclass
+        # identity/version), so the metaclass descriptor must win on the
+        # very next call even though the receiver class version is
+        # unchanged.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -7542,12 +7541,8 @@ class CanaryExecute311Test(unittest.TestCase):
                     lambda cls: (lambda: "meta-descr"))
                 assert call_tm(t) == "meta-descr", call_tm(t)
 
-                stats = cinderjit.get_attr_cache_stats()["load_type_method"]
-                assert stats["fills"] == 0 and stats["hits"] == 0, (
-                    "the 3.11 fail-closed gate leaked a type-method "
-                    "cache: %r" % (stats,))
                 assert cinderjit.is_jit_compiled(call_tm)
-                print("type receiver stayed generic")
+                print("type receiver followed the metaclass takeover")
 
             main()
             """
@@ -7560,7 +7555,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("type receiver stayed generic", proc.stdout)
+        self.assertIn("type receiver followed the metaclass takeover", proc.stdout)
 
     def test_mutation_hammer_stays_correct_over_100_rounds(self):
         # 100 rounds of class mutation, instance shadowing and deletion
@@ -7712,16 +7707,14 @@ class CanaryExecute311Test(unittest.TestCase):
                 "load_attr": True,
                 "store_attr": True,
                 "load_method": True,
-                # The type-receiver caches ARE implemented and
-                # pull-validated (owner version + metaclass identity and
-                # version; see AttrCache311Test), but no 3.11 IR shape
-                # hands them a statically-typed receiver: guarded global
-                # and builtin loads carry no object spec, so the
-                # type(obj) / isinstance / len specializations that would
-                # produce a TType never fire.  Zero traffic is therefore
-                # the honest expectation here, and it is a reachability
-                # fact, not a correctness gate.
-                "load_type_method": False,
+                # A class receiver at a LOAD_METHOD site (P.make()) is
+                # served by the type-method cache held by the method
+                # cache's site; the type-attribute cache has no 3.11 IR
+                # shape feeding it (guarded global and builtin loads carry
+                # no object spec), so zero traffic is the honest
+                # expectation there -- a reachability fact, not a
+                # correctness gate.
+                "load_type_method": True,
                 "load_type_attr": False,
                 "load_module_attr": True,
                 "load_module_method": True,
@@ -7734,8 +7727,8 @@ class CanaryExecute311Test(unittest.TestCase):
                         cls, before[cls], after[cls])
                 else:
                     assert sum(after[cls].values()) == 0, (cls, after[cls])
-            # The type-receiver fixture still ran -- through the generic
-            # method path, counted as misses.
+            # The type-receiver fixture's first call misses the method
+            # cache's site entries before the type-method cache serves it.
             assert after["load_method"]["misses"] > (
                 before["load_method"]["misses"])
             print("stats cover every class")

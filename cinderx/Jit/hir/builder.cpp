@@ -4339,9 +4339,22 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
 #if PY_VERSION_HEX < 0x030C0000
+  // A monomorphic LOAD_METHOD_{WITH_VALUES,NO_DICT} site pins the cached
+  // function as a compile-time constant behind the guards the interpreter
+  // handler itself uses, so the call becomes a direct one.  WITH_DICT is
+  // left to the polymorphic method cache: a materialized instance dict keeps
+  // growing on long-lived objects (yaml's SafeLoader), every growth resets
+  // dk_version and a pinned site would deopt on every growth (yaml +6.5%).
+  // In the running state the site stays on the polymorphic method cache: a
+  // pinned site whose class is later mutated deopts on every call until the
+  // function is retired, which needs the despecializing recompile to be
+  // safe (that lands with the compile policy change).
   if (getConfig().state == jit::State::kRunning ||
-      !getConfig().specialized_opcodes ||
-      bc_instr.specializedOpcode() != LOAD_METHOD_WITH_VALUES) {
+      !getConfig().specialized_opcodes) {
+    return false;
+  }
+  const int lm_spec = bc_instr.specializedOpcode();
+  if (lm_spec != LOAD_METHOD_WITH_VALUES && lm_spec != LOAD_METHOD_NO_DICT) {
     return false;
   }
 
@@ -4349,7 +4362,8 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
   auto cache = reinterpret_cast<const _PyLoadMethodCache*>(instr + 1);
   uint32_t type_version = readCacheU32(cache->type_version);
   uint32_t keys_version = readCacheU32(cache->keys_version);
-  if (type_version == 0 || keys_version == 0) {
+  if (type_version == 0 ||
+      (lm_spec != LOAD_METHOD_NO_DICT && keys_version == 0)) {
     return false;
   }
 
@@ -4361,24 +4375,21 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
   auto func = reinterpret_cast<PyFunctionObject*>(descr);
   BorrowedRef<PyTypeObject> owner_type =
       resolveMethodOwnerType(func, preloader_.globals());
-  if (owner_type == nullptr || owner_type->tp_version_tag != type_version ||
-      !PyType_HasFeature(owner_type, Py_TPFLAGS_MANAGED_DICT)) {
+  if (owner_type == nullptr || owner_type->tp_version_tag != type_version) {
     return false;
   }
-
-  BorrowedRef<PyHeapTypeObject> heap_type{owner_type};
-  PyDictKeysObject* keys = heap_type->ht_cached_keys;
-  if (keys == nullptr || keys->dk_version != keys_version) {
-    return false;
+  if (lm_spec == LOAD_METHOD_WITH_VALUES) {
+    if (!PyType_HasFeature(owner_type, Py_TPFLAGS_MANAGED_DICT)) {
+      return false;
+    }
+    BorrowedRef<PyHeapTypeObject> heap_type{owner_type};
+    PyDictKeysObject* keys = heap_type->ht_cached_keys;
+    if (keys == nullptr || keys->dk_version != keys_version) {
+      return false;
+    }
   }
 
   Register* receiver = tc.frame.stack.pop();
-  Type expected_receiver_type = Type::fromTypeExact(owner_type);
-  if (!receiver->isA(expected_receiver_type)) {
-    auto guard = tc.emit<GuardType>(
-        receiver, expected_receiver_type, receiver, tc.frame);
-    receiver = guard->output();
-  }
 
   auto emit_guard =
       [&](Register* condition, Register* guilty, const char* descr) {
@@ -4388,64 +4399,59 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
         guard->setDescr(descr);
       };
 
+  // The interpreter's own check, on the RECEIVER: Py_TYPE(self)->
+  // tp_version_tag == cached version.  Version tags are unique, so this
+  // pins the receiver's exact type as well as the class dict state.  (A
+  // GuardType on the receiver is not a substitute: GuardTypeRemoval drops
+  // it when no later instruction consumes the refined type, and a guard on
+  // the constant owner class alone lets any same-layout instance through.)
+  Register* type_version_matches =
+      emitSlotTypeVersionMatches(tc, receiver, type_version);
+  emit_guard(type_version_matches, receiver, "LOAD_METHOD type version");
+
   Register* owner = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       owner, Type::fromObject(env_->addReference(BorrowedRef<>{owner_type})));
 
-  Register* current_type_version = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      current_type_version,
-      owner,
-      "tp_version_tag",
-      offsetof(PyTypeObject, tp_version_tag),
-      TCUInt32);
-  Register* expected_type_version = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      expected_type_version, Type::fromCUInt(type_version, TCUInt32));
-  Register* type_version_matches = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      type_version_matches,
-      PrimitiveCompareOp::kEqual,
-      current_type_version,
-      expected_type_version);
-  emit_guard(type_version_matches, receiver, "LOAD_METHOD type version");
+  if (lm_spec == LOAD_METHOD_WITH_VALUES) {
+    Register* dict_ptr = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        dict_ptr, receiver, "__dict__", -3 * sizeof(PyObject*), TCUInt64);
+    Register* zero = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt64));
+    Register* no_dict = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        no_dict, PrimitiveCompareOp::kEqual, dict_ptr, zero);
+    emit_guard(no_dict, receiver, "LOAD_METHOD managed dict check");
 
-  Register* dict_ptr = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      dict_ptr, receiver, "__dict__", -3 * sizeof(PyObject*), TCUInt64);
-  Register* zero = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt64));
-  Register* no_dict = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      no_dict, PrimitiveCompareOp::kEqual, dict_ptr, zero);
-  emit_guard(no_dict, receiver, "LOAD_METHOD managed dict check");
-
-  Register* keys_ptr = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      keys_ptr,
-      owner,
-      "ht_cached_keys",
-      offsetof(PyHeapTypeObject, ht_cached_keys),
-      TCUInt64);
-  Register* keys_obj = temps_.AllocateNonStack();
-  tc.emit<BitCast>(keys_obj, keys_ptr, TOptObject);
-  Register* current_keys_version = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      current_keys_version,
-      keys_obj,
-      "dk_version",
-      offsetof(PyDictKeysObject, dk_version),
-      TCUInt32);
-  Register* expected_keys_version = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      expected_keys_version, Type::fromCUInt(keys_version, TCUInt32));
-  Register* keys_version_matches = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      keys_version_matches,
-      PrimitiveCompareOp::kEqual,
-      current_keys_version,
-      expected_keys_version);
-  emit_guard(keys_version_matches, receiver, "LOAD_METHOD keys version");
+    Register* keys_ptr = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_ptr,
+        owner,
+        "ht_cached_keys",
+        offsetof(PyHeapTypeObject, ht_cached_keys),
+        TCUInt64);
+    Register* keys_obj = temps_.AllocateNonStack();
+    tc.emit<BitCast>(keys_obj, keys_ptr, TOptObject);
+    Register* current_keys_version = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        current_keys_version,
+        keys_obj,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_keys_version = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        expected_keys_version, Type::fromCUInt(keys_version, TCUInt32));
+    Register* keys_version_matches = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        keys_version_matches,
+        PrimitiveCompareOp::kEqual,
+        current_keys_version,
+        expected_keys_version);
+    emit_guard(keys_version_matches, receiver, "LOAD_METHOD keys version");
+  }
+  // NO_DICT: the type version alone pins the answer.
 
   Register* func_reg = temps_.AllocateStack();
   tc.emit<LoadConst>(

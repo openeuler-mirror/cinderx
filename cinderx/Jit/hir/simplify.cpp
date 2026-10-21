@@ -741,6 +741,16 @@ Register* simplifyLoadTypeMethodCached(Env& env, const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   const int cache_id = env.func.env.allocateLoadTypeMethodCache();
   env.emit<UseType>(receiver, TType);
+#if PY_VERSION_HEX < 0x030C0000
+  // On 3.11 the entry-value arm is pull-validated in getValueHelper, which
+  // re-runs the full lookup when stale -- and that lookup can raise
+  // (attribute deleted from the class).  LoadTypeMethodCacheEntryValue
+  // carries no exception check, so the pair {NULL, NULL} would flow into
+  // the call.  Route every load through the deopt-checked fill instruction;
+  // its 3.11 lowering still serves validated hits without the MRO walk.
+  return env.emit<FillTypeMethodCache>(
+      receiver, load_meth->name_idx(), cache_id, *load_meth->frameState());
+#endif
   Register* guard = env.emit<LoadTypeMethodCacheEntryType>(cache_id);
   Register* type_matches =
       env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, guard, receiver);
