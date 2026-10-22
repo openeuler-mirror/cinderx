@@ -680,7 +680,6 @@ class HIRBuilder {
   bool is_simple_leaf_function_{false};
 
   static bool isSimpleLeafFunction(BorrowedRef<PyCodeObject> code);
-  static bool isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code);
 };
 
 } // namespace jit::hir

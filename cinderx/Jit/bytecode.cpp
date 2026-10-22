@@ -200,6 +200,10 @@ int BytecodeInstruction::specializedOpcode() const {
     case TO_BOOL_STR:
     case LOAD_ATTR_METHOD_WITH_VALUES:
 #endif
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+    case LOAD_ATTR_INSTANCE_VALUE:
+#endif
     case LOAD_ATTR_SLOT:
 #if PY_VERSION_HEX < 0x030C0000
     case LOAD_ATTR_INSTANCE_VALUE:

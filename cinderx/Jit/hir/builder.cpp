@@ -10,6 +10,7 @@
 extern "C" {
 #include "internal/pycore_intrinsics.h"
 #include "internal/pycore_long.h"
+#include "internal/pycore_object.h"
 #include "internal/pycore_runtime.h"
 }
 #endif
@@ -19,6 +20,7 @@ extern "C" {
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/annotation_index.h"
@@ -38,6 +40,7 @@ extern "C" {
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -125,6 +128,86 @@ bool attrSlotTypeDefinesGetattr(const BytecodeInstruction& bc_instr) {
   }
   return _PyType_Lookup(type, &_Py_ID(__getattr__)) != nullptr;
 }
+
+#if PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED)
+bool loadAttrInstanceValueCacheInfo(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index,
+    LoadAttrInstanceValueCacheInfo* info) {
+  if (code == nullptr || instruction.opcode() != LOAD_ATTR ||
+      instruction.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE ||
+      inlineCacheSize(code, instruction.opcodeIndex().value()) !=
+          INLINE_CACHE_ENTRIES_LOAD_ATTR) {
+    return false;
+  }
+
+  uint32_t type_version = instruction.attrCacheTypeVersion();
+  if (type_version == 0) {
+    return false;
+  }
+  PyInterpreterState* interp = _PyInterpreterState_GET();
+  PyTypeObject* type =
+      interp->types.type_version_cache[type_version % TYPE_VERSION_CACHE_SIZE];
+  if (type == nullptr || type->tp_version_tag != type_version ||
+      !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) ||
+      !PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT) ||
+      !PyType_HasFeature(type, Py_TPFLAGS_INLINE_VALUES) ||
+      type->tp_dictoffset >= 0 ||
+      type->tp_basicsize < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      type->tp_basicsize % alignof(PyObject*) != 0) {
+    return false;
+  }
+
+  if (code->co_names == nullptr || !PyTuple_CheckExact(code->co_names) ||
+      name_index < 0 || name_index >= PyTuple_GET_SIZE(code->co_names)) {
+    return false;
+  }
+  BorrowedRef<> name = PyTuple_GET_ITEM(code->co_names, name_index);
+  if (!PyUnicode_CheckExact(name)) {
+    return false;
+  }
+
+  auto* heap_type = reinterpret_cast<PyHeapTypeObject*>(type);
+  PyDictKeysObject* keys = heap_type->ht_cached_keys;
+  if (keys == nullptr) {
+    return false;
+  }
+  Py_ssize_t attr_index = getDictKeysIndex(keys, name);
+  if (attr_index < 0 || attr_index >= keys->dk_nentries) {
+    return false;
+  }
+
+  constexpr Py_ssize_t values_offset = offsetof(PyDictValues, values);
+  constexpr Py_ssize_t valid_member_offset = offsetof(PyDictValues, valid);
+  constexpr Py_ssize_t pointer_size = sizeof(PyObject*);
+  if (type->tp_basicsize >
+      std::numeric_limits<uint16_t>::max() - values_offset) {
+    return false;
+  }
+  if (attr_index > (std::numeric_limits<uint16_t>::max() - type->tp_basicsize -
+                    values_offset) /
+          pointer_size) {
+    return false;
+  }
+  Py_ssize_t value_offset =
+      type->tp_basicsize + values_offset + attr_index * pointer_size;
+  Py_ssize_t valid_offset = type->tp_basicsize + valid_member_offset;
+  if (value_offset < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      value_offset > std::numeric_limits<uint16_t>::max() ||
+      valid_offset < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      instruction.attrCacheIndex() != value_offset) {
+    return false;
+  }
+
+  if (info != nullptr) {
+    info->type_version = type_version;
+    info->value_offset = static_cast<uint16_t>(value_offset);
+    info->valid_offset = valid_offset;
+  }
+  return true;
+}
+#endif
 #elif PY_VERSION_HEX < 0x030C0000
 // The LOAD_ATTR_SLOT fast path reads interp->types.type_version_cache, which
 // does not exist on 3.11.  The path is gated off there (slot_fast_path_enabled
@@ -1059,7 +1142,7 @@ bool HIRBuilder::isSimpleLeafFunction(BorrowedRef<PyCodeObject> code) {
   return true;
 }
 
-bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
+static bool isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
   if (code->co_flags & kCoFlagsAnyGenerator) {
     return false;
   }
@@ -1113,6 +1196,29 @@ bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
   }
   return numeric_binary_op_count > 1;
 }
+
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+bool icStabilityIntGuardsUsable(PyCodeObject* code) {
+  return !getConfig().backedge_gated_int_guards || codeHasBackedge(code) ||
+      isSimpleNumericLeafFunction(code);
+}
+
+bool icStabilitySlotCacheUsable(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index) {
+  return attrSlotMemberDef(code, instruction, name_index) != nullptr;
+}
+
+bool icStabilityInstanceValueCacheUsable(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index,
+    LoadAttrInstanceValueCacheInfo* info) {
+  return loadAttrInstanceValueCacheInfo(code, instruction, name_index, info);
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
@@ -4161,6 +4267,13 @@ void HIRBuilder::emitLoadAttr(
         }
         return;
       }
+#endif
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+      case LOAD_ATTR_INSTANCE_VALUE:
+        // The IC stability observer may classify this cache while lowering
+        // remains generic.  Avoid adding a per-access guard chain here.
+        break;
 #endif
 #if PY_VERSION_HEX >= 0x030E0000
       case LOAD_ATTR_METHOD_WITH_VALUES: {

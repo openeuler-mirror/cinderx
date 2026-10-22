@@ -2638,6 +2638,36 @@ obj = InlineBox()
 #endif
 
 #if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED)
+TEST_F(HIRBuildTest, LoadAttrInstanceValueKeepsGenericLoadAttr) {
+  const char* src = R"(
+class InstanceValue:
+    def __init__(self):
+        self.value = 42
+
+obj = InstanceValue()
+
+def test(obj):
+    return obj.value
+
+for _ in range(128):
+    assert test(obj) == 42
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_INSTANCE_VALUE));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  std::string hir = fullPrinter().ToString(*irfunc);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "inline_values.valid"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "LoadField<value@"), 0) << hir;
+}
+#endif
+
 TEST_F(HIRBuildTest, LoadAttrMethodWithValuesLowersToHelperCall) {
   const char* src = R"(
 class MethodValue:

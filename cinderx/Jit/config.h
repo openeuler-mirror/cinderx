@@ -245,6 +245,10 @@ struct Config {
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
   // numeric PYTHONJITAUTO and Python APIs keep this disabled.
   bool auto_classify{false};
+  // Bounded interpreter feedback sampling before ordinary automatic admission.
+  // Numeric thresholds, explicit compilation, OSR and free-threaded builds
+  // retain their existing paths. Disable with CINDERX_AUTOJIT_IC_STABILITY=0.
+  bool auto_jit_ic_stability{true};
   // Provider-before v1 keeps startup/import deferral disabled. This is only
   // for a later import-depth provider-backed slice.
   bool enable_startup_init_policy{false};
