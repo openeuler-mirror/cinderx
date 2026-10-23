@@ -88,6 +88,24 @@
           "STORE_FAST__LOAD_FAST"
         ]
       }
+    },
+    {
+      "id": "EXECUTION-REFCOUNT-001",
+      "lane": "C",
+      "testcase": "test.test_enumerate.TestReversed.test_bug1229429",
+      "stock_observable": "pass",
+      "jit_observable": "failure",
+      "reason": "sys.getrefcount() of a local variable observed from compiled code counts the JIT's single owned reference to the value; the interpreter additionally counts the frame's localsplus copy, so the two totals differ by one while the object's lifetime is unchanged.",
+      "rfc_or_issue": "daily build simulation 2026-10-23 (perf notes daily-sim-mr3); reference-count observable of compiled frames after the inline frame linking of !260",
+      "owner": "CinderX JIT",
+      "reviewer": "maintainer approval requested with the MR that adds this entry",
+      "scope": "C lane only; reference-count observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "!="
+        ]
+      }
     }
   ]
 }

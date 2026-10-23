@@ -397,9 +397,14 @@ bool isSupportedOpcode(int opcode) {
   return false;
 }
 
-// Check that a symbol/name is one that the JIT has banned.
+// Check that a symbol/name is one that the JIT has banned.  These builtins
+// read the calling frame's fast locals through PyEval_GetLocals, which a
+// compiled frame does not keep current (3.11 inline-linked frames and 3.14
+// lightweight frames alike); vars() and dir() without an argument are
+// locals() by another name.
 bool isBannedName(std::string_view name) {
-  return name == "eval" || name == "exec" || name == "locals";
+  return name == "eval" || name == "exec" || name == "locals" ||
+      name == "vars" || name == "dir";
 }
 
 #if PY_VERSION_HEX < 0x030C0000

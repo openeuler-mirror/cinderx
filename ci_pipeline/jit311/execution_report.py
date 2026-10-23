@@ -319,23 +319,29 @@ def compare_with_deviations(
                 "diagnostic_fingerprint_missing": missing,
             }
 
-    # Module failure is a summary, never an approval unit.  Suppress only the
-    # test_dis summary when every concrete test_dis difference is an exact,
-    # approved case.  Any new case difference keeps the summary unexpected.
-    dis_concrete = {
-        key for key in raw["differences"] if key.startswith("test.test_dis.")
-    }
-    if (
-        raw["differences"].get("<module> test_dis") == {"stock": "pass", "execute": "fail"}
-        and dis_concrete
-        and dis_concrete <= set(allowed)
-    ):
-        raw["unexpected"].pop("<module> test_dis", None)
-        raw["derived_module_summaries"] = {
-            "<module> test_dis": raw["differences"].pop("<module> test_dis")
+    # Module failure is a summary, never an approval unit.  Suppress a
+    # module's summary only when every concrete difference in that module is
+    # an exact, approved case whose diagnostic fingerprint matched.  Any new
+    # case difference keeps the summary unexpected.
+    raw["derived_module_summaries"] = {}
+    for key in list(raw["differences"]):
+        if not key.startswith("<module> "):
+            continue
+        module = key[len("<module> "):]
+        if raw["differences"][key] != {"stock": "pass", "execute": "fail"}:
+            continue
+        concrete = {
+            case
+            for case in raw["differences"]
+            if case.startswith(f"test.{module}.")
         }
-    else:
-        raw["derived_module_summaries"] = {}
+        if (
+            concrete
+            and concrete <= set(allowed)
+            and not any(case in raw["unexpected"] for case in concrete)
+        ):
+            raw["unexpected"].pop(key, None)
+            raw["derived_module_summaries"][key] = raw["differences"].pop(key)
 
     raw["approved_deviations"] = entries
     raw["diagnostic_fingerprints"] = fingerprint_results
