@@ -3662,25 +3662,33 @@ int8_t JITRT_UnboxI8(PyObject* obj) {
   return checkedUnboxImpl<int8_t>(obj);
 }
 
-PyObject* JITRT_ImportName(
+namespace {
+// The evaluator's import_name: __import__ is looked up in `builtins`, a
+// lookup that can run Python (a non-string key comparing equal to
+// "__import__") and so can raise -- that exception propagates; only a
+// plain miss is the "__import__ not found" ImportError.  With
+// `frame_locals`, the importing frame's locals dict is handed to a custom
+// __import__ when the frame has one, read after the lookup (the lookup's
+// Python can be the first to materialize it), and None otherwise; nothing
+// materializes one for the import.
+PyObject* importNameWithBuiltins(
     PyThreadState* tstate,
+    PyObject* builtins,
+    bool frame_locals,
     PyObject* name,
     PyObject* fromlist,
     PyObject* level) {
   DEFINE_STATIC_STRING(__import__);
   PyObject* globals = PyEval_GetGlobals();
-  PyObject* builtins = tstate->interp->builtins;
 
-  auto import_func =
-      Ref<>::create(PyDict_GetItemWithError(builtins, s___import__));
-
-  JIT_DCHECK(
-      import_func || !PyErr_Occurred(),
-      "_PyDict_GetItemIdWithError should only fail with invalid identifiers");
-  if (import_func == nullptr) {
-    PyErr_SetString(PyExc_ImportError, "__import__ not found");
+  PyObject* import_func_raw = PyDict_GetItemWithError(builtins, s___import__);
+  if (import_func_raw == nullptr) {
+    if (!_PyErr_Occurred(tstate)) {
+      _PyErr_SetString(tstate, PyExc_ImportError, "__import__ not found");
+    }
     return nullptr;
   }
+  auto import_func = Ref<>::create(import_func_raw);
 
   /* Fast path for not overloaded __import__. */
   if (import_func == CI_INTERP_IMPORT_FIELD(tstate->interp, import_func)) {
@@ -3698,16 +3706,48 @@ PyObject* JITRT_ImportName(
         ilevel);
   }
 
+  PyObject* locals = Py_None;
+  if (frame_locals) {
+    _PyInterpreterFrame* frame = currentFrame(tstate);
+    if (frame != nullptr && frame->f_locals != nullptr) {
+      locals = frame->f_locals;
+    }
+  }
+  return PyObject_CallFunctionObjArgs(
+      import_func, name, globals, locals, fromlist, level, nullptr);
+}
+} // namespace
+
+PyObject* JITRT_ImportName(
+    PyThreadState* tstate,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level) {
   // In this implementation we always pass None for locals as it's easier than
   // fully materializing them now. The CPython interpreter has strange (probably
   // broken) behavior - it will only pass a dictionary of locals to
   // __builtins__.__import__() if the locals have been materialized already, for
   // example by a call to locals(). Reliance on this behavior is unlikely.
-  PyObject* locals = Py_None;
-
-  return PyObject_CallFunctionObjArgs(
-      import_func, name, globals, locals, fromlist, level, nullptr);
+  return importNameWithBuiltins(
+      tstate, tstate->interp->builtins, false, name, fromlist, level);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// See jit_rt.h.  The frame's f_builtins is the function's builtins, which
+// the compilation key fixed for this artifact.  The evaluator hands a
+// custom __import__ the frame's locals dict when one has been materialized
+// (a prior f_locals read) and None otherwise, without materializing one for
+// the import; the compiled frame is the current frame, so the same rule
+// applies.
+PyObject* JITRT_ImportName311(
+    PyThreadState* tstate,
+    PyObject* builtins,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level) {
+  return importNameWithBuiltins(tstate, builtins, true, name, fromlist, level);
+}
+#endif
 
 void JITRT_SetCurrentAwaiter(PyObject* awaitable, PyThreadState* ts) {
 #ifdef ENABLE_GENERATOR_AWAITER

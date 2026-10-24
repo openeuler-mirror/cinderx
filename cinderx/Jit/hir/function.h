@@ -53,6 +53,11 @@ class Function {
   Type return_type{TObject};
 
   FrameMode frameMode{FrameMode::kNormal};
+  // CPython 3.11: the builder writes every local-variable store through to
+  // the materialized frame (MR-08 frame observability), so the frame's
+  // localsplus hold owned references while the body runs and the exit must
+  // release them (the inline unlink assumes empty slots).
+  bool frame_locals_written_through_311{false};
 
   CFG cfg;
 

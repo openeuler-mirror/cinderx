@@ -7505,6 +7505,14 @@ Result compilePreloaderImpl(
 } // namespace jit
 
 #if PY_VERSION_HEX < 0x030C0000
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code) {
+  if (jit::s_exc_edge_311.empty()) {
+    return 0;
+  }
+  auto it = jit::s_exc_edge_311.find(code);
+  return it != jit::s_exc_edge_311.end() && !it->second.granted.empty();
+}
+
 int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset) {
   if (jit::s_exc_edge_311.empty()) {
     return 0;

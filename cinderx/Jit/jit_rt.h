@@ -114,11 +114,21 @@ void JITRT_TransferRecursionToInterpreter311();
 // reference, or NULL with the exception set.
 PyObject*
 JITRT_ImportFrom311(PyThreadState* tstate, PyObject* module, PyObject* name);
+// IMPORT_NAME with the compiled function's own builtins: the evaluator
+// resolves __import__ from the frame's f_builtins, which a function made with
+// exec() or types.FunctionType() over a private builtins dict may redefine.
+PyObject* JITRT_ImportName311(
+    PyThreadState* tstate,
+    PyObject* builtins,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level);
 
 // Per-site exception edges are earned: an eligible site's exception deopts
 // are counted and at the grant the code recompiles with the edge.  Both are
 // CPython 3.11 only and live in pyjit.cpp.
 int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset);
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code);
 void Ci_ExcEdgeDeopt311(
     PyCodeObject* code,
     int64_t bc_offset,

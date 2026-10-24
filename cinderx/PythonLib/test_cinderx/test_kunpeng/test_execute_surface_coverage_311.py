@@ -102,6 +102,173 @@ print("imports ok")
 """
 
 
+IMPORT_BUILTINS_PROBE = PREAMBLE + """
+import builtins
+import types
+
+sentinel = object()
+
+
+# One code object per namespace: an artifact belongs to one (code, globals,
+# builtins) key, and a second namespace over the same code is refused.
+def template_plain():
+    import math
+    return math
+
+
+def template_custom():
+    import math
+    return math
+
+
+def template_bare():
+    import math
+    return math
+
+
+custom_builtins = dict(vars(builtins))
+custom_builtins["__import__"] = lambda *args, **kwargs: sentinel
+with_custom = types.FunctionType(
+    template_custom.__code__,
+    {"__builtins__": custom_builtins, "__name__": "custom_scope"},
+)
+without_import = types.FunctionType(
+    template_bare.__code__,
+    {"__builtins__": {k: v for k, v in vars(builtins).items() if k != "__import__"},
+     "__name__": "bare_scope"},
+)
+compiled(template_plain)
+compiled(with_custom)
+compiled(without_import)
+
+# The evaluator resolves __import__ from the frame's f_builtins: a function
+# over a private builtins dict sees its own __import__, and one whose
+# builtins lack it raises ImportError.
+assert template_plain() is __import__("math")
+assert with_custom() is sentinel, with_custom()
+try:
+    without_import()
+except ImportError as exc:
+    assert "__import__ not found" in str(exc), exc
+else:
+    raise AssertionError("import without __import__ succeeded")
+for fn in (template_plain, with_custom, without_import):
+    assert cinderjit.is_jit_compiled(fn), fn
+
+
+# The evaluator hands __import__ the frame's locals dict when one has been
+# materialized (a prior f_locals read) and None otherwise.
+def template_locals(probe_locals):
+    if probe_locals:
+        seen = sys._getframe().f_locals
+    else:
+        seen = None
+    import math
+    return math, seen
+
+
+received = []
+locals_builtins = dict(vars(builtins))
+locals_builtins["__import__"] = (
+    lambda name, g=None, local_ns=None, fromlist=(), level=0: received.append(local_ns) or sentinel
+)
+with_locals = types.FunctionType(
+    template_locals.__code__,
+    {"__builtins__": locals_builtins, "__name__": "locals_scope", "sys": sys},
+)
+compiled(with_locals)
+for probe_locals in (False, True, False, True):
+    module, seen = with_locals(probe_locals)
+    assert module is sentinel
+    if probe_locals:
+        # Identity is the contract: the hook gets the dict the frame already
+        # materialized.  (Its contents for a live frame without exception
+        # edges follow the execute surface's frame-observability rules,
+        # covered by test_exception_handler_semantics_311.)
+        assert received[-1] is seen and isinstance(seen, dict), (received[-1], seen)
+    else:
+        assert received[-1] is None, received[-1]
+assert cinderjit.is_jit_compiled(with_locals)
+
+
+# The __import__ lookup itself can run Python: a non-string key that hashes
+# and compares equal to "__import__".  (a) An exception raised by the key's
+# comparison propagates unchanged (not turned into "__import__ not found");
+# (b) the key's comparison may be the first to read the importing frame's
+# f_locals, and __import__ then receives that freshly materialized dict.
+exposed = []
+
+
+def template_key():
+    import placeholder_mod
+    return placeholder_mod
+
+
+key_code = template_key.__code__
+
+
+class ImportKey:
+    def __init__(self, fail):
+        self.fail = fail
+
+    def __hash__(self):
+        return hash("__import__")
+
+    def __eq__(self, other):
+        if other != "__import__":
+            return False
+        if self.fail:
+            raise RuntimeError("lookup failed")
+        frame = sys._getframe(1)
+        if frame.f_code is key_code:
+            exposed.append(frame.f_locals)
+        return True
+
+
+def key_importer(name, g=None, local_ns=None, fromlist=(), level=0):
+    return local_ns
+
+
+def key_builtins(fail):
+    d = dict(vars(builtins))
+    del d["__import__"]
+    d[ImportKey(fail)] = key_importer
+    return d
+
+
+raising_key = types.FunctionType(
+    template_key.__code__,
+    {"__builtins__": key_builtins(True), "__name__": "raising_key_scope", "sys": sys},
+)
+compiled(raising_key)
+try:
+    raising_key()
+except RuntimeError as exc:
+    assert str(exc) == "lookup failed", exc
+else:
+    raise AssertionError("lookup exception was swallowed")
+assert cinderjit.is_jit_compiled(raising_key)
+
+# A second namespace over the same code is refused, so the materialization
+# probe gets its own code object.
+def template_key2():
+    import placeholder_mod
+    return placeholder_mod
+
+
+key_code = template_key2.__code__
+materializing_key = types.FunctionType(
+    template_key2.__code__,
+    {"__builtins__": key_builtins(False), "__name__": "materializing_key_scope", "sys": sys},
+)
+compiled(materializing_key)
+result = materializing_key()
+assert exposed and result is exposed[-1] and isinstance(result, dict), (result, exposed)
+assert cinderjit.is_jit_compiled(materializing_key)
+print("import builtins ok")
+"""
+
+
 COVERAGE_PROBE = PREAMBLE + """
 class Box:
     pass
@@ -285,6 +452,9 @@ class ExecuteSurfaceCoverage311Test(unittest.TestCase):
 
     def test_in_function_imports_compile_and_raise_like_the_interpreter(self):
         self._run(IMPORT_PROBE, "imports ok")
+
+    def test_import_name_uses_the_functions_own_builtins(self):
+        self._run(IMPORT_BUILTINS_PROBE, "import builtins ok")
 
     def test_delete_attr_cell_and_global_writes_and_short_circuit_jumps(self):
         self._run(COVERAGE_PROBE, "coverage ok")

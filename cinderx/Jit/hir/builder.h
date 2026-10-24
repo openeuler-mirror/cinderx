@@ -743,6 +743,11 @@ class HIRBuilder {
       Register* cond = nullptr,
       bool ok_when_true = true);
   ExcTable311 exc_table_;
+  // A compiled handler is entered with the frame's locals current: the
+  // traceback created on entry exposes the frame (f_locals, and the
+  // references it keeps alive), as the evaluator's error path does after a
+  // deopt.  Set when this code has a granted site inside a compiled row.
+  bool exc_edge_frame_locals_{false};
   std::vector<std::pair<BasicBlock*, FrameState>> pending_exc_handlers_;
   CFG* cfg_{nullptr};
 #endif

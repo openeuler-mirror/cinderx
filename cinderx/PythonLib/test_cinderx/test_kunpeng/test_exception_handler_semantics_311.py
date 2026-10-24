@@ -476,6 +476,158 @@ print("fresh functions ok")
 """
 
 
+FRAME_LOCALS_PROBE = PREAMBLE + """
+BASE = 0
+import gc
+import weakref
+
+
+class Payload:
+    pass
+
+
+def boom(tag):
+    raise ValueError(tag)
+
+
+@compiled
+def caught(token, tag):
+    only_here = Payload()
+    try:
+        boom(tag)
+    except ValueError as exc:
+        caught_here = tag
+        return exc
+    return None
+
+
+@compiled
+def caught_loop(token, fail):
+    # The body opens with `while True:`: the entry bytecode block holds
+    # only RESUME and the loop's NOP, so the arguments are never the target
+    # of a store and must be seeded into the frame at entry.
+    while True:
+        try:
+            fail()
+        except ValueError as exc:
+            return exc
+
+
+# The traceback created on entry into the compiled handler exposes this
+# frame: its locals must be complete (the values at the raise, and the
+# handler's own stores), and the frame keeps its locals alive while the
+# traceback is held, as the evaluator's frame does.
+tokens = []
+for i in range(ROUNDS):
+    token = Payload()
+    exc = caught(token, i)
+    frame = exc.__traceback__.tb_frame
+    while frame is not None and frame.f_code is not caught.__code__:
+        frame = frame.f_back
+    names = sorted(k for k, v in frame.f_locals.items() if v is not None)
+    only_ref = weakref.ref(frame.f_locals["only_here"])
+    LOG.append((frame.f_code.co_name, names, frame.f_locals["token"] is token,
+                frame.f_locals["tag"] == i, frame.f_locals["caught_here"] == i))
+    gc.collect()
+    LOG.append(("alive while traceback held", only_ref() is not None))
+    del exc, frame
+    gc.collect()
+    LOG.append(("released with traceback", only_ref() is None))
+def boom_loop():
+    raise ValueError("loop")
+
+
+for i in range(ROUNDS):
+    token = Payload()
+    exc = caught_loop(token, boom_loop)
+    frame = exc.__traceback__.tb_frame
+    while frame is not None and frame.f_code is not caught_loop.__code__:
+        frame = frame.f_back
+    LOG.append(("loop", frame.f_locals["token"] is token, frame.f_locals["fail"] is boom_loop,
+                sorted(k for k, v in frame.f_locals.items() if v is not None)))
+    del exc, frame
+LOG.append(compiled_state((caught, caught_loop)))
+print(json.dumps(LOG, default=str))
+print("frame locals ok")
+"""
+
+
+TRACING_MIDCALL_PROBE = PREAMBLE + """
+BASE = sys._getframe().f_lineno
+TRACE_INSIDE = [False]
+
+
+def tracer(frame, event, arg):
+    return tracer
+
+
+def boom_with_trace(tag):
+    if TRACE_INSIDE[0]:
+        sys.settrace(tracer)
+    raise ValueError(tag)
+
+
+class Adder:
+    def __add__(self, other):
+        if TRACE_INSIDE[0]:
+            sys.settrace(tracer)
+        raise TypeError("no add")
+
+
+@compiled
+def guarded_call(tag):
+    try:
+        return boom_with_trace(tag)
+    except ValueError as exc:
+        return exc
+
+
+@compiled
+def guarded_binop(a, b):
+    try:
+        # The operation spans two lines: the BINARY_OP's line differs from
+        # the preceding code unit's, which is the default line-poll
+        # placement's condition.
+        return (a
+                + b)
+    except TypeError as exc:
+        return exc
+
+
+def positions(exc, name):
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_name != name:
+        tb = tb.tb_next
+    return (name, tb.tb_lineno - BASE, tb.tb_lasti) if tb is not None else (name, None, None)
+
+
+# Tracing off: both sites pass the grant threshold and are recompiled with
+# their exception edges (past the budget: the compiled state below proves
+# the edges are taken).
+for i in range(ROUNDS):
+    LOG.append(positions(guarded_call(i), "guarded_call"))
+    LOG.append(positions(guarded_binop(Adder(), i), "guarded_binop"))
+LOG.append(compiled_state((guarded_call, guarded_binop)))
+# Now the raising callee / __add__ switches tracing on while the caller is
+# already in machine code at a granted site: the exception position it
+# reports must be the interpreter's.  Tracing is switched off right after
+# each probe so the next one enters machine code again.
+TRACE_INSIDE[0] = True
+for i in range(3):
+    assert sys.gettrace() is None
+    LOG.append(positions(guarded_call(i), "guarded_call"))
+    sys.settrace(None)
+    assert sys.gettrace() is None
+    LOG.append(positions(guarded_binop(Adder(), i), "guarded_binop"))
+    sys.settrace(None)
+# (The compiled state recorded before the tracing rounds is the one that
+# proves the edges; this final one is the harness's required last entry.)
+LOG.append(compiled_state((guarded_call, guarded_binop)))
+print(json.dumps(LOG, default=str))
+print("tracing midcall ok")
+"""
+
+
 SETTRACE_PROBE = PREAMBLE + """
 BASE = 0
 
@@ -575,6 +727,19 @@ class ExceptionHandlerSemantics311Test(unittest.TestCase):
 
     def test_settrace_falls_back_to_the_evaluator(self):
         self._run(SETTRACE_PROBE, "settrace ok")
+
+    def test_handler_entry_exposes_complete_frame_locals(self):
+        self._run(FRAME_LOCALS_PROBE, "frame locals ok")
+
+    def test_tracing_switched_on_inside_the_raising_callee(self):
+        # Both poll placements: the per-bytecode polls and the default
+        # line polls must not treat the exception stub as a resume point.
+        self._run(TRACING_MIDCALL_PROBE, "tracing midcall ok")
+        self._run(
+            TRACING_MIDCALL_PROBE,
+            "tracing midcall ok",
+            PYTHONJITSUPPORTINSTRUMENTATION="1",
+        )
 
     def test_call_variants_take_the_edge(self):
         self._run(CALL_VARIANTS_PROBE, "call variants ok")

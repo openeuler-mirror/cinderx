@@ -1906,7 +1906,10 @@ void HIRBuilder::emitExcEdge311(
   while (stub.frame.stack.size() > static_cast<size_t>(entry->depth)) {
     stub.frame.stack.pop();
   }
-  stub.emitSnapshot();
+  // No Snapshot in the stub: its frame state is an error continuation (the
+  // operation has failed and the exception is set), not a resumable
+  // bytecode boundary, so no instrumentation poll may be placed on it; the
+  // CheckExc below carries its own frame state.
   Register* published = temps_.AllocateNonStack();
   stub.emit<LoadConst>(
       published,
@@ -1925,7 +1928,6 @@ void HIRBuilder::emitExcEdge311(
   // the CheckExc on the NULL result deopts with the raising instruction's
   // frame state, exactly the exit taken without a compiled handler.
   TranslationContext deopt_tc{deopt_bb, stub.frame};
-  deopt_tc.emitSnapshot();
   Register* dead = temps_.AllocateNonStack();
   deopt_tc.emit<CheckExc>(dead, exc, deopt_tc.frame);
   deopt_tc.emit<Unreachable>();
@@ -2078,10 +2080,18 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   cfg_ = &irfunc->cfg;
   exc_table_ = ExcTable311{};
   pending_exc_handlers_.clear();
+  exc_edge_frame_locals_ = false;
   if (frame_state == nullptr) {
     // Inlined bodies keep the deopt model: their handler would run in the
     // caller's real frame, which the entry helper cannot tell apart.
     exc_table_ = analyzeExcTable311(code_);
+    // With an edge in this function the frame can be exposed by the
+    // traceback while machine code keeps running: keep its locals current
+    // (see frameLocalsWrittenThrough311), and tell the LIR exit to release
+    // them.
+    exc_edge_frame_locals_ = getConfig().state == State::kRunning &&
+        !exc_table_.entries.empty() && Ci_ExcEdgeCodeHasGrant311(code_);
+    irfunc->frame_locals_written_through_311 = exc_edge_frame_locals_;
   }
 #endif
 
@@ -3192,6 +3202,27 @@ void HIRBuilder::translate(
         }
       }
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (is_entry_bc_block && !entry_guards_emitted) {
+      // The entry block held entry-setup instructions only: a body that
+      // opens with `while True:` has RESUME and the loop's NOP ahead of the
+      // back-edge target, so no ordinary instruction reached the seeding
+      // above.  The block runs exactly once, so seed the observable
+      // localsplus here before leaving it (ahead of the branch a jumping
+      // block already emitted).
+      Instr* terminator = tc.block->GetTerminator();
+      bool reattach = terminator != nullptr && terminator->IsTerminator();
+      if (reattach) {
+        terminator->unlink();
+      }
+      emitLocalsplusWriteback311(tc);
+      if (reattach) {
+        tc.block->Append(terminator);
+      }
+      entry_guards_emitted = true;
+      in_entry_setup = false;
+    }
+#endif
     // Insert jumps for blocks that fall through.
     auto last_instr = tc.block->GetTerminator();
     if ((last_instr == nullptr) || !last_instr->IsTerminator()) {
@@ -6792,8 +6823,13 @@ bool HIRBuilder::frameLocalsWrittenThrough311() const {
   // they are materialized; a suspended generator's frame is observed in
   // place (gi_frame.f_locals, inspect.getgeneratorlocals), so generator
   // family code keeps localsplus current at every store, as stock does.
+  // A function with a compiled exception edge is observed the same way:
+  // the traceback entry created on entry into a compiled handler exposes the
+  // frame (f_locals, and the references it keeps alive) while the function
+  // keeps running in machine code, as the evaluator does after the deopt the
+  // edge replaces.
   return getConfig().state == State::kRunning && code_ != nullptr &&
-      (code_->co_flags & kCoFlagsAnyGenerator);
+      ((code_->co_flags & kCoFlagsAnyGenerator) || exc_edge_frame_locals_);
 #else
   return false;
 #endif
