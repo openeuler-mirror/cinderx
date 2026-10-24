@@ -163,6 +163,16 @@ class Execute311Test(unittest.TestCase):
             + ["enter", "enter", "enter", "exit", "after", "exit", "exit"],
         )
 
+    def test_large_frame_initialisation(self):
+        # More than 4095 localsplus slots: the inline zeroing stores reach
+        # offsets the immediate form cannot encode.
+        payload = self.run_ok("large_frame_init", timeout=600)
+        self.assertTrue(payload["compiled"])
+        self.assertEqual(payload["length"], 4200)
+        self.assertEqual(payload["first"], 0)
+        self.assertEqual(payload["mid"], 4096)
+        self.assertEqual(payload["last"], 4199)
+
     # -- fresh function objects ----------------------------------------------
 
     def test_fresh_instances_attach_within_the_budget(self):

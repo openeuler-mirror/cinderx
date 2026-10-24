@@ -1570,7 +1570,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   auto base_location = instr->getInput(1)->getPhyRegister();
   auto base = base_location == SP ? a64::sp : a64::x(base_location.loc);
   // stp signed offset range is -512..504. Fall back to two str instructions
-  // when the offset is out of range.
+  // when the offset is out of range. The str immediate form only reaches
+  // 32760, so frames with thousands of slots (a namedtuple constructor with
+  // more than 4095 fields zeroes its localsplus inline) resolve the address
+  // through the scratch register instead of aborting on an unencodable
+  // displacement.
   if (Support::isInt7(offset >> 3)) {
     as->stp(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
@@ -1579,10 +1583,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   } else {
     as->str(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
-        a64::ptr(base, offset));
+        arch::ptr_resolve(as, base, offset, arch::reg_scratch_0));
     as->str(
         a64::x(instr->getInput(3)->getPhyRegister().loc),
-        a64::ptr(base, offset + kPointerSize));
+        arch::ptr_resolve(
+            as, base, offset + kPointerSize, arch::reg_scratch_0));
   }
 #else
   CINDER_UNSUPPORTED
