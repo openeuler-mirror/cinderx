@@ -582,9 +582,16 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # deopts the loads that read those modules' globals, it re-pins them.
     # The count is sensitive to sys.path; the gate runs with its
     # system-3.11 venv plus the matching CPython 3.11.6 test support paths.
+    # 36 once compiled except handlers land together with the and/or value
+    # jumps on the execute whitelist: typing._BaseGenericAlias.__getattr__
+    # now compiles and its `raise AttributeError` deopts twelve times across
+    # the imports (a raise statement keeps the deopt exit), while the
+    # os.path.exists and _GeneratorContextManager.__exit__ try blocks stop
+    # deopting after their eighth raise, when the site's exception edge is
+    # granted (three fewer).  Attributed with the transition ledger.
     # Verified deterministic across reruns; the exact pin keeps the
     # fail-closed drift guard.
-    default = execute_holds(expected_organic_deopts=30) + [
+    default = execute_holds(expected_organic_deopts=36) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]

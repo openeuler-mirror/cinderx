@@ -869,15 +869,15 @@ def test_unexpected_organic_deopt_turns_red():
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
     # The shared-3.11 gate and its matching CPython test support path pin
-    # the current invocation at 30 (per-site global-load cells re-pin on
-    # import-time module-dict growth instead of deoptimizing); any drift
-    # must still turn red.
+    # the current invocation at 36 (compiled except handlers together with
+    # the and/or value jumps on the execute whitelist; see the runner's
+    # pin comment); any drift must still turn red.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 31})
+        for error in judge({"organic_deopt_hits": 37})
     ]
-    assert any("organic_deopt_hits == 30" in error for error in errors)
+    assert any("organic_deopt_hits == 36" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):
