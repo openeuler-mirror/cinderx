@@ -107,6 +107,15 @@ PyObject* JITRT_ReenterAfterBind(
 // Transfer the current 3.11 JIT frame's recursion slot to the interpreter
 // before deopt resume. The interpreter will Enter/Leave the same real frame.
 void JITRT_TransferRecursionToInterpreter311();
+
+// CPython 3.11 port of ceval's static import_from() for the IMPORT_FROM
+// opcode: attribute lookup on the module, the sys.modules fallback for
+// circular relative imports, the stock ImportError otherwise.  Returns a new
+// reference, or NULL with the exception set.
+PyObject* JITRT_ImportFrom311(
+    PyThreadState* tstate,
+    PyObject* module,
+    PyObject* name);
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,

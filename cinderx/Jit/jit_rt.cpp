@@ -621,6 +621,82 @@ void JITRT_TransferRecursionToInterpreter311() {
   _Py_LeaveRecursiveCallTstate(_PyThreadState_GET());
 }
 
+// Near-verbatim port of import_from() from the 3.11 ceval.c (the function
+// is static there).  Ownership follows stock: the looked-up attribute or
+// sys.modules entry is returned as a new reference; every failure path
+// leaves an ImportError set and returns NULL.
+PyObject* JITRT_ImportFrom311(
+    PyThreadState* tstate,
+    PyObject* v,
+    PyObject* name) {
+  DEFINE_STATIC_STRING(__name__);
+  DEFINE_STATIC_STRING(__spec__);
+  PyObject* x = nullptr;
+  if (_PyObject_LookupAttr(v, name, &x) != 0) {
+    return x;
+  }
+  PyObject* pkgpath = nullptr;
+  PyObject* pkgname_or_unknown = nullptr;
+  PyObject* errmsg = nullptr;
+  // Issue #17636: a circular relative import may have failed the attribute
+  // lookup although the submodule is already in sys.modules.
+  PyObject* pkgname = PyObject_GetAttr(v, s___name__);
+  if (pkgname == nullptr) {
+    goto error;
+  }
+  if (!PyUnicode_Check(pkgname)) {
+    Py_CLEAR(pkgname);
+    goto error;
+  }
+  {
+    PyObject* fullmodname = PyUnicode_FromFormat("%U.%U", pkgname, name);
+    if (fullmodname == nullptr) {
+      Py_DECREF(pkgname);
+      return nullptr;
+    }
+    x = PyImport_GetModule(fullmodname);
+    Py_DECREF(fullmodname);
+    if (x == nullptr && !_PyErr_Occurred(tstate)) {
+      goto error;
+    }
+    Py_DECREF(pkgname);
+    return x;
+  }
+error:
+  pkgpath = PyModule_GetFilenameObject(v);
+  if (pkgname == nullptr) {
+    pkgname_or_unknown = PyUnicode_FromString("<unknown module name>");
+    if (pkgname_or_unknown == nullptr) {
+      Py_XDECREF(pkgpath);
+      return nullptr;
+    }
+  } else {
+    pkgname_or_unknown = pkgname;
+  }
+  if (pkgpath == nullptr || !PyUnicode_Check(pkgpath)) {
+    _PyErr_Clear(tstate);
+    errmsg = PyUnicode_FromFormat(
+        "cannot import name %R from %R (unknown location)",
+        name,
+        pkgname_or_unknown);
+    // NULL checks for errmsg and pkgname are done by PyErr_SetImportError.
+    PyErr_SetImportError(errmsg, pkgname, nullptr);
+  } else {
+    PyObject* spec = PyObject_GetAttr(v, s___spec__);
+    const char* fmt = _PyModuleSpec_IsInitializing(spec)
+        ? "cannot import name %R from partially initialized module %R "
+          "(most likely due to a circular import) (%S)"
+        : "cannot import name %R from %R (%S)";
+    Py_XDECREF(spec);
+    errmsg = PyUnicode_FromFormat(fmt, name, pkgname_or_unknown, pkgpath);
+    PyErr_SetImportError(errmsg, pkgname, pkgpath);
+  }
+  Py_XDECREF(errmsg);
+  Py_XDECREF(pkgname_or_unknown);
+  Py_XDECREF(pkgpath);
+  return nullptr;
+}
+
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,
@@ -4196,6 +4272,40 @@ int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op) {
   int fast_result = 0;
   if (JITRT_TryCompactLongCompareBool(v, w, op, &fast_result)) {
     return fast_result;
+  }
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // Two shapes that dominate the generic arm.  (1) exact float vs exact
+  // float: compare the doubles (C ordering matches Python for exact floats,
+  // NaN included).  (2) EQ / NE between objects whose types both keep
+  // object's own tp_richcompare: object_richcompare answers by identity and
+  // NotImplemented resolves to identity too, so the outcome is the pointer
+  // test.  A type overriding __eq__/__ne__ (slot_tp_richcompare) or
+  // inheriting a C base's compare is excluded by the slot identity check.
+  if (PyFloat_CheckExact(v) && PyFloat_CheckExact(w)) {
+    double a = PyFloat_AS_DOUBLE(v);
+    double b = PyFloat_AS_DOUBLE(w);
+    switch (op) {
+      case Py_LT:
+        return a < b;
+      case Py_LE:
+        return a <= b;
+      case Py_EQ:
+        return a == b;
+      case Py_NE:
+        return a != b;
+      case Py_GT:
+        return a > b;
+      case Py_GE:
+        return a >= b;
+      default:
+        break;
+    }
+  }
+  if ((op == Py_EQ || op == Py_NE) &&
+      Py_TYPE(v)->tp_richcompare == PyBaseObject_Type.tp_richcompare &&
+      Py_TYPE(w)->tp_richcompare == PyBaseObject_Type.tp_richcompare) {
+    return (v == w) == (op == Py_EQ);
   }
 #endif
 

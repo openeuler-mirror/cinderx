@@ -322,11 +322,11 @@ bool isSupportedOpcode(int opcode) {
     case GET_ITER:
     case GET_LEN:
     case GET_YIELD_FROM_ITER:
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
     case IMPORT_FROM:
       // LIR generation for IMPORT_FROM depends on access to _PyEval_ImportFrom
-      // (added in 3.14) or the_PyImport_ImportFrom function that's only added
-      // by Lazy Imports.
+      // (added in 3.14), the _PyImport_ImportFrom function that's only added
+      // by Lazy Imports, or the CPython 3.11 port JITRT_ImportFrom311.
 #endif
     case IMPORT_NAME:
     case INPLACE_ADD:
@@ -1340,8 +1340,6 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
       case MATCH_MAPPING:
       case MATCH_SEQUENCE:
         return "REFUSE_PATTERN_MATCHING_UNAUDITED";
-      case IMPORT_FROM:
-        return "REFUSE_HELPER_UNAVAILABLE_PRE314";
       case DELETE_DEREF:
       case DELETE_GLOBAL:
         return "REFUSE_UNPORTED";
@@ -1464,6 +1462,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case CONTAINS_OP:
     case COPY:
     case COPY_FREE_VARS:
+    case DELETE_ATTR:
     case DELETE_FAST:
     case DICT_MERGE:
     case DICT_UPDATE:
@@ -1471,10 +1470,14 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case FOR_ITER:
     case GET_ITER:
     case GET_YIELD_FROM_ITER:
+    case IMPORT_FROM:
+    case IMPORT_NAME:
     case IS_OP:
     case JUMP_BACKWARD:
     case JUMP_BACKWARD_NO_INTERRUPT:
     case JUMP_FORWARD:
+    case JUMP_IF_FALSE_OR_POP:
+    case JUMP_IF_TRUE_OR_POP:
     case KW_NAMES:
     case LIST_APPEND:
     case LIST_EXTEND:
@@ -1512,7 +1515,9 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case SEND:
     case SET_ADD:
     case STORE_ATTR:
+    case STORE_DEREF:
     case STORE_FAST:
+    case STORE_GLOBAL:
     case STORE_SUBSCR:
     case SWAP:
     case UNARY_INVERT:
@@ -1553,12 +1558,15 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // are checked: an opcode that occurs solely inside a handler region
   // executes in the interpreter after the deopt regardless of what it
   // is, so holding it to the machine-code whitelist would refuse
-  // functions this milestone fully supports.  Still out (on the
-  // reachable surface): DELETE_ATTR, STORE_DEREF, except*
-  // and pattern matching (the latter two refused earlier by the
-  // whole-code translate scan, keeping their audited refusals).  The
-  // decoder yields unspecialized opcodes, so quickened forms cannot
-  // slip past.
+  // functions this milestone fully supports.  DELETE_ATTR, STORE_DEREF,
+  // STORE_GLOBAL, the and/or short-circuit jumps and the in-function
+  // import opcodes (IMPORT_NAME; IMPORT_FROM through the 3.11 port
+  // JITRT_ImportFrom311) are on the surface: their translations were
+  // always present, only this list kept them interpreted.  Still out
+  // (on the reachable surface): except* and pattern matching (refused
+  // earlier by the whole-code translate scan, keeping their audited
+  // refusals).  The decoder yields unspecialized opcodes, so quickened
+  // forms cannot slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
     return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
@@ -2583,7 +2591,7 @@ void HIRBuilder::translate(
           emitPopJumpIf(tc, bc_instr);
           break;
         }
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
         case IMPORT_FROM: {
           emitImportFrom(tc, bc_instr);
           break;

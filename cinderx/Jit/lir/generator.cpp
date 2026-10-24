@@ -5878,6 +5878,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             env_->asm_tstate,
             instr->module(),
             name);
+#elif PY_VERSION_HEX < 0x030C0000
+        // CPython 3.11 has no exported import_from; JITRT_ImportFrom311 is
+        // its port.
+        auto instr = static_cast<const ImportFrom*>(&i);
+        Instruction* name = getNameFromIdx(bbb, instr);
+        bbb.appendCallInstruction(
+            i.output(),
+            JITRT_ImportFrom311,
+            env_->asm_tstate,
+            instr->module(),
+            name);
 #else
         JIT_ABORT(
             "IMPORT_FROM is not supported, LIRGenerator has no access to "
