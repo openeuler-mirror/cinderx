@@ -192,12 +192,19 @@ class NativeGeneratorFactory {
 
   void* deoptTrampoline();
   void* deoptTrampolineGenerators();
+  // The yield-from delegation walker (AArch64, CPython 3.11): generated once
+  // per factory, on the first non-shadow compile, exactly like the deopt
+  // trampolines, so it shares their residency baseline and the observe and
+  // shadow states allocate no executable memory.  Returns nullptr where it
+  // is unavailable (the LIR then calls the C++ walker).
+  void* genDelegateWalker();
   void* failedDeferredCompileTrampoline();
 
  private:
   void* deopt_trampoline_{nullptr};
   void* deopt_trampoline_generators_{nullptr};
   void* failed_deferred_compile_trampoline_{nullptr};
+  void* gen_delegate_walker_{nullptr};
 };
 
 } // namespace jit::codegen

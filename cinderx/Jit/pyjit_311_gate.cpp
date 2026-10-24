@@ -754,7 +754,6 @@ bool isCodeScopedRefusal311(const char* reason) {
       "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
       "REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP",
       "REFUSE_SHAPE_NON_FUNCTION_SCOPE",
-      "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED",
       "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED",
       "REFUSE_SHAPE_INVALID_UTF8_NAME",
       // The compiler could not produce an artifact for this code.
@@ -798,12 +797,6 @@ const char* requestExecute311(
     BorrowedRef<PyCodeObject> code) {
   if (codeAutoJitDisabled311(code)) {
     return "REFUSE_SHAPE_AUTO_JIT_DISABLED";
-  }
-  if ((code->co_flags & CO_GENERATOR) != 0) {
-    // Generators compile on request only: the measured verdict is that
-    // compiling them automatically loses to both compiling them all and
-    // interpreting them all, so the auto default stays off (MR-11).
-    return "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED";
   }
   if (const char* execute_reason = Ci_JitShell311_ExecuteRefusal(func)) {
     return execute_reason;

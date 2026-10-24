@@ -28,7 +28,10 @@ class GenYieldPoint {
     return offsetof(GenYieldPoint, resume_target_);
   }
 
-  GenYieldPoint(std::size_t deopt_idx, ptrdiff_t yield_from_offset);
+  GenYieldPoint(
+      std::size_t deopt_idx,
+      ptrdiff_t yield_from_offset,
+      bool handler_free = false);
 
   // Get and set what address the yield should resume from.
   uintptr_t resumeTarget() const;
@@ -37,11 +40,17 @@ class GenYieldPoint {
   std::size_t deoptIdx() const;
   bool isYieldFrom() const;
   ptrdiff_t yieldFromOffset() const;
+  // No exception-table entry covers this suspend point, so a GeneratorExit
+  // raised here runs no code in this frame.
+  bool handlerFree() const {
+    return handler_free_;
+  }
 
  private:
   uintptr_t resume_target_{0};
   const std::size_t deopt_idx_;
   const ptrdiff_t yield_from_offset_;
+  const bool handler_free_;
 };
 
 // Runtime data for a PyCodeObject object, containing caches and any other data

@@ -50,7 +50,6 @@ INTERP_ONLY_PSEUDO_SLOT = "dispatch slot is never emitted into co_code"
 
 [refusal_reasons.shape]
 REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED = "synchronous generator execution is disabled by the CPython 3.11 capability switch"
-REFUSE_SHAPE_GENERATOR_AUTO_DISABLED = "synchronous generators compile on explicit request only; automatic generator compilation is off by policy (MR-11)"
 REFUSE_SHAPE_ASYNC_CODE = "coroutine and async-generator execution is not eligible"
 REFUSE_SHAPE_NON_FUNCTION_SCOPE = "module, class, and REPL code is not eligible"
 REFUSE_SHAPE_NAMESPACE_UNSUPPORTED = "function globals or builtins namespace cannot be safely preloaded"

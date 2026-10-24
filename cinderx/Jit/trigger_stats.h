@@ -66,6 +66,12 @@ uint64_t* triggerStatsMachineCodeEntriesAddress();
 uint64_t* triggerStatsActiveFramesAddress();
 #if PY_VERSION_HEX < 0x030C0000
 const uint8_t* triggerStatsEntryLedgerEnabledAddress();
+// Ledger half of triggerStatsOnMachineCodeEntry() for entries the machine
+// code already counted (generator resumes through the in-code protocol).
+void triggerStatsOnMachineCodeEntryLedger(PyCodeObject* code);
+// Defined in generators_rt.cpp: the direct-resume gate depends on whether an
+// entry ledger is armed, so every ledger transition recomputes it.
+void updateGenDirectGate();
 #endif
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,

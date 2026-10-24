@@ -1054,8 +1054,8 @@ FlagProcessor initFlagProcessor() {
       "jit-generator",
       "PYTHONJITGENERATOR",
       getMutableConfig().sync_generator_jit,
-      "Enable explicit CPython 3.11 synchronous-generator JIT execution; "
-      "automatic generator compilation remains disabled");
+      "Enable CPython 3.11 synchronous-generator JIT execution (explicit "
+      "and automatic compilation alike)");
 #endif
 
   flag_processor.addOption(

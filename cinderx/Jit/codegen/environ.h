@@ -108,6 +108,9 @@ struct Environ {
   asmjit::Label load_method_invoke_stub;
   // Per-function dispatch stub for non-function callables at call sites.
   asmjit::Label vcdirect_stub;
+  // The generated yield-from delegation walker for this compile, or nullptr
+  // when the LIR has to call the C++ walker (shadow compiles, other targets).
+  void* gen_delegate_walker{nullptr};
   asmjit::Label store_attr_invoke_stub;
 
   struct Aarch64ExactLongAddSubStub {
@@ -156,6 +159,13 @@ struct Environ {
 
   // Instruction definitions that are pinned to physical registers.
   jit::lir::Instruction* asm_tstate{nullptr};
+
+  // Hoisted at function entry (functions with an InvokeIterNext and no OSR
+  // entry): the JIT generator type pointer and the address of the
+  // direct-resume gate byte, so a for loop over a non-generator pays one
+  // compare instead of two dependent loads.
+  jit::lir::Instruction* gen_direct_type{nullptr};
+  jit::lir::Instruction* gen_direct_gate_addr{nullptr};
   jit::lir::Instruction* asm_extra_args{nullptr};
   jit::lir::Instruction* asm_func{nullptr};
   jit::lir::Instruction* asm_interpreter_frame{nullptr};

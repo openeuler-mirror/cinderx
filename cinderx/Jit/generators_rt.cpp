@@ -7,12 +7,15 @@
 #include "internal/pycore_genobject.h"
 #include "internal/pycore_object.h" // _PyObject_GC_UNTRACK()
 #include "internal/pycore_pyerrors.h" // _PyErr_ClearExcState()
+#include "internal/pycore_pystate.h" // _PyThreadState_GET()
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/deopt.h"
 #include "cinderx/Jit/frame.h"
+#include "cinderx/Jit/gen_data_footer.h"
 #include "cinderx/Jit/generators_mm.h"
 #include "cinderx/Jit/tree_iter_state.h"
 #include "cinderx/Jit/trigger_stats.h"
@@ -22,6 +25,28 @@
 #include <string_view>
 
 namespace jit {
+
+bool g_jitgen_am_send_patched = false;
+// the JIT generator and coroutine type objects, cached at
+// type initialisation so type checks on the resume path do not chase the
+// module-state pointer.
+PyTypeObject* g_jitgen_type = nullptr;
+PyTypeObject* g_jitcoro_type = nullptr;
+
+// process gate for the direct resume call from JIT code.
+uint8_t g_gen_direct_gate = 0;
+
+void updateGenDirectGate() {
+#if PY_VERSION_HEX < 0x030C0000
+  // Direct resumes bypass the C++ resume path: closed while the am_send
+  // slot is patched for an instrumentation deopt or an entry ledger is
+  // armed (both need every resume to pass through C++).
+  g_gen_direct_gate =
+      (!g_jitgen_am_send_patched && !*triggerStatsEntryLedgerEnabledAddress())
+      ? 1
+      : 0;
+#endif
+}
 
 bool deopt_jit_gen_with_footer(
     JitGenObject* jit_gen,
@@ -172,13 +197,19 @@ void deopt_finished_coro_object_only(JitGenObject* gen) {
   Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), &PyCoro_Type);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+bool jitgen_fast_close_eligible(JitGenObject* gen);
+#endif
+
 void jitgen_dealloc(PyObject* self) {
   // Clear TreeIter state before deopt so the footer pointer is still valid.
   JitGenObject* jit_gen = JitGenObject::cast(self);
   GenDataFooter* gen_footer = nullptr;
   bool fast_finished_coro = false;
+  bool had_tree_iter = false;
   if (jit_gen != nullptr) {
     gen_footer = jit_gen->genDataFooter();
+    had_tree_iter = gen_footer->tree_iter_state != nullptr;
 #if PY_VERSION_HEX >= 0x030E0000
     // Older frame layouts need the generic deopt path's reified-frame cleanup.
     fast_finished_coro =
@@ -202,17 +233,97 @@ void jitgen_dealloc(PyObject* self) {
     return;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // a plain generator dropped while suspended at a
+  // handler-free plain yield (or never started) runs no user code on close:
+  // release the suspend point's references and free it natively, skipping
+  // the finalizer protocol, the type switch and the generic dealloc path.
+  // (A yield-from suspend point closes its sub-iterator, which may run
+  // Python code, so it keeps the finalizer protocol.)
+  if (jit_gen != nullptr && !had_tree_iter && !_PyGC_FINALIZED(self) &&
+      jitgen_fast_close_eligible(jit_gen) &&
+      !gen_footer->yieldPoint->isYieldFrom()) {
+    if (_PyObject_GC_IS_TRACKED(self)) {
+      _PyObject_GC_UNTRACK(self);
+    }
+    if (jit_gen->gi_weakreflist != nullptr) {
+      PyObject_ClearWeakRefs(self);
+    }
+    const GenYieldPoint* yield_point = gen_footer->yieldPoint;
+    const DeoptMetadata& deopt_meta =
+        gen_footer->code_rt->getDeoptMetadata(yield_point->deoptIdx());
+    // Releasing the live values runs their __del__ methods: read as running
+    // and unresumable first (see jitgen_try_fast_close).
+    jit_gen->gi_frame_state = FRAME_EXECUTING;
+    gen_footer->direct_ok = 0;
+    gen_footer->yieldPoint = nullptr;
+    releaseRefs(deopt_meta, gen_footer);
+    _PyInterpreterFrame* frame = generatorFrame(jit_gen);
+    frame->previous = nullptr;
+    jit_gen->gi_frame_state = FRAME_CLEARED;
+    jitFrameClearExceptCode(frame);
+    _PyErr_ClearExcState(&jit_gen->gi_exc_state);
+    Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+    clearGeneratorCompiledFunction(gen_footer);
+    Py_CLEAR(jit_gen->gi_code);
+    Py_CLEAR(jit_gen->gi_name);
+    Py_CLEAR(jit_gen->gi_qualname);
+    PyTypeObject* type = Py_TYPE(self);
+    cinderx::getModuleState()->jit_gen_free_list->free(self);
+    Py_DECREF(type);
+    return;
+  }
+#endif
   bool deopted = true;
   if (jit_gen == nullptr) {
     deopted = deopt_jit_gen(self);
   } else if (
       gen_footer->yieldPoint == nullptr &&
       FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
+#if PY_VERSION_HEX < 0x030C0000
+    // a completed plain generator whose frame was cleared at
+    // completion holds only gi_code/gi_name/gi_qualname and its heap type:
+    // release them and hand the storage back without the stock finalizer
+    // protocol (a finished generator's finalizer is a no-op).
+    if (jit_gen->gi_frame_state == FRAME_CLEARED &&
+        Py_IS_TYPE(self, g_jitgen_type)) {
+      if (_PyObject_GC_IS_TRACKED(self)) {
+        _PyObject_GC_UNTRACK(self);
+      }
+      if (jit_gen->gi_weakreflist != nullptr) {
+        PyObject_ClearWeakRefs(self);
+      }
+      clearGeneratorCompiledFunction(gen_footer);
+      Py_CLEAR(jit_gen->gi_code);
+      Py_CLEAR(jit_gen->gi_name);
+      Py_CLEAR(jit_gen->gi_qualname);
+      _PyErr_ClearExcState(&jit_gen->gi_exc_state);
+      PyTypeObject* type = Py_TYPE(self);
+      cinderx::getModuleState()->jit_gen_free_list->free(self);
+      Py_DECREF(type);
+      return;
+    }
+#endif
     deopt_jit_gen_object_only(jit_gen);
     clearGeneratorCompiledFunction(gen_footer);
   } else {
+#if PY_VERSION_HEX < 0x030C0000
+    // a generator dropped while suspended outside every
+    // handler needs no interpreter unwinding.  Leave it a JitGen so the
+    // finalizer (run by gen_dealloc_with_custom_free under the resurrection
+    // protocol, since closing a sub-iterator may run Python code) performs
+    // the in-place fast close; anything else takes the deopt path.
+    if (!had_tree_iter && !_PyGC_FINALIZED(self) &&
+        jitgen_fast_close_eligible(jit_gen)) {
+      deopted = true;
+    } else {
+      deopted = deopt_jit_gen_with_footer(
+          jit_gen, gen_footer, true /* tree_iter_cleared */);
+    }
+#else
     deopted = deopt_jit_gen_with_footer(
         jit_gen, gen_footer, true /* tree_iter_cleared */);
+#endif
   }
   if (!deopted) {
     JIT_ABORT("Tried to dealloc a running JIT generator");
@@ -289,16 +400,24 @@ void raise_already_running_exception(JitGenObject* jit_gen) {
 // Resumes a JIT generator. Calling this performs the same work as invoking the
 // interpreter on a generator with a freshly created/suspended frame. As much
 // as possible is broken out into C++ before control is passed to JIT code.
-Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
+Ref<> send_core(
+    JitGenObject* jit_gen,
+    PyObject* arg,
+    PyThreadState* tstate,
+    GenDataFooter* gen_footer,
+    uint64_t finish_yield_from = 0) {
   PyObject* gen_obj = reinterpret_cast<PyObject*>(jit_gen);
-  GenDataFooter* gen_footer = jit_gen->genDataFooter();
 
   _PyInterpreterFrame* frame = generatorFrame(jit_gen);
   // See comment about reusing the cframe in jit_rt.cpp,
   // allocate_and_link_interpreter_frame().
 
-  frame->previous = currentFrame(tstate);
-  setCurrentFrame(tstate, frame);
+  constexpr bool kGenProtoPossible = PY_VERSION_HEX < 0x030C0000;
+  constexpr bool genproto = kGenProtoPossible;
+  if (!genproto) {
+    frame->previous = currentFrame(tstate);
+    setCurrentFrame(tstate, frame);
+  }
 
   // Enter generated code.
   JIT_DCHECK(
@@ -309,18 +428,36 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
   // JITRT_AllocateAndLinkInterpreterFrame(), the ordinary 3.11 counting
   // point.  Count at this unique resume dispatch so canary evidence covers
   // both the initial next() and later send()/throw()/close() resumes.
-  jit::triggerStatsOnMachineCodeEntry(_PyFrame_GetCode(frame));
+  if (genproto) {
+    // the machine code counts the entry; only the ledger
+    // is fed from here.
+    if (*triggerStatsEntryLedgerEnabledAddress()) {
+      triggerStatsOnMachineCodeEntryLedger(_PyFrame_GetCode(frame));
+    }
+  } else {
+    jit::triggerStatsOnMachineCodeEntry(_PyFrame_GetCode(frame));
+  }
 #endif
   Ref<> result = Ref<>::steal(gen_footer->resumeEntry(
-      gen_obj, arg, 0 /* finish_yield_from (not used in 3.12+) */, tstate));
+      gen_obj,
+      arg,
+      finish_yield_from /* consumed by 3.11 JITRT_GenSend */,
+      tstate));
 
   // If we deopted then the interpreter will handle setting frame state and
   // there will no longer be any JIT state. We can check if this happened by
   // seeing if the type of the generator object is no longer a JitGenObject.
   if (JitGen_CheckAny(gen_obj)) {
+#if PY_VERSION_HEX >= 0x030C0000
     tstate->exc_info = jit_gen->gi_exc_state.previous_item;
     jit_gen->gi_exc_state.previous_item = nullptr;
-
+#endif
+    // (3.11 restores the exception-stack link in the resume wrapper, on every
+    // exit path.)
+    if (genproto && jit_gen->gi_frame_state == FRAME_SUSPENDED) {
+      // a yield exit already unlinked and marked suspended.
+      return result;
+    }
     setCurrentFrame(tstate, frame->previous);
 
     frame->previous = nullptr;
@@ -340,7 +477,12 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
 #if PY_VERSION_HEX < 0x030C0000
   else {
     // An in-stack deopt converted this generator to stock PyGen/PyCoro while
-    // its machine code was running. The deopt trampoline still consumes this
+    // its machine code was running; the interpreter finished the frame and
+    // left its back link in place, as it does for gen_send_ex2, whose caller
+    // then clears it.  This resume is that caller.
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    // The deopt trampoline still consumes this
     // artifact's metadata and epilogue after prepareForDeopt(), so the handler
     // cannot release the MakeGen pin. The resume call has now fully left
     // machine code, and stock traversal/deallocation will never visit the
@@ -357,18 +499,177 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
 // JIT function rather than executing with the interpreter. If any of the
 // inputs would lead to an exception, try to deopt and hand back to the CPython
 // version.
-PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
-  JitGenObject* gen = JitGenObject::cast(obj);
-  if (gen == nullptr) {
-    return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
-  }
+PySendResult jitgen_resume_machine_code(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate,
+    GenDataFooter* footer,
+    uint64_t finish_yield_from);
+PySendResult jitgen_am_send_impl(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate);
+#if PY_VERSION_HEX < 0x030C0000
+PySendResult jitgen_resume_fast(
+    JitGenObject* gen,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate,
+    bool plain_gen);
+#endif
+PySendResult jitgen_resume_post(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject* result,
+    PyObject** presult,
+    PyThreadState* tstate,
+    _PyErr_StackItem* prev_exc_info);
 
+#if PY_VERSION_HEX < 0x030C0000
+// send into the sub-iterator of a delegating generator directly.
+// The delegating generator is marked running and its frame and exception
+// state are linked exactly as a machine-code resume would do, so re-entrancy
+// raises "generator already executing" and frame/exception chains stay intact.
+// A yielded value is handed straight to the caller; a return value or an
+// exception resumes the delegating generator at its Send with the finish flag.
+PySendResult jitgen_delegate_send(
+    JitGenObject* gen,
+    PyObject* obj,
+    GenDataFooter* footer,
+    JitGenObject* sub,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate) {
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  frame->previous = currentFrame(tstate);
+  setCurrentFrame(tstate, frame);
+  _PyErr_StackItem* prev_exc_info = tstate->exc_info;
+  gen->gi_exc_state.previous_item = prev_exc_info;
+  tstate->exc_info = &gen->gi_exc_state;
+  gen->gi_frame_state = FRAME_EXECUTING;
+  // Not directly resumable while it delegates (see linkDelegator).
+  footer->direct_ok = 0;
+
+  PyObject* sub_result = nullptr;
+  // the sub-iterator is a suspended plain JitGen by
+  // construction, so it qualifies for the straight-line lane.
+  PySendResult status = jitgen_resume_fast(sub, arg, &sub_result, tstate, true);
+
+  gen->gi_frame_state = FRAME_SUSPENDED;
+  footer->direct_ok = 2;
+  tstate->exc_info = prev_exc_info;
+  gen->gi_exc_state.previous_item = nullptr;
+  setCurrentFrame(tstate, frame->previous);
+  frame->previous = nullptr;
+
+  if (status == PYGEN_NEXT) {
+    *presult = sub_result;
+    return PYGEN_NEXT;
+  }
+  // Finished (sub_result owned) or raised (exception set): resume the
+  // delegating generator at its Send with the outcome.
+  PySendResult res = jitgen_resume_machine_code(
+      gen,
+      obj,
+      status == PYGEN_RETURN ? sub_result : Py_None,
+      presult,
+      tstate,
+      footer,
+      status == PYGEN_RETURN ? 1 : 2);
+  Py_XDECREF(sub_result);
+  return res;
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+// the common resume in one straight sequence.  Callers
+// guarantee an unpatched JitGen/JitCoro in state SUSPENDED, or CREATED with
+// a None (or absent) argument; plain_gen says it is the plain generator
+// type.  Yield-from delegation and the rare completion/raise outcomes fall
+// through to the shared routines.
+PySendResult jitgen_resume_fast(
+    JitGenObject* gen,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate,
+    bool plain_gen) {
+  PyObject* obj = reinterpret_cast<PyObject*>(gen);
+  if (arg == nullptr) {
+    arg = Py_None;
+  }
+  GenDataFooter* footer = gen->genDataFooter();
+  const GenYieldPoint* yield_point = footer->yieldPoint;
+  if (plain_gen && gen->gi_frame_state == FRAME_SUSPENDED &&
+      yield_point != nullptr && yield_point->isYieldFrom() &&
+      footer->tree_iter_state == nullptr) {
+    PyObject* yf = yieldFromValue(footer, yield_point);
+    if (yf != nullptr && Py_IS_TYPE(yf, g_jitgen_type) &&
+        reinterpret_cast<JitGenObject*>(yf)->gi_frame_state ==
+            FRAME_SUSPENDED) {
+      return jitgen_delegate_send(
+          gen,
+          obj,
+          footer,
+          reinterpret_cast<JitGenObject*>(yf),
+          arg,
+          presult,
+          tstate);
+    }
+  }
+  _PyErr_StackItem* prev_exc_info = tstate->exc_info;
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  // the resume entry links the exception state and the
+  // frame and marks the generator running; a plain or yield-from exit
+  // unlinks and marks it suspended.  Only the entry ledger is fed here.
+  if (*triggerStatsEntryLedgerEnabledAddress()) {
+    triggerStatsOnMachineCodeEntryLedger(_PyFrame_GetCode(frame));
+  }
+  PyObject* result = footer->resumeEntry(obj, arg, 0, tstate);
+  if (__builtin_expect(
+          result != nullptr && JitGen_CheckAny(obj) &&
+              gen->gi_frame_state == FRAME_SUSPENDED,
+          1)) {
+    *presult = result;
+    return PYGEN_NEXT;
+  }
+  if (JitGen_CheckAny(obj)) {
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    if (FRAME_STATE_FINISHED(gen->gi_frame_state)) {
+      gen->gi_frame_state = FRAME_CLEARED;
+      jitFrameClearExceptCode(frame);
+    } else {
+      gen->gi_frame_state = FRAME_SUSPENDED;
+    }
+  } else {
+    // Deopted in place: the interpreter ran the frame and left the back
+    // link for its caller to clear (gen_send_ex2 semantics).
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    clearGeneratorCompiledFunction(footer);
+  }
+  return jitgen_resume_post(
+      gen, obj, arg, result, presult, tstate, prev_exc_info);
+}
+#endif
+
+PySendResult jitgen_am_send_impl(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate) {
   // A finalizer can re-enter a generator while its return-path refcount
   // cleanup is still running.  At that point the generator is already
   // logically complete, but deopting it would race the cleanup that is
   // releasing JIT-owned live values.
   if (FRAME_STATE_FINISHED(gen->gi_frame_state) &&
-      Py_TYPE(obj) == cinderx::getModuleState()->gen_type) {
+      Py_TYPE(obj) == g_jitgen_type) {
     *presult = Py_NewRef(Py_None);
     return PYGEN_RETURN;
   }
@@ -389,17 +690,82 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     arg = Py_None;
   }
 
-  PyThreadState* tstate = PyThreadState_Get();
-  _PyErr_StackItem* prev_exc_info = tstate->exc_info;
-  gen->gi_exc_state.previous_item = prev_exc_info;
-  tstate->exc_info = &gen->gi_exc_state;
+  GenDataFooter* footer = gen->genDataFooter();
+#if PY_VERSION_HEX < 0x030C0000
+  // a generator suspended at a yield-from whose sub-iterator is
+  // a suspended JIT generator forwards the send without re-entering its own
+  // machine code; only the sub-iterator's completion resumes it.
+  if (Py_IS_TYPE(obj, g_jitgen_type) &&
+      gen->gi_frame_state == FRAME_SUSPENDED) {
+    const GenYieldPoint* yield_point = footer->yieldPoint;
+    if (yield_point != nullptr && yield_point->isYieldFrom() &&
+        footer->tree_iter_state == nullptr) {
+      PyObject* yf = yieldFromValue(footer, yield_point);
+      if (yf != nullptr && Py_IS_TYPE(yf, g_jitgen_type) &&
+          reinterpret_cast<JitGenObject*>(yf)->gi_frame_state ==
+              FRAME_SUSPENDED) {
+        return jitgen_delegate_send(
+            gen,
+            obj,
+            footer,
+            reinterpret_cast<JitGenObject*>(yf),
+            arg,
+            presult,
+            tstate);
+      }
+    }
+  }
+#endif
 
-  gen->gi_frame_state = FRAME_EXECUTING;
+  return jitgen_resume_machine_code(gen, obj, arg, presult, tstate, footer, 0);
+}
+
+// Resume the generator's machine code with a (borrowed) sent value.
+// finish_yield_from is stored by the resume entry and consumed by the first
+// JITRT_GenSend (see GenDataFooter::resume_finish_flag).
+// Everything after the machine code returned: exception-stack unlink, the
+// completed/raised bookkeeping and the result contract of am_send.  Shared by
+// the general wrapper and the fast lane.
+PySendResult jitgen_resume_post(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject* result,
+    PyObject** presult,
+    PyThreadState* tstate,
+    _PyErr_StackItem* prev_exc_info);
+
+PySendResult jitgen_resume_machine_code(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject** presult,
+    PyThreadState* tstate,
+    GenDataFooter* footer,
+    uint64_t finish_yield_from) {
+  _PyErr_StackItem* prev_exc_info = tstate->exc_info;
+  if constexpr (PY_VERSION_HEX >= 0x030C0000) {
+    gen->gi_exc_state.previous_item = prev_exc_info;
+    tstate->exc_info = &gen->gi_exc_state;
+    gen->gi_frame_state = FRAME_EXECUTING;
+  }
   EVAL_CALL_STAT_INC(EVAL_CALL_GENERATOR);
 
   // Execution happens here
-  PyObject* result = send_core(gen, arg, tstate).release();
+  PyObject* result =
+      send_core(gen, arg, tstate, footer, finish_yield_from).release();
+  return jitgen_resume_post(
+      gen, obj, arg, result, presult, tstate, prev_exc_info);
+}
 
+PySendResult jitgen_resume_post(
+    JitGenObject* gen,
+    PyObject* obj,
+    PyObject* arg,
+    PyObject* result,
+    PyObject** presult,
+    PyThreadState* tstate,
+    _PyErr_StackItem* prev_exc_info) {
 #if PY_VERSION_HEX < 0x030C0000
   // The vendored 3.11 evaluator returns from an entry generator frame
   // without restoring the exception-stack link that gen_send_ex2 owns.
@@ -508,7 +874,8 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     // FRAME_EXECUTABLE.  jitFrameClearExceptCode() already cleared the rest of
     // the frame, so only the preserved executable remains to be released.
     GenDataFooter* gen_footer = gen->genDataFooter();
-    deopt_jit_gen_object_only(gen);
+    // The footer is keyed on gi_code, so a finished generator stays a
+    // JitGen and takes the native dealloc path.
     clearGeneratorCompiledFunction(gen_footer);
     Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
   }
@@ -516,6 +883,14 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
 
   *presult = result;
   return result ? PYGEN_RETURN : PYGEN_ERROR;
+}
+
+PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
+  JitGenObject* gen = JitGenObject::cast(obj);
+  if (gen == nullptr) {
+    return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
+  }
+  return jitgen_am_send_impl(gen, obj, arg, presult, PyThreadState_Get());
 }
 
 // Wrapper installed as am_send when the JIT is paused (e.g. instrumentation
@@ -545,8 +920,28 @@ PyObject* jitgen_send(PyObject* obj, PyObject* arg) {
 
 PyObject* jitgen_iternext(PyObject* obj) {
   PyObject* result = nullptr;
-  if (Py_TYPE(obj)->tp_as_async->am_send(obj, nullptr, &result) ==
-      PYGEN_RETURN) {
+  PySendResult status;
+  // an unpatched JitGen resumes through the direct lane,
+  // skipping the am_send slot dispatch and the thread-state call.
+  PyTypeObject* type = Py_TYPE(obj);
+  bool plain_gen = type == g_jitgen_type;
+  if (!g_jitgen_am_send_patched && (plain_gen || type == g_jitcoro_type)) {
+    JitGenObject* gen = reinterpret_cast<JitGenObject*>(obj);
+#if PY_VERSION_HEX < 0x030C0000
+    int8_t state = gen->gi_frame_state;
+    if (state == FRAME_SUSPENDED || state == FRAME_CREATED) {
+      status = jitgen_resume_fast(
+          gen, nullptr, &result, _PyThreadState_GET(), plain_gen);
+    } else
+#endif
+    {
+      status =
+          jitgen_am_send_impl(gen, obj, nullptr, &result, _PyThreadState_GET());
+    }
+  } else {
+    status = type->tp_as_async->am_send(obj, nullptr, &result);
+  }
+  if (status == PYGEN_RETURN) {
     if (result != Py_None) {
       _PyGen_SetStopIterationValue(result);
     }
@@ -554,6 +949,210 @@ PyObject* jitgen_iternext(PyObject* obj) {
   }
   return result;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// finishes a direct resume from JIT code whose outcome was
+// not a plain yield: a yield-from suspension (already unlinked by the machine
+// code), a return, a raise, or a resume that deopted in place.  Same contract
+// as tp_iternext: the value, or NULL with StopIteration/error set.
+// Shared tail of a direct machine-code resume whose outcome was not a plain
+// yield: returns the send status and the (owned) value/return value.  `arg`
+// selects the post convention: nullptr (tp_iternext: a None return becomes
+// NULL) or Py_None (send: the return value stays an object).
+PySendResult finishDirectResume(
+    JitGenObject* gen,
+    PyObject* value,
+    PyObject** presult,
+    PyThreadState* tstate,
+    PyObject* arg) {
+  PyObject* obj = reinterpret_cast<PyObject*>(gen);
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  _PyErr_StackItem* prev_exc_info = gen->gi_exc_state.previous_item;
+  GenDataFooter* footer = gen->genDataFooter();
+  if (JitGen_CheckAny(obj)) {
+    if (gen->gi_frame_state == FRAME_SUSPENDED) {
+      *presult = value;
+      return PYGEN_NEXT;
+    }
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    if (FRAME_STATE_FINISHED(gen->gi_frame_state)) {
+      gen->gi_frame_state = FRAME_CLEARED;
+      jitFrameClearExceptCode(frame);
+    } else {
+      gen->gi_frame_state = FRAME_SUSPENDED;
+    }
+  } else {
+    // Deopted in place: the interpreter ran the frame and left the back
+    // link for its caller to clear (gen_send_ex2 semantics).
+    setCurrentFrame(tstate, frame->previous);
+    frame->previous = nullptr;
+    clearGeneratorCompiledFunction(footer);
+  }
+  return jitgen_resume_post(
+      gen, obj, arg, value, presult, tstate, prev_exc_info);
+}
+
+PyObject* genNextFinish311(PyObject* obj, PyObject* value) {
+  JitGenObject* gen = reinterpret_cast<JitGenObject*>(obj);
+  PyThreadState* tstate = _PyThreadState_GET();
+  PyObject* result = nullptr;
+  PySendResult status =
+      finishDirectResume(gen, value, &result, tstate, nullptr);
+  if (status == PYGEN_RETURN) {
+    if (result != Py_None) {
+      _PyGen_SetStopIterationValue(result);
+    }
+    Py_CLEAR(result);
+  }
+  return result;
+}
+
+// link `gen` as the running delegator of its sub-iterator
+// without entering its machine code (the entry half of the resume protocol).
+inline void linkDelegator(JitGenObject* gen, PyThreadState* tstate) {
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  frame->previous = currentFrame(tstate);
+  setCurrentFrame(tstate, frame);
+  gen->gi_exc_state.previous_item = tstate->exc_info;
+  tstate->exc_info = &gen->gi_exc_state;
+  gen->gi_frame_state = FRAME_EXECUTING;
+  // A linked delegator is running: the direct paths (JIT loops, walkers)
+  // must not take it again while the chain is live, so re-entry goes
+  // through am_send and raises "generator already executing".
+  gen->genDataFooter()->direct_ok = 0;
+}
+
+inline void unlinkDelegator(JitGenObject* gen, PyThreadState* tstate) {
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  gen->gi_frame_state = FRAME_SUSPENDED;
+  // Every linked delegator was suspended at a yield-from (direct_ok == 2).
+  gen->genDataFooter()->direct_ok = 2;
+  tstate->exc_info = gen->gi_exc_state.previous_item;
+  gen->gi_exc_state.previous_item = nullptr;
+  setCurrentFrame(tstate, frame->previous);
+  frame->previous = nullptr;
+}
+
+// Unlink every delegator recorded from `from` outward (innermost first).
+inline void unwindDelegators(JitGenObject* from, PyThreadState* tstate) {
+  JitGenObject* level = from;
+  while (true) {
+    GenDataFooter* footer = level->genDataFooter();
+    JitGenObject* d = footer->delegator;
+    if (d == nullptr) {
+      break;
+    }
+    footer->delegator = nullptr;
+    unlinkDelegator(d, tstate);
+    level = d;
+  }
+}
+
+// The innermost generator finished, raised or deopted: complete each
+// delegator's Send with the outcome, outermost last.  Returns the
+// top-level outcome with tp_iternext semantics.
+PyObject* delegateFinish(
+    JitGenObject* innermost,
+    PyObject* value,
+    PyThreadState* tstate) {
+  PyObject* val = nullptr;
+  // Send convention: a None return must reach the delegator's Send as an
+  // object (the finish flag hands it over as the sub-iterator's value).
+  PySendResult st = finishDirectResume(innermost, value, &val, tstate, Py_None);
+  JitGenObject* level = innermost;
+  while (true) {
+    GenDataFooter* footer = level->genDataFooter();
+    JitGenObject* d = footer->delegator;
+    if (d == nullptr) {
+      break;
+    }
+    footer->delegator = nullptr;
+    unlinkDelegator(d, tstate);
+    if (st == PYGEN_NEXT) {
+      // A level yielded again after completing its Send: the value passes
+      // straight through the remaining (now unlinked) delegators.
+      level = d;
+      continue;
+    }
+    PyObject* next_val = nullptr;
+    PySendResult r = jitgen_resume_machine_code(
+        d,
+        reinterpret_cast<PyObject*>(d),
+        st == PYGEN_RETURN ? val : Py_None,
+        &next_val,
+        tstate,
+        d->genDataFooter(),
+        st == PYGEN_RETURN ? 1 : 2);
+    Py_XDECREF(val);
+    val = next_val;
+    st = r;
+    level = d;
+  }
+  if (st == PYGEN_NEXT) {
+    return val;
+  }
+  if (st == PYGEN_RETURN) {
+    // tp_iternext contract: a non-None return travels as StopIteration's
+    // value (the loop's exhausted path clears it).
+    if (val != nullptr && val != Py_None) {
+      _PyGen_SetStopIterationValue(val);
+    }
+  }
+  Py_XDECREF(val);
+  return nullptr;
+}
+
+// Resume a plain JIT generator suspended at a yield-from from a JIT'd loop:
+// walk the delegation chain, enter the innermost generator's machine code
+// directly, unwind on a yield.  Anything the walker cannot handle falls back
+// to the generic iternext after undoing its links.
+PyObject* genDelegateNext311(PyObject* top_obj, PyThreadState* tstate) {
+  constexpr int kMaxWalkDepth = 64;
+  JitGenObject* top = reinterpret_cast<JitGenObject*>(top_obj);
+  JitGenObject* cur = top;
+  GenDataFooter* fcur = top->genDataFooter();
+  int depth = 0;
+  while (true) {
+    PyObject* sub_obj = fcur->yf_sub;
+    JitGenObject* sub = reinterpret_cast<JitGenObject*>(sub_obj);
+    GenDataFooter* fsub = nullptr;
+    uint8_t ok = 0;
+    if (sub_obj != nullptr && Py_IS_TYPE(sub_obj, g_jitgen_type) &&
+        fcur->tree_iter_state == nullptr && depth < kMaxWalkDepth) {
+      fsub = sub->genDataFooter();
+      ok = fsub->direct_ok;
+    }
+    if (ok == 0) {
+      // Not a chain the walker handles: undo the links made so far and let
+      // the generic path (yield-from delegation in C++) take it.
+      unwindDelegators(cur, tstate);
+      return jitgen_iternext(top_obj);
+    }
+    linkDelegator(cur, tstate);
+    fsub->delegator = cur;
+    ++depth;
+    if (ok == 2) {
+      cur = sub;
+      fcur = fsub;
+      continue;
+    }
+    // ok == 1: the innermost generator is directly resumable.
+    if (*triggerStatsEntryLedgerEnabledAddress()) {
+      triggerStatsOnMachineCodeEntryLedger(
+          _PyFrame_GetCode(generatorFrame(sub)));
+    }
+    PyObject* value = fsub->resumeEntry(sub_obj, Py_None, 0, tstate);
+    if (value != nullptr && JitGen_CheckAny(sub_obj) && fsub->direct_ok != 0) {
+      // Yielded (plain or at a new yield-from): pass it out, unlinking the
+      // delegators innermost-first.
+      unwindDelegators(sub, tstate);
+      return value;
+    }
+    return delegateFinish(sub, value, tstate);
+  }
+}
+#endif
 
 // Cached methods from base generator filled in by init_jit_genobject_type().
 // These are unlikely to be performance sensitive and don't need to run
@@ -563,9 +1162,8 @@ PyObject* jitgen_iternext(PyObject* obj) {
 // generator may end up in the interpreter unnecessarily. So, I made the
 // machinery to cache methods anyway and we may as well use it. This does all
 // make the assumption that the methods on PyGen_Type don't change.
-using GenThrowMeth = PyObject* (*)(PyObject * obj,
-                                   PyObject* const* args,
-                                   Py_ssize_t nargs);
+using GenThrowMeth =
+    PyObject* (*)(PyObject* obj, PyObject* const* args, Py_ssize_t nargs);
 GenThrowMeth gen_throw_meth;
 PyCFunction gen_close_meth;
 PyCFunction gen___sizeof___meth;
@@ -573,7 +1171,11 @@ PyCFunction gen___sizeof___meth;
 PyObject* jitgen_throw(PyObject* obj, PyObject* const* args, Py_ssize_t nargs) {
   // Always deopt as an exception being raised internally would cause a JIT
   // generator to deopt anyway.
+  // The sub-iterator chain is captured before the deopt, which reifies the
+  // frame; stock _PyGen_yf answers equally well afterwards.
+  PyObject* sub = JitGen_yf(reinterpret_cast<PyGenObject*>(obj));
   if (!deopt_jit_gen(obj)) {
+    Py_XDECREF(sub);
     JitGenObject* gen = reinterpret_cast<JitGenObject*>(obj);
     if (has_active_tree_iter_state(gen)) {
       raise_tree_iter_deopt_blocked();
@@ -582,10 +1184,135 @@ PyObject* jitgen_throw(PyObject* obj, PyObject* const* args, Py_ssize_t nargs) {
     }
     return nullptr;
   }
+  // Stock _gen_throw links a delegator's frame only when the sub-iterator is
+  // an exact generator or coroutine; a JIT sub-iterator would be thrown into
+  // with its delegator missing from the frame chain (traceback and
+  // sys._getframe() would not show it).  Deopt the suspended yield-from
+  // chain first so the stock path sees exact types all the way down.
+  while (sub != nullptr && JitGen_CheckAny(sub)) {
+    PyObject* next = JitGen_yf(reinterpret_cast<PyGenObject*>(sub));
+    if (!deopt_jit_gen(sub)) {
+      Py_XDECREF(next);
+      break;
+    }
+    Py_DECREF(sub);
+    sub = next;
+  }
+  Py_XDECREF(sub);
   return gen_throw_meth(obj, args, nargs);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// close a JIT generator without deopting when GeneratorExit
+// could not run any code in its frame: the suspend point lies outside every
+// exception-table range (no try/with/finally around it), so the whole effect
+// of close() is releasing the live values and clearing the frame.  A
+// delegating generator first closes its sub-iterator, as gen_close does.
+// Returns 1 when closed, 0 when not eligible, -1 with an exception set.
+// Side-effect-free part of the fast close: true when close() could not run
+// any code in this generator's frame.
+bool jitgen_fast_close_eligible(JitGenObject* gen) {
+  PyObject* obj = reinterpret_cast<PyObject*>(gen);
+  if (g_jitgen_am_send_patched || !Py_IS_TYPE(obj, g_jitgen_type) ||
+      (gen->gi_frame_state != FRAME_SUSPENDED &&
+       gen->gi_frame_state != FRAME_CREATED)) {
+    return false;
+  }
+  GenDataFooter* footer = gen->genDataFooter();
+  const GenYieldPoint* yield_point = footer->yieldPoint;
+  return yield_point != nullptr && yield_point->handlerFree() &&
+      footer->tree_iter_state == nullptr;
+}
+
+int jitgen_try_fast_close(JitGenObject* gen) {
+  if (!jitgen_fast_close_eligible(gen)) {
+    return 0;
+  }
+  GenDataFooter* footer = gen->genDataFooter();
+  const GenYieldPoint* yield_point = footer->yieldPoint;
+  // Close the resume entry before anything that can run Python code: the
+  // sub-iterator's close() and the release of the live values can reach an
+  // object's __del__ that calls next() or close() on this very generator.
+  // From here on the generator reads as running, so a re-entry raises
+  // "generator already executing" exactly as the interpreter does while
+  // gen_close runs, and no direct path resumes it.
+  gen->gi_frame_state = FRAME_EXECUTING;
+  footer->direct_ok = 0;
+  footer->yieldPoint = nullptr;
+  int rc = 1;
+  if (yield_point->isYieldFrom()) {
+    PyObject* yf = yieldFromValue(footer, yield_point);
+    if (yf != nullptr) {
+      Py_INCREF(yf);
+      PyObject* res = nullptr;
+      static PyObject* close_str = PyUnicode_InternFromString("close");
+      if (JitGen_CheckAny(yf) || PyGen_CheckExact(yf) ||
+          PyCoro_CheckExact(yf)) {
+        res = PyObject_CallMethodNoArgs(yf, close_str);
+      } else {
+        PyObject* meth = nullptr;
+        if (_PyObject_LookupAttr(yf, close_str, &meth) < 0) {
+          PyErr_WriteUnraisable(yf);
+        }
+        if (meth != nullptr) {
+          res = PyObject_CallNoArgs(meth);
+          Py_DECREF(meth);
+        } else {
+          res = Py_NewRef(Py_None);
+        }
+      }
+      Py_DECREF(yf);
+      if (res == nullptr) {
+        // gen_close throws the sub-iterator's error into the frame.  The
+        // suspend point lies outside every handler, so it propagates out of
+        // the (now finished) generator: GeneratorExit counts as a completed
+        // close and a bare StopIteration becomes RuntimeError (PEP 479).
+        if (PyErr_ExceptionMatches(PyExc_GeneratorExit)) {
+          PyErr_Clear();
+        } else {
+          if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
+            _PyErr_FormatFromCause(
+                PyExc_RuntimeError, "generator raised StopIteration");
+          }
+          rc = -1;
+        }
+      } else {
+        Py_DECREF(res);
+      }
+    }
+  }
+  // Releasing the live values may run __del__ methods; keep the exception
+  // being returned (if any) out of their reach.
+  PyObject *exc_type, *exc_value, *exc_tb;
+  PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+  const DeoptMetadata& deopt_meta =
+      footer->code_rt->getDeoptMetadata(yield_point->deoptIdx());
+  releaseRefs(deopt_meta, footer);
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  frame->previous = nullptr;
+  gen->gi_frame_state = FRAME_CLEARED;
+  jitFrameClearExceptCode(frame);
+  _PyErr_ClearExcState(&gen->gi_exc_state);
+  deopt_jit_gen_object_only(gen);
+  clearGeneratorCompiledFunction(footer);
+  Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+  PyErr_Restore(exc_type, exc_value, exc_tb);
+  return rc;
+}
+#endif
+
 PyObject* jitgen_close(PyObject* obj, PyObject*) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (JitGen_CheckAny(obj)) {
+    int fast = jitgen_try_fast_close(reinterpret_cast<JitGenObject*>(obj));
+    if (fast > 0) {
+      Py_RETURN_NONE;
+    }
+    if (fast < 0) {
+      return nullptr;
+    }
+  }
+#endif
   // Always deopt as closing either raises an exception in the generator which
   // would cause a deopt anyway or if the generator is already done then deopt
   // is cheap and won't rexecute in the interpreter.
@@ -650,6 +1377,25 @@ void jitgen_finalize(PyObject* obj) {
     return;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (JitGen_CheckAny(obj)) {
+    // Like _PyGen_Finalize: a finalizer runs while the caller may have an
+    // exception in flight (a container being released after a failed
+    // subscript), and closing a sub-iterator runs Python code.
+    PyObject *exc_type, *exc_value, *exc_tb;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    int fast = jitgen_try_fast_close(reinterpret_cast<JitGenObject*>(obj));
+    if (fast < 0) {
+      // The sub-iterator's close raised; the generator is finished all the
+      // same, so report it here as gen_close's caller would.
+      PyErr_WriteUnraisable(obj);
+    }
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+    if (fast != 0) {
+      return;
+    }
+  }
+#endif
   // Slow-path: generator is still running, so we deopt and defer to runtime
   // logic for raising errors/warnings and possibly closing the generator (which
   // would require a deopt anyway).
@@ -959,7 +1705,27 @@ static PyAsyncMethods jitcoro_as_async = {
 
 } // namespace
 
+PySendResult
+jitgenSendDirect(PyObject* gen, PyObject* arg, PyObject** presult) {
+  JitGenObject* jit_gen = reinterpret_cast<JitGenObject*>(gen);
+#if PY_VERSION_HEX < 0x030C0000
+  int8_t state = jit_gen->gi_frame_state;
+  if (state == FRAME_SUSPENDED ||
+      (state == FRAME_CREATED && (arg == nullptr || Py_IsNone(arg)))) {
+    return jitgen_resume_fast(
+        jit_gen,
+        arg,
+        presult,
+        _PyThreadState_GET(),
+        Py_IS_TYPE(gen, g_jitgen_type));
+  }
+#endif
+  return jitgen_am_send_impl(jit_gen, gen, arg, presult, _PyThreadState_GET());
+}
+
 void patchJitGenAmSendForDeopt() {
+  g_jitgen_am_send_patched = true;
+  updateGenDirectGate();
   BorrowedRef<PyTypeObject> gen_type = cinderx::getModuleState()->gen_type;
   BorrowedRef<PyTypeObject> coro_type = cinderx::getModuleState()->coro_type;
   gen_type->tp_as_async->am_send =
@@ -969,6 +1735,8 @@ void patchJitGenAmSendForDeopt() {
 }
 
 void unpatchJitGenAmSendForDeopt() {
+  g_jitgen_am_send_patched = false;
+  updateGenDirectGate();
   BorrowedRef<PyTypeObject> gen_type = cinderx::getModuleState()->gen_type;
   BorrowedRef<PyTypeObject> coro_type = cinderx::getModuleState()->coro_type;
   gen_type->tp_as_async->am_send = reinterpret_cast<sendfunc>(jitgen_am_send);
@@ -992,15 +1760,8 @@ PyType_Slot gen_slots[] = {
     {0, nullptr},
 };
 
-constexpr size_t kGenObjectSize =
-#if PY_VERSION_HEX >= 0x030E0000
-    sizeof(PyGenObject)
-#else
-    // For 3.12 and 3.13 generator objects are variable-sized, so we use
-    // offsetof(). This is inherited from genobject.c.
-    offsetof(PyGenObject, gi_iframe) + offsetof(_PyInterpreterFrame, localsplus)
-#endif
-    ;
+// kGenObjectSize lives in gen_data_footer.h so the footer address can be
+// computed without consulting the type object.
 
 PyType_Spec JitGen_Spec = {
     .name = "builtins.generator",
@@ -1050,11 +1811,17 @@ PyType_Spec JitCoro_Spec = {
 void deopt_jit_gen_object_only(JitGenObject* gen) {
   PyTypeObject* old_type = Py_TYPE(gen);
 
-  PyTypeObject* type = Py_TYPE(gen) == cinderx::getModuleState()->gen_type
-      ? &PyGen_Type
-      : &PyCoro_Type;
+  PyTypeObject* type =
+      Py_TYPE(gen) == g_jitgen_type ? &PyGen_Type : &PyCoro_Type;
   Py_DECREF(old_type);
   Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), type);
+#if PY_VERSION_HEX < 0x030C0000
+  if (type == &PyGen_Type) {
+    // the footer pointer parked in gi_origin_or_finalizer
+    // belongs to the JIT type only.
+    gen->gi_origin_or_finalizer = nullptr;
+  }
+#endif
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   if (getConfig().frame_mode == FrameMode::kLightweight) {
     auto frame = generatorFrame(gen);
@@ -1146,6 +1913,9 @@ void init_jit_genobject_type() {
   // Copy base type functions
   BorrowedRef<PyTypeObject> gen_type = cinderx::getModuleState()->gen_type;
   BorrowedRef<PyTypeObject> coro_type = cinderx::getModuleState()->coro_type;
+  g_jitgen_type = gen_type;
+  g_jitcoro_type = coro_type;
+  updateGenDirectGate();
 
   gen_type->tp_repr = PyGen_Type.tp_repr;
 
@@ -1252,6 +2022,15 @@ void init_jit_genobject_type() {
       "PyGen/Coro_Type already overridden");
   PyGen_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
   PyCoro_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
+#else
+  // the same override on 3.11 lets deopted generators die
+  // through the arena-aware path, which in turn allows the free list.
+  JIT_CHECK(
+      PyGen_Type.tp_dealloc == original_gen_dealloc &&
+          PyCoro_Type.tp_dealloc == original_coro_dealloc,
+      "PyGen/Coro_Type already overridden");
+  PyGen_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
+  PyCoro_Type.tp_dealloc = reinterpret_cast<destructor>(jitgen_dealloc);
 #endif
 
 #ifdef ENABLE_GENERATOR_AWAITER
@@ -1265,6 +2044,9 @@ void init_jit_genobject_type() {
 }
 
 void shutdown_jit_genobject_type() {
+  g_jitgen_type = nullptr;
+  g_jitcoro_type = nullptr;
+  g_gen_direct_gate = 0;
   PyGen_Type.tp_dealloc = original_gen_dealloc;
   PyCoro_Type.tp_dealloc = original_coro_dealloc;
 }
@@ -1275,3 +2057,29 @@ PyObject* JitGen_yf(PyGenObject* gen) {
   jit::JitGenObject* jit_gen = jit::JitGenObject::cast(gen);
   return jit_gen == nullptr ? _PyGen_yf(gen) : jit_gen->yieldFrom();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* JITRT_GenNextFinish311(PyObject* gen, PyObject* value) {
+  return jit::genNextFinish311(gen, value);
+}
+
+PyObject* JITRT_GenDelegateNext311(PyObject* gen, PyThreadState* tstate) {
+  return jit::genDelegateNext311(gen, tstate);
+}
+
+PyObject* JITRT_GenDelegateFinish311(
+    PyObject* innermost,
+    PyObject* value,
+    PyThreadState* tstate) {
+  return jit::delegateFinish(
+      reinterpret_cast<jit::JitGenObject*>(innermost), value, tstate);
+}
+
+void JITRT_GenUnwindDelegators311(PyObject* from, PyThreadState* tstate) {
+  jit::unwindDelegators(reinterpret_cast<jit::JitGenObject*>(from), tstate);
+}
+
+PyObject* JITRT_GenIterNext311(PyObject* gen) {
+  return jit::jitgen_iternext(gen);
+}
+#endif

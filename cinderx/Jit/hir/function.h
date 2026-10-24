@@ -12,6 +12,13 @@
 
 namespace jit::hir {
 
+// True when the bytecode offset lies inside a range covered by the code
+// object's exception table (a handler or cleanup would run for an exception
+// raised there).
+bool isInExceptionProtectedRange(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset target_offset);
+
 class Function {
  public:
   using InlineFailureStats =

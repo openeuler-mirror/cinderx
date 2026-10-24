@@ -68,7 +68,10 @@ Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
   // The counting modes' whole disabled-path budget is this predictable flag
   // test; counting, discard-only compilation and execute-mode scheduling
   // never change frame results.
-  if (Ci_Observe311_Enabled) {
+  // Coroutine and asynchronous-generator frames are refused by shape and
+  // skip the hook here, without the call.
+  if (Ci_Observe311_Enabled &&
+      !(frame->f_code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR))) {
     Ci_Observe311_OnFrame(frame->f_func, frame->f_code, frame);
   }
   return Ci_EvalFrameDefault_311(tstate, frame, throwflag);

@@ -694,6 +694,13 @@ void Ci_Observe311_OnFrame(
       ci_observe_compiling) {
     return;
   }
+  // Coroutines and asynchronous generators are refused by the execute gate
+  // by shape, so the observer has nothing to decide for them, yet every
+  // resume re-enters this hook at full price (a nested yield-from chain once
+  // per level per item).  Synchronous generators are admitted and observed.
+  if (code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) {
+    return;
+  }
   // Observation stops where normal execution stops: nothing is counted
   // while the interpreter finalizes, and a frame entered with an exception
   // in flight (generator throw) is skipped so the C-API calls below never

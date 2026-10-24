@@ -135,15 +135,33 @@ class Execute311Test(unittest.TestCase):
         self.assertTrue(payload["forced"])
         self.assertEqual(payload["forced_entered"], 1)
 
-    def test_generator_auto_default_is_off_but_explicit_compile_works(self):
-        payload = self.run_ok("generator_auto_off")
-        self.assertEqual(len(payload["events"]), 1)
-        self.assertEqual(
-            payload["events"][0]["result"], "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED"
-        )
-        self.assertEqual(payload["disabled"], 1)
-        self.assertTrue(payload["forced"])
+    def test_generator_auto_default_is_on(self):
+        # Synchronous generators are scheduled like any other function: the
+        # body crosses the threshold, compiles, and every later resume enters
+        # machine code.
+        payload = self.run_ok("generator_auto_on")
+        self.assertEqual(payload["disabled"], 0)
+        self.assertTrue(payload["compiled"])
         self.assertGreater(payload["entered"], 0)
+        self.assertIn("installed", [e["result"] for e in payload["events"]])
+
+    def test_generator_yield_from_inside_with_block(self):
+        # 3.11's SEND replaces the sub-iterator with its result when the
+        # delegation finishes; the compiled generator must model that so the
+        # `with` block's exit is invoked on the context manager.
+        payload = self.run_ok("generator_yield_from_with")
+        self.assertIsNone(payload["error"])
+        self.assertTrue(payload["compiled"])
+        self.assertEqual(payload["first"], [1, 2, 3, 3])
+        self.assertEqual(payload["second"], [4, 5, 2, 20])
+        self.assertEqual(payload["last"], [4, 5, 2, 20])
+        self.assertEqual(payload["chained"], [1, 2, 3, 4, 5])
+        # One iteration: the plain delegation, then the nested one.
+        self.assertEqual(
+            payload["log"],
+            ["enter", "exit", "after"]
+            + ["enter", "enter", "enter", "exit", "after", "exit", "exit"],
+        )
 
     # -- fresh function objects ----------------------------------------------
 

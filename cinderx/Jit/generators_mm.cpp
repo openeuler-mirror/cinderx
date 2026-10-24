@@ -8,6 +8,7 @@
 
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_state.h"
 #if PY_VERSION_HEX >= 0x030E0000
 #include "internal/pycore_interpframe.h"
@@ -108,14 +109,17 @@ std::pair<JitGenObject*, size_t> JitGenFreeList::allocate(
   bool is_coro = !!(code->co_flags & CO_COROUTINE);
 
 #if PY_VERSION_HEX < 0x030C0000
-  // 3.11 deopt restores PyGen_Type, which still has CPython's dealloc.
-  // Free-list entries are not malloc chunks; handing them to that
-  // destructor aborts with free(): invalid pointer.
-  return allocateNonFreeList(slots, is_coro);
+  // 3.11 deopt restores PyGen_Type, whose dealloc is patched to the
+  // arena-aware path at type initialisation; a free-list entry must never be
+  // handed to CPython's own destructor.
+  if (!head_ || total_size > kGenFreeListEntrySize) {
+    return allocateNonFreeList(slots, is_coro);
+  }
 #else
   if (!head_ || total_size > kGenFreeListEntrySize) {
     return allocateNonFreeList(slots, is_coro);
   }
+#endif
 
   void* raw = rawAllocate();
   // Zero the pre-header, which in this case is the GC header. The
@@ -135,7 +139,6 @@ std::pair<JitGenObject*, size_t> JitGenFreeList::allocate(
   _PyObject_InitVar(op, tp, slots);
 
   return {reinterpret_cast<JitGenObject*>(op), size};
-#endif
 }
 
 std::pair<JitGenObject*, size_t> JITGenFreeThreadedFreeList::allocate(
