@@ -4116,6 +4116,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kGuard:
       case Opcode::kGuardIs: {
         const auto& instr = static_cast<const DeoptBase&>(i);
+#if PY_VERSION_HEX < 0x030C0000
+        // A CheckExc on an exception edge is a plain pass-through; the
+        // following CondBranch is the test.
+        if (instr.IsCheckExc() && instr.excEdge()) {
+          break;
+        }
+#endif
         auto kind = InstrGuardKind::kNotZero;
         if (instr.IsCheckNeg()) {
           kind = InstrGuardKind::kNotNegative;
@@ -6309,6 +6316,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
 #endif
         default: {
+#if PY_VERSION_HEX < 0x030C0000
+          // An instruction on an exception edge: the exit is the CondBranch
+          // that follows (it tests the NULL output), so no guard.  Only this
+          // generic lowering and CheckExc honour the mark; a self-guarding
+          // lowering (the cases above) keeps its guard, and the edge is then
+          // simply never taken.
+          if (db->excEdge()) {
+            break;
+          }
+#endif
           emitExceptionCheck(*db, bbb);
           break;
         }

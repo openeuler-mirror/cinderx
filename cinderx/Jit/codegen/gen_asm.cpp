@@ -458,6 +458,30 @@ DeoptResult prepareForDeopt(
   if (!is_forced_deopt) {
     jit::recordDeoptForRoiBackoff(
         code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+#if PY_VERSION_HEX < 0x030C0000
+    // An eligible site's exception exits are counted; at the grant the code
+    // recompiles with the exit as a CFG edge (see Ci_ExcEdgeDeopt311).
+    if ((deopt_meta.reason == DeoptReason::kUnhandledException ||
+         deopt_meta.reason == DeoptReason::kGuardFailure) &&
+        !is_instrumentation_deopt && deopt_meta.inline_depth() == 0) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        // The deopting activation's function object: a by-code artifact
+        // (fresh function objects dispatched by code) has no registered
+        // member to recompile through, but this one is live on the stack.
+        PyObject* func = frame->f_func != nullptr &&
+                reinterpret_cast<PyCodeObject*>(frame->f_func->func_code) ==
+                    fm.code
+            ? reinterpret_cast<PyObject*>(frame->f_func)
+            : nullptr;
+        Ci_ExcEdgeDeopt311(
+            fm.code,
+            BCOffset(fm.cause_instr_idx).value(),
+            deopt_meta.reason == DeoptReason::kGuardFailure,
+            func);
+      }
+    }
+#endif
   }
   return {frame, is_instrumentation_deopt};
 }

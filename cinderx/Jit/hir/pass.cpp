@@ -121,7 +121,8 @@ RegUses collectDirectRegUses(Function& func) {
   return uses;
 }
 
-Type outputType(
+namespace {
+Type outputTypeImpl(
     const Instr& instr,
     const std::function<Type(std::size_t)>& get_op_type) {
   switch (instr.opcode()) {
@@ -260,7 +261,17 @@ Type outputType(
     // Many opcodes just return a possibly-null PyObject*. Some of these will
     // be further specialized based on the input types in the hopefully near
     // future.
-    case Opcode::kCallCFunc:
+    case Opcode::kCallCFunc: {
+      // The compiled-handler helpers with integer results.
+      switch (static_cast<const CallCFunc&>(instr).func()) {
+        case CallCFunc::Func::kJITRT_PopExcInfo311:
+          return TCUInt64;
+        case CallCFunc::Func::kJITRT_ExcMatch311:
+          return TCInt64;
+        default:
+          return TOptObject;
+      }
+    }
     case Opcode::kLoadCellItem:
     case Opcode::kLoadGlobalCached:
     case Opcode::kMatchClass:
@@ -592,9 +603,30 @@ Type outputType(
   JIT_ABORT("Bad opcode {}", static_cast<int>(instr.opcode()));
 }
 
+} // namespace
+
+// A raising instruction whose exception exit is a CFG edge leaves NULL in
+// its output on that edge; the CondBranch after it is the null test, and
+// the fall-through refines the type back to non-null.
+Type excEdgeOutputType(const Instr& instr, Type type) {
+  const DeoptBase* db = instr.asDeoptBase();
+  if (db != nullptr && db->excEdge() && instr.output() != nullptr &&
+      type <= TObject) {
+    return type | TNullptr;
+  }
+  return type;
+}
+
+Type outputType(
+    const Instr& instr,
+    const std::function<Type(std::size_t)>& get_op_type) {
+  return excEdgeOutputType(instr, outputTypeImpl(instr, get_op_type));
+}
+
 Type outputType(const Instr& instr) {
-  return outputType(
+  Type type = outputTypeImpl(
       instr, [&](std::size_t ind) { return instr.GetOperand(ind)->type(); });
+  return excEdgeOutputType(instr, type);
 }
 
 void reflowTypes(Function& func) {

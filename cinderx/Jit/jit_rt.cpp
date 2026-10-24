@@ -625,10 +625,8 @@ void JITRT_TransferRecursionToInterpreter311() {
 // is static there).  Ownership follows stock: the looked-up attribute or
 // sys.modules entry is returned as a new reference; every failure path
 // leaves an ImportError set and returns NULL.
-PyObject* JITRT_ImportFrom311(
-    PyThreadState* tstate,
-    PyObject* v,
-    PyObject* name) {
+PyObject*
+JITRT_ImportFrom311(PyThreadState* tstate, PyObject* v, PyObject* name) {
   DEFINE_STATIC_STRING(__name__);
   DEFINE_STATIC_STRING(__spec__);
   PyObject* x = nullptr;
@@ -697,6 +695,80 @@ error:
   return nullptr;
 }
 
+// See jit_rt.h.
+PyObject* JITRT_EnterExceptHandler311(uint64_t published_idx) {
+  PyThreadState* tstate = _PyThreadState_GET();
+  if (tstate->c_tracefunc != nullptr) {
+    // Tracing: the evaluator owns the 'exception' event; the caller deopts
+    // with the exception untouched.
+    return nullptr;
+  }
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  // The evaluator's error path publishes the faulting position before the
+  // traceback entry; the compiled code's own cursor stores may lag it.
+  frame->prev_instr = _PyCode_CODE(frame->f_code) + published_idx;
+  if (!_PyErr_Occurred(tstate)) {
+    _PyErr_SetString(
+        tstate, PyExc_SystemError, "error return without exception set");
+  }
+  if (!_PyFrame_IsIncomplete(frame)) {
+    PyFrameObject* f = _PyFrame_GetFrameObject(frame);
+    if (f != nullptr) {
+      PyTraceBack_Here(f);
+    }
+  }
+  PyObject* exc;
+  PyObject* val;
+  PyObject* tb;
+  _PyErr_Fetch(tstate, &exc, &val, &tb);
+  _PyErr_NormalizeException(tstate, &exc, &val, &tb);
+  if (tb != nullptr) {
+    PyException_SetTraceback(val, tb);
+  } else {
+    PyException_SetTraceback(val, Py_None);
+  }
+  Py_XDECREF(tb);
+  Py_XDECREF(exc);
+  return val;
+}
+
+PyObject* JITRT_PushExcInfo311(PyObject* exc) {
+  _PyErr_StackItem* exc_info = _PyThreadState_GET()->exc_info;
+  PyObject* prev = exc_info->exc_value;
+  if (prev == nullptr) {
+    prev = Py_NewRef(Py_None);
+  }
+  exc_info->exc_value = Py_NewRef(exc);
+  return prev;
+}
+
+uint64_t JITRT_PopExcInfo311(PyObject* prev) {
+  _PyErr_StackItem* exc_info = _PyThreadState_GET()->exc_info;
+  PyObject* old = exc_info->exc_value;
+  exc_info->exc_value = Py_NewRef(prev);
+  Py_XDECREF(old);
+  return 0;
+}
+
+int64_t JITRT_ExcMatch311(PyObject* exc, PyObject* type) {
+  static const char* kCannotCatchMsg =
+      "catching classes that do not inherit from BaseException is not allowed";
+  PyThreadState* tstate = _PyThreadState_GET();
+  if (PyTuple_Check(type)) {
+    Py_ssize_t length = PyTuple_GET_SIZE(type);
+    for (Py_ssize_t i = 0; i < length; i++) {
+      if (!PyExceptionClass_Check(PyTuple_GET_ITEM(type, i))) {
+        _PyErr_SetString(tstate, PyExc_TypeError, kCannotCatchMsg);
+        return -1;
+      }
+    }
+  } else if (!PyExceptionClass_Check(type)) {
+    _PyErr_SetString(tstate, PyExc_TypeError, kCannotCatchMsg);
+    return -1;
+  }
+  return PyErr_GivenExceptionMatches(exc, type) ? 1 : 0;
+}
+
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,
@@ -741,6 +813,21 @@ PyObject* JITRT_ReenterAfterBind(
 
 #else
 #define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
+
+// The compiled-handler helpers are CPython 3.11 only; the CallCFunc table
+// references them on every version.
+PyObject* JITRT_EnterExceptHandler311(uint64_t) {
+  JIT_ABORT("JITRT_EnterExceptHandler311 is CPython 3.11 only");
+}
+PyObject* JITRT_PushExcInfo311(PyObject*) {
+  JIT_ABORT("JITRT_PushExcInfo311 is CPython 3.11 only");
+}
+uint64_t JITRT_PopExcInfo311(PyObject*) {
+  JIT_ABORT("JITRT_PopExcInfo311 is CPython 3.11 only");
+}
+int64_t JITRT_ExcMatch311(PyObject*, PyObject*) {
+  JIT_ABORT("JITRT_ExcMatch311 is CPython 3.11 only");
+}
 #endif
 
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword

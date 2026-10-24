@@ -20,7 +20,8 @@ DeoptBase::DeoptBase(const DeoptBase& other)
       live_regs_{other.live_regs()},
       guilty_reg_{other.guiltyReg()},
       nonce_{other.nonce()},
-      descr_{other.descr()} {
+      descr_{other.descr()},
+      exc_edge_{other.excEdge()} {
   if (FrameState* copy_fs = other.frameState()) {
     setFrameState(std::make_unique<FrameState>(*copy_fs));
   }

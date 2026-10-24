@@ -320,6 +320,18 @@ class DeoptBase : public Instr {
   // Get or set the human-readable description of why this instruction might
   // deopt.
   const std::string& descr() const;
+
+  // When set, the exception exit of this instruction is a CFG edge -- the
+  // CondBranch that follows tests its NULL output and branches to the
+  // compiled handler's entry stub -- and the LIR lowering omits the
+  // exception guard.  The deopt metadata stays for the other exits (a nested
+  // guard, the forced-deopt poll).
+  bool excEdge() const {
+    return exc_edge_;
+  }
+  void setExcEdge(bool exc_edge) {
+    exc_edge_ = exc_edge;
+  }
   void setDescr(std::string r);
 
   // Get or set the optional value that is responsible for this deopt
@@ -336,6 +348,7 @@ class DeoptBase : public Instr {
   int nonce_{-1};
   // A human-readable description of why this instruction might deopt.
   std::string descr_;
+  bool exc_edge_{false};
 };
 
 // This pile of template metaprogramming provides a convenient way to define
@@ -942,7 +955,11 @@ class INSTR_CLASS(CallCFunc, (TOptObject | TCUInt64), HasOutput, Operands<>) {
 #define CallCFunc_FUNCS(X)         \
   X(Cix_PyAsyncGenValueWrapperNew) \
   X(JitCoro_GetAwaitableIter)      \
-  X(JitGen_yf)
+  X(JitGen_yf)                     \
+  X(JITRT_EnterExceptHandler311)   \
+  X(JITRT_PushExcInfo311)          \
+  X(JITRT_PopExcInfo311)           \
+  X(JITRT_ExcMatch311)
 
   enum class Func {
 #define ENUM_FUNC(name, ...) k##name,

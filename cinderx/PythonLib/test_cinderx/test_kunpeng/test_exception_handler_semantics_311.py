@@ -1,0 +1,595 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""Semantics of compiled `except` handlers on CPython 3.11: a raising call,
+binary operation, subscript or store inside a try block takes a CFG edge
+into the compiled handler once its site is granted (after eight exception
+deopts), and the function stays compiled across the grant.  Every probe
+prints a transcript that is compared between the JIT and the interpreter:
+handler entry, sys.exc_info() inside and after the handler, __context__
+chaining, bare re-raise, handler-side return/continue/break, nested try,
+finally, traceback line numbers through a handler-free frame, and the
+settrace fallback.  The last transcript entry is the compiled state: a
+function whose every raise sits at an edge-capable site must stay compiled
+past the deopt budget (the edge is taken, nothing deopts), and one that
+re-raises or raises inside its handler must be withdrawn by that budget (the
+raise statement and the handler body keep the deopt exit)."""
+
+import os
+import subprocess
+import sys
+import textwrap
+import unittest
+
+
+PREAMBLE = """
+import json
+import sys
+import traceback
+
+try:
+    import _cinderx
+    import cinderx
+    cinderx.init()
+    _cinderx.install_frame_evaluator()
+    import cinderjit
+    JIT = cinderjit.is_enabled()
+except Exception:  # noqa: BLE001  (the interpreter oracle run)
+    cinderjit = None
+    JIT = False
+
+LOG = []
+
+
+def compiled(fn):
+    if JIT:
+        assert cinderjit.force_compile(fn) is True, fn
+        assert cinderjit.is_jit_compiled(fn), fn
+    return fn
+
+
+def still_compiled(fn):
+    return cinderjit.is_jit_compiled(fn) if JIT else True
+
+
+def compiled_state(edge_functions, deopt_functions=()):
+    # Edge-capable functions stay compiled past the budget; functions that
+    # deopt on every round (re-raise, raise inside a handler) are withdrawn
+    # by it.  Both groups are asserted so the transcript cannot pass with
+    # the edges never taken.
+    if not JIT:
+        return True
+    return all(still_compiled(f) for f in edge_functions) and not any(
+        still_compiled(f) for f in deopt_functions
+    )
+
+
+def exc_summary(exc):
+    return [type(exc).__name__, str(exc)]
+
+
+def tb_lines(exc):
+    return [(f.name, f.lineno - BASE) for f in traceback.extract_tb(exc.__traceback__)]
+
+
+def exc_type():
+    # Read from a helper: a subscript outside a handler would keep the
+    # probe function off the execute surface (subscripts are admitted in
+    # numeric kernels only), while one inside a handler is translated.
+    return sys.exc_info()[0]
+
+
+# The execute surface admits BINARY_SUBSCR/STORE_SUBSCR in numeric kernels
+# only (a loop or a store plus float arithmetic); the subscript probes carry
+# a one-iteration float loop so their subscripts are compiled.
+
+
+# Every probe repeats its scenario past the eighth raise, so the sites are
+# granted and the function recompiled with the edge while it runs.  The
+# count also exceeds the deopt budget (32 per code object): a site whose
+# exit kept deopting after its grant would have the machine code withdrawn,
+# and the compiled-state line at the end of each transcript would say so.
+ROUNDS = 64
+"""
+
+
+HANDLER_SHAPES_PROBE = PREAMBLE + """
+BASE = 0
+
+
+def boom(x):
+    raise ValueError("boom %r" % (x,))
+
+
+@compiled
+def call_site(x):
+    try:
+        return boom(x)
+    except ValueError as exc:
+        return ("caught", exc_summary(exc), sys.exc_info()[0] is ValueError)
+
+
+@compiled
+def binop_site(a, b):
+    try:
+        return a + b
+    except TypeError as exc:
+        # No slicing in a handler: BUILD_SLICE is outside the execute
+        # whitelist and would keep the handler interpreted.
+        return ("type", str(exc))
+
+
+@compiled
+def subscr_sites(d, lst, s, key):
+    out = []
+    acc = 0.5
+    for _ in range(1):
+        acc = acc * 1.5
+    try:
+        out.append(d[key])
+    except KeyError as exc:
+        out.append(("KeyError", exc.args))
+    try:
+        out.append(lst[key])
+    except (IndexError, TypeError) as exc:
+        out.append(exc_summary(exc))
+    try:
+        out.append(s[key])
+    except (IndexError, TypeError) as exc:
+        out.append(exc_summary(exc))
+    return out
+
+
+@compiled
+def store_site(buf, i, v):
+    acc = 0.5
+    for _ in range(1):
+        acc = acc * 1.5
+    try:
+        buf[i] = v
+        return "stored"
+    except IndexError as exc:
+        return exc_summary(exc)
+    except ValueError as exc:
+        return exc_summary(exc)
+
+
+@compiled
+def after_handler(x):
+    try:
+        boom(x)
+    except ValueError:
+        inner = sys.exc_info()[0]
+    return (inner is ValueError, exc_type())
+
+
+d = {"k": 1}
+lst = [10, 20]
+s = "ab"
+buf = bytearray(2)
+for i in range(ROUNDS):
+    LOG.append(call_site(i))
+    LOG.append(binop_site(1, None))
+    LOG.append(binop_site(1, 2))
+    LOG.append(subscr_sites(d, lst, s, "k"))
+    LOG.append(subscr_sites(d, lst, s, 5))
+    LOG.append(subscr_sites(d, lst, s, -1))
+    LOG.append(store_site(buf, 5, 1))
+    LOG.append(store_site(buf, 0, 300))
+    LOG.append(store_site(buf, 1, 7))
+    LOG.append(after_handler(i))
+LOG.append(compiled_state((call_site, binop_site, subscr_sites, store_site, after_handler)))
+print(json.dumps(LOG, default=str))
+print("handler shapes ok")
+"""
+
+
+CONTROL_FLOW_PROBE = PREAMBLE + """
+BASE = 0
+
+
+def boom(tag):
+    raise KeyError(tag)
+
+
+@compiled
+def chaining(tag):
+    try:
+        try:
+            boom(tag)
+        except KeyError as inner:
+            raise ValueError("outer") from None
+    except ValueError as exc:
+        return (
+            exc_summary(exc),
+            exc_summary(exc.__context__) if exc.__context__ else None,
+            exc.__suppress_context__,
+        )
+
+
+@compiled
+def implicit_chain(tag):
+    try:
+        try:
+            boom(tag)
+        except KeyError:
+            1 / 0
+    except ZeroDivisionError as exc:
+        return (exc_summary(exc), exc_summary(exc.__context__))
+
+
+@compiled
+def reraise(tag):
+    try:
+        boom(tag)
+    except KeyError:
+        raise
+
+
+@compiled
+def not_matching(tag):
+    try:
+        boom(tag)
+    except ValueError:
+        return "wrong handler"
+
+
+@compiled
+def loop_control(n):
+    out = []
+    for i in range(n):
+        try:
+            if i % 3 == 0:
+                boom(i)
+            out.append(i)
+        except KeyError:
+            if i == 3:
+                continue
+            if i == 6:
+                break
+            out.append(("caught", i))
+    return out
+
+
+@compiled
+def handler_return(tag):
+    try:
+        boom(tag)
+    except KeyError as exc:
+        return ("returned", exc.args)
+    return "fell through"
+
+
+@compiled
+def with_finally(tag, log):
+    try:
+        boom(tag)
+    except KeyError:
+        log.append("except")
+    finally:
+        log.append("finally")
+    return list(log)
+
+
+@compiled
+def nested_exc_info(tag):
+    try:
+        boom(tag)
+    except KeyError:
+        a = sys.exc_info()[0].__name__
+        try:
+            1 / 0
+        except ZeroDivisionError:
+            b = sys.exc_info()[0].__name__
+        c = sys.exc_info()[0].__name__
+    return (a, b, c, exc_type())
+
+
+for i in range(ROUNDS):
+    LOG.append(chaining(i))
+    LOG.append(implicit_chain(i))
+    try:
+        reraise(i)
+    except KeyError as exc:
+        LOG.append(("reraised", exc.args))
+    try:
+        not_matching(i)
+    except KeyError as exc:
+        LOG.append(("propagated", exc.args))
+    LOG.append(loop_control(8))
+    LOG.append(handler_return(i))
+    LOG.append(with_finally(i, []))
+    LOG.append(nested_exc_info(i))
+# nested_exc_info raises inside its handler too, but into a nested try whose
+# handler is compiled: that site takes an edge and the function stays.
+LOG.append(compiled_state(
+    (loop_control, handler_return, with_finally, nested_exc_info),
+    (chaining, implicit_chain, reraise, not_matching),
+))
+print(json.dumps(LOG, default=str))
+print("control flow ok")
+"""
+
+
+TRACEBACK_PROBE = PREAMBLE + """
+BASE = sys._getframe().f_lineno
+
+
+def boom():
+    raise RuntimeError("deep")
+
+
+@compiled
+def no_handler_call(x):
+    y = x + 1
+    return boom()
+
+
+@compiled
+def no_handler_binop(a, b):
+    return a + b
+
+
+@compiled
+def no_handler_subscr(d, k):
+    acc = 0.5
+    for _ in range(1):
+        acc = acc * 1.5
+    return d[k]
+
+
+@compiled
+def no_handler_store(buf, i):
+    acc = 0.5
+    for _ in range(1):
+        acc = acc * 1.5
+    buf[i] = 1
+    return buf
+
+
+@compiled
+def middle(x):
+    return no_handler_call(x)
+
+
+for i in range(ROUNDS):
+    for fn, args in (
+        (middle, (i,)),
+        (no_handler_binop, (1, None)),
+        (no_handler_subscr, ({}, "k")),
+        (no_handler_store, (bytearray(1), 5)),
+    ):
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            LOG.append((fn.__name__, exc_summary(exc), tb_lines(exc)))
+# No handler in these frames: the raise keeps the deopt exit (the evaluator
+# materializes the frame's locals before the traceback captures it), so the
+# budget withdraws them all.
+LOG.append(compiled_state((), (no_handler_call, no_handler_binop, no_handler_subscr, no_handler_store, middle)))
+print(json.dumps(LOG, default=str))
+print("traceback ok")
+"""
+
+
+CALL_VARIANTS_PROBE = PREAMBLE + """
+BASE = 0
+
+
+class Widget:
+    def __init__(self, tag):
+        raise KeyError(tag)
+
+    def method(self, tag):
+        raise ValueError(tag)
+
+
+def kw_target(*, tag):
+    raise TypeError(tag)
+
+
+widget = Widget.__new__(Widget)
+
+
+@compiled
+def method_site(tag):
+    try:
+        return widget.method(tag)
+    except ValueError as exc:
+        return ("method", exc.args)
+
+
+@compiled
+def kwargs_site(tag):
+    try:
+        return kw_target(tag=tag)
+    except TypeError as exc:
+        return ("kw", exc.args)
+
+
+@compiled
+def ctor_site(tag):
+    try:
+        return Widget(tag)
+    except KeyError as exc:
+        return ("ctor", exc.args)
+
+
+@compiled
+def builtin_site(tag):
+    try:
+        return int(tag)
+    except ValueError as exc:
+        return ("builtin", str(exc))
+
+
+@compiled
+def propagating_site(tag):
+    # The callee raises and this frame has no handler: the deopt exit stays.
+    return widget.method(tag)
+
+
+for i in range(ROUNDS):
+    LOG.append(method_site(i))
+    LOG.append(kwargs_site(i))
+    LOG.append(ctor_site(i))
+    LOG.append(builtin_site("x%d" % i))
+    try:
+        propagating_site(i)
+    except ValueError as exc:
+        LOG.append(("propagated", exc.args, tb_lines(exc)))
+LOG.append(compiled_state((method_site, kwargs_site, ctor_site, builtin_site), (propagating_site,)))
+print(json.dumps(LOG, default=str))
+print("call variants ok")
+"""
+
+
+FRESH_FUNCTIONS_PROBE = PREAMBLE + """
+BASE = 0
+
+
+def outer(tag):
+    # A fresh function object per outer call, attached to the code's artifact
+    # by the observer on its first frame and run there for the rest of the
+    # loop.  The raise is the operation's own (a raise statement in a callee
+    # would be a function withdrawn by the budget).
+    def inner(t):
+        try:
+            return t + None
+        except TypeError as exc:
+            return ("inner", str(exc))
+    out = []
+    for i in range(16):
+        out.append(inner(tag + i))
+    return inner, out
+
+
+# The threshold compiles both; the eighth raise grants the edge and
+# recompiles through the deopting activation's function object (the current
+# inner), and the fresh function objects that follow attach to the new
+# artifact.  24 x 16 raises pass the deopt budget many times over: without
+# the edge the code would be withdrawn and the last inner not compiled.
+for r in range(24):
+    inner, out = outer(r)
+    LOG.append(out)
+LOG.append(compiled_state((outer, inner)))
+print(json.dumps(LOG, default=str))
+print("fresh functions ok")
+"""
+
+
+SETTRACE_PROBE = PREAMBLE + """
+BASE = 0
+
+
+def boom(x):
+    raise ValueError(x)
+
+
+@compiled
+def guarded(x):
+    try:
+        return boom(x)
+    except ValueError as exc:
+        return ("caught", exc.args)
+
+
+for i in range(ROUNDS):
+    LOG.append(guarded(i))
+
+events = []
+
+
+def tracer(frame, event, arg):
+    if event == "exception" and frame.f_code.co_name in ("guarded", "boom"):
+        events.append((frame.f_code.co_name, arg[0].__name__))
+    return tracer
+
+
+sys.settrace(tracer)
+try:
+    for i in range(3):
+        LOG.append(guarded(i))
+finally:
+    sys.settrace(None)
+LOG.append(sorted(set(events)))
+for i in range(3):
+    LOG.append(guarded(i))
+LOG.append(compiled_state((guarded,)))
+print(json.dumps(LOG, default=str))
+print("settrace ok")
+"""
+
+
+@unittest.skipUnless(
+    sys.version_info[:2] == (3, 11), "CPython 3.11 compiled exception handlers"
+)
+class ExceptionHandlerSemantics311Test(unittest.TestCase):
+    def _run_once(self, probe, jit, threshold="1000000", **extra):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "PYTHONPATH"
+            and not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
+        }
+        if jit:
+            env.update(
+                CINDERX_JIT_MODE="execute",
+                PYTHONJITAUTO=threshold,
+                PYTHONJITLIGHTWEIGHTFRAME="0",
+                **extra,
+            )
+        else:
+            env.update(CINDERX_JIT_MODE="off")
+        proc = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(probe)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        return proc.stdout
+
+    def _run(self, probe, marker, threshold="1000000", **extra):
+        jit_out = self._run_once(probe, jit=True, threshold=threshold, **extra)
+        interp_out = self._run_once(probe, jit=False)
+        self.assertIn(marker, jit_out)
+        self.assertIn(marker, interp_out)
+        # The transcript (everything but the compiled-state line) must match
+        # the interpreter's; the JIT run's last entry says the functions
+        # stayed compiled across the grants.
+        import json
+
+        jit_log = json.loads(jit_out.splitlines()[0])
+        interp_log = json.loads(interp_out.splitlines()[0])
+        self.assertEqual(jit_log[:-1], interp_log[:-1])
+        self.assertIs(jit_log[-1], True)
+
+    def test_handler_shapes_at_call_binop_subscript_and_store_sites(self):
+        self._run(HANDLER_SHAPES_PROBE, "handler shapes ok")
+
+    def test_handler_control_flow_matches_the_interpreter(self):
+        self._run(CONTROL_FLOW_PROBE, "control flow ok")
+
+    def test_handler_free_frames_keep_the_deopt_exit_and_traceback(self):
+        self._run(TRACEBACK_PROBE, "traceback ok")
+
+    def test_settrace_falls_back_to_the_evaluator(self):
+        self._run(SETTRACE_PROBE, "settrace ok")
+
+    def test_call_variants_take_the_edge(self):
+        self._run(CALL_VARIANTS_PROBE, "call variants ok")
+
+    def test_fresh_function_objects_re_earn_the_edge(self):
+        # The production threshold, with every fresh function object
+        # attached (an unlimited attach budget): the grant recompiles through
+        # the deopting activation's own function object.
+        self._run(
+            FRESH_FUNCTIONS_PROBE,
+            "fresh functions ok",
+            threshold="4",
+            PYTHONJITFRESHATTACHBUDGET="1000000",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
