@@ -1137,6 +1137,108 @@ print("held traceback ok")
 """
 
 
+# Keep the workload identical in A and B. A's version guard must deopt at
+# the nested function's LOAD_GLOBAL; B's per-site cell re-pins without deopt.
+# The expected count is chosen by the branch's test, never by observed stats.
+def fresh_function_global_change_probe(expected_deopts):
+    return PREAMBLE + f"EXPECTED_GLOBAL_DEOPTS = {expected_deopts}\n" + r"""
+import dis
+import types
+
+filename = "mr4_fresh_global_guard.py"
+source = "def outer(x):\n    def inner(y):\n        return VALUE + y\n    return inner(x)\n"
+
+def new_namespace():
+    ns = {"VALUE": 10, "__builtins__": __builtins__}
+    exec(compile(source, filename, "exec"), ns)
+    return ns
+
+# Obtain the reference with stock evaluation, before compiling either
+# function. Separate code objects/namespaces prevent by-code dispatch from
+# accidentally running the reference through the candidate's artifact.
+_cinderx.remove_frame_evaluator()
+assert not _cinderx.is_frame_evaluator_installed()
+reference = new_namespace()
+reference_initial = reference["outer"](7)
+reference["VALUE"] = 20
+reference_rebound = reference["outer"](7)
+reference["EXTRA"] = True
+reference["VALUE"] = 30
+reference_changed = reference["outer"](7)
+assert (reference_initial, reference_rebound, reference_changed) == (17, 27, 37)
+assert not cinderjit.is_jit_compiled(reference["outer"])
+_cinderx.install_frame_evaluator()
+assert _cinderx.is_frame_evaluator_installed()
+
+candidate = new_namespace()
+outer = candidate["outer"]
+inner_code = next(
+    c for c in outer.__code__.co_consts if isinstance(c, types.CodeType)
+)
+# Quicken the shared inner code before compilation, while auto-compilation
+# remains disabled by the probe's high threshold. Keep candidate globals
+# unchanged from here until the deliberate mutations below.
+for _ in range(16):
+    assert outer(7) == reference_initial
+prototype = types.FunctionType(inner_code, candidate)
+assert cinderjit.force_compile(prototype)
+assert cinderjit.force_compile(outer)
+assert cinderjit.is_jit_compiled(prototype)
+assert cinderjit.is_jit_compiled(outer)
+load_offset = next(
+    instruction.offset for instruction in dis.get_instructions(inner_code)
+    if instruction.opname == "LOAD_GLOBAL" and instruction.argval == "VALUE"
+)
+
+# Each call creates a fresh inner function: the compiled prototype itself
+# is never called here. With fresh-attach budget zero, the inner ledger and
+# both machine-code entries prove dispatch through its code artifact.
+def invoke(expected, expected_deopts):
+    cinderjit._jit311_reset_entry_ledger()
+    cinderjit.get_and_clear_runtime_stats()
+    before = _cinderx._get_trigger_stats()
+    actual = outer(7)
+    after = _cinderx._get_trigger_stats()
+    deopts = cinderjit.get_and_clear_runtime_stats()["deopt"]
+    ledger = cinderjit._jit311_entry_ledger()["entries"]
+    assert actual == expected, (actual, expected)
+    entered = after["machine_code_entries"] - before["machine_code_entries"]
+    assert entered == 2, ("machine-code entries", entered, ledger)
+    for code in (outer.__code__, inner_code):
+        entries = [
+            row["entries"] for row in ledger
+            if row["qualname"] == code.co_qualname
+        ]
+        assert entries == [1], (code.co_qualname, ledger)
+    assert after["forced_deopt_hits"] == before["forced_deopt_hits"]
+    organic = after["organic_deopt_hits"] - before["organic_deopt_hits"]
+    assert organic == expected_deopts, ("organic deopts", organic, expected_deopts, deopts)
+    if expected_deopts == 0:
+        assert deopts == [], deopts
+    else:
+        assert len(deopts) == 1, deopts
+        event = deopts[0]
+        assert event["normal"]["filename"] == filename, event
+        assert event["normal"]["func_qualname"] == inner_code.co_qualname, event
+        assert event["normal"]["reason"] == "GuardFailure", event
+        assert event["normal"]["description"] == "LOAD_GLOBAL_MODULE: VALUE", event
+        assert event["int"]["bc_offset"] == load_offset, event
+        assert event["int"]["opcode"] == dis.opmap["LOAD_GLOBAL"], event
+        assert event["int"]["count"] == 1, event
+
+invoke(reference_initial, 0)
+# Rebinding an existing value must be observed without a key-version miss.
+candidate["VALUE"] = 20
+invoke(reference_rebound, 0)
+# Inserting a new key invalidates the keys-version guard. Rebind VALUE as
+# well so returning a stale cached value cannot satisfy the result check.
+candidate["EXTRA"] = True
+candidate["VALUE"] = 30
+invoke(reference_changed, EXPECTED_GLOBAL_DEOPTS)
+print("fresh global change ok")
+"""
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 call dispatch"
 )
@@ -1194,6 +1296,13 @@ assert after - before >= 200, (before, after)
 print("fresh known function ok")
 """,
             "fresh known function ok",
+            extra_env={"PYTHONJITFRESHATTACHBUDGET": "0"},
+        )
+
+    def test_fresh_function_global_change_matches_interpreter(self):
+        self._run(
+            fresh_function_global_change_probe(expected_deopts=1),
+            "fresh global change ok",
             extra_env={"PYTHONJITFRESHATTACHBUDGET": "0"},
         )
 
