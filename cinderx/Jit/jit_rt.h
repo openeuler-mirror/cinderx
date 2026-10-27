@@ -285,6 +285,39 @@ PyObject* JITRT_VectorcallTstate(
 // comes from a Python function or one of these adapters.
 extern "C" void* g_JITRT_Vectorcall311_slot;
 extern "C" void* g_JITRT_Call311_slot;
+
+// Runs the periodic work the eval breaker requested after a C callable
+// returned `res` through the direct dispatch stub (handle_periodic_activities
+// semantics): returns `res`, or NULL with `res` released when the pending
+// work raised.
+PyObject* JITRT_HandlePendingAfterCall311(PyObject* res);
+
+// Call-site entry-cache miss helper (see jit::CallSiteEntryCache).  The
+// cache rides in the kwnames argument slot, which is NULL at probed sites.
+extern "C" PyObject* JITRT_CallSiteEntryMiss311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw);
+
+// Constructor arm of the call-site probe: the callable is a heap class.
+extern "C" PyObject* JITRT_ConstructSite311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw);
+
+// Compiled entry of a code object's artifact for a function object that was
+// never attached to it (NULL when none applies), and the entry itself: it
+// takes the artifact when one applies, else the function's own vectorcall.
+// Safe for any exact function object.
+extern "C" vectorcallfunc Ci_JitShell311_CodeArtifactEntry(
+    PyFunctionObject* func);
+extern "C" PyObject* Ci_JitShell311_CodeArtifactVectorcall(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
 #endif
 
 /*

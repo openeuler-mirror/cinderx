@@ -1380,6 +1380,146 @@ int attachFreshImpl311(PyFunctionObject* raw_func) {
 
 } // namespace
 
+// The compiled artifact of a code object, reachable for a function object
+// that was never attached to it.  A comprehension body or a closure created
+// per call is a fresh function object every time; the fresh-attach path
+// publishes at most fresh_attach_budget of them per code and refuses the
+// rest, which would then run interpreted (each attach costs far more than
+// one interpreted run, so raising the budget is no answer).  Sharing needs
+// only what attachment needs: the same globals and builtins dicts the
+// artifact was compiled against, and the code not disabled.  The generated
+// entry reads defaults, closure cells and globals from the function object
+// it is called with, and the frame it links records that object, so nothing
+// is registered per function.
+namespace {
+
+// Layout of PyCodeObject::co_extra on 3.11 (Objects/codeobject.c); the
+// header keeps it private, and this file is 3.11-only.
+struct CiCodeObjectExtra311 {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+};
+
+jit::CompiledFunction* codeArtifactFor311(
+    PyFunctionObject* func,
+    CodeExtra** extra_out = nullptr) {
+  // Only a function still on the interpreted entry qualifies: an attached
+  // function already carries the installed entry.
+  if (func == nullptr || func->vectorcall != Ci_PyFunction_Vectorcall) {
+    return nullptr;
+  }
+  // This runs on every interpreted call of a function on the stock entry,
+  // and nearly all of those have no artifact (cold code, code refused by
+  // policy, generator-family code).  Answer that case from the code object
+  // alone -- three dependent loads, no calls -- and leave the per-call
+  // environment predicates to the rare hit.
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  auto* ex = static_cast<CiCodeObjectExtra311*>(code->co_extra);
+  if (ex == nullptr) {
+    return nullptr;
+  }
+  auto* state = cinderx::getModuleState();
+  if (state == nullptr) {
+    return nullptr;
+  }
+  Py_ssize_t index = state->code_extra_index;
+  if (index < 0 || index >= ex->ce_size) {
+    return nullptr;
+  }
+  auto* extra = static_cast<CodeExtra*>(ex->ce_extras[index]);
+  if (extra == nullptr) {
+    return nullptr;
+  }
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr) {
+    return nullptr;
+  }
+  // An artifact exists: the attachment conditions, then the installed
+  // entry's fail-closed predicates (execute mode, our evaluator installed,
+  // the JIT usable, no legacy tracing on this thread).
+  if (Ci_code_extra_jit311_auto_disabled(extra) ||
+      extra->jit_globals != func->func_globals ||
+      extra->jit_builtins != func->func_builtins) {
+    return nullptr;
+  }
+  if ((code->co_flags & CO_GENERATOR) != 0 &&
+      !jit::getConfig().sync_generator_jit) {
+    return nullptr;
+  }
+  if (!executeMode() || !Ci_EvalHook311_IsInstalled() || !jit::isJitUsable()) {
+    return nullptr;
+  }
+  PyThreadState* tstate = PyThreadState_GET();
+  if (tstate->c_tracefunc != nullptr || tstate->c_profilefunc != nullptr) {
+    return nullptr;
+  }
+  if (extra_out != nullptr) {
+    *extra_out = extra;
+  }
+  return compiled;
+}
+
+} // namespace
+
+// Vectorcall-shaped entry for such a function object.  It re-validates on
+// every call and otherwise takes the function's own entry, so a call-site
+// cache may hold it as the fast target for the (code, interpreted entry)
+// pair -- every function object matching that pair is served correctly.
+extern "C" PyObject* Ci_JitShell311_CodeArtifactVectorcall(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  auto* func = reinterpret_cast<PyFunctionObject*>(func_obj);
+  CodeExtra* extra = nullptr;
+  jit::CompiledFunction* compiled = codeArtifactFor311(func, &extra);
+  if (compiled == nullptr) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  // The installed entry's protocol, which the bare generated entry does not
+  // supply: pin the artifact for the duration of the call (from here on --
+  // the attachment offer below runs Python, and a collection reached from
+  // it can retire the artifact and drop its last anchor), and publish it as
+  // the invocation artifact further down.  The argument-binding helpers
+  // (JITRT_CallWithIncorrectArgcount, the keyword path) and generator
+  // creation re-enter machine code through the invocation artifact, falling
+  // back to the function's installed artifact -- which an unattached
+  // function does not have.
+  Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  // The fresh-attach door first: within the per-code budget the function
+  // object takes the installed entry (anchoring on its outer function and
+  // the observe statistics included) and every later call is direct.  The
+  // by-code dispatch below serves the objects the budget refuses; the
+  // budget is read here so that those pay no observer probe per call.
+  if (Ci_code_extra_jit311_attach_count(extra) <
+          jit::getConfig().fresh_attach_budget &&
+      Ci_Observe311_OfferFreshAttach(func) &&
+      func->vectorcall != Ci_PyFunction_Vectorcall) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  // The offer ran Python: the artifact may have been retired (the pin keeps
+  // it allocated, nothing more) and the function's code may have moved.
+  // Resolve again and leave through the function's own entry when the
+  // answer is no longer this artifact.
+  if (codeArtifactFor311(func, &extra) != compiled) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  if (cStackSoftLimitReached311()) {
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+    return nullptr;
+  }
+  InvocationArtifactScope invocation(compiled);
+  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+}
+
+extern "C" vectorcallfunc Ci_JitShell311_CodeArtifactEntry(
+    PyFunctionObject* func) {
+  return codeArtifactFor311(func) != nullptr
+      ? Ci_JitShell311_CodeArtifactVectorcall
+      : nullptr;
+}
+
 extern "C" int Ci_JitShell311_AttachFresh(PyFunctionObject* raw_func) {
   try {
     return attachFreshImpl311(raw_func);

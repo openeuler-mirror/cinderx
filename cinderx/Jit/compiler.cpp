@@ -592,6 +592,7 @@ std::optional<CompiledFunctionData> Compiler::Compile(
 #if PY_VERSION_HEX < 0x030C0000
   compiled_data.artifact_guarded_entry =
       reinterpret_cast<vectorcallfunc>(ngen->getArtifactGuardedEntry311());
+  compiled_data.direct_call_entry = ngen->getDirectCallEntry311();
 #endif
   compiled_data.stack_size = stack_size;
   compiled_data.spill_stack_size = spill_stack_size;

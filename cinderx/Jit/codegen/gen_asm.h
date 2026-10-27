@@ -61,6 +61,12 @@ class NativeGenerator {
   void* getArtifactGuardedEntry311() const {
     return artifact_guarded_entry_311_;
   }
+
+  // Direct call entry (the call-site entry-cache jump target), or null when
+  // unsupported.
+  void* getDirectCallEntry311() const {
+    return direct_call_entry_311_;
+  }
 #endif
 
   // Run the complete native-code generation pipeline without publishing any
@@ -95,6 +101,7 @@ class NativeGenerator {
   void* vectorcall_entry_{nullptr};
 #if PY_VERSION_HEX < 0x030C0000
   void* artifact_guarded_entry_311_{nullptr};
+  void* direct_call_entry_311_{nullptr};
 #endif
   arch::Builder* as_{nullptr};
   CodeHolderMetadata metadata_{CodeSection::kHot};
@@ -154,6 +161,7 @@ class NativeGenerator {
   void emitAarch64LoadAttrInvokeStub311(const asmjit::CodeHolder& code);
   void emitAarch64LoadMethodInvokeStub311(const asmjit::CodeHolder& code);
   void emitAarch64StoreAttrInvokeStub311(const asmjit::CodeHolder& code);
+  void emitAarch64VcDirectStub311(const asmjit::CodeHolder& code);
   void emitAarch64ExactLongAddSubStubs(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   Py_ssize_t giJITDataOffset();

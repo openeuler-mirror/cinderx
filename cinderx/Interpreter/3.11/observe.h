@@ -82,6 +82,14 @@ struct _PyInterpreterFrame;
 // `function.__code__` can be reassigned afterwards while a suspended
 // generator keeps resuming the frame it already has.  Passing it in keeps
 // the decision with the only party that can see the frame layout.
+// Reopen the code's scheduling slot (counting restarts from zero) after its
+// by-code artifact was retired by the ROI backoff.
+void Ci_Observe311_ReopenSlotForCode(PyCodeObject* code);
+
+// Offer a fresh function object over a dispatched code to the fresh-attach
+// entry point from the by-code artifact entry; 1 when it attached.
+int Ci_Observe311_OfferFreshAttach(PyFunctionObject* func);
+
 void Ci_Observe311_OnFrame(
     PyFunctionObject* func,
     PyCodeObject* code,

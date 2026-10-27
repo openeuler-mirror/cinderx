@@ -308,16 +308,27 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
 )";
   auto exact = translate311HIR(exact_source, getContext());
   ASSERT_NE(exact.lir, nullptr);
-  const Instruction* exact_call =
-      findOpcode(*exact.lir, Instruction::kVectorCall);
-  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   EXPECT_FALSE(hasImmediate(
       *exact.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
       << *exact.lir;
+#if defined(CINDER_AARCH64)
+  // A callee known to be a function takes the call-site entry cache as well:
+  // a fresh function object (one this code just made) still carries the
+  // interpreter's vectorcall, and only the cache's miss arm dispatches it by
+  // code into its artifact; the raw vectorcall-slot call would interpret it.
+  EXPECT_NE(findOpcode(*exact.lir, Instruction::kCallSiteVectorCall), nullptr)
+      << *exact.lir;
+  EXPECT_EQ(findOpcode(*exact.lir, Instruction::kVectorCall), nullptr)
+      << *exact.lir;
+#else
+  const Instruction* exact_call =
+      findOpcode(*exact.lir, Instruction::kVectorCall);
+  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   ASSERT_GT(exact_call->getNumInputs(), 0u);
   EXPECT_TRUE(exact_call->getInput(exact_call->getNumInputs() - 1)->isImm());
   EXPECT_EQ(
       exact_call->getInput(exact_call->getNumInputs() - 1)->getConstant(), 0);
+#endif
 
   const char* generic_source = R"(fun generic_call {
   bb 0 {
@@ -330,11 +341,42 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
 )";
   auto generic = translate311HIR(generic_source, getContext());
   ASSERT_NE(generic.lir, nullptr);
-  EXPECT_TRUE(hasImmediate(
+#if defined(CINDER_AARCH64)
+  // A kwnames-free site with an unknown callable takes the call-site entry
+  // cache: the probe sequence replaces the select chain and the slow slot
+  // lives in the per-function dispatch stub.
+  EXPECT_NE(findOpcode(*generic.lir, Instruction::kCallSiteVectorCall), nullptr)
+      << *generic.lir;
+  EXPECT_EQ(findOpcode(*generic.lir, Instruction::kVectorCall), nullptr)
+      << *generic.lir;
+  EXPECT_FALSE(hasImmediate(
       *generic.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
       << *generic.lir;
-  EXPECT_GE(countOpcode(*generic.lir, Instruction::kSelect), 1u)
+  EXPECT_EQ(countOpcode(*generic.lir, Instruction::kSelect), 0u)
       << *generic.lir;
+
+  // A keyword site keeps the branchless select between the callee's own
+  // vectorcall slot and the slow slot.
+  const char* generic_keyword_source = R"(fun generic_keyword_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = VectorCall<1, kwnames> v0 v1
+    Return v2
+  }
+}
+)";
+  auto generic_keyword = translate311HIR(generic_keyword_source, getContext());
+  ASSERT_NE(generic_keyword.lir, nullptr);
+  EXPECT_NE(findOpcode(*generic_keyword.lir, Instruction::kVectorCall), nullptr)
+      << *generic_keyword.lir;
+  EXPECT_TRUE(hasImmediate(
+      *generic_keyword.lir,
+      reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
+      << *generic_keyword.lir;
+  EXPECT_GE(countOpcode(*generic_keyword.lir, Instruction::kSelect), 1u)
+      << *generic_keyword.lir;
+#endif
 
   const char* keyword_source = R"(fun keyword_call {
   bb 0 {
@@ -357,7 +399,8 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
       << *keyword.lir;
 }
 
-TEST_F(LIRGeneratorTest, Python311CallMethodKeepsNullReceiverSlowArm) {
+TEST_F(LIRGeneratorTest, Python311CallMethodTakesTheEntryCacheForm) {
+#if defined(CINDER_AARCH64)
   const char* source = R"(fun method_call {
   bb 0 {
     v0 = LoadArg<0>
@@ -370,15 +413,24 @@ TEST_F(LIRGeneratorTest, Python311CallMethodKeepsNullReceiverSlowArm) {
 )";
   auto function = translate311HIR(source, getContext());
   ASSERT_NE(function.lir, nullptr);
-  EXPECT_NE(findOpcode(*function.lir, Instruction::kVectorCall), nullptr)
+  // The method-call entry cache carries the NULL/None callable and
+  // empty-receiver prechecks itself; its slow arm (the JITRT_Call slot,
+  // shift protocol included) lives in the per-function dispatch stub, so
+  // no select chain remains in the LIR.
+  EXPECT_NE(
+      findOpcode(*function.lir, Instruction::kCallSiteCallMethod), nullptr)
       << *function.lir;
-  EXPECT_TRUE(hasImmediate(
+  EXPECT_EQ(findOpcode(*function.lir, Instruction::kVectorCall), nullptr)
+      << *function.lir;
+  EXPECT_FALSE(hasImmediate(
       *function.lir, reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot)))
       << *function.lir;
-  // The final Select is the receiver-null override of the earlier type-based
-  // fast/slow selection. The preceding Selects make callable loads safe.
-  EXPECT_GE(countOpcode(*function.lir, Instruction::kSelect), 4u)
+  EXPECT_EQ(countOpcode(*function.lir, Instruction::kSelect), 0u)
       << *function.lir;
+
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.11 call-site entry cache";
+#endif
 }
 
 TEST_F(LIRGeneratorTest, Python311FrameLocalWriteEliminatesHelperCall) {

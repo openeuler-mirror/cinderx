@@ -106,6 +106,8 @@ struct Environ {
 
   asmjit::Label load_attr_invoke_stub;
   asmjit::Label load_method_invoke_stub;
+  // Per-function dispatch stub for non-function callables at call sites.
+  asmjit::Label vcdirect_stub;
   asmjit::Label store_attr_invoke_stub;
 
   struct Aarch64ExactLongAddSubStub {
