@@ -46,6 +46,44 @@ TEST(CopyGraphTest, SimpleCycle) {
   EXPECT_EQ(ops[0], Op(Op::Kind::kExchange, 0, 1));
 }
 
+TEST(CopyGraphTest, EdgeOrderPreservesDeterministicParallelCopies) {
+  // Include a register cycle, a memory cycle and independent copies.
+  const std::vector<std::pair<int, int>> edges{
+      {0, 1}, {1, 0}, {-1, -2}, {-2, -1}, {2, 3}, {4, 5}};
+  std::vector<int> order{0, 1, 2, 3, 4, 5};
+  std::vector<Op> reference;
+  do {
+    CopyGraph graph;
+    std::map<int, int> values{
+        {-2, 12}, {-1, 11}, {0, 10}, {1, 20},
+        {2, 30}, {3, 40}, {4, 50}, {5, 60}};
+    auto expected = values;
+    for (auto [from, to] : edges) {
+      expected[to] = values.at(from);
+    }
+    for (int index : order) {
+      auto [from, to] = edges[index];
+      graph.addEdge(from, to);
+    }
+    auto operations = graph.process();
+    if (reference.empty()) {
+      reference = operations;
+    } else {
+      EXPECT_EQ(operations, reference);
+    }
+    for (const auto& operation : operations) {
+      if (operation.kind == Op::Kind::kCopy) {
+        values[operation.to] = values.at(operation.from);
+      } else {
+        std::swap(values.at(operation.from), values.at(operation.to));
+      }
+    }
+    for (auto [location, value] : expected) {
+      EXPECT_EQ(values.at(location), value);
+    }
+  } while (std::next_permutation(order.begin(), order.end()));
+}
+
 TEST(CopyGraphTest, WithCycles) {
   // Build a graph with two cycles and a few offshoots.
   CopyGraph cg;

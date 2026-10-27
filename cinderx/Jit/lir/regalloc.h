@@ -137,9 +137,7 @@ class LinearScanAllocator {
 
  private:
   struct LiveIntervalPtrGreater {
-    bool operator()(const LiveInterval* lhs, const LiveInterval* rhs) const {
-      return rhs->startLocation() < lhs->startLocation();
-    }
+    bool operator()(const LiveInterval* lhs, const LiveInterval* rhs) const;
   };
 
   using UnhandledQueue = std::priority_queue<
