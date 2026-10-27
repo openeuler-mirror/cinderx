@@ -55,8 +55,14 @@ TEST(CopyGraphTest, EdgeOrderPreservesDeterministicParallelCopies) {
   do {
     CopyGraph graph;
     std::map<int, int> values{
-        {-2, 12}, {-1, 11}, {0, 10}, {1, 20},
-        {2, 30}, {3, 40}, {4, 50}, {5, 60}};
+        {-2, 12},
+        {-1, 11},
+        {0, 10},
+        {1, 20},
+        {2, 30},
+        {3, 40},
+        {4, 50},
+        {5, 60}};
     auto expected = values;
     for (auto [from, to] : edges) {
       expected[to] = values.at(from);
