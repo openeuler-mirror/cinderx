@@ -5338,6 +5338,18 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_NOARGS,
      PyDoc_STR("Per-class fill/hit/miss/invalidation tallies of the "
                "pull-validated attribute caches.")},
+    {"get_and_clear_inline_cache_stats",
+     get_and_clear_inline_cache_stats,
+     METH_NOARGS,
+     PyDoc_STR(
+         "Returns and clears information about the runtime inline cache stats "
+         "behavior of JIT-compiled code. Stats will only be collected with X "
+         "flag jit-enable-inline-cache-stats-collection.")},
+    {"is_inline_cache_stats_collection_enabled",
+     is_inline_cache_stats_collection_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True if jit-enable-inline-cache-stats-collection is on "
+               "and False otherwise.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -6023,7 +6035,6 @@ int initialize() {
   auto use_stable_pointers = getConfig().use_stable_pointers;
 
 #if PY_VERSION_HEX < 0x030C0000
-  resetDictValueTransition311();
   // CPython 3.11 only initializes the compiler for the explicit shadow and
   // execute modes (or RuntimeTests' force-init hook). Observe and off stay
   // capability-gated before a compiler context or code allocator is
@@ -7068,9 +7079,15 @@ Result compilePreloaderImpl(
       }
       return Result::OK;
     } else if (jit_ctx->hasCompletedCompile(key)) {
-      // We're in the multi-threaded scenario we've created the
-      // CompiledFunctionData and will create the CompiledFunction at the end
-      return Result::OK;
+      // Multi-threaded compile: a worker already produced the
+      // CompiledFunctionData for this key, and finalizeMultiThreadedCompile()
+      // turns it into a CompiledFunction after the workers have joined.  That
+      // step only attaches the function the data was recorded with, so a
+      // further function sharing the same code must be attached afterwards.
+      // Reporting it as scheduled puts it on the serial retry list, where
+      // lookupCode() finds the published artifact and finalizeFunc() attaches
+      // it.  A bare code object (nested function) has nothing to attach.
+      return func != nullptr ? Result::ALREADY_SCHEDULED : Result::OK;
     } else if (!jit_ctx->addActiveCompile(key)) {
       // The compilation is in-flight on another thread
       return Result::ALREADY_SCHEDULED;
@@ -7126,9 +7143,15 @@ Result compilePreloaderImpl(
   // Re-verify after the drain, so OK still means what the control plane
   // defines it to mean: this function's calls execute machine code as
   // this returns.
-  jit_ctx->drainDeferredAnchorReleases();
-  if (func != nullptr && !isJitCompiled(func)) {
-    return Result::CANNOT_SPECIALIZE;
+  // During a multi-threaded batch the publication was only parked: the
+  // CompiledFunction is created and the function attached by
+  // finalizeMultiThreadedCompile() on the main thread, so the verdict cannot
+  // be taken here and nothing was displaced yet.
+  if (!getThreadedCompileContext().compileRunning()) {
+    jit_ctx->drainDeferredAnchorReleases();
+    if (func != nullptr && !isJitCompiled(func)) {
+      return Result::CANNOT_SPECIALIZE;
+    }
   }
 #else
   jit_ctx->codeCompiled(func, key, std::move(*compiled_func));

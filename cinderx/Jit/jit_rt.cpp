@@ -1706,7 +1706,7 @@ int JITRT_StoreAttrWithHint311(
   if (ep->me_value == nullptr) {
     return 0;
   }
-  jit::replaceMaterializedDictValue311(dict, &ep->me_value, value, true);
+  jit::replaceMaterializedDictValue311(dict, &ep->me_value, value);
   return 1;
 }
 

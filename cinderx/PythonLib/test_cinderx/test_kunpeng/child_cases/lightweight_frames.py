@@ -443,7 +443,10 @@ def run_f_locals_ownership_case() -> None:
         __slots__ = ("__weakref__",)
 
     def target(value):
-        dir()
+        # Materialize the frame's f_locals from compiled code.  (dir() with
+        # no argument reads the frame's locals too, but functions using it
+        # are not compiled at all.)
+        sys._getframe().f_locals
         return value is not None
 
     assert cinderx.jit.force_compile(target)

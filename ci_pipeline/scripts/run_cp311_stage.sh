@@ -265,6 +265,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_attr_cache_new_shape_load_311 \
     test_cinderx.test_kunpeng.test_attr_cache_new_shape_store_311 \
     test_cinderx.test_kunpeng.test_attr_cache_semantics_311 \
+    test_cinderx.test_kunpeng.test_method_cache_semantics_311 \
     test_cinderx.test_kunpeng.test_early_quicken_311 \
     test_cinderx.test_kunpeng.test_load_method_descriptor_fallback \
     test_cinderx.test_kunpeng.test_list_extend_refcount_311 \
@@ -273,6 +274,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_float_box_sink_311 \
     test_cinderx.test_kunpeng.test_float_power_exact_311 \
     test_cinderx.test_kunpeng.test_subscript_profitability_311 \
+    test_cinderx.test_kunpeng.test_locals_reading_builtins \
     test_cinderx.test_kunpeng.test_lightweight_frames &&
     # This regression must execute JIT code; the parent PR suite defaults to off.
     CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 "$PYTHON" -m unittest -v \

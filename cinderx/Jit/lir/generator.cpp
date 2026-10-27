@@ -3155,7 +3155,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         appendCall2RetValues(
             bbb,
             instr->output(),
+#if PY_VERSION_HEX < 0x030C0000
+            LoadTypeMethodCache::lookupOrHitHelper311,
+#else
             LoadTypeMethodCache::lookupHelper,
+#endif
             cache_entry,
             instr->receiver(),
             name);

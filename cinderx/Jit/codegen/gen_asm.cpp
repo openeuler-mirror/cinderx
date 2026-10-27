@@ -2561,18 +2561,20 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub311(
 #endif
 }
 
-void NativeGenerator::emitAarch64LoadMethodStub311(
+void NativeGenerator::emitAarch64LoadMethodInvokeStub311(
     const asmjit::CodeHolder& code) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
-    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+    PY_VERSION_HEX < 0x030C0000
   if (!env_.load_method_invoke_stub.isValid()) {
     return;
   }
+
   CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
   Label slow_path = as_->newLabel();
-  Label materialized = as_->newLabel();
   Label hit = as_->newLabel();
-  constexpr int kEntriesOff =
+
+  constexpr int kEntriesOffset =
       static_cast<int>(jit::LoadMethodCache::entriesOffset());
   constexpr int kEntrySize =
       static_cast<int>(jit::LoadMethodCache::entrySize());
@@ -2586,9 +2588,39 @@ void NativeGenerator::emitAarch64LoadMethodStub311(
       static_cast<int>(jit::LoadMethodCache::entryTypeVersionOffset());
   constexpr int kPeekOff =
       static_cast<int>(jit::LoadMethodCache::entryPeekShadowOffset());
+  constexpr int kPeekKeysOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekKeysOffset());
+  constexpr int kPeekNentriesOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekNentriesOffset());
+  constexpr int kPeekKeysVersionOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekKeysVersionOffset());
+  constexpr int kPeekHintOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekHintOffset());
+  constexpr int kInstAttrOff =
+      static_cast<int>(jit::LoadMethodCache::entryInstAttrOffset());
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkNentriesOffset = offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkLog2SizeOffset = offsetof(PyDictKeysObject, dk_log2_size);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  constexpr int kUnicodeHashOffset = offsetof(PyASCIIObject, hash);
+  static_assert(sizeof(PyDictUnicodeEntry) == 16, "entry size");
+  static_assert(DKIX_EMPTY == -1 && DKIX_DUMMY == -2, "dkix sentinels");
+  static_assert(Py_TPFLAGS_MANAGED_DICT == (1UL << 4), "flag bit moved");
+  // inline arm for peek entries whose memo pins the
+  // name's ABSENCE (peek_hint == kPeekAbsent) -- the LoadMethodCache::lookup
+  // fast answers for values-form (type cached keys anchor) and
+  // materialized-dict receivers (instance dict keys anchor).  Everything
+  // else about a peek entry (hint >= 0, inst_attr, split-materialized dict)
+  // keeps going to the helper.
+  // The receiver's tp_version_tag is hoisted into w17 (see the LoadAttr
+  // stub); the entry walk otherwise keeps its shape.
   constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
   constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
   constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kTpDictoffsetOffset = offsetof(PyTypeObject, tp_dictoffset);
   constexpr int kHtCachedKeysOffset =
       offsetof(PyHeapTypeObject, ht_cached_keys);
   constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
@@ -2603,33 +2635,239 @@ void NativeGenerator::emitAarch64LoadMethodStub311(
     ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   }
   as_->bind(env_.load_method_invoke_stub);
-  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
-  auto emit_entry = [&](uint32_t index, Label next) {
-    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+  // x0=cache, x1=obj, x2=name
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+  as_->ldr(
+      a64::w17,
+      arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+
+  Label mat_check = as_->newLabel();
+
+  auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int off = kEntriesOffset + static_cast<int>(entry_index) * kEntrySize;
     as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
     as_->cmp(a64::x12, a64::x11);
-    as_->b_ne(next);
-    as_->ldr(
-        a64::w14,
-        arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->b_ne(next_entry);
     as_->ldr(
         a64::w15,
         arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
-    as_->cmp(a64::w14, a64::w15);
+    as_->cmp(a64::w17, a64::w15);
     as_->b_ne(slow_path);
+    // peek entries prove no-shadow per hit in the helper.
     as_->ldrb(
         a64::w14,
         arch::ptr_offset(a64::x0, off + kPeekOff, arch::AccessSize::k8));
-    as_->cbnz(a64::w14, slow_path);
+    Label not_peek = as_->newLabel();
+    Label peek_mat = as_->newLabel();
+    Label peek_cmp = as_->newLabel();
+    as_->cbz(a64::w14, not_peek);
+    // peek entry: only the pinned-absent, class-side form is inlined.
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x0, off + kInstAttrOff, arch::AccessSize::k8));
+    {
+      // the instance-attribute callable form (a bound
+      // method stored by __init__: pickle's _Unpickler.read / append,
+      // 17M lookups per unpickle_pure_python run in the helper).  The
+      // memo pins the slot index into the values-form storage: live
+      // cached keys identical to the anchor, same entry count, the entry
+      // at the hint still keyed by this name, the slot within the
+      // instance's used range and non-NULL.  Result is {None, slot},
+      // both references taken here as the helper does.
+      Label class_side = as_->newLabel();
+      as_->cbz(a64::w14, class_side);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+      as_->tbz(a64::x14, 4, slow_path); // Py_TPFLAGS_MANAGED_DICT
+      as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+      as_->cbz(a64::x13, slow_path); // materialized: helper
+      as_->ldr(a64::x9, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+      as_->cbz(a64::x9, slow_path);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+      as_->cmp(a64::x9, a64::x14);
+      as_->b_ne(slow_path);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x9, kDkNentriesOffset));
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+      as_->cmp(a64::x14, a64::x15);
+      as_->b_ne(slow_path);
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekHintOff));
+      as_->tbnz(a64::x15, 63, slow_path); // hint >= 0
+      // entries = keys + indices + (1 << dk_log2_index_bytes); me_key at
+      // entries[hint].
+      as_->ldrb(
+          a64::w14,
+          arch::ptr_offset(
+              a64::x9, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+      as_->mov(a64::x12, 1);
+      as_->lsl(a64::x12, a64::x12, a64::x14);
+      as_->add(a64::x12, a64::x12, a64::x9);
+      as_->add(a64::x12, a64::x12, a64::x15, a64::lsl(4));
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x12, kDkIndicesOffset));
+      as_->cmp(a64::x14, a64::x2);
+      as_->b_ne(slow_path);
+      // hint + 2 < values[-1] (the instance's used-slot count byte)
+      as_->ldrb(a64::w14, arch::ptr_offset(a64::x13, -1, arch::AccessSize::k8));
+      as_->add(a64::x12, a64::x15, 2);
+      as_->cmp(a64::x12, a64::x14);
+      as_->b_hs(slow_path);
+      as_->ldr(a64::x9, a64::ptr(a64::x13, a64::x15, a64::lsl(3)));
+      as_->cbz(a64::x9, slow_path);
+      as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+      arch::add_immediate(as_, a64::x12, a64::x12, 1);
+      as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+      as_->mov(a64::x0, reinterpret_cast<uint64_t>(Py_None));
+      as_->ldr(a64::x12, arch::ptr_offset(a64::x0, kRefcountOffset));
+      arch::add_immediate(as_, a64::x12, a64::x12, 1);
+      as_->str(a64::x12, arch::ptr_offset(a64::x0, kRefcountOffset));
+      as_->mov(a64::x1, a64::x9);
+      as_->ret(arch::lr);
+      as_->bind(class_side);
+    }
     as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
-    as_->cbz(a64::x9, next);
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+    Label non_managed = as_->newLabel();
+    as_->tbz(a64::x14, 4, non_managed); // Py_TPFLAGS_MANAGED_DICT
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekHintOff));
+    as_->cmn(a64::x15, 2); // peek_hint == kPeekAbsent (-2)
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x13, peek_mat);
+    // values form: anchor is the live type's cached keys.
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->b(peek_cmp);
+    as_->bind(peek_mat);
+    // materialized form: anchor is the instance dict's own keys table;
+    // split-materialized dicts (ma_values set) and non-unicode keys keep
+    // the helper's probing path.
+    // (split-materialized dicts -- ma_values set -- share the anchor for
+    // the absent-name form inlined here.)
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x13, kMaKeysOffset));
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w14, slow_path); // DICT_KEYS_GENERAL
+    {
+      // Anchor mismatch (many instances, each with its own combined
+      // keys table) falls into an inline negative probe instead of the
+      // helper: up to two steps of the unicode-key probe sequence on an
+      // int8 index table; an EMPTY slot proves absence (the class-side
+      // method stands), a matching key is a shadow, anything else --
+      // DUMMY, collision, wider tables, uncached hash -- is the helper's.
+      Label probe = as_->newLabel();
+      Label probe2 = as_->newLabel();
+      Label probe_check = as_->newLabel();
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+      as_->cmp(a64::x13, a64::x14);
+      as_->b_ne(probe);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kDkNentriesOffset));
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+      as_->cmp(a64::x14, a64::x15);
+      as_->b_ne(probe);
+      // A combined-keys table freed by dict.clear() and reallocated at
+      // the same address with the same dk_nentries must not satisfy the
+      // anchor: the anchor also records the table's keys version, which
+      // a fresh table lacks (0) and any key-set change resets.
+      as_->ldr(
+          a64::w14,
+          arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+      as_->cbz(a64::w14, probe);
+      as_->ldr(
+          a64::w15,
+          arch::ptr_offset(
+              a64::x0, off + kPeekKeysVersionOff, arch::AccessSize::k32));
+      as_->cmp(a64::w14, a64::w15);
+      as_->b_eq(hit);
+      as_->bind(probe);
+      as_->ldrb(
+          a64::w14,
+          arch::ptr_offset(
+              a64::x13, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+      as_->ldrb(
+          a64::w15,
+          arch::ptr_offset(a64::x13, kDkLog2SizeOffset, arch::AccessSize::k8));
+      as_->cmp(a64::w14, a64::w15); // int8 indices <=> index_bytes == size
+      as_->b_ne(slow_path);
+      as_->mov(a64::x14, 1);
+      as_->lsl(a64::x15, a64::x14, a64::x15); // size
+      as_->sub(a64::x15, a64::x15, 1); // mask
+      as_->ldr(a64::x10, arch::ptr_offset(a64::x2, kUnicodeHashOffset));
+      as_->cmn(a64::x10, 1);
+      as_->b_eq(slow_path); // hash not cached
+      as_->and_(a64::x12, a64::x10, a64::x15); // i = hash & mask
+      as_->bind(probe_check);
+      as_->add(a64::x14, a64::x13, a64::x12);
+      as_->ldrsb(
+          a64::w14,
+          arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+      as_->cmn(a64::w14, 1);
+      as_->b_eq(hit); // DKIX_EMPTY: absent
+      as_->tbnz(a64::w14, 31, slow_path); // DKIX_DUMMY: keep probing in C++
+      // occupied: entries start after the index table (size bytes).
+      as_->add(a64::x14, a64::x14, a64::x14); // ix*2
+      as_->lsl(a64::x14, a64::x14, 3); // ix*16
+      as_->add(a64::x14, a64::x14, a64::x13);
+      as_->add(a64::x14, a64::x14, a64::x15); // + mask (size - 1)
+      as_->ldr(
+          a64::x14, arch::ptr_offset(a64::x14, kDkIndicesOffset + 1)); // me_key
+      as_->cmp(a64::x14, a64::x2);
+      as_->b_eq(slow_path); // shadowed by the instance
+      // Non-identical key: equal iff __eq__ says so, which only the
+      // helper can ask; probe on only when the cached hashes differ.
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kUnicodeHashOffset));
+      as_->cmp(a64::x14, a64::x10);
+      as_->b_eq(slow_path); // same hash, non-identical key
+      // second step: perturb >>= 5; i = (i*5 + perturb + 1) & mask
+      as_->bind(probe2);
+      as_->lsr(a64::x10, a64::x10, 5);
+      as_->add(a64::x14, a64::x12, a64::x12, a64::lsl(2)); // i*5
+      as_->add(a64::x14, a64::x14, a64::x10);
+      as_->add(a64::x14, a64::x14, 1);
+      as_->and_(a64::x12, a64::x14, a64::x15);
+      as_->add(a64::x14, a64::x13, a64::x12);
+      as_->ldrsb(
+          a64::w14,
+          arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+      as_->cmn(a64::w14, 1);
+      as_->b_eq(hit);
+      as_->b(slow_path);
+    }
+    as_->bind(peek_cmp);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+    as_->cmp(a64::x13, a64::x14);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kDkNentriesOffset));
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+    as_->cmp(a64::x14, a64::x15);
+    as_->b_ne(slow_path);
+    as_->b(hit);
+    // a peek entry on a receiver type without a
+    // managed dict -- the non-heap types that still carry an instance
+    // __dict__ slot (_io.BytesIO / StringIO, the unpickle and logging
+    // method receivers), which the fill could not prove shadow-free.
+    // The instance dict lives at tp_dictoffset; an instance that never
+    // grew one cannot shadow the class-side method, so the entry value
+    // stands.  A present dict (or an object-relative offset) keeps the
+    // helper's probe.
+    as_->bind(non_managed);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kTpDictoffsetOffset));
+    as_->cmp(a64::x13, 0);
+    as_->b_le(slow_path);
+    as_->ldr(a64::x13, a64::ptr(a64::x1, a64::x13));
+    as_->cbz(a64::x13, hit);
+    as_->b(slow_path);
+    as_->bind(not_peek);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, next_entry);
     as_->ldr(
         a64::w15,
         arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
     as_->cbz(a64::w15, hit);
     as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x13, materialized);
+    as_->cbz(a64::x13, mat_check);
     as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
     as_->cbz(a64::x13, slow_path);
     as_->ldr(
@@ -2640,18 +2878,22 @@ void NativeGenerator::emitAarch64LoadMethodStub311(
     as_->b(hit);
   };
 
-  const uint32_t count =
+  const uint32_t stub_entries =
       static_cast<uint32_t>(jit::LoadMethodCache::numEntries());
-  for (uint32_t index = 0; index < count; ++index) {
-    const bool more = index + 1 != count;
-    Label next = more ? as_->newLabel() : slow_path;
-    emit_entry(index, next);
-    if (more) {
-      as_->bind(next);
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
     }
   }
 
-  as_->bind(materialized);
+  // Materialized receiver: no dict cannot shadow; a dict whose keys
+  // version equals the entry version proves absence the same way
+  // isValidKeysVersion does.  Anything else goes to the helper.
+  // Entry state on arrival: x9=entry value, w15=entry keys_version.
+  as_->bind(mat_check);
   as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
   as_->cbz(a64::x13, hit);
   as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaKeysOffset));
@@ -2669,6 +2911,7 @@ void NativeGenerator::emitAarch64LoadMethodStub311(
   arch::add_immediate(as_, a64::x12, a64::x12, 1);
   as_->str(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
   as_->mov(a64::x0, a64::x9);
+  // x1 is already obj (self), the second LoadMethodResult member.
   as_->ret(arch::lr);
 
   as_->bind(slow_path);
@@ -3403,7 +3646,7 @@ void NativeGenerator::generateCode(
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
   emitAarch64LoadAttrInvokeStub311(codeholder);
-  emitAarch64LoadMethodStub311(codeholder);
+  emitAarch64LoadMethodInvokeStub311(codeholder);
   emitAarch64StoreAttrInvokeStub311(codeholder);
   emitAarch64ExactLongAddSubStubs(codeholder);
 

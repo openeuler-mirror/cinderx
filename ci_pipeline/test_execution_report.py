@@ -210,22 +210,25 @@ class ExecutionReportTest(unittest.TestCase):
         self.assertEqual(report["functions"]["unknown_refusal"], 1)
 
     def test_exact_test_dis_deviations_are_lane_scoped(self):
-        cases = {
-            "test.test_dis.DisTests.test_loop_quicken": "pass",
-            "test.test_dis.DisTests.test_super_instructions": "pass",
-            "test.test_dis.DisWithFileTests.test_loop_quicken": "pass",
-            "test.test_dis.DisWithFileTests.test_super_instructions": "pass",
-        }
-        stock = {"modules": {"test_dis": "pass"}, "cases": cases, "diagnostics": {}}
-        execute = {
-            "modules": {"test_dis": "fail"},
-            "cases": {key: "failure" for key in cases},
-            "diagnostics": {},
-        }
+        # Every approved deviation in the data file, reproduced exactly
+        # (stock pass, execute failure with the recorded fingerprint): the
+        # module summaries derive from the cases and nothing is unexpected.
         deviations = json.loads(
             (DATA / "execution_compatibility_deviations.json").read_text()
         )["deviations"]
         by_case = {entry["testcase"]: entry for entry in deviations}
+        cases = {key: "pass" for key in by_case}
+        modules = sorted({key.split(".")[1] for key in by_case})
+        stock = {
+            "modules": {module: "pass" for module in modules},
+            "cases": cases,
+            "diagnostics": {},
+        }
+        execute = {
+            "modules": {module: "fail" for module in modules},
+            "cases": {key: "failure" for key in cases},
+            "diagnostics": {},
+        }
         execute["diagnostics"] = {
             key: " ".join(
                 by_case[key]["execute_diagnostic"]["required_substrings"]
@@ -245,7 +248,11 @@ class ExecutionReportTest(unittest.TestCase):
         self.assertEqual(report["result"], "PASS_WITH_APPROVED_DEVIATIONS")
         self.assertFalse(report["unexpected"])
         self.assertFalse(report["stale_baseline"])
-        self.assertEqual(len(report["approved_deviations"]), 4)
+        self.assertEqual(len(report["approved_deviations"]), len(deviations))
+        self.assertEqual(
+            set(report["derived_module_summaries"]),
+            {f"<module> {module}" for module in modules},
+        )
 
     def test_matching_state_with_wrong_diagnostic_fails(self):
         testcase = "test.test_dis.DisTests.test_loop_quicken"
@@ -280,8 +287,11 @@ class ExecutionReportTest(unittest.TestCase):
             report = compare_with_deviations(
                 left, right, DATA / "execution_compatibility_deviations.json"
             )
+        deviations = json.loads(
+            (DATA / "execution_compatibility_deviations.json").read_text()
+        )["deviations"]
         self.assertEqual(report["result"], "REVIEW_REQUIRED")
-        self.assertEqual(len(report["stale_baseline"]), 4)
+        self.assertEqual(len(report["stale_baseline"]), len(deviations))
 
 
 if __name__ == "__main__":

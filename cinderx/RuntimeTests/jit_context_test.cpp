@@ -3,6 +3,7 @@
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
@@ -1148,6 +1149,92 @@ TEST_F(JITContextTest, UnwatchWaitsForCompileLock) {
   jit_ctx_->watchPendingTypes();
   jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
   EXPECT_EQ(patcher.notifications, 0);
+}
+
+TEST_F(JITContextTest, LateSharedCodeFunctionIsAttachedAfterBatchFinalization) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Two functions share one code object and therefore one CompilationKey.
+  // During a batch compile a worker may take up the second function only
+  // after the first one's compile has completed but before the main thread
+  // has turned the parked CompiledFunctionData into a CompiledFunction.  The
+  // second function must still be attached once the batch is finalized.
+  const char* py_src = R"(
+def make():
+    def unit(x):
+        return x * 2
+    return unit
+
+first = make()
+second = make()
+)";
+  Ref<PyFunctionObject> first(compileAndGet(py_src, "first"));
+  ASSERT_NE(first, nullptr);
+  Ref<PyFunctionObject> second(getGlobal("second"));
+  ASSERT_NE(second, nullptr);
+  ASSERT_EQ(first->func_code, second->func_code);
+
+  std::unique_ptr<jit::hir::Preloader> first_preloader(
+      jit::hir::Preloader::make(
+          first, jit::makeFrameReifier(first->func_code)));
+  ASSERT_NE(first_preloader, nullptr);
+  std::unique_ptr<jit::hir::Preloader> second_preloader(
+      jit::hir::Preloader::make(
+          second, jit::makeFrameReifier(second->func_code)));
+  ASSERT_NE(second_preloader, nullptr);
+
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  // An assertion failure below must not leave the process in the batch
+  // state: every later test in this binary would observe compileRunning().
+  bool batch_closed = false;
+  SCOPE_EXIT({
+    if (!batch_closed) {
+      threaded.endCompile();
+      jit_ctx_->finalizeMultiThreadedCompile();
+    }
+  });
+  // A worker compiles the first function; its data is parked until the batch
+  // is finalized, so no CompiledFunction exists yet.
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *first_preloader, first),
+      jit::Result::OK);
+  ASSERT_EQ(
+      jit_ctx_->lookupCode(
+          first->func_code, first->func_builtins, first->func_globals),
+      nullptr);
+  // The second function reaches the worker inside that window.
+  jit::Result late =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *second_preloader, second);
+  threaded.endCompile();
+  jit_ctx_->finalizeMultiThreadedCompile();
+  batch_closed = true;
+
+  if (late == jit::Result::OK) {
+    EXPECT_TRUE(jit_ctx_->didCompile(second))
+        << "Result::OK was reported for a function the batch never attached";
+  } else {
+    // Scheduled for the serial retry that compile_all() runs after
+    // finalization; the retry finds the published artifact and attaches it.
+    EXPECT_EQ(late, jit::Result::ALREADY_SCHEDULED);
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *second_preloader, second),
+        jit::Result::OK);
+  }
+
+  auto compiled = jit_ctx_->lookupCode(
+      second->func_code, second->func_builtins, second->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  EXPECT_EQ(compiled->functions().count(first), 1u);
+  EXPECT_EQ(compiled->functions().count(second), 1u);
+  EXPECT_TRUE(jit_ctx_->didCompile(first));
+  EXPECT_TRUE(jit_ctx_->didCompile(second));
+
+  compiled.reset();
+  second_preloader.reset();
+  first_preloader.reset();
+  second.reset();
+  first.reset();
 }
 
 TEST_F(JITContextTest, UnwatchableBuiltins) {
