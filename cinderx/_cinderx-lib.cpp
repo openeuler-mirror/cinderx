@@ -17,6 +17,7 @@
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 #include "cinderx/Jit/anextawaitable.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
@@ -818,6 +819,7 @@ void module_free(void* raw_mod) {
   Ci_Observe311_Finalize();
 #endif
 
+  jit::finiAutoJitStabilityCodeExtraIndex();
   jit::finiOSRCodeExtraIndex();
   finiCodeExtraIndex();
 
@@ -1563,6 +1565,7 @@ int _cinderx_exec_impl(PyObject* m) {
   // interpreter and try to use it.
   initCodeExtraIndex();
   jit::initOSRCodeExtraIndex();
+  jit::initAutoJitStabilityCodeExtraIndex();
 
   if (watcher_state.init() < 0) {
     return -1;

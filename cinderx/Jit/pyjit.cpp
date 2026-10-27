@@ -19,6 +19,7 @@
 #include "cinderx/Common/type.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/bytecode.h"
@@ -123,6 +124,13 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_frozen{0};
   std::atomic<uint64_t> roi_aging_events{0};
   std::atomic<uint64_t> roi_aging_count_reduced{0};
+  std::atomic<uint64_t> ic_stability_sample{0};
+  std::atomic<uint64_t> ic_stability_change{0};
+  std::atomic<uint64_t> ic_stability_defer{0};
+  std::atomic<uint64_t> ic_stability_stable{0};
+  std::atomic<uint64_t> ic_stability_cap{0};
+  std::atomic<uint64_t> ic_stability_unknown{0};
+  std::atomic<uint64_t> ic_stability_bypass{0};
 };
 
 struct AutoJitGateState {
@@ -199,6 +207,38 @@ void recordAutoJitAgingStats(uint32_t count_reduced) {
   }
 }
 
+void recordICStabilityStats(
+    const ICStabilityDecision& decision,
+    bool admission = true) {
+  if (decision.sampled) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_sample);
+  }
+  if (decision.changed) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_change);
+  }
+  if (decision.unknown) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_unknown);
+  }
+  // Warmup only collects feedback; stability is not permission to compile
+  // before the existing threshold has also been reached.
+  if (!admission) {
+    return;
+  }
+  if (decision.defer) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_defer);
+  } else if (!decision.terminal_reuse) {
+    if (decision.reason == ICStabilityReason::Stable) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_stable);
+    } else if (decision.reason == ICStabilityReason::Cap) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_cap);
+    } else if (
+        decision.reason != ICStabilityReason::Disabled &&
+        decision.reason != ICStabilityReason::NonAuto) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_bypass);
+    }
+  }
+}
+
 void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.jit_vectorcall.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.global_threshold_return.store(
@@ -219,6 +259,14 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_aging_events.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_aging_count_reduced.store(
       0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_sample.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_change.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_defer.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_stable.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_cap.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_unknown.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_bypass.store(0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -350,7 +398,8 @@ void writeAutoJitCompileEvent(
     const AutoJitGateState& state,
     const std::optional<StructureKey>& key,
     const ThresholdDecision& decision,
-    uint32_t effective_limit) {
+    uint32_t effective_limit,
+    const ICStabilityDecision& stability) {
   const char* path = std::getenv("CINDERX_AUTOJIT_COMPILE_EVENTS_FILE");
   if (path == nullptr || path[0] == '\0') {
     return;
@@ -380,7 +429,16 @@ void writeAutoJitCompileEvent(
       << ",\"import_phase\":" << (state.context.import_phase ? "true" : "false")
       << ",\"setup_phase\":" << (state.context.setup_phase ? "true" : "false")
       << ",\"branch_reason\":\"" << branchReasonName(decision.branch_reason)
-      << "\"";
+      << "\""
+      << ",\"ic_stability_reason\":\""
+      << icStabilityReasonName(stability.reason) << "\""
+      << ",\"ic_stability_samples\":" << stability.samples
+      << ",\"ic_stability_first_calls\":" << stability.first_calls
+      << ",\"ic_stability_admission_calls\":" << stability.admission_calls
+      << ",\"ic_stability_sites\":" << stability.sites
+      << ",\"ic_stability_known_sites\":" << stability.ready_sites
+      << ",\"ic_stability_ready_sites\":" << stability.ready_sites
+      << ",\"ic_stability_skipped_sites\":" << stability.skipped_sites;
   if (key.has_value()) {
     out << ",\"shape\":{"
         << "\"family\":\"" << familyName(key->family) << "\""
@@ -458,6 +516,60 @@ void recordAutoJitInterpretedCall(const AutoJitGateState& state) {
   if (!(skey_word & kSkeyDecidedColdBit)) {
     Ci_code_extra_incr_calls(state.extra);
   }
+}
+
+ICStabilityReason icStabilityBypassReason(
+    BorrowedRef<PyCodeObject> code,
+    const AutoJitGateState& state) {
+  if (!getConfig().auto_jit_ic_stability) {
+    return ICStabilityReason::Disabled;
+  }
+  if (!getConfig().auto_classify) {
+    return ICStabilityReason::NonAuto;
+  }
+  auto module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    return ICStabilityReason::Unsupported;
+  }
+  if ((code->co_flags &
+       (CI_CO_STATICALLY_COMPILED | CO_GENERATOR | CO_COROUTINE |
+        CO_ASYNC_GENERATOR)) != 0 ||
+      module_state->jit_list != nullptr) {
+    return ICStabilityReason::Explicit;
+  }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+  // Read history before roiBackoffStateAllowsCompile() consumes its recompile
+  // floor. Warmup observation and admission share this same bypass decision.
+  if (state.extra != nullptr &&
+      (state.extra->roi_ctl != 0 || state.extra->roi_deopt_count != 0 ||
+       state.extra->roi_recompile_floor != 0 ||
+       state.extra->roi_aging_epoch_ms != 0)) {
+    return ICStabilityReason::ROI;
+  }
+#endif
+  return ICStabilityReason::None;
+}
+
+void observeAutoJitICWarmup(
+    BorrowedRef<PyCodeObject> code,
+    const AutoJitGateState& state,
+    uint32_t threshold,
+    ICStabilityReason bypass_reason) {
+  if (bypass_reason != ICStabilityReason::None || state.calls == 0) {
+    return;
+  }
+  // Reuse the known threshold without running classification again. Collect
+  // near it to avoid full IC scans throughout a long interpreted warmup.
+  constexpr uint64_t warmup_span =
+      kICStabilitySampleInterval * (kICStabilityRequiredSamples - 1);
+  uint64_t first_sample = threshold > warmup_span ? threshold - warmup_span : 1;
+  if (state.calls < first_sample ||
+      (state.extra != nullptr &&
+       (Ci_code_extra_load_skey_acquire(state.extra) & kSkeyDecidedColdBit))) {
+    return;
+  }
+  recordICStabilityStats(observeICStabilityWarmup(code, state.calls), false);
 }
 
 bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code);
@@ -695,9 +807,11 @@ PyObject* jitVectorcall(
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     AutoJitGateState state = readAutoJitGateState(code);
+    ICStabilityReason stability_bypass = icStabilityBypassReason(code, state);
     if (state.calls < *limit) {
       incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
       auto entry = getInterpretedVectorcall(func);
+      observeAutoJitICWarmup(code, state, *limit, stability_bypass);
       recordAutoJitInterpretedCall(state);
       return entry(func_obj, stack, nargsf, kwnames);
     }
@@ -747,12 +861,29 @@ PyObject* jitVectorcall(
         setVectorcall(func, entry);
       } else {
         incAutoJitGateStat(g_auto_jit_gate_stats.classified_warmup_return);
+        observeAutoJitICWarmup(code, state, effective_limit, stability_bypass);
         recordAutoJitInterpretedCall(state);
       }
       return entry(func_obj, stack, nargsf, kwnames);
     }
 
-    writeAutoJitCompileEvent(func, state, key, decision, effective_limit);
+    stability_bypass = icStabilityAdmissionBypassReason(stability_bypass, key);
+    ICStabilityDecision stability;
+    stability.first_calls = state.calls;
+    stability.admission_calls = state.calls;
+    if (stability_bypass != ICStabilityReason::None) {
+      stability.reason = stability_bypass;
+    } else {
+      stability = checkICStabilityAdmission(code, state.calls);
+    }
+    recordICStabilityStats(stability);
+    if (stability.defer) {
+      auto entry = getInterpretedVectorcall(func);
+      recordAutoJitInterpretedCall(state);
+      return entry(func_obj, stack, nargsf, kwnames);
+    }
+    writeAutoJitCompileEvent(
+        func, state, key, decision, effective_limit, stability);
   }
 
   incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile);
@@ -949,6 +1080,13 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().roi_backoff_enabled,
       "Enable or disable AutoJIT dynamic negative-ROI backoff after "
       "repeated deopts");
+
+  flag_processor.addOption(
+      "jit-auto-ic-stability",
+      "CINDERX_AUTOJIT_IC_STABILITY",
+      getMutableConfig().auto_jit_ic_stability,
+      "Use bounded mature, stable interpreter feedback before classified "
+      "automatic compilation (CPython 3.14 with the GIL)");
 
   flag_processor.addOption(
       "jit-auto-roi-backoff-budget",
@@ -4472,7 +4610,34 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats,
           "roi_aging_count_reduced",
-          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0) {
+          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_sample",
+          g_auto_jit_gate_stats.ic_stability_sample) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_change",
+          g_auto_jit_gate_stats.ic_stability_change) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_defer",
+          g_auto_jit_gate_stats.ic_stability_defer) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_stable",
+          g_auto_jit_gate_stats.ic_stability_stable) != 0 ||
+      setAutoJitGateStat(
+          stats, "ic_stability_cap", g_auto_jit_gate_stats.ic_stability_cap) !=
+          0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_unknown",
+          g_auto_jit_gate_stats.ic_stability_unknown) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_bypass",
+          g_auto_jit_gate_stats.ic_stability_bypass) != 0) {
     return nullptr;
   }
 
