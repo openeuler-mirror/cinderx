@@ -1304,6 +1304,74 @@ print("OUTCOME " + json.dumps(outcome), flush=True)
     )
 
 
+# The handler belongs to the compiled caller itself. A malformed native
+# return must be diagnosed at CALL, then deopt into that frame's handler,
+# rather than escaping to the caller of invoke or executing the next line.
+def invalid_c_return_same_frame_probe(function_name, compiled):
+    return (
+        PREAMBLE
+        + f"FUNCTION_NAME = {function_name!r}\nCOMPILED = {compiled!r}\n"
+        + r"""
+import _testcapi
+import dis
+import json
+
+def invoke(fn, events):
+    try:
+        result = fn()
+        events.append("continued")
+        return result
+    except SystemError as error:
+        events.append("caught_same_frame")
+        return {
+            "type": type(error).__name__,
+            "message": str(error),
+            "cause": None if error.__cause__ is None else (
+                type(error.__cause__).__name__, str(error.__cause__)
+            ),
+            "events": events,
+        }
+
+if COMPILED:
+    assert cinderjit.force_compile(invoke)
+    assert cinderjit.is_jit_compiled(invoke)
+else:
+    _cinderx.remove_frame_evaluator()
+    assert not _cinderx.is_frame_evaluator_installed()
+
+fn = getattr(_testcapi, FUNCTION_NAME)
+call_offset = next(
+    i.offset for i in dis.get_instructions(invoke) if i.opname == "CALL"
+)
+events = []
+cinderjit.get_and_clear_runtime_stats()
+before = _cinderx._get_trigger_stats()
+print("calling invalid C function", flush=True)
+outcome = invoke(fn, events)
+after = _cinderx._get_trigger_stats()
+deopts = cinderjit.get_and_clear_runtime_stats()["deopt"]
+assert events == ["caught_same_frame"], events
+assert outcome["type"] == "SystemError", outcome
+entered = after["machine_code_entries"] - before["machine_code_entries"]
+assert entered == int(COMPILED), (entered, COMPILED)
+organic = after["organic_deopt_hits"] - before["organic_deopt_hits"]
+assert organic == int(COMPILED), (organic, COMPILED, deopts)
+assert after["forced_deopt_hits"] == before["forced_deopt_hits"]
+if COMPILED:
+    assert len(deopts) == 1, deopts
+    event = deopts[0]
+    assert event["normal"]["func_qualname"] == invoke.__qualname__, event
+    assert event["normal"]["reason"] == "UnhandledException", event
+    assert event["int"]["bc_offset"] == call_offset, event
+    assert event["int"]["opcode"] == dis.opmap["CALL"], event
+    assert event["int"]["count"] == 1, event
+else:
+    assert deopts == [], deopts
+print("OUTCOME " + json.dumps(outcome), flush=True)
+"""
+    )
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 call dispatch"
 )
@@ -1337,13 +1405,16 @@ class CallDispatchSemantics311Test(unittest.TestCase):
             self.assertNotIn(needle, proc.stderr)
         return proc
 
-    def _check_invalid_c_return(self, name, diagnostic):
+    def _check_invalid_c_return(self, name, diagnostic, same_frame=False):
         debug_python = hasattr(sys, "gettotalrefcount")
+        probe = (
+            invalid_c_return_same_frame_probe if same_frame else invalid_c_return_probe
+        )
         outcomes = []
         for compiled in (False, True):
             with self.subTest(compiled=compiled):
                 proc = self._run(
-                    invalid_c_return_probe(name, compiled),
+                    probe(name, compiled),
                     "calling invalid C function",
                     expected_returncode=-signal.SIGABRT if debug_python else 0,
                     stderr_contains=(name, diagnostic) if debug_python else (),
@@ -1355,7 +1426,9 @@ class CallDispatchSemantics311Test(unittest.TestCase):
                     )
                     outcome = json.loads(line[len("OUTCOME "):])
                     self.assertEqual(outcome["type"], "SystemError")
-                    self.assertEqual(outcome["events"], [])
+                    self.assertEqual(
+                        outcome["events"], ["caught_same_frame"] if same_frame else []
+                    )
                     self.assertIn(name, outcome["message"])
                     self.assertIn(diagnostic, outcome["message"])
                     outcomes.append(outcome)
@@ -1370,6 +1443,20 @@ class CallDispatchSemantics311Test(unittest.TestCase):
     def test_c_vectorcall_result_with_exception_matches_interpreter(self):
         self._check_invalid_c_return(
             "return_result_with_error", "returned a result with an exception set"
+        )
+
+    def test_c_vectorcall_null_without_exception_is_caught_in_same_frame(self):
+        self._check_invalid_c_return(
+            "return_null_without_error",
+            "returned NULL without setting an exception",
+            same_frame=True,
+        )
+
+    def test_c_vectorcall_result_with_exception_is_caught_in_same_frame(self):
+        self._check_invalid_c_return(
+            "return_result_with_error",
+            "returned a result with an exception set",
+            same_frame=True,
         )
 
     def test_fresh_known_function_uses_its_code_artifact(self):
