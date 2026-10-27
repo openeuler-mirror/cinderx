@@ -7,6 +7,7 @@
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
+#include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
 
@@ -2568,8 +2569,10 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub311(
 // for the plain form, or the site's entry cache address for the plain form
 // with a constructor arm.  Dispatches the way _PyObject_VectorcallTstate
 // does: tp_flags HAVE_VECTORCALL and the slot at tp_vectorcall_offset are
-// read and the slot is called directly, saving the helper frame, its own
-// dispatch and the _Py_CheckFunctionResult call on every C-function call.
+// read and the slot is called directly. Result/exception consistency is
+// checked inline; malformed returns go through _Py_CheckFunctionResult so
+// its SystemError, exception chaining and debug-build diagnostics match
+// the interpreter. Ordinary returns need no additional C helper call.
 // After a successful call the eval breaker is tested and pending work runs
 // through JITRT_HandlePendingAfterCall311.  A heap class takes the
 // constructor arm (JITRT_ConstructSite311) when a site cache was supplied;
@@ -2591,6 +2594,8 @@ void NativeGenerator::emitAarch64VcDirectStub311(
   Label dispatch = as_->newLabel();
   Label not_type = as_->newLabel();
   Label out = as_->newLabel();
+  Label null_result = as_->newLabel();
+  Label invalid_result = as_->newLabel();
 
   as_->bind(env_.vcdirect_stub);
   // --- method form: JITRT_Call's slot protocol (consuming a slot forfeits
@@ -2664,10 +2669,23 @@ void NativeGenerator::emitAarch64VcDirectStub311(
   as_->ldr(a64::x14, a64::ptr(a64::x0, a64::x12));
   as_->cbz(a64::x14, slow);
 
-  as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -16));
+  // Keep the callable for the error diagnostic across the vectorcall;
+  // x0 becomes the result and all argument/scratch registers may be lost.
+  as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -32));
   as_->mov(a64::x29, a64::sp);
+  as_->str(a64::x0, a64::ptr(a64::sp, 16));
   as_->blr(a64::x14);
-  as_->cbz(a64::x0, out);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                      ->runtime->gilstate.tstate_current));
+  as_->ldr(a64::x9, a64::ptr(a64::x9));
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x9, static_cast<int32_t>(offsetof(PyThreadState, curexc_type))));
+  as_->cbz(a64::x0, null_result);
+  as_->cbnz(a64::x10, invalid_result);
   as_->mov(
       a64::x9,
       reinterpret_cast<uint64_t>(
@@ -2678,8 +2696,22 @@ void NativeGenerator::emitAarch64VcDirectStub311(
       a64::x9, reinterpret_cast<uint64_t>(JITRT_HandlePendingAfterCall311));
   as_->blr(a64::x9);
   as_->bind(out);
-  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 16));
+  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 32));
   as_->ret(a64::x30);
+
+  as_->bind(null_result);
+  // NULL with an exception is a legitimate error return. NULL without
+  // one, or a non-NULL result with an exception, must be audited before
+  // the caller's exception guard or any pending work can run.
+  as_->cbnz(a64::x10, out);
+  as_->bind(invalid_result);
+  as_->mov(a64::x2, a64::x0);
+  as_->ldr(a64::x1, a64::ptr(a64::sp, 16));
+  as_->mov(a64::x0, a64::x9);
+  as_->mov(a64::x3, 0);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(_Py_CheckFunctionResult));
+  as_->blr(a64::x16);
+  as_->b(out);
 
   // --- slow: tail-call the plain vectorcall helper.  The slot protocol has
   // already been applied above, so JITRT_Call must not see the shifted

@@ -1,7 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 """Runtime dispatch, binding and lifetime semantics for CPython 3.11."""
 
+import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -1239,12 +1241,75 @@ print("fresh global change ok")
 """
 
 
+# Exercise the actual non-function vectorcall slot with CPython's own
+# malformed-C-return fixtures. Both oracle and JIT run in fresh children;
+# Py_DEBUG deliberately aborts in _Py_CheckFunctionResult in either mode.
+def invalid_c_return_probe(function_name, compiled):
+    return (
+        PREAMBLE
+        + f"FUNCTION_NAME = {function_name!r}\nCOMPILED = {compiled!r}\n"
+        + r"""
+import _testcapi
+import json
+
+def invoke(fn, events):
+    result = fn()
+    events.append("continued")
+    return result
+
+if COMPILED:
+    assert cinderjit.force_compile(invoke)
+    assert cinderjit.is_jit_compiled(invoke)
+else:
+    _cinderx.remove_frame_evaluator()
+    assert not _cinderx.is_frame_evaluator_installed()
+
+# Cover both legal result/error combinations before the malformed one:
+# a successful C vectorcall and a NULL return carrying a real TypeError.
+events = []
+assert invoke(dict, events) == {}
+assert events == ["continued"]
+events.clear()
+try:
+    invoke(len, events)
+except TypeError:
+    pass
+else:
+    raise AssertionError("len() must reject the missing argument")
+assert events == []
+if COMPILED:
+    assert cinderjit.is_jit_compiled(invoke)
+
+fn = getattr(_testcapi, FUNCTION_NAME)
+before = _cinderx._get_trigger_stats()["machine_code_entries"]
+print("calling invalid C function", flush=True)
+try:
+    invoke(fn, events)
+except SystemError as error:
+    outcome = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "cause": None if error.__cause__ is None else (
+            type(error.__cause__).__name__, str(error.__cause__)
+        ),
+        "events": events,
+    }
+else:
+    raise AssertionError("malformed C return did not raise SystemError")
+after = _cinderx._get_trigger_stats()["machine_code_entries"]
+assert after - before == int(COMPILED), (before, after, COMPILED)
+assert events == [], events
+print("OUTCOME " + json.dumps(outcome), flush=True)
+"""
+    )
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 call dispatch"
 )
 class CallDispatchSemantics311Test(unittest.TestCase):
     def _run(self, probe, marker, extra_env=None, stderr_contains=(),
-             stderr_excludes=()):
+             stderr_excludes=(), expected_returncode=0):
         env = {
             key: value
             for key, value in os.environ.items()
@@ -1264,12 +1329,48 @@ class CallDispatchSemantics311Test(unittest.TestCase):
             env=env,
             timeout=300,
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual(proc.returncode, expected_returncode, proc.stderr[-2000:])
         self.assertIn(marker, proc.stdout)
         for needle in stderr_contains:
             self.assertIn(needle, proc.stderr)
         for needle in stderr_excludes:
             self.assertNotIn(needle, proc.stderr)
+        return proc
+
+    def _check_invalid_c_return(self, name, diagnostic):
+        debug_python = hasattr(sys, "gettotalrefcount")
+        outcomes = []
+        for compiled in (False, True):
+            with self.subTest(compiled=compiled):
+                proc = self._run(
+                    invalid_c_return_probe(name, compiled),
+                    "calling invalid C function",
+                    expected_returncode=-signal.SIGABRT if debug_python else 0,
+                    stderr_contains=(name, diagnostic) if debug_python else (),
+                )
+                if not debug_python:
+                    line = next(
+                        line for line in proc.stdout.splitlines()
+                        if line.startswith("OUTCOME ")
+                    )
+                    outcome = json.loads(line[len("OUTCOME "):])
+                    self.assertEqual(outcome["type"], "SystemError")
+                    self.assertEqual(outcome["events"], [])
+                    self.assertIn(name, outcome["message"])
+                    self.assertIn(diagnostic, outcome["message"])
+                    outcomes.append(outcome)
+        if not debug_python and len(outcomes) == 2:
+            self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_c_vectorcall_null_without_exception_matches_interpreter(self):
+        self._check_invalid_c_return(
+            "return_null_without_error", "returned NULL without setting an exception"
+        )
+
+    def test_c_vectorcall_result_with_exception_matches_interpreter(self):
+        self._check_invalid_c_return(
+            "return_result_with_error", "returned a result with an exception set"
+        )
 
     def test_fresh_known_function_uses_its_code_artifact(self):
         self._run(
