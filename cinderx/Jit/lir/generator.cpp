@@ -3270,6 +3270,24 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadMethodSuper: {
         auto instr = static_cast<const LoadMethodSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
+#if PY_VERSION_HEX < 0x030C0000
+        // Replay the (instance type, start class) resolution from a per-site
+        // entry; the MRO walk only runs on a version miss.
+        if (env_->ctx != nullptr) {
+          auto* cache = env_->ctx->allocateSuperSiteCache311();
+          appendCall2RetValues(
+              bbb,
+              instr->output(),
+              JITRT_GetMethodFromSuperCached311,
+              cache,
+              instr->global_super(),
+              instr->type(),
+              instr->receiver(),
+              name,
+              instr->no_args_in_super_call());
+          break;
+        }
+#endif
         appendCall2RetValues(
             bbb,
             instr->output(),
@@ -3284,6 +3302,21 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadAttrSuper: {
         auto instr = static_cast<const LoadAttrSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
+#if PY_VERSION_HEX < 0x030C0000
+        if (env_->ctx != nullptr) {
+          auto* cache = env_->ctx->allocateSuperSiteCache311();
+          bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_GetAttrFromSuperCached311,
+              cache,
+              instr->global_super(),
+              instr->type(),
+              instr->receiver(),
+              name,
+              instr->no_args_in_super_call());
+          break;
+        }
+#endif
         bbb.appendCallInstruction(
             instr->output(),
             JITRT_GetAttrFromSuper,

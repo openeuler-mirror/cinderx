@@ -1609,6 +1609,97 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+namespace {
+void unpinGlobalLoadCell311(jit::GlobalLoadCell311* cell) {
+  cell->globals_keys_version = jit::kGlobalLoadCellUnpinned311;
+  cell->builtins_keys_version = jit::kGlobalLoadCellUnpinned311;
+  cell->slot = nullptr;
+}
+
+// Pins the cell to the entry slot the lookup answered from, recording the
+// keys versions the fast arm compares against.  Runs on the executing
+// thread with the GIL held: the version allocator and the dict tables are
+// not touched from compile threads.
+bool pinGlobalLoadCell311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals_obj,
+    PyObject* builtins_obj,
+    PyObject* name,
+    PyObject* value) {
+  auto* globals = reinterpret_cast<PyDictObject*>(globals_obj);
+  auto* builtins = reinterpret_cast<PyDictObject*>(builtins_obj);
+  // Only combined, unicode-keyed tables have a stable per-entry value slot
+  // and exact-str keys whose comparison runs no Python code.
+  if (!PyDict_CheckExact(globals_obj) || !PyDict_CheckExact(builtins_obj) ||
+      globals->ma_values != nullptr || builtins->ma_values != nullptr ||
+      !hasOnlyUnicodeKeys(globals_obj) || !hasOnlyUnicodeKeys(builtins_obj)) {
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  // The versions are read after the lookups below cannot run anymore.  A
+  // zero version (the allocator is exhausted) cannot be pinned: a live zero
+  // would compare equal to it; nor can the unpinned sentinel, which the
+  // vendored allocator reserves.
+  PyDictObject* owner = globals;
+  Py_ssize_t index = getDictKeysIndex(globals->ma_keys, name);
+  if (index < 0 ||
+      DK_UNICODE_ENTRIES(globals->ma_keys)[index].me_value == nullptr) {
+    if (cell->globals_only) {
+      // The site checks the globals version only, which cannot witness a
+      // builtins entry; it stays on the slow arm until the global returns.
+      unpinGlobalLoadCell311(cell);
+      return false;
+    }
+    owner = builtins;
+    index = getDictKeysIndex(builtins->ma_keys, name);
+    if (index < 0) {
+      unpinGlobalLoadCell311(cell);
+      return false;
+    }
+  }
+  PyObject** slot = &DK_UNICODE_ENTRIES(owner->ma_keys)[index].me_value;
+  if (*slot != value) {
+    // The scan and the lookup disagree (a deleted entry below dk_nentries,
+    // or a value swapped in between): do not pin a slot the lookup did not
+    // answer from.
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  uint32_t globals_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+  uint32_t builtins_version = dictGetKeysVersion(nullptr, builtins->ma_keys);
+  if (globals_version == 0 || builtins_version == 0 ||
+      globals_version == jit::kGlobalLoadCellUnpinned311 ||
+      builtins_version == jit::kGlobalLoadCellUnpinned311) {
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  cell->globals_keys_version = globals_version;
+  cell->builtins_keys_version = builtins_version;
+  cell->slot = slot;
+  return true;
+}
+} // namespace
+
+PyObject** JITRT_LoadGlobalRepin311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name) {
+  PyObject* value = JITRT_LoadGlobal(globals, builtins, name);
+  if (value == nullptr) {
+    unpinGlobalLoadCell311(cell);
+    return &jit::kGlobalLoadNoValue311;
+  }
+  if (pinGlobalLoadCell311(cell, globals, builtins, name, value)) {
+    // The dict entry keeps the value alive; the site reads it from there.
+    Py_DECREF(value);
+    return cell->slot;
+  }
+  // Unpinnable shape: the cell keeps this answer alive until the next one.
+  Py_XSETREF(cell->held, value);
+  return &cell->held;
+}
+
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value) {
   // MR-08 frame observability: keep the materialized frame's localsplus
   // current so sys._getframe()/f_locals readers see what stock 3.11
@@ -1631,44 +1722,6 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id) {
   return code_rt->consumeForcedDeopt(static_cast<std::size_t>(deopt_id));
 }
 
-PyObject* JITRT_LoadGlobalModuleValue(
-    PyObject* globals,
-    PyObject* name,
-    uint32_t keys_version,
-    Py_ssize_t index) {
-  if (!PyDict_CheckExact(globals) || index < 0) {
-    return nullptr;
-  }
-
-  auto dict = reinterpret_cast<PyDictObject*>(globals);
-  PyDictKeysObject* keys = dict->ma_keys;
-  if (keys->dk_version != keys_version || index >= keys->dk_nentries ||
-      dict->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
-    return nullptr;
-  }
-
-  PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[index];
-  if (entry->me_key == nullptr || entry->me_value == nullptr) {
-    return nullptr;
-  }
-  if (entry->me_key != name) {
-    int equal = PyObject_RichCompareBool(entry->me_key, name, Py_EQ);
-    if (equal < 0) {
-      PyErr_Clear();
-      return nullptr;
-    }
-    if (!equal) {
-      return nullptr;
-    }
-  }
-
-  PyObject* result = entry->me_value;
-  if (result == nullptr) {
-    return nullptr;
-  }
-  Py_INCREF(result);
-  return result;
-}
 #endif
 
 PyObject* JITRT_LoadGlobalFromThreadState(
@@ -2968,6 +3021,144 @@ PyObject* JITRT_GetAttrFromSuper(
   return super_lookup_method_or_attr(
       global_super, type, self, name, no_args_in_super_call, nullptr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// The instance type super() resolves against on the builtin fast path: the
+// receiver itself when it is a class (classmethod form), else its type.
+inline PyTypeObject* superObjType311(PyObject* self) {
+  return PyType_Check(self) ? reinterpret_cast<PyTypeObject*>(self)
+                            : Py_TYPE(self);
+}
+
+inline bool superSiteHit311(
+    const jit::SuperSiteCache311* cache,
+    PyTypeObject* obj_type,
+    PyTypeObject* type) {
+  return obj_type == cache->obj_type && type == cache->start_type &&
+      obj_type->tp_version_tag == cache->version &&
+      (obj_type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) != 0;
+}
+
+// Resolve the descriptor through the MRO on a miss and fill the entry when
+// the answer is replayable (builtin super, subtype relation holds, lookup
+// found the name, instance type carries a valid version tag).  Returns a new
+// reference, or nullptr with no error set when the generic path must run.
+PyObject* superSiteLookupFill311(
+    jit::SuperSiteCache311* cache,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    PyTypeObject** obj_type_out) {
+  PyTypeObject* obj_type = superObjType311(self);
+  if (!PyType_IsSubtype(obj_type, type)) {
+    return nullptr;
+  }
+  PyObject* res = super_lookup_descr_builtin(type, obj_type, name);
+  if (res == nullptr) {
+    return nullptr;
+  }
+  if ((obj_type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) == 0 ||
+      obj_type->tp_version_tag == 0) {
+    // The MRO walk above used raw dict lookups; the type lookup assigns a
+    // version tag when it can.
+    _PyType_Lookup(obj_type, name);
+  }
+  if ((obj_type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) != 0 &&
+      obj_type->tp_version_tag != 0) {
+    cache->obj_type = obj_type;
+    cache->version = obj_type->tp_version_tag;
+    cache->start_type = type;
+    cache->descr = res;
+  }
+  *obj_type_out = obj_type;
+  return res;
+}
+
+inline bool superIsMethodDescr311(PyObject* res) {
+  return PyFunction_Check(res) ||
+      PyType_HasFeature(Py_TYPE(res), Py_TPFLAGS_METHOD_DESCRIPTOR);
+}
+
+// Apply the descriptor protocol the way super_lookup_builtin() does for a
+// non-method result.  Steals `res`.
+PyObject* superBind311(PyObject* res, PyObject* self, PyTypeObject* obj_type) {
+  descrgetfunc f = Py_TYPE(res)->tp_descr_get;
+  if (f == nullptr) {
+    return res;
+  }
+  PyObject* value =
+      f(res,
+        self == reinterpret_cast<PyObject*>(obj_type) ? nullptr : self,
+        reinterpret_cast<PyObject*>(obj_type));
+  Py_DECREF(res);
+  return value;
+}
+} // namespace
+
+LoadMethodResult JITRT_GetMethodFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call) {
+  if (global_super == reinterpret_cast<PyObject*>(&PySuper_Type)) {
+    PyTypeObject* obj_type = superObjType311(self);
+    PyObject* res;
+    if (superSiteHit311(cache, obj_type, type)) {
+      res = cache->descr;
+      Py_INCREF(res);
+    } else {
+      res = superSiteLookupFill311(cache, type, self, name, &obj_type);
+      if (res == nullptr && PyErr_Occurred()) {
+        return {nullptr, nullptr};
+      }
+    }
+    if (res != nullptr) {
+      if (superIsMethodDescr311(res)) {
+        Py_INCREF(self);
+        return {res, self};
+      }
+      PyObject* value = superBind311(res, self, obj_type);
+      if (value == nullptr) {
+        return {nullptr, nullptr};
+      }
+      Py_INCREF(Py_None);
+      return {Py_None, value};
+    }
+  }
+  return JITRT_GetMethodFromSuper(
+      global_super, type, self, name, no_args_in_super_call);
+}
+
+PyObject* JITRT_GetAttrFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call) {
+  if (global_super == reinterpret_cast<PyObject*>(&PySuper_Type)) {
+    PyTypeObject* obj_type = superObjType311(self);
+    PyObject* res;
+    if (superSiteHit311(cache, obj_type, type)) {
+      res = cache->descr;
+      Py_INCREF(res);
+    } else {
+      res = superSiteLookupFill311(cache, type, self, name, &obj_type);
+      if (res == nullptr && PyErr_Occurred()) {
+        return nullptr;
+      }
+    }
+    if (res != nullptr) {
+      return superBind311(res, self, obj_type);
+    }
+  }
+  return JITRT_GetAttrFromSuper(
+      global_super, type, self, name, no_args_in_super_call);
+}
+#endif
 
 PyObject* JITRT_InvokeMethod(
     Py_ssize_t slot,

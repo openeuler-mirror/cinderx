@@ -1771,7 +1771,12 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def _g():
+            # A positional call with fewer arguments than parameters pins
+            # the function-valued global by identity (the simplifier
+            # completes the default at compile time); that pin is the deopt
+            # point left at LOAD_GLOBAL now that key-version misses re-pin
+            # the site instead of deoptimizing.
+            def _g(a=1):
                 return 7
 
             G = _g
@@ -1886,10 +1891,10 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("load_method pair restored", proc.stdout)
 
-    def test_organic_deopt_on_load_global_keys_version(self):
-        # Organic LOAD_GLOBAL miss: inserting a global key bumps dk_version
-        # so the module-value guard fails and re-executes without a second
-        # PUSH_NULL.
+    def test_load_global_keys_version_miss_repins_without_deopt(self):
+        # Organic LOAD_GLOBAL miss: inserting a global key bumps dk_version;
+        # the site's slow arm looks the name up again and re-pins the cell,
+        # so the call neither deopts nor leaves machine code.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1911,11 +1916,17 @@ class CanaryExecute311Test(unittest.TestCase):
             for _ in range(64):
                 assert read() == 7
             assert cinderjit.force_compile(read) is True
-            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            stats = _cinderx._get_trigger_stats()
+            before = stats["organic_deopt_hits"]
+            entries = stats["machine_code_entries"]
             read.__globals__["_mr7_scratch"] = 1
-            assert read() == 7
-            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
-            assert after > before, (before, after, cinderjit.deopt_sites(read))
+            for _ in range(10):
+                assert read() == 7
+            stats = _cinderx._get_trigger_stats()
+            assert stats["organic_deopt_hits"] == before, (
+                before, stats["organic_deopt_hits"], cinderjit.deopt_sites(read))
+            assert stats["machine_code_entries"] - entries == 10, stats
+            assert cinderjit.is_jit_compiled(read)
             print("load_global organic miss")
             """
         )

@@ -66,6 +66,56 @@ static_assert(
         offsetof(CallSiteEntryCache, helper_budget) == 24,
     "codegen probe hardcodes CallSiteEntryCache layout");
 
+// Per-site cache for the builtin super() lookup.  The descriptor super()
+// finds for (instance type, start class, name) is a function of the
+// instance type's MRO and of the dicts along it, all covered by the
+// instance type's version tag (a change to any base invalidates every
+// subclass), so one entry keyed by (instance type, version tag, start class)
+// replays the lookup.  descr is borrowed from the type dict that the tag
+// keeps unchanged.
+// Per-site state of a 3.11 LOAD_GLOBAL (HIRBuilder::tryEmitLoadGlobal311).
+// The slot is the address of the pinned entry's value inside the dict keys
+// that were live when the pin was taken, and it is read only while both
+// recorded keys versions still match the live ones: versions are allocated
+// monotonically and never reused, so a match proves the keys objects (and
+// with them the slot) are the pinned ones.  A same-key rebinding does not
+// change dk_version, so the value is read live.  A version match also
+// proves the entry still holds a value: 3.11 zeroes dk_version on every key
+// insertion and deletion (insertdict, delitem_common, popitem) and a resize
+// or clear installs another keys object, so the fast arm reads the slot
+// without a NULL test.  An unpinned cell records kGlobalLoadCellUnpinned311
+// in both version fields, a value the vendored keys-version allocator
+// (Ci_GetDictKeysVersion_311) never issues, so it matches no live dict.
+inline constexpr uint32_t kGlobalLoadCellUnpinned311 = UINT32_MAX;
+// The slow arm answers through a pointer to stable storage so that both
+// arms hand the site a borrowed reference (an owned slow-arm result merged
+// with the borrowed fast-arm load would make the merge owned and put an
+// incref/decref pair on the fast arm): the pinned entry slot when the cell
+// could be pinned, the cell's own `held` reference otherwise, and this
+// NULL storage when the lookup raised.
+inline PyObject* kGlobalLoadNoValue311 = nullptr;
+
+struct GlobalLoadCell311 {
+  uint32_t globals_keys_version{kGlobalLoadCellUnpinned311};
+  uint32_t builtins_keys_version{kGlobalLoadCellUnpinned311};
+  PyObject** slot{nullptr};
+  // Owned: the last value the slow arm answered with when the cell could
+  // not be pinned, kept until the next such answer replaces it (the cell
+  // itself lives as long as the JIT context).
+  PyObject* held{nullptr};
+  // Fixed at compile time from where the name resolved then.  A name found
+  // in the module dict cannot be shadowed by builtins, so its site checks
+  // the globals keys version only and the pin refuses a builtins entry; a
+  // name resolved in builtins checks both versions.
+  bool globals_only{false};
+};
+
+struct SuperSiteCache311 {
+  PyTypeObject* obj_type{nullptr};
+  uint32_t version{0};
+  PyTypeObject* start_type{nullptr};
+  PyObject* descr{nullptr};
+};
 #endif
 
 // Mutator for an instance attribute that is stored in a split dictionary

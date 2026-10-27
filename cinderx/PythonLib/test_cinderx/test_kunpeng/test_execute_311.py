@@ -342,6 +342,9 @@ class Execute311Test(unittest.TestCase):
         self.assertGreater(payload["entry_delta"], 0)
 
     def test_frame_local_inline_preserves_materialized_frame_semantics(self):
+        # Generator frames write every store through to localsplus (the
+        # inline lowering under test); a normal frame's observable locals
+        # come from deopt metadata, so the child uses generators.
         payload = self.run_ok("frame_local_inline", threshold="2")
         self.assertTrue(all(payload["compiled"].values()))
         self.assertEqual(payload["stored"], 17)
