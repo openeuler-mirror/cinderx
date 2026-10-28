@@ -125,6 +125,14 @@ enum OperandSizeType {
     {},                                                                        \
     1)                                                                         \
   X(VectorCall, false, FlagEffects::kInvalidate, kAlways64, 1, {1}, 1)         \
+  /* Call-site entry-cache forms of VectorCall (CPython 3.11, AArch64).  */    \
+  /* Operand layout matches VectorCall with [0] the cache address Imm;   */    \
+  /* postalloc runs the same argument-move rewrite but keeps the opcode, */    \
+  /* and a dedicated translator emits the probe + blr sequence.  The     */    \
+  /* CallMethod form adds the NULL/None callable and empty-receiver      */    \
+  /* prechecks and routes its slow arm through the JITRT_Call slot.      */    \
+  X(CallSiteVectorCall, false, FlagEffects::kInvalidate, kAlways64, 1, {1}, 1) \
+  X(CallSiteCallMethod, false, FlagEffects::kInvalidate, kAlways64, 1, {1}, 1) \
   X(VectorCallTstate, false, FlagEffects::kInvalidate, kAlways64, 1, {1}, 1)   \
   X(VarArgCall, false, FlagEffects::kInvalidate, kDefault, 1, {1})             \
   X(Guard, false, FlagEffects::kInvalidate, kDefault, 1, {0, 0, 1, 1}, 1)      \

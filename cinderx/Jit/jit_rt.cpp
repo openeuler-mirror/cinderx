@@ -46,6 +46,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -78,7 +79,18 @@ std::unique_ptr<T[]> allocateBindArray(size_t n) {
 // reference.
 struct BoundDefaultRefs {
   Ref<> positional_tuple;
+  // Owned keyword-only defaults are held in an inline array; the vector
+  // (allocated on the first emplace) only takes the overflow.  Both release
+  // after the call has returned.
+  static constexpr size_t kInlineKeywordValues = 8;
+  PyObject* inline_keyword_values[kInlineKeywordValues];
+  size_t num_inline_keyword_values{0};
   std::vector<Ref<>> keyword_values;
+  ~BoundDefaultRefs() {
+    for (size_t i = 0; i < num_inline_keyword_values; i++) {
+      Py_DECREF(inline_keyword_values[i]);
+    }
+  }
 };
 
 static void bindPositionalDefault(
@@ -96,9 +108,121 @@ static void bindKeywordDefault(
     BoundDefaultRefs& owned_defaults,
     PyObject** slot,
     PyObject* def) {
+  if (owned_defaults.num_inline_keyword_values <
+      BoundDefaultRefs::kInlineKeywordValues) {
+    Py_INCREF(def);
+    owned_defaults
+        .inline_keyword_values[owned_defaults.num_inline_keyword_values++] =
+        def;
+    *slot = def;
+    return;
+  }
   owned_defaults.keyword_values.emplace_back(Ref<>::create(def));
   *slot = owned_defaults.keyword_values.back().get();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// Keyword-only defaults table.  A call that leaves a keyword-only parameter
+// unbound looked its default up in func->func_kwdefaults by name on every
+// call, one dict probe per parameter.  The values are memoised per
+// (defaults dict, its version tag, code): the version tag is bumped by every
+// mutation of the dict and is unique across dicts, so a matching entry still
+// describes the live dict, whose own references keep the memoised values
+// alive until they are taken as owned references by the binder.
+namespace {
+constexpr size_t kKwDefaultsEntries311 = 256;
+constexpr Py_ssize_t kKwDefaultsMax311 = 12;
+struct KwDefaultsEntry311 {
+  PyObject* kwdefs{nullptr}; // identity only, never dereferenced (the
+                             // version tag is process-unique, so a later
+                             // dict at this address never matches)
+  PyCodeObject* code{nullptr}; // held: the values are laid out by this
+                               // code's parameter names, and a code object
+                               // that died could be succeeded at its
+                               // address by one with another signature
+  uint64_t version{0};
+  PyObject* values[kKwDefaultsMax311]; // borrowed; nullptr = no default
+};
+KwDefaultsEntry311 s_kwdefaults_311[kKwDefaultsEntries311];
+
+// The memoised defaults of `co`'s keyword-only parameters under `kwdefs`,
+// or nullptr (too many parameters; a lookup raised, with *error set).
+// Nothing here runs Python: the entry's previous code object, when the
+// rewrite displaces one, is handed back in *retired for the caller to
+// release once it owns the values it took from the shared array -- the
+// release can run a weakref callback (code_dealloc clears weak references),
+// which can refill this very entry or empty the defaults dict.
+const PyObject* const* kwOnlyDefaults311(
+    PyCodeObject* co,
+    PyObject* kwdefs,
+    bool* error,
+    PyObject** retired) {
+  *error = false;
+  *retired = nullptr;
+  const Py_ssize_t nkw = co->co_kwonlyargcount;
+  if (nkw > kKwDefaultsMax311) {
+    return nullptr;
+  }
+  // The lookups below collect borrowed pointers and run no Python only on
+  // a unicode-keyed table (every key an exact str, compared without a
+  // call); any other table can run a key's __eq__, which can drop a default
+  // collected earlier.  Such a dict takes the generic bind, which owns each
+  // default as it is found.
+  if (!hasOnlyUnicodeKeys(kwdefs)) {
+    return nullptr;
+  }
+  // Slots are chosen by the code object, not the defaults dict: a function
+  // re-created on every call brings a fresh dict (and address) each time,
+  // and indexing by dict would spread one code's entries over the table,
+  // each holding a reference to the code until some later dict happens to
+  // land on that slot.  Per code, the entry is rewritten in place and the
+  // table reaches a steady state after one fill, like the type cache.
+  KwDefaultsEntry311& e = s_kwdefaults_311
+      [(reinterpret_cast<uintptr_t>(co) >> 4) & (kKwDefaultsEntries311 - 1)];
+  const uint64_t version =
+      reinterpret_cast<PyDictObject*>(kwdefs)->ma_version_tag;
+  if (e.kwdefs == kwdefs && e.code == co && e.version == version) {
+    return e.values;
+  }
+  // The entry is rewritten in place: retire its old key first so that a
+  // lookup that raises midway cannot leave another key over half-written
+  // values.
+  e.kwdefs = nullptr;
+  for (Py_ssize_t i = 0; i < nkw; i++) {
+    PyObject* name = jit::getVarname(co, co->co_argcount + i);
+    PyObject* def = PyDict_GetItemWithError(kwdefs, name);
+    if (def == nullptr && _PyErr_Occurred(_PyThreadState_GET())) {
+      *error = true;
+      return nullptr;
+    }
+    e.values[i] = def;
+  }
+  e.kwdefs = kwdefs;
+  Py_INCREF(co);
+  *retired = reinterpret_cast<PyObject*>(e.code);
+  e.code = co;
+  e.version = version;
+  return e.values;
+}
+} // namespace
+#endif
+
+// Argument array for one bind: inline for the usual arities, heap beyond.
+class BindArgs {
+ public:
+  PyObject** allocate(size_t n) {
+    if (n <= kInline) {
+      return inline_;
+    }
+    heap_ = allocateBindArray<PyObject*>(n);
+    return heap_.get();
+  }
+
+ private:
+  static constexpr size_t kInline = 32;
+  PyObject* inline_[kInline];
+  std::unique_ptr<PyObject*[]> heap_;
+};
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
@@ -112,7 +236,8 @@ static BindKwStatus JITRT_BindKeywordArgs(
     Py_ssize_t total_args,
     Ref<PyObject>& kwdict,
     Ref<PyObject>& varargs,
-    BoundDefaultRefs& owned_defaults) {
+    BoundDefaultRefs& owned_defaults,
+    std::vector<Ref<>>& retired_codes) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   const Py_ssize_t named_args = co->co_argcount + co->co_kwonlyargcount;
@@ -243,11 +368,44 @@ static BindKwStatus JITRT_BindKeywordArgs(
   if (co->co_kwonlyargcount > 0) {
     Py_ssize_t missing = 0;
     PyObject* kwdefs = func->func_kwdefaults;
+#if PY_VERSION_HEX < 0x030C0000
+    // The memo is consulted at the first unbound keyword-only parameter
+    // only; a call that named every one of them pays nothing here.
+    const PyObject* const* cached = nullptr;
+    bool probed = false;
+#endif
     for (Py_ssize_t i = co->co_argcount; i < named_args; i++) {
       PyObject* name;
       if (arg_space[i] != nullptr) {
         continue;
       }
+#if PY_VERSION_HEX < 0x030C0000
+      if (kwdefs != nullptr && !probed) {
+        probed = true;
+        bool error = false;
+        PyObject* retired = nullptr;
+        cached = kwOnlyDefaults311(co, kwdefs, &error, &retired);
+        if (retired != nullptr) {
+          // Released by the caller after the call it is binding for: the
+          // release can run Python (a weak reference callback), which could
+          // re-code the function under the argument space, the binding and
+          // the re-entry that were all derived from this code object.
+          retired_codes.emplace_back(Ref<>::steal(retired));
+        }
+        if (error) {
+          return BindKwStatus::Error;
+        }
+      }
+      if (cached != nullptr) {
+        PyObject* def = const_cast<PyObject*>(cached[i - co->co_argcount]);
+        if (def != nullptr) {
+          bindKeywordDefault(owned_defaults, &arg_space[i], def);
+          continue;
+        }
+        missing++;
+        continue;
+      }
+#endif
       name = jit::getVarname(co, i);
       if (kwdefs != nullptr) {
         PyObject* def = PyDict_GetItemWithError(kwdefs, name);
@@ -306,6 +464,34 @@ class PrologueActivation311 {};
 // the CompiledFunction for this call, and binding must not re-query
 // function state after keyword equality has run.  InstalledArtifact is
 // only the fallback when this helper is entered without a snapshot.
+// The invocation artifact published by a C entry (the by-code dispatch of
+// an unattached function object, the RuntimeTests invoke) describes the
+// function it was published for.  While that scope is open, a nested call
+// of another function through its generated entry reaches the binding
+// helpers too; its prologue must not take the outer artifact, so the
+// snapshot only answers for the function's own code.
+static jit::CompiledFunction* invocationArtifactFor311(PyFunctionObject* func) {
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InvocationArtifact());
+  if (compiled == nullptr || compiled->runtime() == nullptr) {
+    return nullptr;
+  }
+  // The artifact is compiled for one namespace: its global loads read the
+  // globals fixed at compile time.  The same code under other globals or
+  // builtins (an artifact retired while still running, a twin published
+  // since) is another function as far as the snapshot is concerned.
+  const jit::CodeRuntime* runtime = compiled->runtime();
+  if (runtime->code().get() !=
+          reinterpret_cast<PyCodeObject*>(func->func_code) ||
+      reinterpret_cast<PyObject*>(runtime->globals().get()) !=
+          func->func_globals ||
+      reinterpret_cast<PyObject*>(runtime->builtins().get()) !=
+          func->func_builtins) {
+    return nullptr;
+  }
+  return compiled;
+}
+
 static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
   // Captured before any binding runs user code: the artifact installed for
   // the function at this moment is the one whose prologue dispatched here.
@@ -313,8 +499,7 @@ static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
   // snapshot; the installed-artifact lookup answers instead, and a function
   // that is no longer installed re-enters the interpreter with the bound
   // arguments.
-  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
-      Ci_JitShell311_InvocationArtifact());
+  jit::CompiledFunction* compiled = invocationArtifactFor311(func);
   if (compiled == nullptr) {
     compiled = reinterpret_cast<jit::CompiledFunction*>(
         Ci_JitShell311_InstalledArtifact(func));
@@ -501,8 +686,117 @@ PyObject* JITRT_CallWithKeywordArgs(
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
       ((co->co_flags & CO_VARARGS) ? 1 : 0);
-  auto arg_space =
-      allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
+  // Code objects the keyword-only defaults memo displaced during this call,
+  // released when the call is over: everything above and below (the
+  // argument space, the binding, the re-entry) is derived from `co`, and a
+  // release can run Python that re-codes the function.
+  std::vector<Ref<>> retired_codes;
+#if PY_VERSION_HEX < 0x030C0000
+  // A *args / **kwargs callee is entered here on every call (its prologue
+  // has no argument-count arm), and the usual shape is the positional one:
+  // no keywords, every named parameter supplied.  The general binder below
+  // clears and re-derives every slot, walks the default and keyword-only
+  // tables and keeps its results behind owning holders; this shape needs
+  // none of it: the named slots are the arguments as given, *args is the
+  // tail (the empty tuple when there is none) and **kwargs is a fresh dict,
+  // as initialize_locals builds them.  Missing positionals (defaults),
+  // keyword-only parameters and keyword calls keep the general path; so
+  // does an oversupplied call without *args, whose TypeError the
+  // interpreter fallback produces.
+  if (kwnames == nullptr && co->co_kwonlyargcount == 0 && total_args <= 32) {
+    const Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    const Py_ssize_t argcount = co->co_argcount;
+    if (nargs >= argcount &&
+        (nargs == argcount || (co->co_flags & CO_VARARGS))) {
+      PyObject* stack[32];
+      for (Py_ssize_t i = 0; i < argcount; i++) {
+        stack[i] = args[i];
+      }
+      Py_ssize_t idx = argcount;
+      PyObject* varargs = nullptr;
+      PyObject* kwdict = nullptr;
+      if (co->co_flags & CO_VARARGS) {
+        varargs = Cix_PyTuple_FromArray(args + argcount, nargs - argcount);
+        if (varargs == nullptr) {
+          return nullptr;
+        }
+        stack[idx++] = varargs;
+      }
+      if (co->co_flags & CO_VARKEYWORDS) {
+        kwdict = PyDict_New();
+        if (kwdict == nullptr) {
+          Py_XDECREF(varargs);
+          return nullptr;
+        }
+        stack[idx++] = kwdict;
+      }
+      PyObject* result = jitrtReenterAfterBind(
+          reentry,
+          reinterpret_cast<PyObject*>(func),
+          stack,
+          static_cast<size_t>(idx),
+          nullptr);
+      Py_XDECREF(kwdict);
+      Py_XDECREF(varargs);
+      return result;
+    }
+  }
+  // A positional call that fills every positional parameter of a function
+  // whose only other parameters are keyword-only ones with defaults.  The
+  // bound vector is the arguments followed by the memoised defaults, owned
+  // for the duration of the call; nothing else of the generic bind applies.
+  if (kwnames == nullptr && co->co_kwonlyargcount > 0 &&
+      !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) && total_args <= 32 &&
+      static_cast<Py_ssize_t>(PyVectorcall_NARGS(nargsf)) == co->co_argcount &&
+      func->func_kwdefaults != nullptr) {
+    bool error = false;
+    PyObject* retired = nullptr;
+    const PyObject* const* defs =
+        kwOnlyDefaults311(co, func->func_kwdefaults, &error, &retired);
+    if (retired != nullptr) {
+      retired_codes.emplace_back(Ref<>::steal(retired));
+    }
+    if (error) {
+      return nullptr;
+    }
+    if (defs != nullptr) {
+      PyObject* stack[32];
+      const Py_ssize_t argcount = co->co_argcount;
+      const Py_ssize_t nkw = co->co_kwonlyargcount;
+      bool complete = true;
+      for (Py_ssize_t k = 0; k < nkw; k++) {
+        if (defs[k] == nullptr) {
+          // A required keyword-only parameter: the generic bind raises the
+          // proper TypeError.
+          complete = false;
+          break;
+        }
+      }
+      if (complete) {
+        for (Py_ssize_t i = 0; i < argcount; i++) {
+          stack[i] = args[i];
+        }
+        for (Py_ssize_t k = 0; k < nkw; k++) {
+          PyObject* d = const_cast<PyObject*>(defs[k]);
+          Py_INCREF(d);
+          stack[argcount + k] = d;
+        }
+        PyObject* result = jitrtReenterAfterBind(
+            reentry,
+            reinterpret_cast<PyObject*>(func),
+            stack,
+            static_cast<size_t>(total_args),
+            nullptr);
+        for (Py_ssize_t k = 0; k < nkw; k++) {
+          Py_DECREF(stack[argcount + k]);
+        }
+        return result;
+      }
+    }
+  }
+#endif
+  BindArgs bind_args;
+  PyObject** arg_space = bind_args.allocate(static_cast<size_t>(total_args));
   if (arg_space == nullptr) {
     return nullptr;
   }
@@ -514,22 +808,23 @@ PyObject* JITRT_CallWithKeywordArgs(
       args,
       nargsf,
       kwnames,
-      arg_space.get(),
+      arg_space,
       total_args,
       kwdict,
       varargs,
-      owned_defaults)) {
+      owned_defaults,
+      retired_codes)) {
     case BindKwStatus::Bound: {
       size_t new_nargsf = total_args;
 #if PY_VERSION_HEX < 0x030C0000
       return jitrtReenterAfterBind(
           reentry,
           reinterpret_cast<PyObject*>(func),
-          arg_space.get(),
+          arg_space,
           new_nargsf,
           nullptr);
 #else
-      return reentry((PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+      return reentry((PyObject*)func, arg_space, new_nargsf, nullptr);
 #endif
     }
     case BindKwStatus::Error:
@@ -571,7 +866,8 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
+  BindArgs bind_args;
+  PyObject** arg_space = bind_args.allocate(static_cast<size_t>(argcount));
   if (arg_space == nullptr) {
     return {0.0, 0.0};
   }
@@ -606,7 +902,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 #endif
   return reinterpret_cast<staticvectorcallfuncfp>(reentry)(
       (PyObject*)func,
-      arg_space.get(),
+      arg_space,
       new_nargsf,
       // We lie to C++ here, and smuggle in the number of defaulted args filled
       // in.
@@ -639,7 +935,8 @@ JITRT_CallWithIncorrectArgcount(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
+  BindArgs bind_args;
+  PyObject** arg_space = bind_args.allocate(static_cast<size_t>(argcount));
   if (arg_space == nullptr) {
 #ifdef _WIN32
     return nullptr;
@@ -685,11 +982,11 @@ JITRT_CallWithIncorrectArgcount(
 #endif
 #ifdef _WIN32
   return reentry(
-      (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
+      (PyObject*)func, arg_space, new_nargsf, (PyObject*)defaulted_args);
 #else
   return reinterpret_cast<staticvectorcallfunc>(reentry)(
       (PyObject*)func,
-      arg_space.get(),
+      arg_space,
       new_nargsf,
       // We lie to C++ here, and smuggle in the number of defaulted args filled
       // in.
@@ -810,32 +1107,31 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
         ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
         ((co->co_flags & CO_VARARGS) ? 1 : 0);
-    auto arg_space =
-        allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
+    BindArgs bind_args;
+    PyObject** arg_space = bind_args.allocate(static_cast<size_t>(total_args));
     if (arg_space == nullptr) {
       return TRetType();
     }
     Ref<PyObject> kwdict, varargs;
     BoundDefaultRefs owned_defaults;
+    std::vector<Ref<>> retired_codes; // held through the call below
 
     switch (JITRT_BindKeywordArgs(
         func,
         args,
         nargsf,
         kwnames,
-        arg_space.get(),
+        arg_space,
         total_args,
         kwdict,
         varargs,
-        owned_defaults)) {
+        owned_defaults,
+        retired_codes)) {
       case BindKwStatus::Bound:
         return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
             TRetType,
             TVectorcall>(
-            func,
-            arg_space.get(),
-            total_args | vectorcall_flags(nargsf),
-            arg_info);
+            func, arg_space, total_args | vectorcall_flags(nargsf), arg_info);
       case BindKwStatus::Error:
         return TRetType();
       case BindKwStatus::Fallback:
@@ -1087,8 +1383,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   // this function, and nothing counts this activation as a live frame yet.
   auto* compiled = code_rt->compiledFunction();
   if (compiled == nullptr) {
-    compiled = reinterpret_cast<jit::CompiledFunction*>(
-        Ci_JitShell311_InvocationArtifact());
+    compiled = invocationArtifactFor311(func);
   }
   if (compiled == nullptr) {
     compiled = reinterpret_cast<jit::CompiledFunction*>(
@@ -1730,14 +2025,350 @@ void JITRT_StoreSplitValueInsert311(
 }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+// Construction fast path for plain Python classes, the 3.11 counterpart of
+// 3.12's CALL_ALLOC_AND_ENTER_INIT.  Stock routes `Cls(args)` through
+// _PyObject_MakeTpCall (argument tuple), type_call, object_new and
+// slot_tp_init, the last two each doing a _PyType_Lookup.  For a heap type
+// with the default tp_new / tp_alloc whose __init__ resolves to a Python
+// function, the same effect is: allocate, call the function with self
+// prepended, insist on a None result.  The __init__ resolution is cached per
+// type and validated against tp_version_tag.
+namespace {
+// Stock initialisation of an instance object_new already produced, for a
+// constructor fast path whose cached resolution no longer holds after the
+// allocation: type_call reads tp_init only after tp_new returns, and the
+// allocation can run Python (a collection reached from the GC link runs
+// callbacks and finalizers).  Returns -1 with an exception set.
+int initAfterNew311(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    PyObject* kwnames) {
+  auto tuple = Ref<>::steal(Cix_PyTuple_FromArray(args, nargs));
+  if (tuple == nullptr) {
+    return -1;
+  }
+  Ref<> kwargs;
+  if (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) > 0) {
+    kwargs = Ref<>::steal(PyDict_New());
+    if (kwargs == nullptr) {
+      return -1;
+    }
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(kwnames); i++) {
+      if (PyDict_SetItem(
+              kwargs, PyTuple_GET_ITEM(kwnames, i), args[nargs + i]) < 0) {
+        return -1;
+      }
+    }
+  }
+  // The containers above are allocations too: the slot is read once they
+  // exist, immediately before the call.
+  initproc init = Py_TYPE(self)->tp_init;
+  if (init == nullptr) {
+    return 0;
+  }
+  return init(self, tuple, kwargs);
+}
+
+struct CtorCacheEntry311 {
+  PyTypeObject* type{nullptr};
+  uint32_t version{0};
+  PyObject* init{nullptr}; // borrowed; pinned by the class dict at `version`
+};
+constexpr size_t kCtorCacheSize = 128;
+CtorCacheEntry311 s_ctor_cache_311[kCtorCacheSize];
+
+// Returns true when the call was handled (result in *out, possibly NULL
+// with an exception set).  False means "not this fast path".
+bool constructFast311(
+    PyTypeObject* type,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames,
+    PyObject** out) {
+  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+  if (nargs + nkw > 7) {
+    return false;
+  }
+  uint32_t version = type->tp_version_tag;
+  if (version == 0) {
+    return false;
+  }
+  CtorCacheEntry311& e = s_ctor_cache_311
+      [(reinterpret_cast<uintptr_t>(type) >> 4) % kCtorCacheSize];
+  if (e.type != type || e.version != version) {
+    if (!PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) ||
+        (type->tp_flags & Py_TPFLAGS_IS_ABSTRACT) ||
+        type->tp_new != PyBaseObject_Type.tp_new ||
+        type->tp_alloc != PyType_GenericAlloc ||
+        type->tp_init == PyBaseObject_Type.tp_init ||
+        !Ci_Type_HasValidVersionTag(type)) {
+      return false;
+    }
+    PyObject* init = _PyType_Lookup(type, &_Py_ID(__init__));
+    if (init == nullptr || !PyFunction_Check(init)) {
+      return false;
+    }
+    e.type = type;
+    e.version = type->tp_version_tag;
+    e.init = init;
+  }
+  // object_new itself, not just tp_alloc: on 3.11 it is object_new that
+  // attaches the split values array to a managed-dict instance
+  // (_PyObject_InitializeDict, not linkable), and __init__ stores need it.
+  // The allocation can run Python: the initialiser is held across it, and
+  // the resolution is proved again afterwards -- a moved one (the class
+  // re-versioned, or this shared entry refilled by a nested construction)
+  // initialises the instance the stock way instead.
+  PyObject* init = e.init;
+  Py_INCREF(init);
+  static PyObject* empty_args = PyTuple_New(0);
+  PyObject* self = PyBaseObject_Type.tp_new(type, empty_args, nullptr);
+  if (self == nullptr) {
+    Py_DECREF(init);
+    *out = nullptr;
+    return true;
+  }
+  if (e.type != type || e.version != type->tp_version_tag ||
+      !Ci_Type_HasValidVersionTag(type) || e.init != init) {
+    Py_DECREF(init);
+    if (initAfterNew311(self, args, nargs, kwnames) < 0) {
+      Py_DECREF(self);
+      *out = nullptr;
+      return true;
+    }
+    *out = self;
+    return true;
+  }
+  PyObject* stack[8];
+  stack[0] = self;
+  for (Py_ssize_t i = 0; i < nargs + nkw; i++) {
+    stack[i + 1] = args[i];
+  }
+  // init is a Python function (checked at fill).
+  PyObject* r = reinterpret_cast<PyFunctionObject*>(init)->vectorcall(
+      init, stack, static_cast<size_t>(nargs + 1), kwnames);
+  Py_DECREF(init);
+  if (r == nullptr) {
+    Py_DECREF(self);
+    *out = nullptr;
+    return true;
+  }
+  if (r != Py_None) {
+    PyErr_Format(
+        PyExc_TypeError,
+        "__init__() should return None, not '%.200s'",
+        Py_TYPE(r)->tp_name);
+    Py_DECREF(r);
+    Py_DECREF(self);
+    *out = nullptr;
+    return true;
+  }
+  Py_DECREF(r);
+  *out = self;
+  return true;
+}
+
+// Generic-call shapes that 3.11 routes through _PyObject_MakeTpCall
+// (argument tuple, tp_call) although the effect has a direct C entry:
+//  * str(x) / int(x) / float(x) / bool(x) / tuple(x) with one positional
+//    argument: the type objects carry no vectorcall on 3.11, so each call
+//    built a tuple and went through type_call -> tp_new; the *_new
+//    implementations reduce to PyObject_Str / PyNumber_Long / PyNumber_Float
+//    / PyObject_IsTrue / PySequence_Tuple for that shape.
+//  * object.__init__(self): the base-class initialiser reached through
+//    super().__init__() chains; with no extra argument object_init has
+//    nothing to check and returns None.
+//  * min(a, b) / max(a, b): the builtins are METH_VARARGS | METH_KEYWORDS,
+//    so stock packs an argument tuple and min_max iterates it with a generic
+//    compare per item; for two items the answer is one rich comparison, the
+//    first argument kept on a false or NaN result exactly as min_max does.
+//  * an instance of a plain Python class whose __call__ is a Python
+//    function: stock builds the tuple, slot_tp_call looks __call__ up and
+//    _PyObject_Call_Prepend copies the arguments once more with self in
+//    front.  The __call__ resolution is cached per type and validated
+//    against tp_version_tag like the constructor cache above.
+struct CallCacheEntry311 {
+  PyTypeObject* type{nullptr};
+  uint32_t version{0};
+  PyObject* call{nullptr}; // borrowed; pinned by the class dict at `version`
+};
+constexpr size_t kCallCacheSize = 128;
+CallCacheEntry311 s_call_cache_311[kCallCacheSize];
+
+// Returns true when the call was handled (result in *out, possibly NULL
+// with an exception set).  False means "not this fast path".
+bool callFast311(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames,
+    PyObject** out) {
+  PyTypeObject* ct = Py_TYPE(callable);
+  Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  if (ct == &PyType_Type) {
+    if (kwnames != nullptr || nargs != 1) {
+      return false;
+    }
+    PyObject* x = args[0];
+    if (callable == reinterpret_cast<PyObject*>(&PyUnicode_Type)) {
+      *out = PyObject_Str(x);
+      return true;
+    }
+    if (callable == reinterpret_cast<PyObject*>(&PyLong_Type)) {
+      *out = PyNumber_Long(x);
+      return true;
+    }
+    if (callable == reinterpret_cast<PyObject*>(&PyFloat_Type)) {
+      *out = PyNumber_Float(x);
+      return true;
+    }
+    if (callable == reinterpret_cast<PyObject*>(&PyBool_Type)) {
+      int truth = PyObject_IsTrue(x);
+      *out = truth < 0 ? nullptr : PyBool_FromLong(truth);
+      return true;
+    }
+    if (callable == reinterpret_cast<PyObject*>(&PyTuple_Type)) {
+      *out = PySequence_Tuple(x);
+      return true;
+    }
+    return false;
+  }
+  if (ct == &PyWrapperDescr_Type) {
+    // Identity against object's own slot wrapper; a subclass wrapper takes
+    // the stock path.
+    if (kwnames != nullptr || nargs != 1) {
+      return false;
+    }
+    static PyObject* s_object_init =
+        PyDict_GetItemString(PyBaseObject_Type.tp_dict, "__init__");
+    if (callable != s_object_init) {
+      return false;
+    }
+    Py_INCREF(Py_None);
+    *out = Py_None;
+    return true;
+  }
+  if (ct == &PyCFunction_Type) {
+    // The builtins module's own min and max, identified by implementation:
+    // the object's method definition must be the entry of the builtins
+    // module's own method table (the Builtins table of the context, which
+    // records those entries by address).  A C function created by an
+    // extension with its own definition -- whatever its name, module or
+    // calling convention -- never matches.  The identity is proved once per
+    // object and the object then held, so a later object at a reused
+    // address cannot alias it.
+    if (kwnames != nullptr || nargs != 2) {
+      return false;
+    }
+    static PyObject* s_min = nullptr; // strong
+    static PyObject* s_max = nullptr; // strong
+    int op;
+    if (callable == s_min) {
+      op = Py_LT;
+    } else if (callable == s_max) {
+      op = Py_GT;
+    } else {
+      auto* cf = reinterpret_cast<PyCFunctionObject*>(callable);
+      const jit::Builtins& builtins = jit::getContext()->builtins();
+      std::optional<std::string> name = builtins.find(cf->m_ml);
+      if (!name.has_value()) {
+        return false;
+      }
+      if (*name == "min") {
+        Py_XSETREF(s_min, Py_NewRef(callable));
+        op = Py_LT;
+      } else if (*name == "max") {
+        Py_XSETREF(s_max, Py_NewRef(callable));
+        op = Py_GT;
+      } else {
+        return false;
+      }
+    }
+    PyObject* first = args[0];
+    PyObject* second = args[1];
+    int cmp = JITRT_RichCompareBool(second, first, op);
+    if (cmp < 0) {
+      *out = nullptr;
+      return true;
+    }
+    PyObject* res = cmp > 0 ? second : first;
+    Py_INCREF(res);
+    *out = res;
+    return true;
+  }
+  if (!PyType_HasFeature(ct, Py_TPFLAGS_HEAPTYPE) ||
+      PyType_HasFeature(ct, Py_TPFLAGS_HAVE_VECTORCALL)) {
+    return false;
+  }
+  Py_ssize_t nkw = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+  if (nargs + nkw > 7) {
+    return false;
+  }
+  uint32_t version = ct->tp_version_tag;
+  if (version == 0 || !Ci_Type_HasValidVersionTag(ct)) {
+    return false;
+  }
+  CallCacheEntry311& e =
+      s_call_cache_311[(reinterpret_cast<uintptr_t>(ct) >> 4) % kCallCacheSize];
+  if (e.type != ct || e.version != version) {
+    PyObject* call = _PyType_Lookup(ct, &_Py_ID(__call__));
+    if (call == nullptr || !PyFunction_Check(call)) {
+      return false;
+    }
+    e.type = ct;
+    e.version = ct->tp_version_tag;
+    e.call = call;
+  }
+  PyObject* stack[8];
+  stack[0] = callable;
+  for (Py_ssize_t i = 0; i < nargs + nkw; i++) {
+    stack[i + 1] = args[i];
+  }
+  // A compiled frame does not own its function: the caller keeps it alive
+  // for the whole call.  The class dict may be the function's only owner
+  // and the body may delete it, so the call holds the function captured
+  // here (not the shared slot, which a nested call can refill).
+  PyObject* call = e.call;
+  Py_INCREF(call);
+  // call is a Python function (checked at fill).
+  *out = reinterpret_cast<PyFunctionObject*>(call)->vectorcall(
+      call, stack, static_cast<size_t>(nargs + 1), kwnames);
+  Py_DECREF(call);
+  return true;
+}
+} // namespace
+#endif
+
 PyObject* JITRT_VectorcallTstate(
     PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  PyObject* res =
-      _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
+  PyObject* res;
+#if PY_VERSION_HEX < 0x030C0000
+  if (Py_IS_TYPE(callable, &PyType_Type) &&
+      constructFast311(
+          reinterpret_cast<PyTypeObject*>(callable),
+          args,
+          nargsf,
+          kwnames,
+          &res)) {
+    // fall through to the periodic check below
+  } else if (callFast311(callable, args, nargsf, kwnames, &res)) {
+    // fall through to the periodic check below
+  } else if (PyFunction_Check(callable)) {
+    // A Python function's vectorcall is either the generated entry or the
+    // interpreter's; neither needs _PyObject_VectorcallTstate's result
+    // audit, which the compiled call sites already skip.
+    res = reinterpret_cast<PyFunctionObject*>(callable)->vectorcall(
+        callable, args, nargsf, kwnames);
+  } else
+#endif
+    res = _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
   // We handle that here rather than bloat every function call w/ an extra
   // check.
@@ -1750,13 +2381,15 @@ PyObject* JITRT_VectorcallTstate(
 
 #if PY_VERSION_HEX < 0x030C0000
 namespace {
+// _PyThreadState_GET() is the core inline load; the public PyThreadState_GET
+// macro is a PLT call to PyThreadState_Get() on 3.11.
 PyObject* JITRT_Vectorcall311(
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
   return JITRT_VectorcallTstate(
-      PyThreadState_GET(), callable, args, nargsf, kwnames);
+      _PyThreadState_GET(), callable, args, nargsf, kwnames);
 }
 
 PyObject* JITRT_Call311(
@@ -1764,13 +2397,257 @@ PyObject* JITRT_Call311(
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  return JITRT_Call(PyThreadState_GET(), callable, args, nargsf, kwnames);
+  return JITRT_Call(_PyThreadState_GET(), callable, args, nargsf, kwnames);
 }
 } // namespace
 
 extern "C" {
 void* g_JITRT_Vectorcall311_slot = reinterpret_cast<void*>(JITRT_Vectorcall311);
 void* g_JITRT_Call311_slot = reinterpret_cast<void*>(JITRT_Call311);
+}
+
+PyObject* JITRT_HandlePendingAfterCall311(PyObject* res) {
+  PyThreadState* tstate = _PyThreadState_GET();
+  if (Ci_EvalFrameHandlePending_311(tstate) != 0) {
+    Py_DECREF(res);
+    return nullptr;
+  }
+  return res;
+}
+
+// Call-site entry-cache miss helper.  kwnames is NULL by construction at
+// probed sites (KwArgs sites do not emit the probe), and the probe reloads
+// the x3 argument slot with the cache pointer.  Dispatch semantics match
+// the plain arm: an exact Python function calls its own vectorcall slot
+// (or the code artifact entry, see below), everything else goes through
+// the JITRT_Vectorcall slot.  Filling happens before dispatch, within
+// budget:
+//  - a direct fill requires a bare compiled entry installed (vectorcall ==
+//    compiled entry), a direct entry present, no varargs / keyword-only
+//    parameters, site argc == co_argcount (the 32-bit mirror of the
+//    prologue's comparison) and a non-static prototype (static prototypes
+//    carry the typecheck chain and cannot be bypassed);
+//  - otherwise a neutral fill records the current vectorcall as the fast
+//    target, semantically the plain arm's per-call slot load.
+// Promotion, reattachment and recompilation change vectorcall, the identity
+// guard fails back here, and refills within budget track the lifecycle.
+extern "C" PyObject* JITRT_CallSiteEntryMiss311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw) {
+  auto* cache = reinterpret_cast<jit::CallSiteEntryCache*>(cache_raw);
+  bool is_function = Py_IS_TYPE(callable, &PyFunction_Type);
+  if (cache->helper_budget > 0) {
+    cache->helper_budget--;
+    if (is_function) {
+      auto* func = reinterpret_cast<PyFunctionObject*>(callable);
+      auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+      void* fast = reinterpret_cast<void*>(func->vectorcall);
+      auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+          Ci_JitShell311_InstalledArtifact(func));
+      // A function object without an installed artifact takes the by-code
+      // entry: it serves an artifact of the function's code when one exists
+      // (fresh comprehension / closure objects over compiled code) and the
+      // function's own entry otherwise.  The cache keys on (code,
+      // vectorcall), which neither a later compile of the code nor an
+      // attachment of another object changes, so a neutral fill recording
+      // the interpreter entry would never see the artifact published after
+      // it; the by-code entry resolves that per call.
+      if (compiled == nullptr) {
+        fast = reinterpret_cast<void*>(Ci_JitShell311_CodeArtifactVectorcall);
+      }
+      if (compiled != nullptr) {
+        void* direct = compiled->directCallEntry311();
+        if (direct != nullptr &&
+            func->vectorcall == compiled->vectorcallEntry() &&
+            !(code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) &&
+            code->co_kwonlyargcount == 0 &&
+            !(code->co_flags & CI_CO_STATICALLY_COMPILED) &&
+            static_cast<uint32_t>(nargsf) ==
+                static_cast<uint32_t>(code->co_argcount)) {
+          fast = direct;
+        }
+      }
+      // The caller's artifact owns the code object the entry names for as
+      // long as it lives: the hit compares addresses only, and a code
+      // object that died could be succeeded at its address by one of
+      // another signature while the artifact entry at the cached address
+      // is replaced by one of that signature's artifact.
+      if (cache->runtime != nullptr) {
+        cache->runtime->addReference(BorrowedRef<>{func->func_code});
+      }
+      cache->code = func->func_code;
+      cache->vectorcall = reinterpret_cast<void*>(func->vectorcall);
+      cache->fast_target = fast;
+    }
+  }
+  if (is_function) {
+    return Ci_JitShell311_CodeArtifactVectorcall(
+        callable, args, nargsf, nullptr);
+  }
+  return reinterpret_cast<vectorcallfunc>(g_JITRT_Vectorcall311_slot)(
+      callable, args, nargsf, nullptr);
+}
+
+// Constructor arm of the call-site entry cache.  A class callable reached
+// the site probe's non-function arm; the site keeps the class resolution
+// itself: the class version tag pins the __init__ lookup, the function's
+// vectorcall identity pins its entry, and a hit is object_new plus a direct
+// entry into the compiled __init__ with self prepended -- the effect of
+// type_call -> object_new -> slot_tp_init for a heap class with the default
+// tp_new / tp_alloc, exactly the set constructFast311 admits.  Anything
+// else (a non-heap class, an overridden __new__, an abstract class, an
+// __init__ that is not a Python function, more than seven arguments, an
+// exhausted budget) takes the slow slot unchanged.
+namespace {
+bool ctorSiteFill311(
+    jit::CallSiteEntryCache* cache,
+    PyTypeObject* type,
+    Py_ssize_t nargs) {
+  cache->ctor_type = nullptr;
+  if (cache->ctor_budget == 0) {
+    return false;
+  }
+  cache->ctor_budget--;
+  if (nargs > 7 || !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) ||
+      (type->tp_flags & Py_TPFLAGS_IS_ABSTRACT) ||
+      type->tp_new != PyBaseObject_Type.tp_new ||
+      type->tp_alloc != PyType_GenericAlloc ||
+      type->tp_init == PyBaseObject_Type.tp_init ||
+      !Ci_Type_HasValidVersionTag(type)) {
+    return false;
+  }
+  PyObject* init = _PyType_Lookup(type, &_Py_ID(__init__));
+  if (init == nullptr || !PyFunction_Check(init)) {
+    return false;
+  }
+  auto* func = reinterpret_cast<PyFunctionObject*>(init);
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  void* target = reinterpret_cast<void*>(func->vectorcall);
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  if (compiled != nullptr) {
+    // The same admission as the function arm's direct fill: a bare compiled
+    // entry installed, a direct entry present, positional-only shape, and
+    // self plus the site's arguments filling co_argcount exactly.
+    void* direct = compiled->directCallEntry311();
+    if (direct != nullptr && func->vectorcall == compiled->vectorcallEntry() &&
+        !(code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) &&
+        code->co_kwonlyargcount == 0 &&
+        !(code->co_flags & CI_CO_STATICALLY_COMPILED) &&
+        code->co_argcount == nargs + 1) {
+      target = direct;
+    }
+  }
+  // The identity of the initialiser's code is compared by address: the
+  // caller's artifact owns it (see the function arm's fill).
+  if (cache->runtime != nullptr) {
+    cache->runtime->addReference(BorrowedRef<>{func->func_code});
+  }
+  cache->ctor_type = type;
+  cache->ctor_version = type->tp_version_tag;
+  cache->ctor_init = init;
+  cache->ctor_init_vectorcall = reinterpret_cast<void*>(func->vectorcall);
+  cache->ctor_init_code = func->func_code;
+  cache->ctor_target = target;
+  return true;
+}
+
+// The constructor arm's resolution still holds for `type`: the class and
+// its version, and the initialiser's entry and code (the direct entry
+// carries no __code__ check of its own, and a __code__ assignment changes
+// neither the class version nor the function's vectorcall).
+bool ctorSiteHolds311(
+    const jit::CallSiteEntryCache* cache,
+    PyTypeObject* type) {
+  if (cache->ctor_type != type || cache->ctor_version != type->tp_version_tag ||
+      !(type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+    return false;
+  }
+  auto* init = reinterpret_cast<PyFunctionObject*>(cache->ctor_init);
+  return reinterpret_cast<void*>(init->vectorcall) ==
+      cache->ctor_init_vectorcall &&
+      init->func_code == cache->ctor_init_code;
+}
+} // namespace
+
+namespace {
+// The construction helper is tail-called by the dispatch stub, so its
+// result does not pass the stub's post-call eval-breaker check: a signal,
+// pending call or asynchronous exception that became due during __init__
+// is handled here, as the generic vectorcall path handles it after a
+// non-Python callable returns.
+PyObject* ctorSiteReturn311(PyObject* callable, PyObject* self) {
+  if (handle_periodic_activities_on_call(
+          _PyThreadState_GET(), self, callable)) {
+    Py_DECREF(self);
+    return nullptr;
+  }
+  return self;
+}
+} // namespace
+
+extern "C" PyObject* JITRT_ConstructSite311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw) {
+  auto* cache = reinterpret_cast<jit::CallSiteEntryCache*>(cache_raw);
+  auto* type = reinterpret_cast<PyTypeObject*>(callable);
+  const Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  if (!ctorSiteHolds311(cache, type) && !ctorSiteFill311(cache, type, nargs)) {
+    return reinterpret_cast<vectorcallfunc>(g_JITRT_Vectorcall311_slot)(
+        callable, args, nargsf, nullptr);
+  }
+  // object_new itself, not just tp_alloc: on 3.11 it is object_new that
+  // attaches the split values array to a managed-dict instance.  The
+  // allocation can run Python: the initialiser is held across it, and the
+  // resolution is proved again afterwards -- a moved one (the class
+  // re-versioned, its __init__ re-coded, or this site refilled by a nested
+  // construction of another class) initialises the instance the stock way
+  // instead of constructing a second one.
+  PyObject* init = cache->ctor_init;
+  Py_INCREF(init);
+  void* target = cache->ctor_target;
+  static PyObject* empty_args = PyTuple_New(0);
+  PyObject* self = PyBaseObject_Type.tp_new(type, empty_args, nullptr);
+  if (self == nullptr) {
+    Py_DECREF(init);
+    return nullptr;
+  }
+  if (!ctorSiteHolds311(cache, type) || cache->ctor_init != init ||
+      cache->ctor_target != target) {
+    Py_DECREF(init);
+    if (initAfterNew311(self, args, nargs, nullptr) < 0) {
+      Py_DECREF(self);
+      return nullptr;
+    }
+    return ctorSiteReturn311(callable, self);
+  }
+  PyObject* stack[8];
+  stack[0] = self;
+  for (Py_ssize_t i = 0; i < nargs; i++) {
+    stack[i + 1] = args[i];
+  }
+  PyObject* r = reinterpret_cast<vectorcallfunc>(target)(
+      init, stack, static_cast<size_t>(nargs + 1), nullptr);
+  Py_DECREF(init);
+  if (r == nullptr) {
+    Py_DECREF(self);
+    return nullptr;
+  }
+  if (r != Py_None) {
+    PyErr_Format(
+        PyExc_TypeError,
+        "__init__() should return None, not '%.200s'",
+        Py_TYPE(r)->tp_name);
+    Py_DECREF(r);
+    Py_DECREF(self);
+    return nullptr;
+  }
+  Py_DECREF(r);
+  return ctorSiteReturn311(callable, self);
 }
 #endif
 
@@ -1781,8 +2658,14 @@ PyObject* JITRT_VectorcallPythonFunction(
     size_t nargsf,
     PyObject* kwnames) {
   JIT_DCHECK(PyFunction_Check(callable), "expected exact Python function");
+#if PY_VERSION_HEX < 0x030C0000
+  // An unattached function object over compiled code takes the artifact
+  // entry; anything else its own vectorcall.
+  return Ci_JitShell311_CodeArtifactVectorcall(callable, args, nargsf, kwnames);
+#else
   PyFunctionObject* func = reinterpret_cast<PyFunctionObject*>(callable);
   return func->vectorcall(callable, args, nargsf, kwnames);
+#endif
 }
 
 PyObject* JITRT_UnaryNot(PyObject* value) {

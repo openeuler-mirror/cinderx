@@ -315,6 +315,8 @@ bool Instruction::isCallLike() const {
     case kBinaryOpExactLongAddSubFastPath:
     case kVarArgCall:
     case kVectorCall:
+    case kCallSiteVectorCall:
+    case kCallSiteCallMethod:
     case kVectorCallTstate:
       return true;
     default:

@@ -6065,6 +6065,46 @@ class PreservePythonError {
   PyObject* traceback_{nullptr};
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+// The artifact a code object runs through when no function object is
+// attached to it.  A comprehension body or a per-call closure is a fresh
+// function object every time (dispatched by code through the code-extra
+// cache, see Ci_JitShell311_CodeArtifactVectorcall); the artifact is kept
+// resident by the outer function's nested list, and compiledFuncs() never
+// names it once the few fresh-attached members have died.  Without this
+// arm the backoff returned early on that empty member set, which left such
+// a code deopting for the life of the process and rescanned every compiled
+// function on every further deopt.  Only an artifact with no members at all
+// qualifies; a member whose __code__ moved elsewhere keeps the function
+// path.
+CompiledFunction* roiByCodeArtifact311(
+    BorrowedRef<PyCodeObject> code,
+    CodeExtra* extra) {
+  auto* compiled = reinterpret_cast<CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr || compiled->runtime() == nullptr ||
+      compiled->runtime()->code() != code || !compiled->functions().empty()) {
+    return nullptr;
+  }
+  return compiled;
+}
+
+// Retire the by-code artifact: drop the outer function's anchor and the
+// code-extra cache entry so the by-code dispatch stops.  Its machine code
+// may be on the C stack right now (the backoff runs at deopt time); the
+// artifact's dealloc then defers itself onto the graveyard, which the sweep
+// drains once the stack has unwound.  The observer's slot is reopened by
+// the caller, which makes the next interpreted frames re-earn the threshold
+// and re-dispatch a compile.
+void retireByCodeArtifact311(BorrowedRef<CompiledFunction> compiled) {
+  {
+    Ref<CompiledFunction> pin = Ref<CompiledFunction>::create(compiled);
+    jitCtx()->forgetCodeForArtifact(nullptr, compiled);
+  }
+  Ci_JitShell311_SweepGraveyard();
+}
+#endif
+
 void triggerRoiBackoff(
     BorrowedRef<PyCodeObject> code,
     CodeExtra* extra,
@@ -6088,7 +6128,13 @@ void triggerRoiBackoff(
     }
   }
 
-  if (funcs.empty()) {
+  BorrowedRef<CompiledFunction> by_code;
+#if PY_VERSION_HEX < 0x030C0000
+  if (funcs.empty() && jitCtx() != nullptr) {
+    by_code = roiByCodeArtifact311(code, extra);
+  }
+#endif
+  if (funcs.empty() && by_code == nullptr) {
     Ci_code_extra_store_roi_ctl_release(extra, ctl);
     return;
   }
@@ -6101,6 +6147,11 @@ void triggerRoiBackoff(
   for (auto& func : funcs) {
     ::uncompileImpl(func);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (by_code != nullptr) {
+    retireByCodeArtifact311(by_code);
+  }
+#endif
 
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
   extra->roi_aging_epoch_ms = 0;
@@ -6123,6 +6174,13 @@ void triggerRoiBackoff(
   for (auto& func : funcs) {
     scheduleJitCompile(func);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // No function object to reschedule; the observer's slot re-dispatches the
+  // code once its frames re-earn the threshold.
+  if (by_code != nullptr) {
+    Ci_Observe311_ReopenSlotForCode(code.get());
+  }
+#endif
 }
 
 } // namespace

@@ -867,15 +867,16 @@ def test_unexpected_organic_deopt_turns_red():
     assert any("organic_deopt_hits == 0" in error for error in errors)
 
 
-def test_stdlib_organic_deopt_count_drift_turns_red():
-    # The shared-3.11 gate and its matching CPython test support path pin
-    # the current invocation at 333; any drift must still turn red.
+@pytest.mark.parametrize("count", [333, 335])
+def test_stdlib_organic_deopt_count_drift_turns_red(count):
+    # MR4-A's newly executed sysconfig joinuser adds one global-guard deopt.
+    # Reject drift in either direction, including the old baseline of 333.
     errors = [
         error
         for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 334})
+        for error in judge({"organic_deopt_hits": count})
     ]
-    assert any("organic_deopt_hits == 333" in error for error in errors)
+    assert any("organic_deopt_hits == 334" in error for error in errors)
 
 
 def test_green_gate_refuses_skips(tmp_path):

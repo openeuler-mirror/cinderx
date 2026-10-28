@@ -7,6 +7,7 @@
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
+#include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
 
@@ -2561,6 +2562,175 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub311(
 #endif
 }
 
+// Per-function dispatch stub for non-function callables at call sites (the
+// generic arm of translateCallSiteVectorCall).  Entered by blr with
+// x0=callable / x1=args / x2=nargsf / x3=kwnames (NULL at these sites) and
+// x15 = 1 for the method-call form (JITRT_Call's slot protocol applies), 0
+// for the plain form, or the site's entry cache address for the plain form
+// with a constructor arm.  Dispatches the way _PyObject_VectorcallTstate
+// does: tp_flags HAVE_VECTORCALL and the slot at tp_vectorcall_offset are
+// read and the slot is called directly. Result/exception consistency is
+// checked inline; malformed returns go through _Py_CheckFunctionResult so
+// its SystemError, exception chaining and debug-build diagnostics match
+// the interpreter. Ordinary returns need no additional C helper call.
+// After a successful call the eval breaker is tested and pending work runs
+// through JITRT_HandlePendingAfterCall311.  A heap class takes the
+// constructor arm (JITRT_ConstructSite311) when a site cache was supplied;
+// anything without a vectorcall slot tail-calls the slow slot.  Out of line
+// so call sites stay short.
+void NativeGenerator::emitAarch64VcDirectStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  if (!env_.vcdirect_stub.isValid()) {
+    return;
+  }
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow = as_->newLabel();
+  Label slow_call_slot = as_->newLabel();
+  Label have_callable = as_->newLabel();
+  Label check_receiver = as_->newLabel();
+  Label dispatch = as_->newLabel();
+  Label not_type = as_->newLabel();
+  Label out = as_->newLabel();
+  Label null_result = as_->newLabel();
+  Label invalid_result = as_->newLabel();
+
+  as_->bind(env_.vcdirect_stub);
+  // --- method form: JITRT_Call's slot protocol (consuming a slot forfeits
+  // PY_VECTORCALL_ARGUMENTS_OFFSET) ---
+  as_->cmp(a64::x15, 1);
+  as_->b_ne(dispatch);
+  as_->cbnz(a64::x0, have_callable);
+  as_->ldr(a64::x0, a64::ptr(a64::x1));
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+  as_->b(dispatch);
+
+  as_->bind(have_callable);
+  as_->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+  as_->cmp(a64::x0, a64::x11);
+  as_->b_ne(check_receiver);
+  as_->ldr(a64::x14, a64::ptr(a64::x1));
+  as_->cbz(a64::x14, slow_call_slot); // None with an empty receiver slot
+  as_->mov(a64::x0, a64::x14);
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+  as_->b(dispatch);
+
+  as_->bind(check_receiver);
+  as_->ldr(a64::x14, a64::ptr(a64::x1));
+  as_->cbnz(a64::x14, dispatch);
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+
+  // --- dispatch ---
+  as_->bind(dispatch);
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyObject, ob_type))));
+  as_->mov(a64::x11, reinterpret_cast<uint64_t>(&PyType_Type));
+  as_->cmp(a64::x10, a64::x11);
+  as_->b_ne(not_type);
+  static_assert(Py_TPFLAGS_HEAPTYPE == (1UL << 9), "HEAPTYPE bit");
+  as_->ldr(
+      a64::x11,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyTypeObject, tp_flags))));
+  as_->tbz(a64::x11, 9, not_type);
+  // A heap class.  With a site cache in x15 the constructor arm validates
+  // the class version and the __init__ entry and runs object_new plus a
+  // direct __init__ entry (or falls to the slow slot itself); without one,
+  // the slow slot.  x3 (kwnames) is NULL at every site that reaches this
+  // stub, so it carries the cache.
+  as_->cmp(a64::x15, 1);
+  as_->b_ls(slow);
+  as_->mov(a64::x3, a64::x15);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(JITRT_ConstructSite311));
+  as_->br(a64::x16);
+
+  as_->bind(not_type);
+  static_assert(Py_TPFLAGS_HAVE_VECTORCALL == (1UL << 11), "VECTORCALL bit");
+  as_->ldr(
+      a64::x11,
+      arch::ptr_offset(
+          a64::x10, static_cast<int32_t>(offsetof(PyTypeObject, tp_flags))));
+  as_->tbz(a64::x11, 11, slow);
+  as_->ldr(
+      a64::x12,
+      arch::ptr_offset(
+          a64::x10,
+          static_cast<int32_t>(offsetof(PyTypeObject, tp_vectorcall_offset))));
+  as_->ldr(a64::x14, a64::ptr(a64::x0, a64::x12));
+  as_->cbz(a64::x14, slow);
+
+  // Keep the callable for the error diagnostic across the vectorcall;
+  // x0 becomes the result and all argument/scratch registers may be lost.
+  as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -32));
+  as_->mov(a64::x29, a64::sp);
+  as_->str(a64::x0, a64::ptr(a64::sp, 16));
+  as_->blr(a64::x14);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                      ->runtime->gilstate.tstate_current));
+  as_->ldr(a64::x9, a64::ptr(a64::x9));
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x9, static_cast<int32_t>(offsetof(PyThreadState, curexc_type))));
+  as_->cbz(a64::x0, null_result);
+  as_->cbnz(a64::x10, invalid_result);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(
+          &ThreadedCompileContext::interpreter()->ceval.eval_breaker));
+  as_->ldr(a64::w9, a64::ptr(a64::x9));
+  as_->cbz(a64::w9, out);
+  as_->mov(
+      a64::x9, reinterpret_cast<uint64_t>(JITRT_HandlePendingAfterCall311));
+  as_->blr(a64::x9);
+  as_->bind(out);
+  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 32));
+  as_->ret(a64::x30);
+
+  as_->bind(null_result);
+  // NULL with an exception is a legitimate error return. NULL without
+  // one, or a non-NULL result with an exception, must be audited before
+  // the caller's exception guard or any pending work can run.
+  as_->cbnz(a64::x10, out);
+  as_->bind(invalid_result);
+  as_->mov(a64::x2, a64::x0);
+  as_->ldr(a64::x1, a64::ptr(a64::sp, 16));
+  as_->mov(a64::x0, a64::x9);
+  as_->mov(a64::x3, 0);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(_Py_CheckFunctionResult));
+  as_->blr(a64::x16);
+  as_->b(out);
+
+  // --- slow: tail-call the plain vectorcall helper.  The slot protocol has
+  // already been applied above, so JITRT_Call must not see the shifted
+  // arguments again: with zero remaining arguments its empty-receiver-slot
+  // test would read past the argument vector.  Only the unresolved
+  // None-with-empty-receiver shape keeps the Call slot.
+  as_->bind(slow);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot));
+  as_->ldr(a64::x16, a64::ptr(a64::x16));
+  as_->br(a64::x16);
+  as_->bind(slow_call_slot);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot));
+  as_->ldr(a64::x16, a64::ptr(a64::x16));
+  as_->br(a64::x16);
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::emitAarch64LoadMethodInvokeStub311(
     const asmjit::CodeHolder& code) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
@@ -3476,6 +3646,25 @@ void NativeGenerator::generateCode(
       as_->cbnz(a64::w10, entry_guard_cstack_overflow);
     }
   };
+  // Direct call entry: the jump target of a call-site entry-cache hit.  The
+  // __code__ identity check is carried by the caller's cached func_code
+  // guard, and the argument-count / defaults / kwnames chain is proven once
+  // by the cache fill conditions (no varargs or keyword-only parameters,
+  // site argument count equal to co_argcount, kwnames NULL).  Tracing,
+  // evaluator and recursion semantics are re-proved by the shared entry
+  // guard; the frame record is built here and the body joined directly, so
+  // a hit pays neither the prologue nor the reentry trampoline.  Sits in
+  // the safe zone before the reentry stub, leaving the
+  // JITRT_CALL_REENTRY_OFFSET span untouched.
+  Label direct_call_entry_label = as_->newLabel();
+  {
+    auto direct_cursor = as_->cursor();
+    as_->bind(direct_call_entry_label);
+    emit_entry_guard();
+    generateFunctionEntry();
+    as_->b(env_.correct_arg_count);
+    env_.addAnnotation("Direct-call entry", direct_cursor);
+  }
   // Helper reentry (JITRT_CallWithIncorrectArgcount and
   // the keyword path jump to the stub after binding arguments) arrives
   // without the entry guard, so the thread state is loaded on the way in.
@@ -3648,6 +3837,7 @@ void NativeGenerator::generateCode(
   emitAarch64LoadAttrInvokeStub311(codeholder);
   emitAarch64LoadMethodInvokeStub311(codeholder);
   emitAarch64StoreAttrInvokeStub311(codeholder);
+  emitAarch64VcDirectStub311(codeholder);
   emitAarch64ExactLongAddSubStubs(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
@@ -3741,6 +3931,8 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
   artifact_guarded_entry_311_ = static_cast<char*>(code_start_) +
       codeholder.labelOffsetFromBase(artifact_guarded_entry_label);
+  direct_call_entry_311_ = static_cast<char*>(code_start_) +
+      codeholder.labelOffsetFromBase(direct_call_entry_label);
 #endif
 
   for (auto& entry : env_.unresolved_gen_entry_labels) {

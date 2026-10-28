@@ -482,6 +482,13 @@ StoreAttrCache* Context::allocateStoreAttrCache() {
   return store_attr_caches_.allocate();
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+CallSiteEntryCache* Context::allocateCallSiteEntryCache() {
+  return call_site_entry_caches_.allocate();
+}
+
+#endif
+
 const Builtins& Context::builtins() {
   // Lock-free fast path followed by single-lock slow path during
   // initialization.

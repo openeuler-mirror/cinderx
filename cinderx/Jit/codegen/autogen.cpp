@@ -2379,6 +2379,145 @@ void translateStoreAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #endif
 }
 
+// Call-site entry-cache probe (CPython 3.11, AArch64).  postalloc has
+// already placed x0=callable / x1=args / x2=nargsf / x3=0 per the
+// vectorcall convention (the instruction is only emitted for kwnames-free
+// sites); the call-shape semantics guarantee x9-x15 hold no live values.
+// Guards: (1) exact function type -- anything else takes the generic arm
+// (which also excludes out-of-bounds field reads on non-function objects);
+// (2) func_code identity -- carries the callee entry's __code__ check;
+// (3) vectorcall identity -- deopt, recompile and reattachment invalidate.
+// A hit blr's fast_target (the callee's direct entry, or a neutral fill with
+// the per-call-slot-load semantics of the plain arm).  A function-shaped
+// miss within budget passes the cache in x3 (kwnames is NULL here by
+// construction; the helper knows) to the miss helper; an exhausted budget
+// short-circuits inline through x13 (func->vectorcall is already loaded).
+// All paths converge on a single blr; return-value and debug-location
+// handling match translateCall.  Cache field offsets are locked by the
+// static_assert in inline_cache.h.
+void translateCallSiteVectorCall(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  auto as = env->as;
+  auto output = instr->output();
+  uint64_t cache_addr =
+      static_cast<uint64_t>(instr->getInput(0)->getConstant());
+  // Method-call form (CallSiteCallMethod): a NULL/None callable (LOAD_METHOD
+  // fallback form, real callable in args[0]) and an empty receiver slot
+  // (the second of JITRT_Call's double-NULL protocol) take the generic arm,
+  // whose stub applies JITRT_Call's slot protocol.
+  const bool method_form = instr->opcode() == Instruction::kCallSiteCallMethod;
+
+  asmjit::Label miss_func = as->newLabel();
+  asmjit::Label generic = as->newLabel();
+  asmjit::Label generic_func = as->newLabel();
+  asmjit::Label do_call = as->newLabel();
+  asmjit::Label post_call = as->newLabel();
+  asmjit::Label done = as->newLabel();
+
+  if (method_form) {
+    as->cbz(a64::x0, generic);
+    as->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+    as->cmp(a64::x0, a64::x11);
+    as->b_eq(generic);
+    as->ldr(a64::x14, a64::ptr(a64::x1)); // receiver slot args[0]
+    as->cbz(a64::x14, generic);
+  }
+
+  as->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyObject, ob_type))));
+  as->mov(a64::x11, reinterpret_cast<uint64_t>(&PyFunction_Type));
+  as->cmp(a64::x10, a64::x11);
+  as->b_ne(generic);
+  as->mov(a64::x9, cache_addr);
+  as->ldp(a64::x10, a64::x11, a64::ptr(a64::x9));
+  as->ldr(
+      a64::x12,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+  as->ldr(
+      a64::x13,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall))));
+  as->cmp(a64::x10, a64::x12);
+  as->b_ne(miss_func);
+  as->cmp(a64::x11, a64::x13);
+  as->b_ne(miss_func);
+  as->ldr(
+      arch::reg_scratch_br,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(
+              offsetof(jit::CallSiteEntryCache, fast_target))));
+
+  as->bind(do_call);
+  as->blr(arch::reg_scratch_br);
+  as->bind(post_call);
+
+  if (instr->origin()) {
+    asmjit::Label label = as->newLabel();
+    as->bind(label);
+    env->pending_debug_locs.emplace_back(label, instr->origin());
+  }
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+  as->b(done);
+
+  as->bind(miss_func);
+  as->ldrb(
+      a64::w10,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(
+              offsetof(jit::CallSiteEntryCache, helper_budget)),
+          arch::AccessSize::k8));
+  as->cbz(a64::w10, generic_func);
+  as->mov(a64::x3, a64::x9);
+  as->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(JITRT_CallSiteEntryMiss311));
+  as->b(do_call);
+
+  // Generic arm: the per-function dispatch stub (emitted at the end of the
+  // function, see emitAarch64VcDirectStub311).  x15 tells the stub whether
+  // JITRT_Call's slot protocol applies (1, method form); the plain form
+  // hands it the site cache (an 8-byte-aligned address, never 1) so that
+  // the stub's class-callable test can take the constructor arm.
+  as->bind(generic);
+  if (!env->vcdirect_stub.isValid()) {
+    env->vcdirect_stub = as->newLabel();
+  }
+  if (method_form) {
+    as->mov(a64::x15, 1);
+  } else {
+    as->mov(a64::x15, cache_addr);
+  }
+  as->adr(arch::reg_scratch_br, env->vcdirect_stub);
+  as->b(do_call);
+
+  as->bind(generic_func);
+  as->mov(arch::reg_scratch_br, a64::x13);
+  as->b(do_call);
+
+  as->bind(done);
+#else
+  (void)env;
+  (void)instr;
+  JIT_ABORT("CallSiteVectorCall is AArch64 CPython 3.11 only");
+#endif
+}
+
 void translateBinaryOpExactLongAddSubFastPath(
     Environ* env,
     const Instruction* instr) {
@@ -4144,6 +4283,10 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kStoreAttrCachedFastPath:
       translateStoreAttrCachedFastPath(env, instr);
+      return;
+    case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
+      translateCallSiteVectorCall(env, instr);
       return;
     case Instruction::kBinaryOpExactLongAddSubFastPath:
       translateBinaryOpExactLongAddSubFastPath(env, instr);

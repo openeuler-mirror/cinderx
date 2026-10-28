@@ -98,6 +98,9 @@ struct CompiledFunctionData {
   vectorcallfunc vectorcall_entry{nullptr};
 #if PY_VERSION_HEX < 0x030C0000
   vectorcallfunc artifact_guarded_entry{nullptr};
+  // Call-site entry-cache jump target (AArch64 only); null when the
+  // compilation did not emit a direct entry.
+  void* direct_call_entry{nullptr};
 #endif
   int stack_size{0};
   int spill_stack_size{0};
@@ -178,6 +181,12 @@ class CompiledFunction {
   bool isInstalledEntry311(vectorcallfunc vc) const {
     return vc != nullptr &&
         (vc == data_.artifact_guarded_entry || vc == data_.vectorcall_entry);
+  }
+
+  // The direct entry a call-site entry cache may branch to; null when the
+  // compilation did not emit one.
+  void* directCallEntry311() const {
+    return data_.direct_call_entry;
   }
 #endif
 
