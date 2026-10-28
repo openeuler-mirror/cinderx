@@ -259,6 +259,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_observe_311 \
     test_cinderx.test_kunpeng.test_canary_execute_311 \
     test_cinderx.test_kunpeng.test_execute_311 \
+    test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
     test_cinderx.test_kunpeng.test_instrumentation_polls_311 \
     test_cinderx.test_kunpeng.test_attr_cache_method_peek_311 \
     test_cinderx.test_kunpeng.test_attr_cache_combined_keys_311 \
