@@ -103,6 +103,13 @@ rm -rf "$WORK/venv"
 "$WORK/venv/bin/pip" install -q "$WHEEL"
 VENV_PY="$WORK/venv/bin/python"
 
+# Exercise finalization with Py_DEBUG assertions enabled as well as the
+# release gate: the in-place JIT finalizer enters deallocation before it
+# restores the stock generator type.
+PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
+  test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
+  > "$WORK/generator-close.log" 2>&1
+
 # Build sanity only: this shows the debug build CAN run the JIT.  The
 # trigger proof comes from the -R processes themselves, below.
 CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \

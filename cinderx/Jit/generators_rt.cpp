@@ -94,8 +94,11 @@ void clearGeneratorCompiledFunction(GenDataFooter* gen_footer) {
 // Reimplementation of CPython's gen_dealloc that uses our custom free-list
 // (Ci_free_jit_list_gen) instead of PyObject_GC_Del for memory recycling.
 void gen_dealloc_with_custom_free(PyObject* self) {
+  // On 3.11 the fast finalizer closes a suspended JIT generator in place
+  // and restores its stock type before frame cleanup below.
   JIT_DCHECK(
-      PyGen_Check(self) || PyCoro_CheckExact(self),
+      PyGen_Check(self) || PyCoro_CheckExact(self) ||
+          (PY_VERSION_HEX < 0x030C0000 && Py_IS_TYPE(self, g_jitgen_type)),
       "gen_dealloc_with_custom_free called on a non-generator object");
 
   auto* gen = reinterpret_cast<PyGenObject*>(self);
@@ -113,6 +116,9 @@ void gen_dealloc_with_custom_free(PyObject* self) {
   if (PyObject_CallFinalizerFromDealloc(self)) {
     return;
   }
+  JIT_DCHECK(
+      PyGen_Check(self) || PyCoro_CheckExact(self),
+      "generator finalizer did not restore its stock type");
   PyObject_GC_UnTrack(self);
 
   JIT_DCHECK(
