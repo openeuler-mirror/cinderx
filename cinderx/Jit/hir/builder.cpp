@@ -3850,7 +3850,7 @@ void HIRBuilder::emitBinaryOp(
           "Unrecognized oparg for BINARY_OP: {}",
           oparg);
       InPlaceOpKind inplace_op_kind = *inplace_opt_op_kind;
-      tc.emit<InPlaceOp>(
+      auto* inplace = tc.emit<InPlaceOp>(
           result,
           inplace_op_kind,
           left,
@@ -3858,6 +3858,11 @@ void HIRBuilder::emitBinaryOp(
           tc.frame,
           float_inplace_fast_path);
       stack.push(result);
+#if PY_VERSION_HEX < 0x030C0000
+      emitExcEdge311(tc, bc_instr, inplace, result);
+#else
+      (void)inplace;
+#endif
       return;
     }
   } else {

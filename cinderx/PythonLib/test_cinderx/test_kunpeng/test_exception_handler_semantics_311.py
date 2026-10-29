@@ -22,19 +22,22 @@ import unittest
 
 PREAMBLE = """
 import json
+import os
 import sys
 import traceback
 
-try:
+JIT = os.environ.get("CINDERX_TEST_REQUIRE_JIT", "1") == "1"
+if JIT:
     import _cinderx
     import cinderx
     cinderx.init()
+    assert cinderx.is_initialized(), "CinderX must be initialized"
     _cinderx.install_frame_evaluator()
+    assert _cinderx.is_frame_evaluator_installed(), "evaluator must be installed"
     import cinderjit
-    JIT = cinderjit.is_enabled()
-except Exception:  # noqa: BLE001  (the interpreter oracle run)
+    assert cinderjit.is_enabled(), "JIT must be enabled"
+else:
     cinderjit = None
-    JIT = False
 
 LOG = []
 
@@ -179,6 +182,98 @@ for i in range(ROUNDS):
 LOG.append(compiled_state((call_site, binop_site, subscr_sites, store_site, after_handler)))
 print(json.dumps(LOG, default=str))
 print("handler shapes ok")
+"""
+
+
+INPLACE_OPS_PROBE = PREAMBLE + """
+BASE = 0
+
+
+@compiled
+def inplace_add(value, other):
+    try:
+        value += other
+    except TypeError as exc:
+        return ("type", str(exc))
+    return ("value", value)
+
+
+@compiled
+def inplace_divide(value):
+    try:
+        value /= 0.0
+    except ZeroDivisionError as exc:
+        return ("zero", str(exc))
+    return ("value", value)
+
+
+@compiled
+def exact_float_divide(value, divisor):
+    value = float(value)
+    divisor = float(divisor)
+    try:
+        value /= divisor
+    except ZeroDivisionError as exc:
+        return ("zero", str(exc))
+    return ("value", value)
+
+
+@compiled
+def exact_int_divide(value, divisor):
+    value = int(value)
+    divisor = int(divisor)
+    try:
+        value //= divisor
+    except ZeroDivisionError as exc:
+        return ("zero", str(exc))
+    return ("value", value + 0.0)
+
+
+class BadAdd:
+    def __init__(self):
+        self.calls = 0
+
+    def __iadd__(self, other):
+        self.calls += 1
+        raise ValueError("custom inplace")
+
+
+@compiled
+def custom_inplace(value):
+    try:
+        value += 1
+    except ValueError as exc:
+        return ("custom", str(exc), value.calls)
+    return ("unexpected",)
+
+
+obj = BadAdd()
+functions = (inplace_add, inplace_divide, exact_float_divide,
+             exact_int_divide, custom_inplace)
+for i in range(ROUNDS):
+    if JIT:
+        before = _cinderx._get_trigger_stats()["machine_code_entries"]
+    LOG.append(inplace_add(1, None))
+    LOG.append(inplace_add(1, 2))
+    LOG.append(inplace_divide(1.0))
+    LOG.append(exact_float_divide(1.0, 0.0))
+    LOG.append(exact_float_divide(8.0, 2.0))
+    LOG.append(exact_int_divide(1, 0))
+    LOG.append(exact_int_divide(8, 2))
+    LOG.append(custom_inplace(obj))
+    assert obj.calls == i + 1  # The failed __iadd__ must not be replayed.
+    if JIT:
+        stats = _cinderx._get_trigger_stats()
+        assert stats["machine_code_entries"] > before
+        assert all(cinderjit.is_jit_compiled(fn) for fn in functions)
+        if i == 15:
+            # Each raising site has passed the eighth-exception grant.
+            settled_deopts = stats["organic_deopt_hits"]
+        elif i > 15:
+            assert stats["organic_deopt_hits"] == settled_deopts, stats
+LOG.append(compiled_state(functions))
+print(json.dumps(LOG, default=str))
+print("inplace ops ok")
 """
 
 
@@ -691,6 +786,10 @@ class ExceptionHandlerSemantics311Test(unittest.TestCase):
             )
         else:
             env.update(CINDERX_JIT_MODE="off")
+        env.update(
+            CINDERX_PLUGIN_ENABLE="0",
+            CINDERX_TEST_REQUIRE_JIT="1" if jit else "0",
+        )
         proc = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(probe)],
             capture_output=True,
@@ -715,6 +814,61 @@ class ExceptionHandlerSemantics311Test(unittest.TestCase):
         interp_log = json.loads(interp_out.splitlines()[0])
         self.assertEqual(jit_log[:-1], interp_log[:-1])
         self.assertIs(jit_log[-1], True)
+
+    def test_inplace_operations_take_the_exception_edge(self):
+        self._run(INPLACE_OPS_PROBE, "inplace ops ok")
+
+    def _unavailable_runtime_probes(self):
+        import_failure = """
+import builtins
+original_import = builtins.__import__
+def unavailable(name, *args, **kwargs):
+    if name == "_cinderx":
+        raise ImportError("injected native import failure")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = unavailable
+"""
+        init_failure = """
+import sys
+import types
+fake = types.ModuleType("cinderx")
+def broken_init():
+    raise RuntimeError("injected initialization failure")
+fake.init = broken_init
+sys.modules["cinderx"] = fake
+"""
+        disabled = """
+import sys
+import types
+cx = types.ModuleType("cinderx")
+cx.init = lambda: None
+cx.is_initialized = lambda: True
+native = types.ModuleType("_cinderx")
+native.install_frame_evaluator = lambda: None
+native.is_frame_evaluator_installed = lambda: True
+jit = types.ModuleType("cinderjit")
+jit.is_enabled = lambda: False
+sys.modules.update(cinderx=cx, _cinderx=native, cinderjit=jit)
+"""
+        return (
+            ("import", import_failure, "injected native import failure"),
+            ("init", init_failure, "injected initialization failure"),
+            ("disabled", disabled, "JIT must be enabled"),
+        )
+
+    def test_jit_probe_rejects_unavailable_runtime(self):
+        for name, setup, message in self._unavailable_runtime_probes():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(AssertionError, message):
+                    self._run_once(setup + PREAMBLE, jit=True)
+
+    def test_interpreter_probe_does_not_require_jit(self):
+        for name, setup, _ in self._unavailable_runtime_probes():
+            with self.subTest(name=name):
+                output = self._run_once(
+                    setup + PREAMBLE + "\nprint('interpreter ok')", jit=False
+                )
+                self.assertIn("interpreter ok", output)
 
     def test_handler_shapes_at_call_binop_subscript_and_store_sites(self):
         self._run(HANDLER_SHAPES_PROBE, "handler shapes ok")

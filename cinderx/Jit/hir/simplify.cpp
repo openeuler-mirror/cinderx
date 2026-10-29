@@ -1375,6 +1375,14 @@ Register* trySimplifyFloatInPlace(Env& env, const InPlaceOp* instr) {
 }
 
 Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (env.exc_edge) {
+    // The generic helper leaves NULL for the compiled handler's branch.
+    // Numeric fast paths guard their own errors (or merge through a Phi),
+    // so they cannot inherit this exception edge on just the final result.
+    return nullptr;
+  }
+#endif
   Register* lhs = instr->left();
   Register* rhs = instr->right();
   if (lhs->isA(TLongExact) && rhs->isA(TLongExact)) {
