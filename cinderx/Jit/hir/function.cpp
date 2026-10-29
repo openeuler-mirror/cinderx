@@ -128,6 +128,8 @@ bool parseExceptionTableVarint(
   return true;
 }
 
+} // namespace
+
 bool isInExceptionProtectedRange(
     BorrowedRef<PyCodeObject> code,
     BCOffset target_offset) {
@@ -152,6 +154,8 @@ bool isInExceptionProtectedRange(
   }
   return false;
 }
+
+namespace {
 
 int findLocalsplusIndex(const FrameState& fs, Register* reg) {
   auto it = std::find(fs.localsplus.begin(), fs.localsplus.end(), reg);

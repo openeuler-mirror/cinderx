@@ -722,10 +722,20 @@ void emitStoreGenYieldPoint(
       live_regs_input - num_live_regs,
       live_regs_input);
 
+  // Input 0 is tstate; the yield-from sub-iterator is input 1.
   auto yield_from_offset =
-      is_yield_from ? calc_spill_offset(0) : kInvalidYieldFromOffset;
+      is_yield_from ? calc_spill_offset(1) : kInvalidYieldFromOffset;
+  // record whether the suspend point sits outside every
+  // exception-table range, so close() can skip the deopt when no handler or
+  // cleanup code would run.
+  bool handler_free = false;
+  if (yield->origin() != nullptr &&
+      yield->origin()->bytecodeOffset().value() >= 0) {
+    handler_free = !hir::isInExceptionProtectedRange(
+        env->code_rt->code(), yield->origin()->bytecodeOffset());
+  }
   GenYieldPoint* gen_yield_point = env->code_rt->addGenYieldPoint(
-      GenYieldPoint{deopt_idx, yield_from_offset});
+      GenYieldPoint{deopt_idx, yield_from_offset, handler_free});
 
   env->unresolved_gen_entry_labels.emplace(gen_yield_point, resume_label);
   if (yield->origin()) {
@@ -944,10 +954,16 @@ void translateYieldInitial(Environ* env, const Instruction* instr) {
       a64::x0,
       arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
 
+#if PY_VERSION_HEX < 0x030C0000
+  // fp holds the footer here.
+  as->mov(a64::x1, arch::fp);
+  emitCall(*env, reinterpret_cast<uint64_t>(JITRT_UnlinkGenFrame311), instr);
+#else
   emitCall(
       *env,
       reinterpret_cast<uint64_t>(JITRT_UnlinkGenFrameAndReturnGenDataFooter),
       instr);
+#endif
   // This will return pointers to a generator in X0 and JIT data in X1.
 
   // Arbitrary scratch register for use in emitStoreGenYieldPoint(). Any
@@ -970,6 +986,48 @@ void translateYieldInitial(Environ* env, const Instruction* instr) {
   CINDER_UNSUPPORTED
 #endif
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// the exit half of the resume protocol for a plain or a
+// yield-from suspension.  Every allocatable register is spilled at a yield,
+// so x13/x14/x16/x30 are free scratch; fp still addresses the footer.
+void emitGenYieldExitProtocol(
+    a64::Builder* as,
+    const Instruction* yield,
+    bool is_yield_from) {
+  PhyLocation tstate = yield->getInput(0)->getStackSlot();
+  as->ldr(a64::x14, arch::ptr_resolve(as, arch::fp, tstate.loc, a64::x13));
+  as->ldr(a64::x16, a64::ptr(arch::fp, offsetof(GenDataFooter, gen)));
+  constexpr int prev_item_off = offsetof(PyGenObject, gi_exc_state) +
+      offsetof(_PyErr_StackItem, previous_item);
+  constexpr int frame_prev_off = offsetof(PyGenObject, gi_iframe) +
+      offsetof(_PyInterpreterFrame, previous);
+  // tstate->exc_info = gen->gi_exc_state.previous_item; previous_item = NULL
+  as->ldr(a64::x30, a64::ptr(a64::x16, prev_item_off));
+  as->str(a64::x30, a64::ptr(a64::x14, offsetof(PyThreadState, exc_info)));
+  as->str(a64::xzr, a64::ptr(a64::x16, prev_item_off));
+  // tstate->cframe->current_frame = frame->previous; frame->previous = NULL
+  as->ldr(a64::x30, a64::ptr(a64::x16, frame_prev_off));
+  as->ldr(a64::x13, a64::ptr(a64::x14, offsetof(PyThreadState, cframe)));
+  as->str(a64::x30, a64::ptr(a64::x13, offsetof(_PyCFrame, current_frame)));
+  as->str(a64::xzr, a64::ptr(a64::x16, frame_prev_off));
+  // gen->gi_frame_state = FRAME_SUSPENDED
+  as->mov(a64::w30, static_cast<uint8_t>(FRAME_SUSPENDED));
+  as->strb(a64::w30, a64::ptr(a64::x16, offsetof(PyGenObject, gi_frame_state)));
+  // footer->direct_ok = plain yield ? 1 : (walker ? 2 : 0)
+  if (is_yield_from) {
+    // record the sub-iterator (input 1) for the walker.
+    PhyLocation sub = yield->getInput(1)->getStackSlot();
+    as->ldr(a64::x30, arch::ptr_resolve(as, arch::fp, sub.loc, a64::x13));
+    as->str(a64::x30, a64::ptr(arch::fp, offsetof(GenDataFooter, yf_sub)));
+    as->mov(a64::w30, 2);
+    as->strb(a64::w30, a64::ptr(arch::fp, offsetof(GenDataFooter, direct_ok)));
+  } else {
+    as->mov(a64::w30, 1);
+    as->strb(a64::w30, a64::ptr(arch::fp, offsetof(GenDataFooter, direct_ok)));
+  }
+}
+#endif
 
 void translateStoreGenYieldPoint(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
@@ -996,6 +1054,9 @@ void translateStoreGenYieldPoint(Environ* env, const Instruction* instr) {
       arch::fp,
       scratch_r,
       false);
+#if PY_VERSION_HEX < 0x030C0000
+  emitGenYieldExitProtocol(as, instr, false);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -1026,6 +1087,9 @@ void translateStoreGenYieldFromPoint(Environ* env, const Instruction* instr) {
       arch::fp,
       scratch_r,
       true);
+#if PY_VERSION_HEX < 0x030C0000
+  emitGenYieldExitProtocol(as, instr, true);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -1506,7 +1570,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   auto base_location = instr->getInput(1)->getPhyRegister();
   auto base = base_location == SP ? a64::sp : a64::x(base_location.loc);
   // stp signed offset range is -512..504. Fall back to two str instructions
-  // when the offset is out of range.
+  // when the offset is out of range. The str immediate form only reaches
+  // 32760, so frames with thousands of slots (a namedtuple constructor with
+  // more than 4095 fields zeroes its localsplus inline) resolve the address
+  // through the scratch register instead of aborting on an unencodable
+  // displacement.
   if (Support::isInt7(offset >> 3)) {
     as->stp(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
@@ -1515,10 +1583,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   } else {
     as->str(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
-        a64::ptr(base, offset));
+        arch::ptr_resolve(as, base, offset, arch::reg_scratch_0));
     as->str(
         a64::x(instr->getInput(3)->getPhyRegister().loc),
-        a64::ptr(base, offset + kPointerSize));
+        arch::ptr_resolve(
+            as, base, offset + kPointerSize, arch::reg_scratch_0));
   }
 #else
   CINDER_UNSUPPORTED

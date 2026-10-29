@@ -51,6 +51,11 @@ void JITRT_InitFrameCellVars(
 std::pair<jit::JitGenObject*, jit::GenDataFooter*>
 JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate);
 
+// Initial-yield unlink taking the footer directly (CPython 3.11).
+std::pair<jit::JitGenObject*, jit::GenDataFooter*> JITRT_UnlinkGenFrame311(
+    PyThreadState* tstate,
+    jit::GenDataFooter* footer);
+
 void JITRT_MarkGeneratorCompleted();
 
 /*
@@ -492,6 +497,28 @@ PyObject* JITRT_BoxBool(uint32_t i);
 PyObject* JITRT_BoxI64(int64_t i);
 PyObject* JITRT_BoxU64(uint64_t i);
 PyObject* JITRT_BoxDouble(double_t d);
+
+#if PY_VERSION_HEX < 0x030C0000
+// Tail of an inlined tp_iternext call that returned NULL: StopIteration (or
+// no exception) yields the done sentinel, anything else propagates as NULL.
+PyObject* JITRT_IterNextExhausted311();
+
+// Finish a direct generator resume from JIT code whose outcome was not a
+// plain yield (defined in generators_rt.cpp).
+PyObject* JITRT_GenNextFinish311(PyObject* gen, PyObject* value);
+
+// Resume a plain JIT generator suspended at a yield-from from a JIT'd loop
+// by walking its delegation chain (defined in generators_rt.cpp).
+// tp_iternext contract.
+PyObject* JITRT_GenDelegateNext311(PyObject* gen, PyThreadState* tstate);
+// Pieces of the walker the generated routine leaves to C++.
+PyObject* JITRT_GenDelegateFinish311(
+    PyObject* innermost,
+    PyObject* value,
+    PyThreadState* tstate);
+void JITRT_GenUnwindDelegators311(PyObject* from, PyThreadState* tstate);
+PyObject* JITRT_GenIterNext311(PyObject* gen);
+#endif
 
 PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right);
 

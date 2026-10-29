@@ -951,7 +951,12 @@ void LinearScanAllocator::linearScan() {
     }
 
     if (current->isRegisterAllocated()) {
-      changed_regs_.Set(current->allocated_loc);
+      // Reservations (call clobbers, yield spills) are fixed intervals that
+      // never write the register; counting them made every generator save and
+      // restore the whole callee-saved set on each resume.
+      if (!current->isFixed()) {
+        changed_regs_.Set(current->allocated_loc);
+      }
       active.insert(current);
     } else {
       stack_intervals.emplace(current);

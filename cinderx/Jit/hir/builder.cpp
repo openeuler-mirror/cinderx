@@ -2851,6 +2851,24 @@ void HIRBuilder::translate(
         queue.emplace_back(condbr->false_bb(), new_frame);
         break;
       }
+#if PY_VERSION_HEX < 0x030C0000
+      case SEND: {
+        // 3.11's SEND replaces the receiver with the result when the
+        // sub-iterator finishes (there is no END_SEND to pop it later), so the
+        // finished edge leaves [.., result] while the resume edge keeps
+        // [.., receiver, result].  Leaving the receiver behind shifts every
+        // stack-relative operand below a `yield from`: the exit call of an
+        // enclosing `with` block was invoked on the sub-iterator.
+        auto condbr = static_cast<CondBranch*>(last_instr);
+        auto new_frame = tc.frame;
+        Register* result = new_frame.stack.pop();
+        new_frame.stack.pop();
+        new_frame.stack.push(result);
+        queue.emplace_back(condbr->true_bb(), new_frame);
+        queue.emplace_back(condbr->false_bb(), tc.frame);
+        break;
+      }
+#endif
       default: {
         if (prev_bc_instr.opcode() == YIELD_FROM &&
             is_in_async_for_header_block()) {

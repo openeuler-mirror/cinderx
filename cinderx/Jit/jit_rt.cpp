@@ -1446,8 +1446,28 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
           reinterpret_cast<uintptr_t>(gen) + gen_size -
           sizeof(jit::GenDataFooter));
   *gen->genDataFooterPtr(co) = footer;
+#if PY_VERSION_HEX < 0x030C0000
+  // the 3.11 generator frame initialised in place (what
+  // _PyFrame_InitializeSpecials plus jitFrameInit do, without the calls).
+  frame->f_func = reinterpret_cast<PyFunctionObject*>(Py_NewRef(func));
+  frame->f_code = reinterpret_cast<PyCodeObject*>(Py_NewRef(co));
+  frame->f_builtins = func->func_builtins;
+  frame->f_globals = func->func_globals;
+  frame->f_locals = nullptr;
+  frame->stacktop = co->co_nlocalsplus;
+  frame->frame_obj = nullptr;
+  frame->prev_instr = _PyCode_CODE(co) - 1;
+  frame->is_entry = false;
+  frame->owner = FRAME_OWNED_BY_GENERATOR;
+  for (int i = 0; i < co->co_nlocalsplus; i++) {
+    frame->localsplus[i] = nullptr;
+  }
+  frame->previous = currentFrame(tstate);
+  setCurrentFrame(tstate, frame);
+#else
   init_and_link_interpreter_frame(
       func, co, tstate, FRAME_OWNED_BY_GENERATOR, frame, code_rt);
+#endif
 
   footer->resumeEntry = resume_func;
   footer->yieldPoint = nullptr;
@@ -1457,6 +1477,18 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->compiled = compiled_pin.release();
 #endif
   footer->tree_iter_state = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  footer->resume_finish_flag = 0;
+  // a freshly created generator is directly resumable; the
+  // footer is reachable from the (otherwise unused) gi_origin_or_finalizer
+  // slot of a plain generator.
+  footer->direct_ok = 1;
+  footer->yf_sub = nullptr;
+  footer->delegator = nullptr;
+  if (!(co->co_flags & CO_COROUTINE)) {
+    gen->gi_origin_or_finalizer = reinterpret_cast<PyObject*>(footer);
+  }
+#endif
   footer->originalFramePointer = original_frame_pointer;
   footer->linkAddress =
       *reinterpret_cast<uint64_t*>( // NOLINT performance-no-int-to-ptr
@@ -1480,10 +1512,28 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
     memcpy(dst, src, spill_bytes);
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  _PyObject_GC_TRACK(gen);
+#else
   PyObject_GC_Track(gen);
+#endif
 
   return {tstate, footer};
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// the initial yield already holds the footer in the frame
+// pointer; unlink the generator frame and hand back gen/footer without the
+// frame-to-generator lookups.
+std::pair<jit::JitGenObject*, jit::GenDataFooter*> JITRT_UnlinkGenFrame311(
+    PyThreadState* tstate,
+    jit::GenDataFooter* footer) {
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  setCurrentFrame(tstate, frame->previous);
+  frame->previous = nullptr;
+  return {reinterpret_cast<jit::JitGenObject*>(footer->gen), footer};
+}
+#endif
 
 std::pair<jit::JitGenObject*, jit::GenDataFooter*>
 JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate) {
@@ -3517,6 +3567,22 @@ JITRT_GenSendRes JITRT_GenSend(
     PyObject* v,
     uint64_t finish_yield_from,
     _PyInterpreterFrame* frame) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (frame != nullptr) {
+    // a delegation finished by the C++ shortcut resumed this
+    // generator with the outcome in the footer flag: 1 = v is the
+    // sub-iterator's return value, 2 = it raised (exception already set).
+    jit::GenDataFooter* footer = jit::jitGenDataFooter(frame);
+    if (footer != nullptr && footer->resume_finish_flag != 0) {
+      uint64_t flag = footer->resume_finish_flag;
+      footer->resume_finish_flag = 0;
+      if (flag == 2) {
+        return {nullptr, 1};
+      }
+      finish_yield_from = 1;
+    }
+  }
+#endif
   if (v == nullptr) {
     return {nullptr, 1};
   }
@@ -3535,7 +3601,10 @@ JITRT_GenSendRes JITRT_GenSend(
 
   PySendResult gen_status;
   PyAsyncMethods* async_methods = Py_TYPE(gen)->tp_as_async;
-  if (async_methods != nullptr && async_methods->am_send != nullptr) {
+  if (!jit::g_jitgen_am_send_patched && jit::JitGen_CheckAny(gen)) {
+    // JitGen-to-JitGen send bypasses the am_send slot.
+    gen_status = jit::jitgenSendDirect(gen, v, &retval);
+  } else if (async_methods != nullptr && async_methods->am_send != nullptr) {
     // Inline PyIter_Send's first branch while honoring the current slot, which
     // may be replaced by the instrumentation deopt wrapper.
     gen_status = async_methods->am_send(gen, v, &retval);
@@ -4365,6 +4434,20 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   // (on 3.12+ it is immortal and an incref was merely a no-op).
   return &JITRT_IterDoneSentinel;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// Tail of an inlined tp_iternext call that returned NULL: StopIteration (or
+// no exception at all) is the done sentinel, anything else propagates.
+PyObject* JITRT_IterNextExhausted311() {
+  if (PyErr_Occurred()) {
+    if (!PyErr_ExceptionMatches(PyExc_StopIteration)) {
+      return nullptr;
+    }
+    PyErr_Clear();
+  }
+  return &JITRT_IterDoneSentinel;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // TreeIter state machine runtime helpers

@@ -924,6 +924,178 @@ static void* emitAndRegisterTrampoline(
   return result;
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+// the yield-from delegation walker as a generated routine.
+// PyObject* walker(PyObject* top, PyThreadState* tstate), tp_iternext
+// contract.  Mirrors jit::genDelegateNext311: link each delegator (frame,
+// exception stack, EXECUTING, back-pointer), enter the innermost
+// generator's resume entry, and on a yield unlink the chain innermost-first.
+// A finish/raise/deopt goes to JITRT_GenDelegateFinish311; anything the
+// walker does not handle undoes its links and takes the generic path.
+static void* generateGenDelegateWalker() {
+  const char* name = "gen_delegate_walker";
+  auto mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    throw std::runtime_error{
+        fmt::format("CinderX not initialized, cannot generate {}", name)};
+  }
+  CodeHolder code;
+  ICodeAllocator* code_allocator = mod_state->code_allocator.get();
+  ASM_CHECK(code.init(code_allocator->asmJitEnvironment()), name);
+  arch::Builder a(&code);
+
+  constexpr int kOrigin = offsetof(PyGenObject, gi_origin_or_finalizer);
+  constexpr int kFrameOff = offsetof(PyGenObject, gi_iframe);
+  constexpr int kPrevOff = offsetof(_PyInterpreterFrame, previous);
+  constexpr int kExcStateOff = offsetof(PyGenObject, gi_exc_state);
+  constexpr int kPrevItemOff = offsetof(PyGenObject, gi_exc_state) +
+      offsetof(_PyErr_StackItem, previous_item);
+  constexpr int kStateOff = offsetof(PyGenObject, gi_frame_state);
+  constexpr int kCframeOff = offsetof(PyThreadState, cframe);
+  constexpr int kCurFrameOff = offsetof(_PyCFrame, current_frame);
+  constexpr int kExcInfoOff = offsetof(PyThreadState, exc_info);
+  constexpr int kTypeOff = offsetof(PyObject, ob_type);
+  constexpr int kYfSub = offsetof(GenDataFooter, yf_sub);
+  constexpr int kDelegator = offsetof(GenDataFooter, delegator);
+  constexpr int kDirectOk = offsetof(GenDataFooter, direct_ok);
+  constexpr int kTreeIter = offsetof(GenDataFooter, tree_iter_state);
+  constexpr int kResumeEntry = offsetof(GenDataFooter, resumeEntry);
+  constexpr int kMaxDepth = 64;
+
+  asmjit::Label loop = a.newLabel();
+  asmjit::Label innermost = a.newLabel();
+  asmjit::Label unwind = a.newLabel();
+  asmjit::Label done = a.newLabel();
+  asmjit::Label finish = a.newLabel();
+  asmjit::Label fallback = a.newLabel();
+  asmjit::Label epilogue = a.newLabel();
+
+  // Prologue: frame + callee-saved x19..x24.
+  a.stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -64));
+  a.mov(a64::x29, a64::sp);
+  a.stp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
+  a.stp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
+  a.stp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
+  a.mov(a64::x19, a64::x0); // top
+  a.mov(a64::x20, a64::x1); // tstate
+  a.mov(a64::x21, a64::x0); // cur
+  a.ldr(a64::x22, a64::ptr(a64::x21, kOrigin)); // footer(cur)
+  a.mov(a64::w24, 0); // depth
+
+  a.bind(loop);
+  a.ldr(a64::x0, a64::ptr(a64::x22, kYfSub)); // sub
+  a.cbz(a64::x0, fallback);
+  a.ldr(a64::x2, a64::ptr(a64::x0, kTypeOff));
+  a.mov(a64::x3, asmjit::Imm(reinterpret_cast<uint64_t>(&g_jitgen_type)));
+  a.ldr(a64::x3, a64::ptr(a64::x3));
+  a.cmp(a64::x2, a64::x3);
+  a.b_ne(fallback);
+  a.ldr(a64::x2, a64::ptr(a64::x22, kTreeIter));
+  a.cbnz(a64::x2, fallback);
+  a.cmp(a64::w24, kMaxDepth);
+  a.b_ge(fallback);
+  a.ldr(a64::x23, a64::ptr(a64::x0, kOrigin)); // footer(sub)
+  a.ldrb(a64::w2, a64::ptr(a64::x23, kDirectOk));
+  a.cbz(a64::w2, fallback);
+  // link cur as the running delegator.
+  a.add(a64::x4, a64::x21, kFrameOff); // frame
+  a.ldr(a64::x5, a64::ptr(a64::x20, kCframeOff));
+  a.ldr(a64::x6, a64::ptr(a64::x5, kCurFrameOff));
+  a.str(a64::x6, a64::ptr(a64::x4, kPrevOff)); // frame->previous = current
+  a.str(a64::x4, a64::ptr(a64::x5, kCurFrameOff)); // current = frame
+  a.ldr(a64::x6, a64::ptr(a64::x20, kExcInfoOff));
+  a.str(a64::x6, a64::ptr(a64::x21, kPrevItemOff)); // previous_item = exc_info
+  a.add(a64::x7, a64::x21, kExcStateOff);
+  a.str(a64::x7, a64::ptr(a64::x20, kExcInfoOff)); // exc_info = &gi_exc_state
+  a.strb(a64::wzr, a64::ptr(a64::x21, kStateOff)); // FRAME_EXECUTING
+  a.strb(a64::wzr, a64::ptr(a64::x22, kDirectOk)); // cur: not resumable
+  a.str(
+      a64::x21, a64::ptr(a64::x23, kDelegator)); // footer(sub)->delegator = cur
+  a.add(a64::w24, a64::w24, 1);
+  a.cmp(a64::w2, 2);
+  a.b_ne(innermost);
+  a.mov(a64::x21, a64::x0); // cur = sub
+  a.mov(a64::x22, a64::x23);
+  a.b(loop);
+
+  a.bind(innermost);
+  a.mov(a64::x21, a64::x0); // keep sub / footer(sub) across the call
+  a.mov(a64::x22, a64::x23);
+  a.ldr(a64::x8, a64::ptr(a64::x23, kResumeEntry));
+  a.mov(a64::x1, asmjit::Imm(reinterpret_cast<uint64_t>(Py_None)));
+  a.mov(a64::x2, 0);
+  a.mov(a64::x3, a64::x20);
+  a.blr(a64::x8); // value = resumeEntry(sub, None, 0, tstate)
+  a.cbz(a64::x0, finish);
+  a.ldr(a64::x2, a64::ptr(a64::x21, kTypeOff));
+  a.mov(a64::x3, asmjit::Imm(reinterpret_cast<uint64_t>(&g_jitgen_type)));
+  a.ldr(a64::x3, a64::ptr(a64::x3));
+  a.cmp(a64::x2, a64::x3);
+  a.b_ne(finish);
+  a.ldrb(a64::w2, a64::ptr(a64::x22, kDirectOk));
+  a.cbz(a64::w2, finish);
+  // Yielded: unlink the delegators innermost-first.  x4 = footer(level).
+  a.mov(a64::x4, a64::x22);
+  a.bind(unwind);
+  a.ldr(a64::x5, a64::ptr(a64::x4, kDelegator));
+  a.cbz(a64::x5, done);
+  a.str(a64::xzr, a64::ptr(a64::x4, kDelegator));
+  a.mov(a64::w6, 0xff); // FRAME_SUSPENDED
+  a.strb(a64::w6, a64::ptr(a64::x5, kStateOff));
+  a.ldr(a64::x6, a64::ptr(a64::x5, kPrevItemOff));
+  a.str(a64::x6, a64::ptr(a64::x20, kExcInfoOff));
+  a.str(a64::xzr, a64::ptr(a64::x5, kPrevItemOff));
+  a.add(a64::x6, a64::x5, kFrameOff);
+  a.ldr(a64::x7, a64::ptr(a64::x6, kPrevOff));
+  a.ldr(a64::x8, a64::ptr(a64::x20, kCframeOff));
+  a.str(a64::x7, a64::ptr(a64::x8, kCurFrameOff));
+  a.str(a64::xzr, a64::ptr(a64::x6, kPrevOff));
+  a.ldr(a64::x4, a64::ptr(a64::x5, kOrigin)); // footer(d)
+  a.mov(a64::w6, 2); // suspended at its yield-from again
+  a.strb(a64::w6, a64::ptr(a64::x4, kDirectOk));
+  a.b(unwind);
+
+  a.bind(finish); // x0 = value or NULL, x21 = sub
+  a.mov(a64::x1, a64::x0);
+  a.mov(a64::x0, a64::x21);
+  a.mov(a64::x2, a64::x20);
+  a.mov(
+      a64::x9,
+      asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenDelegateFinish311)));
+  a.blr(a64::x9);
+  a.b(epilogue);
+
+  a.bind(fallback); // undo links from cur outward, generic path for top
+  a.mov(a64::x0, a64::x21);
+  a.mov(a64::x1, a64::x20);
+  a.mov(
+      a64::x9,
+      asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenUnwindDelegators311)));
+  a.blr(a64::x9);
+  a.mov(a64::x0, a64::x19);
+  a.mov(a64::x9, asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenIterNext311)));
+  a.blr(a64::x9);
+  a.b(epilogue);
+
+  a.bind(done);
+  a.bind(epilogue);
+  a.ldp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
+  a.ldp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
+  a.ldp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
+  a.ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 64));
+  a.ret(a64::x30);
+
+  void* result = finalizeCode(a, name);
+  auto code_size = code.codeSize();
+  register_raw_debug_symbol(name, __FILE__, __LINE__, result, code_size, 0);
+  std::vector<std::pair<void*, std::size_t>> code_sections;
+  populateCodeSections(code_sections, code, result);
+  code_sections.emplace_back(result, code_size);
+  perf::registerFunction(code_sections, name);
+  return result;
+}
+#endif
+
 void* generateDeoptTrampoline(bool generator_mode) {
   lir::Function lir_func;
   lir::GenerateDeoptTrampolineBlocks(
@@ -968,6 +1140,17 @@ class ThrowableErrorHandler : public ErrorHandler {
 };
 
 } // namespace
+
+void* NativeGeneratorFactory::genDelegateWalker() {
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  if (gen_delegate_walker_ == nullptr) {
+    gen_delegate_walker_ = generateGenDelegateWalker();
+  }
+  return gen_delegate_walker_;
+#else
+  return nullptr;
+#endif
+}
 
 NativeGenerator::NativeGenerator(
     const hir::Function* func,
@@ -1124,6 +1307,11 @@ void* NativeGenerator::compile(bool shadow) {
   for (auto& ref : func->env.references()) {
     env_.code_rt->addReference(ref);
   }
+
+  // Shadow compiles never run, so they take the C++ walker and allocate no
+  // executable memory for the generated one.
+  env_.gen_delegate_walker =
+      is_shadow_compile_ ? nullptr : factory_.genDelegateWalker();
 
   lir::LIRGenerator lirgen(GetFunction(), &env_);
   std::unique_ptr<lir::Function> lir_func;

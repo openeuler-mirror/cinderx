@@ -7902,6 +7902,9 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIsNotNone(interp[1])
 
     def test_generator_capability_switch_and_auto_default(self):
+        # The capability switch (PYTHONJITGENERATOR) governs both automatic
+        # and explicit compilation of synchronous generators; with it on,
+        # a generator crosses the threshold and compiles like any function.
         probe = textwrap.dedent(
             """
             import _cinderx, cinderx
@@ -7914,10 +7917,10 @@ class CanaryExecute311Test(unittest.TestCase):
 
             for _ in range(8):
                 assert list(gen()) == [1]
-            assert cinderjit.is_jit_compiled(gen) is False, (
-                "sync generators must remain auto-JIT disabled in MR-10")
 
             if __import__("os").environ["PYTHONJITGENERATOR"] == "0":
+                assert cinderjit.is_jit_compiled(gen) is False, (
+                    "capability off: sync generators must not compile")
                 try:
                     cinderjit.force_compile(gen)
                 except RuntimeError as exc:
@@ -7925,8 +7928,8 @@ class CanaryExecute311Test(unittest.TestCase):
                 else:
                     raise SystemExit("generator capability-off force-compiled")
             else:
-                assert cinderjit.force_compile(gen) is True
-                assert cinderjit.is_jit_compiled(gen) is True
+                assert cinderjit.is_jit_compiled(gen) is True, (
+                    "capability on: sync generators compile automatically")
                 before = _cinderx._get_trigger_stats()["machine_code_entries"]
                 assert list(gen()) == [1]
                 after = _cinderx._get_trigger_stats()["machine_code_entries"]

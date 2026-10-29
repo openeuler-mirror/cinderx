@@ -105,6 +105,12 @@ const uint8_t* triggerStatsEntryLedgerEnabledAddress() {
 void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   s_machine_code_entries.fetch_add(1, std::memory_order_relaxed);
 #if PY_VERSION_HEX < 0x030C0000
+  triggerStatsOnMachineCodeEntryLedger(code);
+#endif
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+void triggerStatsOnMachineCodeEntryLedger(PyCodeObject* code) {
   if (code == nullptr ||
       !s_entry_ledger_enabled.load(std::memory_order_relaxed)) {
     return;
@@ -127,10 +133,8 @@ void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   } catch (const std::bad_alloc&) {
     s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
   }
-#else
-  (void)code;
-#endif
 }
+#endif
 
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
@@ -204,16 +208,19 @@ TriggerStats triggerStatsSnapshot() {
 void executionEntryLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
   s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  updateGenDirectGate();
   s_entry_ledger.clear();
   s_entry_ledger_archived.clear();
   s_entry_ledger_dropped.store(0, std::memory_order_relaxed);
   s_entry_ledger_enabled.store(true, std::memory_order_relaxed);
+  updateGenDirectGate();
 #endif
 }
 
 void executionEntryLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
   s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  updateGenDirectGate();
   s_entry_ledger.clear();
   s_entry_ledger_archived.clear();
 #endif
@@ -233,12 +240,14 @@ PyObject* executionEntryLedgerSnapshot() {
     }
   } catch (const std::bad_alloc&) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     PyErr_NoMemory();
     return nullptr;
   }
   Ref<> entries = Ref<>::steal(PyList_New(0));
   if (entries == nullptr) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     return nullptr;
   }
   for (const auto& [key, count] : rows) {
@@ -255,6 +264,7 @@ PyObject* executionEntryLedgerSnapshot() {
         static_cast<unsigned long long>(count)));
     if (item == nullptr || PyList_Append(entries, item) < 0) {
       s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+      updateGenDirectGate();
       return nullptr;
     }
   }
@@ -265,9 +275,11 @@ PyObject* executionEntryLedgerSnapshot() {
       PyDict_SetItemString(result, "entries", entries) < 0 ||
       PyDict_SetItemString(result, "dropped", dropped) < 0) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     return nullptr;
   }
   s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  updateGenDirectGate();
   return result.release();
 #else
   PyErr_SetString(

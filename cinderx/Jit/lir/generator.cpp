@@ -594,6 +594,90 @@ void PopulateResumeEntryBlock(BasicBlock* bb, Py_ssize_t gi_jit_data_offset) {
   bb->allocateInstr(
       Instruction::kMove, nullptr, OutPhyReg(fp_reg), PhyReg(jit_data_reg));
 
+#if PY_VERSION_HEX < 0x030C0000
+  // footer->resume_finish_flag = finish_yield_from (third
+  // resume argument, untouched by the prologue).
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(
+          fp_reg,
+          static_cast<int32_t>(offsetof(GenDataFooter, resume_finish_flag))),
+      PhyReg(codegen::ARGUMENT_REGS[2]));
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // the entry half of the resume protocol in machine
+  // code.  x0 = gen and x3 = tstate are the resume arguments; x4..x6 are
+  // free here (the resume block reloads everything from spill slots).
+  auto tstate_reg = codegen::ARGUMENT_REGS[3];
+  PhyLocation t0 = codegen::ARGUMENT_REGS[4];
+  PhyLocation t1 = codegen::ARGUMENT_REGS[5];
+  PhyLocation t2 = codegen::ARGUMENT_REGS[6];
+  auto exc_state_off =
+      static_cast<int32_t>(offsetof(PyGenObject, gi_exc_state));
+  auto prev_item_off = static_cast<int32_t>(
+      offsetof(PyGenObject, gi_exc_state) +
+      offsetof(_PyErr_StackItem, previous_item));
+  auto exc_info_off = static_cast<int32_t>(offsetof(PyThreadState, exc_info));
+  auto frame_off = static_cast<int32_t>(offsetof(PyGenObject, gi_iframe));
+  auto frame_prev_off = static_cast<int32_t>(
+      offsetof(PyGenObject, gi_iframe) +
+      offsetof(_PyInterpreterFrame, previous));
+  auto cframe_off = static_cast<int32_t>(offsetof(PyThreadState, cframe));
+  auto cur_frame_off = static_cast<int32_t>(offsetof(_PyCFrame, current_frame));
+  // gen->gi_exc_state.previous_item = tstate->exc_info;
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg(t0),
+      Ind(tstate_reg, exc_info_off));
+  bb->allocateInstr(
+      Instruction::kMove, nullptr, OutInd(gen_reg, prev_item_off), PhyReg(t0));
+  // tstate->exc_info = &gen->gi_exc_state;
+  bb->allocateInstr(
+      Instruction::kLea, nullptr, OutPhyReg(t1), Ind(gen_reg, exc_state_off));
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(tstate_reg, exc_info_off),
+      PhyReg(t1));
+  // gen->gi_frame_state = FRAME_EXECUTING;
+  auto* state_store = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(
+          gen_reg, static_cast<int32_t>(offsetof(PyGenObject, gi_frame_state))),
+      Imm(static_cast<uint64_t>(FRAME_EXECUTING), DataType::k8bit));
+  state_store->output()->setDataType(DataType::k8bit);
+  // frame->previous = tstate->cframe->current_frame; current_frame = frame
+  bb->allocateInstr(
+      Instruction::kMove, nullptr, OutPhyReg(t0), Ind(tstate_reg, cframe_off));
+  bb->allocateInstr(
+      Instruction::kMove, nullptr, OutPhyReg(t2), Ind(t0, cur_frame_off));
+  bb->allocateInstr(
+      Instruction::kMove, nullptr, OutInd(gen_reg, frame_prev_off), PhyReg(t2));
+  bb->allocateInstr(
+      Instruction::kLea, nullptr, OutPhyReg(t1), Ind(gen_reg, frame_off));
+  bb->allocateInstr(
+      Instruction::kMove, nullptr, OutInd(t0, cur_frame_off), PhyReg(t1));
+  // ++machine_code_entries (GIL-serialised; the ledger is fed from C++).
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg(t0),
+      Imm(reinterpret_cast<uint64_t>(triggerStatsMachineCodeEntriesAddress())));
+  bb->allocateInstr(Instruction::kMove, nullptr, OutPhyReg(t1), Ind(t0));
+  bb->allocateInstr(Instruction::kAdd, nullptr, PhyReg(t1), Imm(1));
+  bb->allocateInstr(Instruction::kMove, nullptr, OutInd(t0), PhyReg(t1));
+  // footer->direct_ok = 0 while the generator runs.
+  auto* ok_store = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(fp_reg, static_cast<int32_t>(offsetof(GenDataFooter, direct_ok))),
+      Imm(0, DataType::k8bit));
+  ok_store->output()->setDataType(DataType::k8bit);
+#endif
+
   // scratch = footer->yieldPoint
   bb->allocateInstr(
       Instruction::kMove, nullptr, OutPhyReg(scratch), Ind(fp_reg, yp_off));
@@ -2149,6 +2233,35 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kLoadFrame: {
         emitLoadFrame(bbb);
+#if PY_VERSION_HEX < 0x030C0000
+        // hoist the loop-side constants once per function.
+        // Skipped when an OSR entry exists, as that entry would bypass the
+        // definitions.
+        bool has_iternext = false;
+        bool has_osr = false;
+        for (const auto& block : GetHIRFunction()->cfg.blocks) {
+          for (const auto& instr : block) {
+            if (instr.IsInvokeIterNext()) {
+              has_iternext = true;
+            } else if (instr.IsOSREntry()) {
+              has_osr = true;
+            }
+          }
+        }
+        if (has_iternext && !has_osr) {
+          bbb.annotateNext("hoisted generator type/gate");
+          Instruction* jt_addr = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&g_jitgen_type)});
+          env_->gen_direct_type = bbb.appendInstr(
+              OutVReg{DataType::k64bit}, Instruction::kMove, Ind{jt_addr, 0});
+          env_->gen_direct_gate_addr = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&g_gen_direct_gate)});
+        }
+#endif
         break;
       }
       case Opcode::kMakeCell: {
@@ -2936,12 +3049,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* store_instr;
         if (hir_instr->isYieldFrom()) {
           store_instr = bbb.appendInstr(Instruction::kStoreGenYieldFromPoint);
-          // Add the sub-iterator as input 0 so that
-          // emitStoreGenYieldPoint can capture its spill offset.
+          // Input 0 is tstate (the yield exit unlinks the
+          // frame and the exception state), input 1 the sub-iterator so
+          // that emitStoreGenYieldPoint can capture its spill offset.
+          store_instr->addOperands(VReg{env_->asm_tstate});
           store_instr->addOperands(
               VReg{bbb.getDefInstr(hir_instr->yieldFromIter())});
         } else {
           store_instr = bbb.appendInstr(Instruction::kStoreGenYieldPoint);
+          store_instr->addOperands(VReg{env_->asm_tstate});
         }
         finishYield(bbb, store_instr, hir_instr);
 
@@ -5104,6 +5220,206 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kInvokeIterNext: {
         auto instr = static_cast<const InvokeIterNext*>(&i);
+#if PY_VERSION_HEX < 0x030C0000
+        // call tp_iternext directly instead of through
+        // JITRT_InvokeIterNext (a frame plus indirect call per iteration on
+        // every for loop).  A non-NULL result is the value; NULL goes to a
+        // thin helper that turns StopIteration into the done sentinel; a
+        // missing tp_iternext slot falls back to the original helper (which
+        // raises the TypeError).  The generic trailing exception check still
+        // guards the merged result.
+        Instruction* iter = bbb.getDefInstr(instr->GetOperand(0));
+        Instruction* type = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{iter, static_cast<int>(offsetof(PyObject, ob_type))});
+        BasicBlock* has_slot = bbb.allocateBlock();
+        BasicBlock* no_slot = bbb.allocateBlock();
+        BasicBlock* got_value = bbb.allocateBlock();
+        BasicBlock* exhausted = bbb.allocateBlock();
+        BasicBlock* done_block = bbb.allocateBlock();
+        BasicBlock* slot_path = bbb.allocateBlock();
+        BasicBlock* direct_pred = nullptr;
+        Instruction* direct_value = nullptr;
+        BasicBlock* finish_pred = nullptr;
+        Instruction* finish_value = nullptr;
+        BasicBlock* walk_done_pred = nullptr;
+        Instruction* walk_done_value = nullptr;
+        // a plain JIT generator that is resumable by a
+        // direct call (process gate byte and footer byte both set)
+        // enters its resume entry from here.  The entry links state and
+        // frame; a plain-yield exit unlinks and re-arms the footer byte.
+        // Any other outcome is finished by JITRT_GenNextFinish311.
+        BasicBlock* is_gen = bbb.allocateBlock();
+        BasicBlock* gate_ok = bbb.allocateBlock();
+        BasicBlock* direct = bbb.allocateBlock();
+        BasicBlock* after_call = bbb.allocateBlock();
+        BasicBlock* finish = bbb.allocateBlock();
+        BasicBlock* finish_done = bbb.allocateBlock();
+        Instruction* jt = env_->gen_direct_type;
+        if (jt == nullptr) {
+          Instruction* jt_addr = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&g_jitgen_type)});
+          jt = bbb.appendInstr(
+              OutVReg{DataType::k64bit}, Instruction::kMove, Ind{jt_addr, 0});
+        }
+        Instruction* same = bbb.appendInstr(
+            OutVReg{DataType::k8bit}, Instruction::kEqual, type, jt);
+        bbb.appendBranch(Instruction::kCondBranch, same, is_gen, slot_path);
+        bbb.switchBlock(is_gen);
+        Instruction* gate_addr = env_->gen_direct_gate_addr;
+        if (gate_addr == nullptr) {
+          gate_addr = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&g_gen_direct_gate)});
+        }
+        Instruction* gate = bbb.appendInstr(
+            OutVReg{DataType::k8bit},
+            Instruction::kMove,
+            Ind{gate_addr, 0, DataType::k8bit});
+        bbb.appendBranch(Instruction::kCondBranch, gate, gate_ok, slot_path);
+        bbb.switchBlock(gate_ok);
+        Instruction* footer = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{iter,
+                static_cast<int>(
+                    offsetof(PyGenObject, gi_origin_or_finalizer))});
+        Instruction* ok = bbb.appendInstr(
+            OutVReg{DataType::k8bit},
+            Instruction::kMove,
+            Ind{footer,
+                static_cast<int>(offsetof(GenDataFooter, direct_ok)),
+                DataType::k8bit});
+        BasicBlock* walk = nullptr;
+        BasicBlock* walk_done = nullptr;
+        Instruction* walk_value = nullptr;
+        // 1 = resume directly, 2 = yield-from
+        // suspension handled by the chain walker, 0 = slot path.
+        BasicBlock* nonzero = bbb.allocateBlock();
+        walk = bbb.allocateBlock();
+        walk_done = bbb.allocateBlock();
+        bbb.appendBranch(Instruction::kCondBranch, ok, nonzero, slot_path);
+        bbb.switchBlock(nonzero);
+        Instruction* two = bbb.appendInstr(
+            OutVReg{DataType::k8bit}, Instruction::kMove, Imm{2});
+        Instruction* is_two = bbb.appendInstr(
+            OutVReg{DataType::k8bit}, Instruction::kEqual, ok, two);
+        bbb.appendBranch(Instruction::kCondBranch, is_two, walk, direct);
+        bbb.switchBlock(walk);
+        using WalkerFn = PyObject* (*)(PyObject*, PyThreadState*);
+        WalkerFn walker_fn = JITRT_GenDelegateNext311;
+        // the generated walker, when available.
+        void* generated = env_->gen_delegate_walker;
+        if (generated != nullptr) {
+          walker_fn = reinterpret_cast<WalkerFn>(generated);
+        }
+        walk_value = bbb.appendCallInstruction(
+            OutVReg{DataType::kObject}, walker_fn, iter, env_->asm_tstate);
+        bbb.appendBranch(
+            Instruction::kCondBranch, walk_value, walk_done, exhausted);
+        bbb.switchBlock(walk_done);
+        walk_done_pred = bbb.curBlock();
+        walk_done_value = walk_value;
+        bbb.appendBranch(Instruction::kBranch, done_block);
+        bbb.switchBlock(direct);
+        Instruction* entry = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{footer,
+                static_cast<int>(offsetof(GenDataFooter, resumeEntry))});
+        Instruction* direct_call = bbb.appendInstr(
+            OutVReg{DataType::kObject},
+            Instruction::kCall,
+            entry,
+            iter,
+            Imm{reinterpret_cast<uint64_t>(Py_None)},
+            Imm{0},
+            env_->asm_tstate);
+        Instruction* ok_after = bbb.appendInstr(
+            OutVReg{DataType::k8bit},
+            Instruction::kMove,
+            Ind{footer,
+                static_cast<int>(offsetof(GenDataFooter, direct_ok)),
+                DataType::k8bit});
+        bbb.appendBranch(
+            Instruction::kCondBranch, ok_after, after_call, finish);
+        bbb.switchBlock(after_call);
+        direct_pred = bbb.curBlock();
+        direct_value = direct_call;
+        bbb.appendBranch(Instruction::kBranch, done_block);
+        bbb.switchBlock(finish);
+        if (getConfig().multiple_code_sections) {
+          finish->setSection(codegen::CodeSection::kCold);
+        }
+        Instruction* finished = bbb.appendCallInstruction(
+            OutVReg{DataType::kObject},
+            JITRT_GenNextFinish311,
+            iter,
+            direct_call);
+        bbb.appendBranch(
+            Instruction::kCondBranch, finished, finish_done, exhausted);
+        bbb.switchBlock(finish_done);
+        finish_pred = bbb.curBlock();
+        finish_value = finished;
+        bbb.appendBranch(Instruction::kBranch, done_block);
+        bbb.switchBlock(slot_path);
+        Instruction* fn = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{type, static_cast<int>(offsetof(PyTypeObject, tp_iternext))});
+        bbb.appendBranch(Instruction::kCondBranch, fn, has_slot, no_slot);
+
+        bbb.switchBlock(has_slot);
+        Instruction* value = bbb.appendInstr(
+            OutVReg{DataType::kObject}, Instruction::kCall, fn, iter);
+        bbb.appendBranch(Instruction::kCondBranch, value, got_value, exhausted);
+
+        bbb.switchBlock(got_value);
+        BasicBlock* value_pred = bbb.curBlock();
+        bbb.appendBranch(Instruction::kBranch, done_block);
+
+        bbb.switchBlock(exhausted);
+        if (getConfig().multiple_code_sections) {
+          exhausted->setSection(codegen::CodeSection::kCold);
+        }
+        Instruction* sentinel = bbb.appendCallInstruction(
+            OutVReg{DataType::kObject}, JITRT_IterNextExhausted311);
+        BasicBlock* exhausted_pred = bbb.curBlock();
+        bbb.appendBranch(Instruction::kBranch, done_block);
+
+        bbb.switchBlock(no_slot);
+        if (getConfig().multiple_code_sections) {
+          no_slot->setSection(codegen::CodeSection::kCold);
+        }
+        Instruction* generic = bbb.appendCallInstruction(
+            OutVReg{DataType::kObject}, JITRT_InvokeIterNext, iter);
+        BasicBlock* generic_pred = bbb.curBlock();
+        bbb.appendBranch(Instruction::kBranch, done_block);
+
+        bbb.switchBlock(done_block);
+        Instruction* phi = bbb.appendInstr(instr->output(), Instruction::kPhi);
+        phi->allocateLabelInput(value_pred);
+        phi->allocateLinkedInput(value);
+        phi->allocateLabelInput(exhausted_pred);
+        phi->allocateLinkedInput(sentinel);
+        phi->allocateLabelInput(generic_pred);
+        phi->allocateLinkedInput(generic);
+        if (direct_pred != nullptr) {
+          phi->allocateLabelInput(direct_pred);
+          phi->allocateLinkedInput(direct_value);
+          phi->allocateLabelInput(finish_pred);
+          phi->allocateLinkedInput(finish_value);
+          if (walk_done_pred != nullptr) {
+            phi->allocateLabelInput(walk_done_pred);
+            phi->allocateLinkedInput(walk_done_value);
+          }
+        }
+        break;
+#endif
         bbb.appendCallInstruction(
             instr->output(), JITRT_InvokeIterNext, instr->GetOperand(0));
         break;

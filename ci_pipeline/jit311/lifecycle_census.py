@@ -88,7 +88,14 @@ def run_round(jit, index: int, threshold: int) -> dict:
         for i in range(warm):
             assert f(i, 2) == i * 2
 
-    compiled = sum(1 for f in [first, *fresh] if jit.is_jit_compiled(f))
+    # Plain loops, not generator expressions: synchronous generators are
+    # auto-compiled like any other code, so a generator expression inside the
+    # harness would cross the threshold mid-run and park its own artifact in
+    # the residency gauges the census is reading.
+    compiled = 0
+    for f in [first, *fresh]:
+        if jit.is_jit_compiled(f):
+            compiled += 1
 
     # Park and resume: disable() deopts the registry, enable() puts the
     # published artifacts back to work.
@@ -103,7 +110,10 @@ def run_round(jit, index: int, threshold: int) -> dict:
     # so the first retirement takes it for all of them and the rest answer
     # False -- the count below reads "the retirement path ran", not "four
     # artifacts went away".
-    retired = sum(1 for f in fresh[:4] if jit.force_uncompile(f))
+    retired = 0
+    for f in fresh[:4]:
+        if jit.force_uncompile(f):
+            retired += 1
 
     del first, fresh, namespace
     gc.collect()

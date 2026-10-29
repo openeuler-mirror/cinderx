@@ -6,8 +6,13 @@
 
 namespace jit {
 
-GenYieldPoint::GenYieldPoint(std::size_t deopt_idx, ptrdiff_t yield_from_offset)
-    : deopt_idx_{deopt_idx}, yield_from_offset_{yield_from_offset} {}
+GenYieldPoint::GenYieldPoint(
+    std::size_t deopt_idx,
+    ptrdiff_t yield_from_offset,
+    bool handler_free)
+    : deopt_idx_{deopt_idx},
+      yield_from_offset_{yield_from_offset},
+      handler_free_{handler_free} {}
 
 void GenYieldPoint::setResumeTarget(uintptr_t resume_target) {
   resume_target_ = resume_target;
