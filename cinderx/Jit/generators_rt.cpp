@@ -1360,6 +1360,14 @@ PyObject* jitgen_getyieldfrom(PyObject* obj, void*) {
   if (jit_gen == nullptr) {
     return PyObject_GetAttrString(obj, "gi_yieldfrom");
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Direct delegation keeps the suspended yield point in the footer while
+  // the generator runs. It is internal resume state, not a currently
+  // suspended delegation exposed by gi_yieldfrom (or cr_await).
+  if (jit_gen->gi_frame_state == FRAME_EXECUTING) {
+    Py_RETURN_NONE;
+  }
+#endif
   PyObject* yield_from = jit_gen->yieldFrom();
   if (yield_from == nullptr) {
     Py_RETURN_NONE;

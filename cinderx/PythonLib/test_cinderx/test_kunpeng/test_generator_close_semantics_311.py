@@ -303,11 +303,101 @@ print("subclose raises ok")
 """
 
 
+YIELDFROM_STATE_PROBE = """
+import json
+import os
+
+jit = os.environ["TEST_YIELDFROM_JIT"] == "1"
+if jit:
+    import _cinderx
+    import cinderx
+    cinderx.init()
+    _cinderx.install_frame_evaluator()
+    import cinderjit
+
+
+def consume(gen):
+    result = []
+    for item in gen:
+        result.append(item)
+    return result
+
+
+def scenario(compiled_child, compiled_loop, depth):
+    events = []
+
+    def leaf():
+        events.append(["first", gen.gi_running, gen.gi_yieldfrom is None])
+        assert gen.gi_running and gen.gi_yieldfrom is None
+        yield 1
+        events.append(["resumed", gen.gi_running, gen.gi_yieldfrom is None])
+        assert gen.gi_running and gen.gi_yieldfrom is None
+        yield 2
+
+    def delegate(child):
+        yield from child
+
+    def outer():
+        assert gen.gi_yieldfrom is None
+        child = leaf()
+        for _ in range(depth - 1):
+            child = delegate(child)
+        yield from child
+        events.append(["finished_child", gen.gi_running, gen.gi_yieldfrom is None])
+        assert gen.gi_running and gen.gi_yieldfrom is None
+        yield 3
+
+    if jit:
+        for fn in (outer, delegate, consume):
+            if not cinderjit.is_jit_compiled(fn):
+                assert cinderjit.force_compile(fn)
+        if compiled_child:
+            if not cinderjit.is_jit_compiled(leaf):
+                assert cinderjit.force_compile(leaf)
+        else:
+            cinderjit.jit_suppress(leaf)
+        before = _cinderx._get_trigger_stats()["machine_code_entries"]
+
+    gen = outer()
+    assert gen.gi_yieldfrom is None  # Created.
+    assert next(gen) == 1
+    assert gen.gi_yieldfrom is not None  # Suspended delegation.
+    if compiled_loop:
+        # A compiled loop consumes an already suspended chain, exercising
+        # direct delegation on both sides of the walker depth limit.
+        assert consume(gen) == [2, 3]
+    else:
+        assert gen.send(None) == 2
+        assert gen.gi_yieldfrom is not None
+        assert gen.send(None) == 3
+        assert gen.gi_yieldfrom is None  # Suspended plain yield.
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+        else:
+            raise AssertionError("generator did not finish")
+    assert gen.gi_yieldfrom is None  # Closed.
+    if jit:
+        assert _cinderx._get_trigger_stats()["machine_code_entries"] > before
+    return events
+
+
+rows = []
+for compiled_child in (True, False):
+    for compiled_loop in (False, True):
+        for depth in (1, 65):
+            rows.append(scenario(compiled_child, compiled_loop, depth))
+print(json.dumps(rows))
+print("yieldfrom state ok")
+"""
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 generator close paths"
 )
 class GeneratorCloseSemantics311Test(unittest.TestCase):
-    def _run(self, probe, marker):
+    def _run(self, probe, marker, *, extra_env=None):
         env = {
             key: value
             for key, value in os.environ.items()
@@ -319,6 +409,7 @@ class GeneratorCloseSemantics311Test(unittest.TestCase):
             PYTHONJITAUTO="1000000",
             PYTHONJITLIGHTWEIGHTFRAME="0",
         )
+        env.update(extra_env or {})
         proc = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(probe)],
             capture_output=True,
@@ -328,6 +419,7 @@ class GeneratorCloseSemantics311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
         self.assertIn(marker, proc.stdout)
+        return proc.stdout
 
     def test_reentry_during_fast_close_raises_already_executing(self):
         self._run(CLOSE_REENTRY_PROBE, "close reentry ok")
@@ -340,6 +432,19 @@ class GeneratorCloseSemantics311Test(unittest.TestCase):
 
     def test_sub_iterator_close_error_finishes_the_delegator(self):
         self._run(SUBCLOSE_RAISES_PROBE, "subclose raises ok")
+
+    def test_gi_yieldfrom_tracks_public_execution_state(self):
+        expected = self._run(
+            YIELDFROM_STATE_PROBE,
+            "yieldfrom state ok",
+            extra_env={"TEST_YIELDFROM_JIT": "0", "CINDERX_JIT_MODE": "off"},
+        )
+        actual = self._run(
+            YIELDFROM_STATE_PROBE,
+            "yieldfrom state ok",
+            extra_env={"TEST_YIELDFROM_JIT": "1"},
+        )
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":
