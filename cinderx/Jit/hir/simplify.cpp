@@ -14,6 +14,7 @@
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/array_specialize.h"
+#include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -1529,6 +1530,18 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // True-divide is similar to add/sub/mul, but needs to guard against division
   // by zero as that would raise a ZeroDivisionError in the interpreter.
   if (op == BinaryOpKind::kTrueDivide) {
+#if PY_VERSION_HEX < 0x030C0000
+    const FrameState* frame = instr->frameState();
+    if (frame != nullptr && frame->parent == nullptr &&
+        frame->code != nullptr &&
+        PyBytes_GET_SIZE(frame->code->co_exceptiontable) != 0 &&
+        excEdgeCapable311(frame->code, instr->bytecodeOffset().value())) {
+      // A zero-divide guard does not count as an exception at BINARY_OP.
+      // Keep the helper's exception exit so this site can earn its grant,
+      // including FloatBinaryOp produced by an in-place specialization.
+      return nullptr;
+    }
+#endif
     Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
     Register* unbox_right = env.emit<PrimitiveUnbox>(instr->right(), TCDouble);
     Register* zero = env.emit<LoadConst>(Type::fromCDouble(0.0));

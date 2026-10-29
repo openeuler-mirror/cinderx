@@ -208,6 +208,16 @@ def inplace_divide(value):
 
 
 @compiled
+def literal_float_divide():
+    value = 1.0
+    try:
+        value /= 0.0
+    except ZeroDivisionError as exc:
+        return ("zero", str(exc))
+    return ("value", value)
+
+
+@compiled
 def exact_float_divide(value, divisor):
     value = float(value)
     divisor = float(divisor)
@@ -248,14 +258,15 @@ def custom_inplace(value):
 
 
 obj = BadAdd()
-functions = (inplace_add, inplace_divide, exact_float_divide,
-             exact_int_divide, custom_inplace)
+functions = (inplace_add, inplace_divide, literal_float_divide,
+             exact_float_divide, exact_int_divide, custom_inplace)
 for i in range(ROUNDS):
     if JIT:
         before = _cinderx._get_trigger_stats()["machine_code_entries"]
     LOG.append(inplace_add(1, None))
     LOG.append(inplace_add(1, 2))
     LOG.append(inplace_divide(1.0))
+    LOG.append(literal_float_divide())
     LOG.append(exact_float_divide(1.0, 0.0))
     LOG.append(exact_float_divide(8.0, 2.0))
     LOG.append(exact_int_divide(1, 0))
