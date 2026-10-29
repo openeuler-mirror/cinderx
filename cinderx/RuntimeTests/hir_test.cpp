@@ -69,20 +69,28 @@ void expectColdGlobalGuardShape(
     const Function& func,
     const std::string& hir,
     size_t expected_guard_type,
-    size_t expected_guard_is) {
+    size_t expected_guard_is,
+    size_t expected_pin_guard_is_311 = 0) {
 #if PY_VERSION_HEX < 0x030C0000
-  // Combined unicode globals take the module-value fast path (CallStatic
-  // + Guard).  Cold split dictionaries still emit LoadGlobal.  Neither
-  // shape uses GuardType/GuardIs; those are the 3.14 cached-global
-  // sentinels this helper originally described.
+  // Combined unicode globals go through the per-site cell: the fast arm
+  // compares the live keys version(s) with the cell and reads the entry
+  // slot, the slow arm is one CallStatic to the re-pin helper; neither is
+  // a deopt point.  Cold split dictionaries still emit LoadGlobal.
+  // GuardType is a 3.14 cached-global sentinel; GuardIs appears on 3.11
+  // only as the identity pin of a builtin the simplifier opens (len /
+  // isinstance / type) or of a callable in call position.
   (void)expected_guard_type;
   (void)expected_guard_is;
   size_t load_global = countOpcode(func, Opcode::kLoadGlobal);
-  size_t guards = countOpcode(func, Opcode::kGuard);
-  EXPECT_TRUE(load_global == 1 || guards >= 1) << hir;
+  size_t repin_calls = countOpcode(func, Opcode::kCallStatic);
+  bool cell_shape =
+      repin_calls >= 1 && countSubstring(hir, "globals_keys_version") >= 1;
+  EXPECT_TRUE(load_global == 1 || cell_shape) << hir;
+  EXPECT_EQ(countOpcode(func, Opcode::kGuard), 0) << hir;
   EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
-  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), expected_pin_guard_is_311) << hir;
 #else
+  (void)expected_pin_guard_is_311;
   (void)func;
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), expected_guard_type)
       << hir;
@@ -1466,7 +1474,8 @@ def test():
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  expectColdGlobalGuardShape(*irfunc, hir, 0, 1);
+  // 3.11 pins len by identity so the simplifier can open len(x).
+  expectColdGlobalGuardShape(*irfunc, hir, 0, 1, 1);
 }
 
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
@@ -1633,7 +1642,14 @@ def test(x):
       << hir;
   ASSERT_NE(call->self(), nullptr);
   ASSERT_NE(call->self()->instr(), nullptr);
-  EXPECT_TRUE(call->self()->instr()->IsLoadGlobal()) << hir;
+  // The builtin arrives through the per-site cell: before SSA the merge
+  // of the fast arm's slot read and the slow arm's re-pin helper result is
+  // an Assign into the result register (a Phi after SSA); the helper form
+  // (LoadGlobal) is the fallback for cold split dictionaries.
+  EXPECT_TRUE(
+      call->self()->instr()->IsAssign() || call->self()->instr()->IsPhi() ||
+      call->self()->instr()->IsLoadGlobal())
+      << hir;
   EXPECT_NE(call->frameState(), nullptr);
 }
 
@@ -1785,7 +1801,7 @@ TEST_F(HIRBuildTest, InPlaceBinaryOpSpecialization311DoesNotGuardLongs) {
   EXPECT_EQ(inplace_op_count, 1);
 }
 
-TEST_F(HIRBuildTest, LoadGlobalModule311UsesIndexedValueGuard) {
+TEST_F(HIRBuildTest, LoadGlobalModule311ReadsTheCellSlot) {
   const char* src = R"(
 value = object()
 
@@ -1822,13 +1838,20 @@ def test():
     }
   }
 
-  EXPECT_EQ(call_static_count, 1);
-  EXPECT_EQ(guard_count, 1);
-  EXPECT_EQ(load_global_count, 0);
-  EXPECT_EQ(load_global_cached_count, 0);
+  // The load goes through the per-site cell: the fast arm compares the
+  // globals keys version with the cell and reads the entry slot, the slow
+  // arm is the one CallStatic to the re-pin helper; no deopt point.  A
+  // module-resolved name checks the globals version only.
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(call_static_count, 1) << hir;
+  EXPECT_EQ(guard_count, 0) << hir;
+  EXPECT_EQ(load_global_count, 0) << hir;
+  EXPECT_EQ(load_global_cached_count, 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "globals_keys_version"), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "builtins_keys_version"), 0) << hir;
 }
 
-TEST_F(HIRBuildTest, ColdLoadGlobalModule311UsesTheSharedVersionAllocator) {
+TEST_F(HIRBuildTest, ColdLoadGlobalModule311TakesTheCellPath) {
   const char* src = R"(
 value = object()
 
@@ -1859,15 +1882,16 @@ def test():
     }
   }
 
-  // A cold 3.11 dict starts with an unassigned keys version, but since
-  // MR-09 the JIT shares the vendored specializer's allocator
-  // (Ci_GetDictKeysVersion_311, issuing from the top half of the 32-bit
-  // range), so even a cold module global load can version the keys and
-  // take the guarded fast path.
-  EXPECT_EQ(call_static_count, 1);
-  EXPECT_EQ(guard_count, 1);
-  EXPECT_EQ(load_global_count, 0);
-  EXPECT_EQ(load_global_cached_count, 0);
+  // A cold 3.11 dict starts with an unassigned keys version.  The cell
+  // path does not need one at compile time: the site is emitted unpinned
+  // and the slow arm's helper assigns the version (through the vendored
+  // specializer's allocator, Ci_GetDictKeysVersion_311) and pins the cell
+  // on the first call.
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(call_static_count, 1) << hir;
+  EXPECT_EQ(guard_count, 0) << hir;
+  EXPECT_EQ(load_global_count, 0) << hir;
+  EXPECT_EQ(load_global_cached_count, 0) << hir;
 }
 
 static void expectCompactLongInPlaceFastPath(Function& irfunc) {

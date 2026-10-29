@@ -576,14 +576,15 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # one more when MR-08 opened the exception family, 333 once MR-09's
     # pull-validated attribute caches guard attribute sites across 72
     # importing modules (import-time class mutation retires
-    # receiver-version guards by design). MR4-A routes fresh known-function
-    # calls through the code artifact too: sysconfig._getuserbase's joinuser
-    # now enters machine code and hits its LOAD_GLOBAL_MODULE: os guard once.
-    # This adds exactly one deopt (333 -> 334); three repeated base/candidate
-    # sweeps differ only at that site. The count is sensitive to sys.path;
-    # the gate uses its system-3.11 venv and CPython 3.11.6 test support paths.
-    # Keep an exact pin so unrelated changes still fail closed.
-    default = execute_holds(expected_organic_deopts=334) + [
+    # receiver-version guards by design), 333 in the shared-3.11 gate after
+    # the CPython test support path is added, and 30 once LOAD_GLOBAL goes
+    # through the per-site cell: import-time module-dict growth no longer
+    # deopts the loads that read those modules' globals, it re-pins them.
+    # The count is sensitive to sys.path; the gate runs with its
+    # system-3.11 venv plus the matching CPython 3.11.6 test support paths.
+    # Verified deterministic across reruns; the exact pin keeps the
+    # fail-closed drift guard.
+    default = execute_holds(expected_organic_deopts=30) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -962,11 +963,15 @@ def exception_semantics_runner(*, judges: list[Judge] | None = None) -> RunnerSp
         "    assert cinderjit.is_jit_compiled(target), (\n"
         "        'a handled exception must not uninstall the artifact')\n"
     )
-    # Eight organic deopts: the corpus raises through compiled code by
-    # design, and each raising form deopts exactly once (kUnhandledException
+    # Six organic deopts: the corpus raises through compiled code by
+    # design, once per raising checkpoint (k = 1..N; the N+1 and 0 sweeps
+    # never raise), and each raise deopts exactly once (kUnhandledException
     # delegation).  The exact pin replaces the old ">0" judge so a deopt
-    # storm cannot wash green.
-    default = execute_holds(expected_organic_deopts=8)
+    # storm cannot wash green.  (The two non-raising sweeps used to deopt
+    # as well, at LOAD_GLOBAL, because the sweep loop's own module-level
+    # bindings changed the globals keys version after the compile; the
+    # per-site global-load cell re-pins instead of deoptimizing.)
+    default = execute_holds(expected_organic_deopts=6)
     return RunnerSpec(
         name="exception_semantics",
         payload=payload,

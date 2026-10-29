@@ -1489,7 +1489,8 @@ print("fresh known function ok")
 
     def test_fresh_function_global_change_matches_interpreter(self):
         self._run(
-            fresh_function_global_change_probe(expected_deopts=1),
+            # MR4-B re-pins the global cell instead of deoptimizing.
+            fresh_function_global_change_probe(expected_deopts=0),
             "fresh global change ok",
             extra_env={"PYTHONJITFRESHATTACHBUDGET": "0"},
         )

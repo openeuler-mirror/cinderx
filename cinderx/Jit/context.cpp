@@ -487,6 +487,13 @@ CallSiteEntryCache* Context::allocateCallSiteEntryCache() {
   return call_site_entry_caches_.allocate();
 }
 
+SuperSiteCache311* Context::allocateSuperSiteCache311() {
+  return super_site_caches_.allocate();
+}
+
+GlobalLoadCell311* Context::allocateGlobalLoadCell311() {
+  return global_load_cells_311_.allocate();
+}
 #endif
 
 const Builtins& Context::builtins() {

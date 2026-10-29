@@ -12,6 +12,7 @@
 namespace jit {
 class CodeRuntime;
 struct GenDataFooter;
+struct GlobalLoadCell311;
 struct JitGenObject;
 } // namespace jit
 
@@ -163,12 +164,6 @@ PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name);
 
 #if PY_VERSION_HEX < 0x030C0000
-PyObject* JITRT_LoadGlobalModuleValue(
-    PyObject* globals,
-    PyObject* name,
-    uint32_t keys_version,
-    Py_ssize_t index);
-
 // Returns 1 when this visit should take the deopt stub because a test
 // armed the site.  The subsequent Guard/AlwaysFail uses the same
 // DeoptMetadata, so forced and organic hits share one restore.
@@ -178,6 +173,18 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
 // localsplus slot (MR-08 frame observability; value may be nullptr for
 // DELETE_FAST).  Returns 0.
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
+
+// 3.11 LOAD_GLOBAL per-site cell (jit::GlobalLoadCell311): the slow arm.
+// Performs the interpreter's lookup, then pins the cell for the next call
+// when the dicts allow it (combined, unicode-keyed, versionable) or leaves
+// it unpinned.  Returns a pointer to storage holding the value as a
+// borrowed reference: the pinned entry slot, the cell's own held reference
+// when it could not pin, or NULL storage with NameError set when absent.
+PyObject** JITRT_LoadGlobalRepin311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name);
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
     PyFunctionObject* func);
 void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
@@ -367,6 +374,30 @@ PyObject* JITRT_GetAttrFromSuper(
     PyObject* self,
     PyObject* name,
     bool no_args_in_super_call);
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace jit {
+struct SuperSiteCache311;
+} // namespace jit
+
+// Per-site cached forms of the two lookups above (see
+// jit::SuperSiteCache311); the generic helper is the fallback for anything
+// but builtin super() on a receiver type with a valid version tag.
+LoadMethodResult JITRT_GetMethodFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call);
+PyObject* JITRT_GetAttrFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call);
+#endif
 
 /*
  * Mimics the behavior of the UNARY_NOT opcode.

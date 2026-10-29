@@ -37,11 +37,16 @@ static uint32_t ci_next_func_version_311 = CI_VERSION_RANGE_BASE;
 // keys versions from THIS stream.  A second allocator would eventually hand
 // the same number to two different keys objects, and a version's only job
 // is to make that impossible.  Declared in interpreter_contract.h.
+// UINT32_MAX is never issued: the JIT's LOAD_GLOBAL cells record it as the
+// "unpinned" version (jit::kGlobalLoadCellUnpinned311), which must compare
+// unequal to every live keys version.  Reaching it exhausts the stream.
 uint32_t Ci_GetDictKeysVersion_311(PyDictKeysObject* keys) {
   if (keys->dk_version != 0) {
     return keys->dk_version;
   }
-  if (ci_next_dict_keys_version_311 == 0) {
+  if (ci_next_dict_keys_version_311 == 0 ||
+      ci_next_dict_keys_version_311 == UINT32_MAX) {
+    ci_next_dict_keys_version_311 = 0;
     return 0;
   }
   uint32_t version = ci_next_dict_keys_version_311++;

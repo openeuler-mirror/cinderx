@@ -4,7 +4,9 @@
 
 #include "pycore_long.h"
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/property.h"
 #include "cinderx/Common/py-portability.h"
@@ -2486,6 +2488,21 @@ static Register* resolveArgs(
       offsetof(PyFunctionObject, func_defaults),
       TTuple);
   env.emit<GuardIs>(defaults, defaults_obj);
+#if PY_VERSION_HEX < 0x030C0000
+  // The completion is written against this code object's signature.  A
+  // __code__ assignment changes neither the function's identity (pinned by
+  // the callee guard) nor its defaults tuple, so the code object is pinned
+  // and guarded as well; the guard fails before the call, which the
+  // interpreter then makes with the arguments as written.
+  env.func.env.addReference(
+      BorrowedRef<>{reinterpret_cast<PyObject*>(code.get())});
+  Register* code_obj = env.emit<LoadField>(
+      resolved_func,
+      "func_code",
+      offsetof(PyFunctionObject, func_code),
+      TObject);
+  env.emit<GuardIs>(reinterpret_cast<PyObject*>(code.get()), code_obj);
+#endif
 
   // creates an instruction VectorCall(arg_size, dest_reg, frame_state)
   // and inserts it to the current block. Returns the output of vectorcall
@@ -2851,6 +2868,187 @@ std::optional<std::pair<Instr*, std::vector<Instr*>>> isVectorCallIfIsInstance(
   return std::nullopt;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// A keyword call whose callee is a compile-time constant Python function (a
+// guarded global, a pinned method) is bound here, at compile time, into the
+// positional call the callee's direct entry takes.  The names tuple is a code
+// constant, so the site's (positional count, names) resolve against the
+// callee's signature once: every callee slot maps to a positional value, a
+// keyword value or a default by index.  Two facts the callee constant does
+// not pin are re-proved per call: the function's code object (a __code__
+// assignment changes the signature) by identity, and its defaults tuple by
+// shape (an exact tuple of the arity seen here; the values are read live, so
+// a same-arity rebinding needs no deopt).  Shapes the binder cannot settle
+// statically -- varargs / varkeywords / keyword-only parameters, static
+// prototypes, more than 16 parameters, a name that is not a parameter or
+// names a positional-only one, a parameter given twice, a required parameter
+// unset -- keep the keyword call (the generic path binds or raises).
+Register* trySimplifyStaticKwCall311(Env& env, const VectorCall* instr) {
+  Register* callable = instr->func();
+  Type ct = callable->type();
+  if (!ct.hasObjectSpec()) {
+    return nullptr;
+  }
+  PyObject* fobj = ct.objectSpec();
+  if (fobj == nullptr || !PyFunction_Check(fobj)) {
+    return nullptr;
+  }
+  const size_t nops = instr->NumOperands();
+  if (nops < 2) {
+    return nullptr;
+  }
+  Register* kwnames_reg = instr->GetOperand(nops - 1);
+  Type kt = kwnames_reg->type();
+  if (!kt.hasObjectSpec()) {
+    return nullptr;
+  }
+  PyObject* kwnames = kt.objectSpec();
+  if (kwnames == nullptr || !PyTuple_CheckExact(kwnames)) {
+    return nullptr;
+  }
+  const Py_ssize_t nkw = PyTuple_GET_SIZE(kwnames);
+  const Py_ssize_t nargs_total = static_cast<Py_ssize_t>(nops) - 2;
+  const Py_ssize_t npos = nargs_total - nkw;
+  if (npos < 0) {
+    return nullptr;
+  }
+  auto* func = reinterpret_cast<PyFunctionObject*>(fobj);
+  auto* co = reinterpret_cast<PyCodeObject*>(func->func_code);
+  const Py_ssize_t argcount = co->co_argcount;
+  if ((co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) ||
+      co->co_kwonlyargcount != 0 ||
+      (co->co_flags & CI_CO_STATICALLY_COMPILED) || argcount > 16 ||
+      npos > argcount || nargs_total > argcount) {
+    return nullptr;
+  }
+  constexpr int kUnset = -128;
+  int src[16];
+  for (Py_ssize_t i = 0; i < argcount; ++i) {
+    src[i] = i < npos ? static_cast<int>(i) : kUnset;
+  }
+  for (Py_ssize_t k = 0; k < nkw; ++k) {
+    PyObject* keyword = PyTuple_GET_ITEM(kwnames, k);
+    Py_ssize_t j = -1;
+    for (Py_ssize_t c = co->co_posonlyargcount; c < argcount; ++c) {
+      if (getVarname(co, c) == keyword) {
+        j = c;
+        break;
+      }
+    }
+    if (j < 0 || src[j] != kUnset) {
+      return nullptr;
+    }
+    src[j] = static_cast<int>(npos + k);
+  }
+  PyObject* defaults = func->func_defaults;
+  const Py_ssize_t defcount =
+      defaults == nullptr ? 0 : PyTuple_GET_SIZE(defaults);
+  bool need_defaults = false;
+  for (Py_ssize_t j = 0; j < argcount; ++j) {
+    if (src[j] != kUnset) {
+      continue;
+    }
+    Py_ssize_t d = j - (argcount - defcount);
+    if (d < 0) {
+      return nullptr;
+    }
+    src[j] = static_cast<int>(-(d + 1));
+    need_defaults = true;
+  }
+  const FrameState* dominating_fs = instr->getDominatingFrameState();
+  if (dominating_fs == nullptr) {
+    return nullptr;
+  }
+  // The guards below fail back to the interpreter.  The call's own frame
+  // state resumes at CALL, but the keyword names of a 3.11 call are not on
+  // the operand stack: KW_NAMES sets them in the evaluator's call shape,
+  // which a frame entered at CALL has empty -- the keyword arguments would
+  // be bound as positional ones.  The guards therefore resume at the
+  // KW_NAMES instruction (its EXTENDED_ARG prefix included): the operand
+  // stack is the same there, no argument is evaluated again, and the
+  // interpreter replays KW_NAMES, PRECALL and CALL.
+  FrameState guard_fs = *dominating_fs;
+  {
+    BorrowedRef<PyCodeObject> caller_code = guard_fs.code;
+    if (caller_code == nullptr) {
+      return nullptr;
+    }
+    const BCOffset call_off = guard_fs.cur_instr_offs;
+    BCOffset resume_off{-1};
+    BytecodeInstructionBlock block{caller_code};
+    BytecodeInstruction prev1{caller_code, BCOffset{0}};
+    BytecodeInstruction prev2{caller_code, BCOffset{0}};
+    int seen = 0;
+    for (const BytecodeInstruction& bc : block) {
+      if (bc.baseOffset() == call_off || bc.opcodeOffset() == call_off) {
+        if (seen >= 2 && bc.opcode() == CALL && prev1.opcode() == PRECALL &&
+            prev2.opcode() == KW_NAMES) {
+          resume_off = prev2.baseOffset();
+        }
+        break;
+      }
+      prev2 = prev1;
+      prev1 = bc;
+      seen++;
+    }
+    if (resume_off < BCOffset{0}) {
+      return nullptr;
+    }
+    guard_fs.cur_instr_offs = resume_off;
+  }
+  // The code object is compared by identity; pin it so a __code__
+  // reassignment cannot recycle the address under the guard.
+  env.func.env.addReference(BorrowedRef<>{reinterpret_cast<PyObject*>(co)});
+  env.emit<Snapshot>(guard_fs);
+  Register* code_reg = env.emit<LoadField>(
+      callable, "func_code", offsetof(PyFunctionObject, func_code), TObject);
+  env.emit<GuardIs>(reinterpret_cast<PyObject*>(co), code_reg);
+  Register* defaults_reg = nullptr;
+  if (need_defaults) {
+    defaults_reg = env.emit<LoadField>(
+        callable,
+        "func_defaults",
+        offsetof(PyFunctionObject, func_defaults),
+        TOptObject);
+    // __defaults__ = None clears the slot to NULL; the type guard reads
+    // ob_type, so the null case must deopt first.
+    env.emit<Snapshot>(guard_fs);
+    env.emit<Guard>(defaults_reg);
+    defaults_reg = env.emit<RefineType>(TObject, defaults_reg);
+    env.emit<Snapshot>(guard_fs);
+    defaults_reg = env.emit<GuardType>(TTupleExact, defaults_reg);
+    Register* size = env.emit<LoadField>(
+        defaults_reg, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
+    Register* expected = env.emit<LoadConst>(Type::fromCInt(defcount, TCInt64));
+    Register* same_size =
+        env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, size, expected);
+    env.emit<Snapshot>(guard_fs);
+    env.emit<Guard>(same_size);
+  }
+  // Every operand must be defined before the call is emitted (the default
+  // loads go first; the call takes the cursor after them).
+  Register* bound[16];
+  for (Py_ssize_t j = 0; j < argcount; ++j) {
+    bound[j] = src[j] >= 0 ? instr->GetOperand(1 + src[j])
+                           : env.emit<LoadTupleItem>(defaults_reg, -src[j] - 1);
+  }
+  CallFlags flags = static_cast<CallFlags>(
+      static_cast<uint32_t>(instr->flags()) &
+      ~static_cast<uint32_t>(CallFlags::KwArgs));
+  auto call = env.emitRawInstr<VectorCall>(
+      static_cast<size_t>(argcount) + 1,
+      env.func.env.AllocateRegister(),
+      flags,
+      *instr->frameState());
+  call->SetOperand(0, callable);
+  for (Py_ssize_t j = 0; j < argcount; ++j) {
+    call->SetOperand(j + 1, bound[j]);
+  }
+  call->output()->set_type(instr->output()->type());
+  return call->output();
+}
+#endif
+
 Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
   if (Register* result = simplifyVectorCallStatic(env, instr)) {
     return result;
@@ -2859,7 +3057,11 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
     return result;
   }
   if (instr->flags() & CallFlags::KwArgs) {
+#if PY_VERSION_HEX < 0x030C0000
+    return trySimplifyStaticKwCall311(env, instr);
+#else
     return nullptr;
+#endif
   }
 
   Register* target = instr->GetOperand(0);

@@ -232,8 +232,13 @@ def unpack(seq):
 TEST_F(DeoptSite311Test, LoadGlobalReexecDoesNotDoublePushNull) {
   SKIP_311_EXECUTABLE_COMPILE();
 
+  // A positional call with fewer arguments than parameters pins the
+  // function-valued global by identity (the simplifier completes the
+  // default at compile time); that pin is the GuardFailure site left at
+  // LOAD_GLOBAL now that keys-version misses re-pin the site's cell
+  // instead of deoptimizing.
   const char* src = R"(
-def _g():
+def _g(a=1):
     return 7
 
 G = _g

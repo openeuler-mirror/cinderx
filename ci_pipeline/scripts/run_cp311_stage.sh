@@ -276,6 +276,8 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_float_power_exact_311 \
     test_cinderx.test_kunpeng.test_subscript_profitability_311 \
     test_cinderx.test_kunpeng.test_locals_reading_builtins \
+    test_cinderx.test_kunpeng.test_global_load_repin_311 \
+    test_cinderx.test_kunpeng.test_global_call_optimizations_311 \
     test_cinderx.test_kunpeng.test_lightweight_frames &&
     # This regression must execute JIT code; the parent PR suite defaults to off.
     CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 "$PYTHON" -m unittest -v \
