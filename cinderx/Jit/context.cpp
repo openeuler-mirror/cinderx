@@ -1489,6 +1489,9 @@ LifecycleSnapshot311 Context::lifecycleSnapshot311() {
   for (CodeRuntime& runtime : code_runtimes_) {
     snapshot.code_runtimes_allocated++;
     snapshot.code_runtimes_live += !runtime.isCleared();
+#if PY_VERSION_HEX < 0x030C0000
+    snapshot.subscript_caches += runtime.subscrCacheCount311();
+#endif
   }
   return snapshot;
 }
@@ -1996,7 +1999,31 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
       (func != nullptr && _Py_IsImmortal(func)) ||
       (outer != nullptr && _Py_IsImmortal(outer));
   compiled_func.runtime_lifetime = code_runtime_lifetime_;
+#if PY_VERSION_HEX < 0x030C0000
+  bool runtime_adopted = false;
+  SCOPE_EXIT({
+    if (!runtime_adopted && compiled_func.runtime != nullptr) {
+      // No artifact owns these resources if allocating its Python object
+      // failed. Preserve that failure while releasing Python references.
+      PyObject *type, *value, *traceback;
+      PyErr_Fetch(&type, &value, &traceback);
+      compiled_func.runtime->releaseReferences();
+      recycleCodeRuntime(compiled_func.runtime);
+      if (compiled_func.code.data() != nullptr) {
+        auto* allocator = cinderx::getModuleState()->code_allocator.get();
+        auto error = allocator->releaseCode(
+            const_cast<std::byte*>(compiled_func.code.data()));
+        JIT_CHECK(
+            error == asmjit::kErrorOk, "Failed to release unpublished code");
+      }
+      PyErr_Restore(type, value, traceback);
+    }
+  });
+#endif
   auto compiled = CompiledFunction::create(std::move(compiled_func), immortal);
+#if PY_VERSION_HEX < 0x030C0000
+  runtime_adopted = compiled != nullptr;
+#endif
   if (compiled == nullptr) {
     return nullptr;
   }

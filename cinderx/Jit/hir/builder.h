@@ -706,6 +706,9 @@ class HIRBuilder {
   Register* kwnames_{nullptr};
 
   bool code_has_backedge_{false};
+  // SPIKE(SLICEFAST): bytecode offset of a BINARY_SUBSCR / STORE_SUBSCR that
+  // was fused into the preceding BUILD_SLICE and must not be translated.
+  int spike_skip_bc_offset_{-1};
 
   // True for small no-loop helpers that contain at least two specialized
   // numeric binary operations. These are often inlined into loop-heavy

@@ -12,6 +12,7 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
@@ -2606,6 +2607,187 @@ bool callFast311(
   return true;
 }
 } // namespace
+#endif
+
+// SPIKE(SLICEFAST) helpers.
+namespace {
+// Mirrors PySlice_Unpack for a None step: None keeps the default, ints and
+// __index__ objects go through _PyEval_SliceIndex (same TypeError text and
+// overflow clamping as the slice object path).
+inline bool spikeSliceBounds311(
+    PyObject* start,
+    PyObject* stop,
+    Py_ssize_t* lo,
+    Py_ssize_t* hi) {
+  *lo = 0;
+  *hi = PY_SSIZE_T_MAX;
+  return _PyEval_SliceIndex(start, lo) && _PyEval_SliceIndex(stop, hi);
+}
+} // namespace
+
+PyObject* JITRT_GetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step) {
+  if (step == Py_None) {
+    Py_ssize_t lo, hi;
+    if (PyList_CheckExact(container) || PyTuple_CheckExact(container)) {
+      if (!spikeSliceBounds311(start, stop, &lo, &hi)) {
+        return nullptr;
+      }
+      PySlice_AdjustIndices(Py_SIZE(container), &lo, &hi, 1);
+      return PyList_CheckExact(container) ? PyList_GetSlice(container, lo, hi)
+                                          : PyTuple_GetSlice(container, lo, hi);
+    }
+    if (PyUnicode_CheckExact(container)) {
+      if (!spikeSliceBounds311(start, stop, &lo, &hi)) {
+        return nullptr;
+      }
+      PySlice_AdjustIndices(PyUnicode_GET_LENGTH(container), &lo, &hi, 1);
+      return PyUnicode_Substring(container, lo, hi);
+    }
+  }
+  PyObject* slice = PySlice_New(start, stop, step);
+  if (slice == nullptr) {
+    return nullptr;
+  }
+  PyObject* result = PyObject_GetItem(container, slice);
+  Py_DECREF(slice);
+  return result;
+}
+
+Py_ssize_t JITRT_SetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step,
+    PyObject* value) {
+  if (step == Py_None && PyList_CheckExact(container)) {
+    Py_ssize_t lo, hi;
+    if (!spikeSliceBounds311(start, stop, &lo, &hi)) {
+      return -1;
+    }
+    PySlice_AdjustIndices(Py_SIZE(container), &lo, &hi, 1);
+    return PyList_SetSlice(container, lo, hi, value);
+  }
+  PyObject* slice = PySlice_New(start, stop, step);
+  if (slice == nullptr) {
+    return -1;
+  }
+  int result = PyObject_SetItem(container, slice, value);
+  Py_DECREF(slice);
+  return result;
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Resolve `name` on the container's type if the type is a heap type and the
+// attribute is a plain Python function (which is exactly when the type's
+// mp_subscript / mp_ass_subscript slot is the Python-level slot_ wrapper).
+// Fills the cache and returns the function, or nullptr.
+constexpr uint32_t kSpikeSubscrGenericAfter = 4;
+
+PyObject* spikeSubscrFill311(
+    JITRT_SubscrSiteCache311* cache,
+    PyTypeObject* type,
+    PyObject* name) {
+  if (type->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+    PyObject* descr = _PyType_Lookup(type, name);
+    if (descr != nullptr && PyFunction_Check(descr) &&
+        (type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) &&
+        type->tp_version_tag != 0) {
+      cache->type = type;
+      cache->version = type->tp_version_tag;
+      cache->func = descr;
+      return descr;
+    }
+  }
+  // Unfillable receiver.  A site that has never been filled and keeps
+  // producing these (str/list/tuple/dict receivers) is judged generic; the
+  // machine code then bypasses this helper entirely.
+  if (cache->type == nullptr && ++cache->misses >= kSpikeSubscrGenericAfter) {
+    cache->generic = 1;
+  }
+  return nullptr;
+}
+
+inline PyObject* spikeSubscrLookup311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* name) {
+  PyTypeObject* type = Py_TYPE(container);
+  if (type == cache->type && type->tp_version_tag == cache->version &&
+      (type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+    return cache->func;
+  }
+  return spikeSubscrFill311(cache, type, name);
+}
+} // namespace
+
+PyObject* JITRT_SubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key) {
+  PyObject* func = spikeSubscrLookup311(cache, container, &_Py_ID(__getitem__));
+  if (func != nullptr) {
+    PyObject* args[2] = {container, key};
+    // Calling Python can replace the descriptor and retire its artifact.
+    // Hold the callable across the call even though the cache borrows it.
+    auto callable = Ref<>::create(func);
+    return PyObject_Vectorcall(callable, args, 2, nullptr);
+  }
+  return JITRT_GetItem311(container, key);
+}
+
+int JITRT_StoreSubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key,
+    PyObject* value) {
+  PyObject* func = spikeSubscrLookup311(cache, container, &_Py_ID(__setitem__));
+  if (func != nullptr) {
+    PyObject* args[3] = {container, key, value};
+    auto callable = Ref<>::create(func);
+    PyObject* res = PyObject_Vectorcall(callable, args, 3, nullptr);
+    if (res == nullptr) {
+      return -1;
+    }
+    Py_DECREF(res);
+    return 0;
+  }
+  return PyObject_SetItem(container, key, value);
+}
+
+// SPIKE(STRSUB): generic subscript with a str[int] fast path.  An exact str
+// indexed by a compact exact int reads the code point directly and hands it
+// to PyUnicode_FromOrdinal; everything else takes the stock path.
+PyObject* JITRT_GetItem311(PyObject* container, PyObject* index) {
+  static const bool spike_strsub = Ci_SpikeGetenv("SPIKE_STRSUB") != nullptr;
+  if (spike_strsub && PyUnicode_CheckExact(container) &&
+      PyLong_CheckExact(index) && PyUnicode_IS_READY(container)) {
+    Py_ssize_t size = Py_SIZE(index);
+    if (size == 0 || size == 1 || size == -1) {
+      Py_ssize_t i = size == 0
+          ? 0
+          : static_cast<Py_ssize_t>(
+                reinterpret_cast<PyLongObject*>(index)->ob_digit[0]);
+      if (size < 0) {
+        i = -i;
+      }
+      Py_ssize_t len = PyUnicode_GET_LENGTH(container);
+      if (i < 0) {
+        i += len;
+      }
+      if (i >= 0 && i < len) {
+        Py_UCS4 ch = PyUnicode_READ(
+            PyUnicode_KIND(container), PyUnicode_DATA(container), i);
+        return PyUnicode_FromOrdinal(static_cast<int>(ch));
+      }
+    }
+  }
+  return PyObject_GetItem(container, index);
+}
 #endif
 
 PyObject* JITRT_VectorcallTstate(

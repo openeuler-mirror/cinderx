@@ -10,9 +10,14 @@
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+
+#if PY_VERSION_HEX < 0x030C0000
+struct JITRT_SubscrSiteCache311;
+#endif
 
 namespace jit {
 
@@ -62,6 +67,17 @@ class alignas(16) CodeRuntime {
       BorrowedRef<PyCodeObject> code,
       BorrowedRef<PyDictObject> builtins,
       BorrowedRef<PyDictObject> globals);
+
+  ~CodeRuntime();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Each lowering owns a separate cell. Its address remains stable until
+  // the artifact's runtime references are released, including active frames.
+  JITRT_SubscrSiteCache311* allocateSubscrCache311();
+  size_t subscrCacheCount311() const {
+    return subscr_caches_311_.size();
+  }
+#endif
 
   // Ensure that this CodeRuntime owns a reference to the given borrowed
   // object, keeping it alive for use by the compiled code. Make CodeRuntime a
@@ -222,6 +238,7 @@ class alignas(16) CodeRuntime {
 
 #if PY_VERSION_HEX < 0x030C0000
   CompiledFunction* compiled_function_{nullptr};
+  std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> subscr_caches_311_;
 #endif
   // See entryGuardInlined().
   bool entry_guard_inlined_{false};

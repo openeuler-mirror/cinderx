@@ -140,6 +140,7 @@ struct LifecycleSnapshot311 {
   size_t context_references{0};
   size_t code_runtimes_allocated{0};
   size_t code_runtimes_live{0};
+  size_t subscript_caches{0};
 };
 
 } // namespace jit

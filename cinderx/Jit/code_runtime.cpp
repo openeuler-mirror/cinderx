@@ -3,6 +3,7 @@
 #include "cinderx/Jit/code_runtime.h"
 
 #include "cinderx/Common/util.h"
+#include "cinderx/Jit/jit_rt.h"
 
 namespace jit {
 
@@ -68,6 +69,19 @@ CodeRuntime::CodeRuntime(
   addReference(globals);
 }
 
+CodeRuntime::~CodeRuntime() = default;
+
+#if PY_VERSION_HEX < 0x030C0000
+JITRT_SubscrSiteCache311* CodeRuntime::allocateSubscrCache311() {
+  // Only the compiler building this runtime mutates this collection. Other
+  // workers have distinct runtimes, and runtime cache access holds the GIL.
+  auto cache = std::make_unique<JITRT_SubscrSiteCache311>();
+  auto* result = cache.get();
+  subscr_caches_311_.push_back(std::move(cache));
+  return result;
+}
+#endif
+
 void CodeRuntime::addReference(BorrowedRef<> obj) {
   // Serialize as we modify the ref-count to obj which may be widely accessible.
   ThreadedCompileSerialize guard;
@@ -79,12 +93,20 @@ void CodeRuntime::releaseReferences() {
   // the objects could cause our CompiledFunction to be freed as well so first
   // we grab the references and then clear them.
   std::unordered_set<ThreadedRef<>> refs;
+#if PY_VERSION_HEX < 0x030C0000
+  std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> caches;
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   ThreadedRef<> tmp;
 #endif
   {
     ThreadedCompileSerialize guard;
     refs = std::move(references_);
+#if PY_VERSION_HEX < 0x030C0000
+    // Release the cells and backing storage even when this cleared runtime
+    // remains as an arena husk. Do this before dropping Python references.
+    caches.swap(subscr_caches_311_);
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     tmp = std::move(reifier_);
 #endif

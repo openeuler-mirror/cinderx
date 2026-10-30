@@ -243,16 +243,16 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_subscr(a):
-                return a[0]
+            def uses_slice(a):
+                return a[1:]
 
             try:
-                cinderjit.force_compile(uses_subscr)
+                cinderjit.force_compile(uses_slice)
             except RuntimeError as exc:
                 assert "CANNOT_SPECIALIZE" in str(exc), exc
             else:
                 raise SystemExit(
-                    "execute surface failed to refuse BINARY_SUBSCR")
+                    "execute surface failed to refuse BUILD_SLICE")
             """
         )
         proc = subprocess.run(
@@ -6434,13 +6434,9 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("signal interrupted the compiled loop", proc.stdout)
 
     def test_handler_only_opcodes_do_not_refuse_the_function(self):
-        # The execute whitelist is scoped to normal-flow-reachable
-        # instructions: an opcode that occurs solely inside an
-        # exception-handler region runs in the interpreter after the
-        # deopt regardless of what it is, so STORE_DEREF or a subscript
-        # in a handler must not refuse a function whose normal path this
-        # milestone fully supports.  A normal-flow subscript still
-        # refuses.
+        # BUILD_SLICE is translated but still outside the normal-flow
+        # execute whitelist. In a handler it can run in the interpreter
+        # after deopt without excluding the function's supported normal path.
         probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
             def make_counter():
@@ -6460,25 +6456,25 @@ class CanaryExecute311Test(unittest.TestCase):
                 try:
                     return 10 // z
                 except ZeroDivisionError:
-                    return d[k]
+                    return d[k:]
 
             bump = make_counter()
             compile_all(bump, pick)
             journal = [
                 bump(6, 2), bump(6, 0), bump(6, 0),
-                pick({"k": "v"}, "k", 2), pick({"k": "v"}, "k", 0),
+                pick(["a", "b", "c"], 1, 2), pick(["a", "b", "c"], 1, 0),
             ]
             if mode == "jit":
-                def normal_flow_subscr(d, k):
-                    return d[k]
+                def normal_flow_slice(d, k):
+                    return d[k:]
 
                 try:
-                    cinderjit.force_compile(normal_flow_subscr)
+                    cinderjit.force_compile(normal_flow_slice)
                 except RuntimeError as exc:
                     assert "CANNOT_SPECIALIZE" in str(exc), exc
                 else:
                     raise SystemExit(
-                        "a normal-flow subscript compiled; the reachability "
+                        "a normal-flow slice compiled; the reachability "
                         "scope leaks")
             still_compiled(bump, pick)
             print("JOURNAL " + json.dumps(journal))
@@ -8245,6 +8241,58 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("async refused", proc.stdout)
 
+    def test_generator_subscripts_execute_and_match_interpreter(self):
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+
+            class Index:
+                def __index__(self):
+                    events.append("index")
+                    return -1
+
+            class Mapping:
+                def __getitem__(self, key):
+                    events.append(["get", key])
+                    return "custom"
+
+            class Failing:
+                def __getitem__(self, key):
+                    events.append(["fail", key])
+                    raise LookupError("custom lookup")
+
+            def uses_subscr(items, index):
+                yield items[index]
+
+            compile_all(uses_subscr)
+            journal = []
+            for items, index in (
+                ([10, 20], -1), ((30, 40), 0), ({"k": 50}, "k"),
+                ("abc", Index()), (Mapping(), "q"), (Failing(), 0),
+                ([], 0), ([1], 2**100),
+            ):
+                gen = uses_subscr(items, index)
+                before = _cinderx._get_trigger_stats()["machine_code_entries"]
+                try:
+                    journal.append(["value", next(gen)])
+                except Exception as exc:
+                    journal.append(["raise", type(exc).__name__, str(exc)])
+                if mode == "jit":
+                    assert _cinderx._get_trigger_stats()["machine_code_entries"] > before
+                try:
+                    next(gen)
+                except StopIteration:
+                    journal.append("closed")
+                else:
+                    raise AssertionError("generator resumed after completion")
+            still_compiled(uses_subscr)
+            journal.append(events)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
     def test_generator_body_outside_the_execute_surface_is_refused(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
@@ -8256,17 +8304,17 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_subscr(a):
-                yield a[0]
+            def uses_slice(a):
+                yield a[1:]
 
             try:
-                cinderjit.force_compile(uses_subscr)
+                cinderjit.force_compile(uses_slice)
             except RuntimeError as exc:
                 assert "CANNOT_SPECIALIZE" in str(exc), exc
             else:
                 raise SystemExit(
-                    "execute surface compiled a generator with BINARY_SUBSCR")
-            print("generator subscr refused")
+                    "execute surface compiled a generator with BUILD_SLICE")
+            print("generator slice refused")
             """
         )
         proc = subprocess.run(
@@ -8277,7 +8325,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("generator subscr refused", proc.stdout)
+        self.assertIn("generator slice refused", proc.stdout)
 
 
 if __name__ == "__main__":

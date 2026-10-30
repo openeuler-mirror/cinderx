@@ -1313,6 +1313,20 @@ void* NativeGenerator::compile(bool shadow) {
     env_.code_rt = env_.ctx->allocateCodeRuntime(
         func->code.get(), func->builtins.get(), func->globals.get());
   }
+#if PY_VERSION_HEX < 0x030C0000
+  bool runtime_ready = false;
+  SCOPE_EXIT({
+    if (!shadow && !runtime_ready && env_.code_rt != nullptr) {
+      if (getThreadedCompileContext().compileRunning()) {
+        env_.ctx->deferCodeRuntimeRelease(env_.code_rt);
+      } else {
+        env_.code_rt->releaseReferences();
+        env_.ctx->recycleCodeRuntime(env_.code_rt);
+      }
+      env_.code_rt = nullptr;
+    }
+  });
+#endif
   SCOPE_EXIT(if (shadow) {
     if (env_.code_rt != nullptr) {
       env_.code_rt->releaseReferences();
@@ -1517,6 +1531,9 @@ void* NativeGenerator::compile(bool shadow) {
     env_.code_rt->setSpillWords(
         env_.shadow_frames_and_spill_size / kPointerSize);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  runtime_ready = true;
+#endif
   return shadow ? nullptr : vectorcall_entry_;
 }
 

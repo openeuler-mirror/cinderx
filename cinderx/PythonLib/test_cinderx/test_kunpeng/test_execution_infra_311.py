@@ -1,3 +1,4 @@
+import dis
 import json
 import os
 import subprocess
@@ -10,14 +11,14 @@ import unittest
     sys.version_info[:2] == (3, 11), "CPython 3.11 execution acceptance infrastructure"
 )
 class ExecutionInfra311Test(unittest.TestCase):
-    def run_child(self, body: str):
+    def run_child(self, body: str, *, threshold="1000000"):
         env = {
             key: value
             for key, value in os.environ.items()
             if not key.startswith(("CINDERX_", "PYTHONJIT", "PARALLEL_GC_"))
         }
         env["CINDERX_JIT_MODE"] = "canary"
-        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONJITAUTO"] = threshold
         proc = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(body)],
             capture_output=True,
@@ -46,12 +47,20 @@ class ExecutionInfra311Test(unittest.TestCase):
             async def async_fn():
                 return 1
 
+            def sliced(value):
+                return value[1:]
+
             before = _cinderx._get_trigger_stats()
-            payload = {
-                "simple": cinderjit._jit311_compile_diagnostic(simple),
-                "subscr": cinderjit._jit311_compile_diagnostic(subscr),
-                "async": cinderjit._jit311_compile_diagnostic(async_fn),
-            }
+            payload = {}
+            deltas = []
+            for name, fn in (("simple", simple), ("subscr", subscr),
+                             ("async", async_fn), ("sliced", sliced)):
+                prior = _cinderx._get_trigger_stats()
+                payload[name] = cinderjit._jit311_compile_diagnostic(fn)
+                current = _cinderx._get_trigger_stats()
+                deltas.append(current["compiled_function_creations"] -
+                              prior["compiled_function_creations"])
+            payload["creation_deltas"] = deltas
             after = _cinderx._get_trigger_stats()
             payload["creations_delta"] = (
                 after["compiled_function_creations"]
@@ -59,10 +68,20 @@ class ExecutionInfra311Test(unittest.TestCase):
             payload["alloc_delta"] = (
                 after["executable_alloc_calls"]
                 - before["executable_alloc_calls"])
+            entry_before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            payload["values"] = [simple(4), subscr([42])]
+            payload["entries_delta"] = (
+                _cinderx._get_trigger_stats()["machine_code_entries"] - entry_before)
+            payload["compiled"] = [cinderjit.is_jit_compiled(fn)
+                                   for fn in (simple, subscr)]
             print(json.dumps(payload, sort_keys=True))
             """
         )
-        self.assertEqual(result["creations_delta"], 1)
+        self.assertEqual(result["creation_deltas"], [1, 1, 0, 0])
+        self.assertEqual(result["creations_delta"], 2)
+        self.assertEqual(result["values"], [5, 42])
+        self.assertEqual(result["compiled"], [True, True])
+        self.assertEqual(result["entries_delta"], 2)
         self.assertEqual(result["alloc_delta"], 1)
         self.assertEqual(
             result["simple"],
@@ -75,13 +94,94 @@ class ExecutionInfra311Test(unittest.TestCase):
                 "offset": None,
             },
         )
-        self.assertEqual(
-            result["subscr"]["reason"], "REFUSE_SHAPE_SUBSCRIPT_ADMISSION")
-        self.assertIsInstance(result["subscr"]["opcode"], int)
-        self.assertIsInstance(result["subscr"]["offset"], int)
-        self.assertFalse(result["subscr"]["eligible"])
+        self.assertEqual(result["subscr"], result["simple"])
         self.assertEqual(result["async"]["reason"], "REFUSE_SHAPE_ASYNC_CODE")
         self.assertFalse(result["async"]["eligible"])
+        self.assertFalse(result["sliced"]["eligible"])
+        self.assertFalse(result["sliced"]["compiled"])
+        self.assertEqual(result["sliced"]["reason"], "REFUSE_SHAPE_EXECUTE_SURFACE")
+        self.assertEqual(result["sliced"]["opcode"], dis.opmap["BUILD_SLICE"])
+        self.assertIsInstance(result["sliced"]["offset"], int)
+        self.assertGreaterEqual(result["sliced"]["offset"], 0)
+
+    def test_initialization_keeps_setup_interpreted_and_resumes_autojit(self):
+        result = self.run_child(
+            """
+            import json, _cinderx
+            before = _cinderx._get_trigger_stats()
+            import cinderx
+            cinderx.init()
+            after = _cinderx._get_trigger_stats()
+            assert cinderx.is_initialized()
+            assert cinderx._autojit_setup_depth() == 0
+            import cinderjit
+
+            def hot(value, step):
+                return value + step
+
+            entries = after["machine_code_entries"]
+            for i in range(40):
+                assert hot(i, 1) == i + 1
+            assert cinderjit.is_jit_compiled(hot)
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] > entries
+            print(json.dumps({
+                "initialization_deopts": after["organic_deopt_hits"] -
+                                         before["organic_deopt_hits"],
+                "compiled": cinderjit.is_jit_compiled(hot),
+            }))
+            """,
+            threshold="8",
+        )
+        self.assertEqual(result["initialization_deopts"], 0)
+        self.assertTrue(result["compiled"])
+
+    def test_initialization_failure_and_nested_setup_restore_scheduling(self):
+        result = self.run_child(
+            """
+            import json, _cinderx, cinderx, cinderjit
+            cinderx.init()
+            original = cinderx._install_autojit_import_provider
+
+            def fail_setup():
+                assert cinderx._autojit_setup_depth() == 1
+                raise RuntimeError("injected setup failure")
+
+            cinderx._is_init = False
+            cinderx._install_autojit_import_provider = fail_setup
+            try:
+                cinderx.init()
+            except RuntimeError as exc:
+                assert str(exc) == "injected setup failure"
+            else:
+                raise AssertionError("initialization error was swallowed")
+            finally:
+                cinderx._install_autojit_import_provider = original
+            assert not cinderx.is_initialized()
+            assert cinderx._autojit_setup_depth() == 0
+
+            def after_failure(value, step):
+                return value + step
+
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            for i in range(40):
+                assert after_failure(i, 1) == i + 1
+            assert cinderjit.is_jit_compiled(after_failure)
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] > before
+
+            # An enclosing provider's scope must survive our nested setup.
+            cinderx._autojit_setup_enter()
+            try:
+                cinderx.init()
+                assert cinderx.is_initialized()
+                assert cinderx._autojit_setup_depth() == 1
+            finally:
+                cinderx._autojit_setup_leave()
+            assert cinderx._autojit_setup_depth() == 0
+            print(json.dumps({"restored": True}))
+            """,
+            threshold="8",
+        )
+        self.assertTrue(result["restored"])
 
     def test_compile_diagnostic_reports_runtime_fallback(self):
         result = self.run_child(

@@ -241,9 +241,57 @@ PyObject** JITRT_LoadGlobalRepin311(
     PyObject* globals,
     PyObject* builtins,
     PyObject* name);
+#if PY_VERSION_HEX < 0x030C0000
+// Artifact-owned per-site cache for subscripts on heap types whose
+// __getitem__ / __setitem__ resolve to a Python function.  A hit (same type,
+// same tp_version_tag) calls the function directly, skipping
+// slot_mp_subscript -> lookup_maybe_method -> _PyType_Lookup ->
+// vectorcall_method; everything else takes the generic path.  The cached
+// function pointer is borrowed: the version check proves the class dict is
+// unchanged, hence the function is still referenced by it.
+struct JITRT_SubscrSiteCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  // Unfillable receivers (non-heap type, or __getitem__/__setitem__ not a
+  // Python function) seen while the entry was still empty.
+  uint32_t misses;
+  PyObject* func;
+  // Set once `misses` reaches its threshold: the site never saw a Python-
+  // class receiver, so the machine code tests this word inline and calls
+  // the plain generic helper, avoiding the extra call level on str/list
+  // sites (measured +5% tomli_loads without it).
+  int64_t generic;
+};
+PyObject* JITRT_SubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key);
+int JITRT_StoreSubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key,
+    PyObject* value);
+#endif
+// SPIKE(SLICEFAST): container[start:stop:step] / container[start:stop:step] =
+// value without materialising a slice object.  Exact list / tuple / str with a
+// None step take PyList_GetSlice / PyTuple_GetSlice / PyUnicode_Substring
+// (and PyList_SetSlice for the store); everything else builds the slice and
+// goes through PyObject_GetItem / PyObject_SetItem exactly as before.
+PyObject* JITRT_GetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step);
+Py_ssize_t JITRT_SetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step,
+    PyObject* value);
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
     PyFunctionObject* func);
 void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
+PyObject* JITRT_GetItem311(PyObject* container, PyObject* index);
 #endif
 
 /*

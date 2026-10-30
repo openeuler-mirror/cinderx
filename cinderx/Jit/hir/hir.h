@@ -581,10 +581,12 @@ class INSTR_CLASS(
       Register* left,
       Register* right,
       const FrameState& frame,
-      bool array_subscr_slow_path = false)
+      bool array_subscr_slow_path = false,
+      bool subscr_adaptive_stuck = false)
       : InstrT(dst, left, right, frame),
         op_(op),
-        array_subscr_slow_path_(array_subscr_slow_path) {}
+        array_subscr_slow_path_(array_subscr_slow_path),
+        subscr_adaptive_stuck_(subscr_adaptive_stuck) {}
 
   BinaryOpKind op() const {
     return op_;
@@ -602,9 +604,17 @@ class INSTR_CLASS(
     return array_subscr_slow_path_;
   }
 
+  // Subscript site whose interpreter specialization was attempted and
+  // failed (see BytecodeInstruction::isSubscrAdaptiveStuck).  Used as
+  // emission evidence for the speculative array.array fast path.
+  bool isSubscrAdaptiveStuck() const {
+    return subscr_adaptive_stuck_;
+  }
+
  private:
   BinaryOpKind op_;
   bool array_subscr_slow_path_;
+  bool subscr_adaptive_stuck_;
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \
