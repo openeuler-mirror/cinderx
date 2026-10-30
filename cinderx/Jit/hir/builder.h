@@ -122,6 +122,45 @@ struct InlineResult {
   BasicBlock* exit{nullptr};
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+// The exception table of a code object as the CPython 3.11 builder compiles
+// it.  One entry per row whose handler is compiled: a non-lasti row (a plain
+// try/except body, not a handler's own cleanup) whose target begins with
+// PUSH_EXC_INFO and whose body -- every instruction reachable from the
+// target by normal control flow before rejoining the function's normal-flow
+// code -- is on the execute whitelist and free of with / except* / generator
+// opcodes.  Raising instructions covered by such a row take a CFG edge into
+// the handler instead of the UnhandledException deopt; every other raise
+// keeps the deopt exit.  The grant hook (pyjit.cpp) runs the same analysis to
+// tell an edge-capable site from one it would recompile for nothing.
+struct ExcTable311 {
+  struct Entry {
+    int start; // code-unit index, inclusive
+    int end; // code-unit index, exclusive
+    int target; // handler entry, code-unit index
+    int depth; // operand-stack depth to unwind to
+  };
+  std::vector<Entry> entries;
+  // Code-unit indices of the compiled handler bodies.
+  std::vector<unsigned char> handler_region;
+
+  const Entry* entryFor(int index) const;
+  bool inHandlerRegion(int index) const;
+  // The exception exit of the instruction at `index` can be an edge.
+  bool edgeCapable(int index) const {
+    return entryFor(index) != nullptr;
+  }
+};
+
+// Empty (nothing compiled) for generators and for a table that does not
+// parse.
+ExcTable311 analyzeExcTable311(BorrowedRef<PyCodeObject> code);
+
+// Whether the raising instruction at `base_offset` (its base bytecode offset)
+// would get an exception edge once its site is granted.
+bool excEdgeCapable311(BorrowedRef<PyCodeObject> code, int64_t base_offset);
+#endif
+
 class HIRBuilder {
  public:
   explicit HIRBuilder(const Preloader& preloader)
@@ -685,6 +724,33 @@ class HIRBuilder {
   bool is_simple_leaf_function_{false};
 
   static bool isSimpleLeafFunction(BorrowedRef<PyCodeObject> code);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Compiled `except` handlers: the code's exception-table analysis (see
+  // ExcTable311), empty for an inlined body.
+  const ExcTable311::Entry* excEntryFor311(BCOffset off) const;
+  bool inExcHandlerRegion311(BCOffset off) const;
+  bool excEdgeSite311(const jit::BytecodeInstruction& bc_instr) const;
+  // `raising` (may be null) is marked; `result` (may be null) is the raising
+  // result on top of the operand stack, refined to non-null on the
+  // fall-through; the edge is taken when `cond` (defaults to `result`) is
+  // nonzero if `ok_when_true` is false, or zero if it is true.
+  void emitExcEdge311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      DeoptBase* raising,
+      Register* result,
+      Register* cond = nullptr,
+      bool ok_when_true = true);
+  ExcTable311 exc_table_;
+  // A compiled handler is entered with the frame's locals current: the
+  // traceback created on entry exposes the frame (f_locals, and the
+  // references it keeps alive), as the evaluator's error path does after a
+  // deopt.  Set when this code has a granted site inside a compiled row.
+  bool exc_edge_frame_locals_{false};
+  std::vector<std::pair<BasicBlock*, FrameState>> pending_exc_handlers_;
+  CFG* cfg_{nullptr};
+#endif
 };
 
 } // namespace jit::hir

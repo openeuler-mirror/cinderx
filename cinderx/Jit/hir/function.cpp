@@ -13,7 +13,11 @@ namespace jit::hir {
 // Ignore it for libc++ and Windows for now though, too tricky to track multiple
 // implementations.
 #if !defined(_LIBCPP_VERSION) && !defined(WIN32)
+#if PY_VERSION_HEX < 0x030C0000
+static_assert(sizeof(Function) == 65 * kPointerSize);
+#else
 static_assert(sizeof(Function) == 60 * kPointerSize);
+#endif
 static_assert(sizeof(CFG) == 5 * kPointerSize);
 static_assert(sizeof(BasicBlock) == 20 * kPointerSize);
 static_assert(sizeof(Instr) == 6 * kPointerSize);

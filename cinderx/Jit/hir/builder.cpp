@@ -322,11 +322,15 @@ bool isSupportedOpcode(int opcode) {
     case GET_ITER:
     case GET_LEN:
     case GET_YIELD_FROM_ITER:
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+// One line: the bytecode-support checker's preprocessor filter does not
+// read continued #if expressions.
+// clang-format off
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+      // clang-format on
     case IMPORT_FROM:
       // LIR generation for IMPORT_FROM depends on access to _PyEval_ImportFrom
-      // (added in 3.14) or the_PyImport_ImportFrom function that's only added
-      // by Lazy Imports.
+      // (added in 3.14), the _PyImport_ImportFrom function that's only added
+      // by Lazy Imports, or the CPython 3.11 port JITRT_ImportFrom311.
 #endif
     case IMPORT_NAME:
     case INPLACE_ADD:
@@ -1061,6 +1065,12 @@ HIRBuilder::BlockMap HIRBuilder::createBlocks(
 
   // Mark the beginning of each basic block in the bytecode
   std::set<BCIndex> block_starts = {BCIndex{0}};
+#if PY_VERSION_HEX < 0x030C0000
+  // A compiled handler is entered through its stub.
+  for (const ExcTable311::Entry& entry : exc_table_.entries) {
+    block_starts.insert(BCIndex{entry.target});
+  }
+#endif
   auto maybe_add_next_instr = [&](const BytecodeInstruction& bc_instr) {
     BCIndex next_instr_idx = bc_instr.nextInstrOffset();
     if (next_instr_idx < bc_block.size()) {
@@ -1340,8 +1350,6 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
       case MATCH_MAPPING:
       case MATCH_SEQUENCE:
         return "REFUSE_PATTERN_MATCHING_UNAUDITED";
-      case IMPORT_FROM:
-        return "REFUSE_HELPER_UNAVAILABLE_PRE314";
       case DELETE_DEREF:
       case DELETE_GLOBAL:
         return "REFUSE_UNPORTED";
@@ -1464,6 +1472,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case CONTAINS_OP:
     case COPY:
     case COPY_FREE_VARS:
+    case DELETE_ATTR:
     case DELETE_FAST:
     case DICT_MERGE:
     case DICT_UPDATE:
@@ -1471,10 +1480,14 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case FOR_ITER:
     case GET_ITER:
     case GET_YIELD_FROM_ITER:
+    case IMPORT_FROM:
+    case IMPORT_NAME:
     case IS_OP:
     case JUMP_BACKWARD:
     case JUMP_BACKWARD_NO_INTERRUPT:
     case JUMP_FORWARD:
+    case JUMP_IF_FALSE_OR_POP:
+    case JUMP_IF_TRUE_OR_POP:
     case KW_NAMES:
     case LIST_APPEND:
     case LIST_EXTEND:
@@ -1512,7 +1525,9 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case SEND:
     case SET_ADD:
     case STORE_ATTR:
+    case STORE_DEREF:
     case STORE_FAST:
+    case STORE_GLOBAL:
     case STORE_SUBSCR:
     case SWAP:
     case UNARY_INVERT:
@@ -1553,12 +1568,15 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // are checked: an opcode that occurs solely inside a handler region
   // executes in the interpreter after the deopt regardless of what it
   // is, so holding it to the machine-code whitelist would refuse
-  // functions this milestone fully supports.  Still out (on the
-  // reachable surface): DELETE_ATTR, STORE_DEREF, except*
-  // and pattern matching (the latter two refused earlier by the
-  // whole-code translate scan, keeping their audited refusals).  The
-  // decoder yields unspecialized opcodes, so quickened forms cannot
-  // slip past.
+  // functions this milestone fully supports.  DELETE_ATTR, STORE_DEREF,
+  // STORE_GLOBAL, the and/or short-circuit jumps and the in-function
+  // import opcodes (IMPORT_NAME; IMPORT_FROM through the 3.11 port
+  // JITRT_ImportFrom311) are on the surface: their translations were
+  // always present, only this list kept them interpreted.  Still out
+  // (on the reachable surface): except* and pattern matching (refused
+  // earlier by the whole-code translate scan, keeping their audited
+  // refusals).  The decoder yields unspecialized opcodes, so quickened
+  // forms cannot slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
     return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
@@ -1651,6 +1669,286 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   return unsupportedExecuteDetail311(code).reason;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Decoder for co_exceptiontable (the same varint layout Objects/codeobject.c
+// writes; see also isInExceptionProtectedRange in function.cpp).
+bool excTableVarint311(
+    const unsigned char*& cursor,
+    const unsigned char* end,
+    bool is_entry_start,
+    int* result) {
+  if (cursor >= end || (((cursor[0] & 128) != 0) != is_entry_start)) {
+    return false;
+  }
+  unsigned int value = cursor[0] & 63;
+  while ((cursor[0] & 64) != 0) {
+    cursor++;
+    if (cursor >= end || (cursor[0] & 128) != 0) {
+      return false;
+    }
+    unsigned int chunk = cursor[0] & 63;
+    if (value > (std::numeric_limits<int>::max() - chunk) >> 6) {
+      return false;
+    }
+    value = (value << 6) | chunk;
+  }
+  *result = static_cast<int>(value);
+  cursor++;
+  return true;
+}
+} // namespace
+
+ExcTable311 analyzeExcTable311(BorrowedRef<PyCodeObject> code) {
+  ExcTable311 table;
+  if ((code->co_flags & kCoFlagsAnyGenerator) != 0) {
+    return table;
+  }
+  std::set<int> reachable;
+  if (!collectNormalFlowReachable311(code, reachable)) {
+    return table;
+  }
+  BytecodeInstructionBlock bc_instrs{code};
+  std::vector<BytecodeInstruction> instrs;
+  for (const auto& instr : bc_instrs) {
+    instrs.push_back(instr);
+  }
+  size_t n_units =
+      static_cast<size_t>(_PyCode_NBYTES(code)) / sizeof(_Py_CODEUNIT);
+  std::vector<int> slot_of_index(n_units, -1);
+  for (size_t i = 0; i < instrs.size(); ++i) {
+    int idx = instrs[i].baseIndex().value();
+    if (idx >= 0 && static_cast<size_t>(idx) < n_units) {
+      slot_of_index[idx] = static_cast<int>(i);
+    }
+  }
+  table.handler_region.assign(n_units, 0);
+
+  const auto* cursor = reinterpret_cast<const unsigned char*>(
+      PyBytes_AS_STRING(code->co_exceptiontable));
+  const auto* end = cursor + PyBytes_GET_SIZE(code->co_exceptiontable);
+  while (cursor < end) {
+    int start = 0;
+    int size = 0;
+    int target = 0;
+    int depth_lasti = 0;
+    if (!excTableVarint311(cursor, end, true, &start) ||
+        !excTableVarint311(cursor, end, false, &size) ||
+        !excTableVarint311(cursor, end, false, &target) ||
+        !excTableVarint311(cursor, end, false, &depth_lasti)) {
+      return ExcTable311{};
+    }
+    bool lasti = (depth_lasti & 1) != 0;
+    int depth = depth_lasti >> 1;
+    if (lasti || target < 0 || static_cast<size_t>(target) >= n_units ||
+        slot_of_index[target] < 0 || reachable.contains(target) ||
+        instrs[slot_of_index[target]].opcode() != PUSH_EXC_INFO) {
+      continue;
+    }
+    // The handler body: normal flow from the target until it rejoins code
+    // reachable from the entry.
+    std::vector<int> region;
+    std::vector<unsigned char> seen(n_units, 0);
+    std::vector<int> worklist{target};
+    bool ok = true;
+    while (ok && !worklist.empty()) {
+      int index = worklist.back();
+      worklist.pop_back();
+      if (index < 0 || static_cast<size_t>(index) >= n_units) {
+        ok = false;
+        break;
+      }
+      if (seen[index] || reachable.contains(index)) {
+        continue;
+      }
+      seen[index] = 1;
+      int slot = slot_of_index[index];
+      if (slot < 0) {
+        ok = false;
+        break;
+      }
+      const BytecodeInstruction& instr = instrs[slot];
+      int op = instr.opcode();
+      switch (op) {
+        case WITH_EXCEPT_START:
+        case CLEANUP_THROW:
+        case CHECK_EG_MATCH:
+        case PREP_RERAISE_STAR:
+        case YIELD_VALUE:
+        case SEND:
+        case RETURN_GENERATOR:
+          ok = false;
+          break;
+        case PUSH_EXC_INFO:
+          if (index != target) {
+            ok = false;
+          }
+          break;
+        default:
+          break;
+      }
+      if (!ok || !isExecuteOpcodeSupported311(op)) {
+        ok = false;
+        break;
+      }
+      region.push_back(index);
+      if (instr.isBranch()) {
+        worklist.push_back(instr.getJumpTarget().asIndex().value());
+      }
+      bool falls_through = !instr.isReturn() && op != RAISE_VARARGS &&
+          op != RERAISE && op != JUMP_FORWARD && op != JUMP_BACKWARD &&
+          op != JUMP_BACKWARD_NO_INTERRUPT && op != JUMP_ABSOLUTE;
+      if (falls_through) {
+        worklist.push_back(instr.nextInstrOffset().asIndex().value());
+      }
+    }
+    if (!ok) {
+      continue;
+    }
+    for (int index : region) {
+      table.handler_region[index] = 1;
+    }
+    table.entries.push_back(
+        ExcTable311::Entry{start, start + size, target, depth});
+  }
+  return table;
+}
+
+const ExcTable311::Entry* ExcTable311::entryFor(int index) const {
+  for (const Entry& entry : entries) {
+    if (index >= entry.start && index < entry.end) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+bool ExcTable311::inHandlerRegion(int index) const {
+  return index >= 0 && static_cast<size_t>(index) < handler_region.size() &&
+      handler_region[index] != 0;
+}
+
+bool excEdgeCapable311(BorrowedRef<PyCodeObject> code, int64_t base_offset) {
+  return analyzeExcTable311(code).edgeCapable(
+      BCOffset{base_offset}.asIndex().value());
+}
+
+const ExcTable311::Entry* HIRBuilder::excEntryFor311(BCOffset off) const {
+  return exc_table_.entryFor(off.asIndex().value());
+}
+
+// A granted site whose exception exit the builder can turn into an edge: it
+// lies in a compiled row.
+bool HIRBuilder::excEdgeSite311(
+    const jit::BytecodeInstruction& bc_instr) const {
+  BCOffset off = bc_instr.baseOffset();
+  if (!Ci_ExcEdgeSiteGranted311(code_, off.value())) {
+    return false;
+  }
+  return exc_table_.edgeCapable(off.asIndex().value());
+}
+
+bool HIRBuilder::inExcHandlerRegion311(BCOffset off) const {
+  return exc_table_.inHandlerRegion(off.asIndex().value());
+}
+
+// The exception exit of `raising` (its output `result` is NULL on that exit,
+// and is the top of the operand stack) becomes a CFG edge when the
+// instruction sits at a granted site inside a compiled row.  The stub replays
+// the evaluator's error path for a non-lasti row -- operand stack unwound to
+// the row's depth, traceback entry, normalized exception pushed -- and enters
+// the handler block; with a trace function installed it deopts instead,
+// exception untouched.  The fall-through refines the result to non-null.  A
+// raise with no handler in the function keeps the deopt exit: the evaluator
+// materializes the frame's locals before the traceback captures it, which
+// returning NULL from machine code would not.
+void HIRBuilder::emitExcEdge311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr,
+    DeoptBase* raising,
+    Register* result,
+    Register* cond,
+    bool ok_when_true) {
+  if (cfg_ == nullptr || !excEdgeSite311(bc_instr)) {
+    return;
+  }
+  const ExcTable311::Entry* entry = excEntryFor311(bc_instr.baseOffset());
+  JIT_CHECK(entry != nullptr, "exception edge site outside a compiled row");
+  if (result != nullptr) {
+    JIT_CHECK(
+        tc.frame.stack.top() == result,
+        "exception edge expects the raising result on top of the stack");
+  }
+  if (raising != nullptr) {
+    raising->setExcEdge(true);
+  }
+  Register* test = cond != nullptr ? cond : result;
+  JIT_CHECK(test != nullptr, "exception edge needs a condition");
+  CFG& cfg = *cfg_;
+  BasicBlock* ok_bb = cfg.AllocateBlock();
+  BasicBlock* exc_bb = cfg.AllocateBlock();
+  if (ok_when_true) {
+    tc.emit<CondBranch>(test, ok_bb, exc_bb);
+  } else {
+    tc.emit<CondBranch>(test, exc_bb, ok_bb);
+  }
+
+  TranslationContext stub{exc_bb, tc.frame};
+  if (result != nullptr) {
+    stub.frame.stack.pop();
+  }
+  // The position the evaluator publishes for the faulting instruction (its
+  // last cache unit for CALL, see InsertUpdatePrevInstr).
+  int64_t published_idx = bc_instr.opcode() == CALL
+      ? bc_instr.nextInstrOffset().asIndex().value() - 1
+      : bc_instr.opcodeIndex().value();
+  while (stub.frame.stack.size() > static_cast<size_t>(entry->depth)) {
+    stub.frame.stack.pop();
+  }
+  // No Snapshot in the stub: its frame state is an error continuation (the
+  // operation has failed and the exception is set), not a resumable
+  // bytecode boundary, so no instrumentation poll may be placed on it; the
+  // CheckExc below carries its own frame state.
+  Register* published = temps_.AllocateNonStack();
+  stub.emit<LoadConst>(
+      published,
+      Type::fromCUInt(static_cast<uint64_t>(published_idx), TCUInt64));
+  Register* exc = temps_.AllocateStack();
+  stub.emit<CallCFunc>(
+      1,
+      exc,
+      CallCFunc::Func::kJITRT_EnterExceptHandler311,
+      std::vector<Register*>{published});
+  BasicBlock* enter_bb = cfg.AllocateBlock();
+  BasicBlock* deopt_bb = cfg.AllocateBlock();
+  stub.emit<CondBranch>(exc, enter_bb, deopt_bb);
+
+  // Tracing installed: the helper declined and the exception is still set;
+  // the CheckExc on the NULL result deopts with the raising instruction's
+  // frame state, exactly the exit taken without a compiled handler.
+  TranslationContext deopt_tc{deopt_bb, stub.frame};
+  Register* dead = temps_.AllocateNonStack();
+  deopt_tc.emit<CheckExc>(dead, exc, deopt_tc.frame);
+  deopt_tc.emit<Unreachable>();
+
+  TranslationContext enter_tc{enter_bb, stub.frame};
+  enter_tc.frame.stack.push(exc);
+  BasicBlock* handler = getBlockAtOff(BCIndex{entry->target}.asOffset());
+  enter_tc.emit<Branch>(handler);
+  BlockCanonicalizer canon;
+  canon.Run(enter_bb, temps_, enter_tc.frame.stack);
+  pending_exc_handlers_.emplace_back(handler, enter_tc.frame);
+
+  tc.block = ok_bb;
+  if (result != nullptr) {
+    Register* refined = temps_.AllocateStack();
+    tc.emit<RefineType>(refined, TObject, result);
+    tc.frame.stack.pop();
+    tc.frame.stack.push(refined);
+  }
+}
+#endif
 
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
@@ -1778,6 +2076,37 @@ BasicBlock* HIRBuilder::buildHIRImpl(
     FrameState* frame_state) {
   temps_ = TempAllocator(&irfunc->env);
   env_ = &irfunc->env;
+#if PY_VERSION_HEX < 0x030C0000
+  cfg_ = &irfunc->cfg;
+  exc_table_ = ExcTable311{};
+  pending_exc_handlers_.clear();
+  exc_edge_frame_locals_ = false;
+  if (frame_state == nullptr) {
+    // Inlined bodies keep the deopt model: their handler would run in the
+    // caller's real frame, which the entry helper cannot tell apart.
+    exc_table_ = analyzeExcTable311(code_);
+    auto& capable = irfunc->exc_edge_capable_311;
+    capable.clear();
+    if (!exc_table_.entries.empty()) {
+      int units = static_cast<int>(exc_table_.handler_region.size());
+      capable.resize(units, false);
+      for (const auto& entry : exc_table_.entries) {
+        for (int index = std::max(entry.start, 0);
+             index < std::min(entry.end, units);
+             ++index) {
+          capable[index] = true;
+        }
+      }
+    }
+    // With an edge in this function the frame can be exposed by the
+    // traceback while machine code keeps running: keep its locals current
+    // (see frameLocalsWrittenThrough311), and tell the LIR exit to release
+    // them.
+    exc_edge_frame_locals_ = getConfig().state == State::kRunning &&
+        !exc_table_.entries.empty() && Ci_ExcEdgeCodeHasGrant311(code_);
+    irfunc->frame_locals_written_through_311 = exc_edge_frame_locals_;
+  }
+#endif
 
   BytecodeInstructionBlock bc_instrs{code_};
   block_map_ = createBlocks(*irfunc, bc_instrs);
@@ -2583,7 +2912,11 @@ void HIRBuilder::translate(
           emitPopJumpIf(tc, bc_instr);
           break;
         }
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+// One line: the bytecode-support checker's preprocessor filter does not
+// read continued #if expressions.
+// clang-format off
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+          // clang-format on
         case IMPORT_FROM: {
           emitImportFrom(tc, bc_instr);
           break;
@@ -2776,9 +3109,90 @@ void HIRBuilder::translate(
           emitStoreGlobal(tc, bc_instr);
           break;
         }
-#if PY_VERSION_HEX >= 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000
+        // The handler-body opcodes, translated only in a compiled handler
+        // region (see analyzeExcTable311).
+        case PUSH_EXC_INFO: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // [.., exc] -> [.., prev, exc]; exc becomes the handled exception.
+          Register* exc = tc.frame.stack.pop();
+          Register* prev = temps_.AllocateStack();
+          tc.emit<CallCFunc>(
+              1,
+              prev,
+              CallCFunc::Func::kJITRT_PushExcInfo311,
+              std::vector<Register*>{exc});
+          tc.frame.stack.push(prev);
+          tc.frame.stack.push(exc);
+          break;
+        }
+        case CHECK_EXC_MATCH: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // [.., exc, type] -> [.., exc, bool]; an invalid type raises
+          // TypeError, which the CheckNeg hands to the interpreter with the
+          // type already popped, as the evaluator does.
+          Register* type = tc.frame.stack.pop();
+          Register* exc = tc.frame.stack.top();
+          Register* res = temps_.AllocateNonStack();
+          tc.emit<CallCFunc>(
+              2,
+              res,
+              CallCFunc::Func::kJITRT_ExcMatch311,
+              std::vector<Register*>{exc, type});
+          Register* checked = temps_.AllocateNonStack();
+          tc.emit<CheckNeg>(checked, res, tc.frame);
+          Register* zero = temps_.AllocateNonStack();
+          tc.emit<LoadConst>(zero, Type::fromCInt(0, TCInt64));
+          Register* matched = temps_.AllocateNonStack();
+          tc.emit<PrimitiveCompare>(
+              matched, PrimitiveCompareOp::kNotEqual, checked, zero);
+          Register* boxed = temps_.AllocateStack();
+          tc.emit<PrimitiveBoxBool>(boxed, matched);
+          tc.frame.stack.push(boxed);
+          break;
+        }
+        case POP_EXCEPT: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          Register* prev = tc.frame.stack.pop();
+          Register* dead = temps_.AllocateNonStack();
+          tc.emit<CallCFunc>(
+              1,
+              dead,
+              CallCFunc::Func::kJITRT_PopExcInfo311,
+              std::vector<Register*>{prev});
+          break;
+        }
+        case RERAISE: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // Re-executed by the interpreter: it pops the exception, restores
+          // it and unwinds through the exception table from here (the
+          // cleanup rows are never compiled).
+          tc.emitSnapshot();
+          tc.emit<Deopt>();
+          break;
+        }
+        case CLEANUP_THROW:
+        case WITH_EXCEPT_START:
+          BUILDER_THROW(
+              "{} appearing outside of exception handler", opcodeName(opcode));
+#else
         case CHECK_EG_MATCH:
-#endif
         case CHECK_EXC_MATCH:
         case CLEANUP_THROW:
         case POP_EXCEPT:
@@ -2787,6 +3201,7 @@ void HIRBuilder::translate(
         case WITH_EXCEPT_START:
           BUILDER_THROW(
               "{} appearing outside of exception handler", opcodeName(opcode));
+#endif
         default: {
           BUILDER_THROW("Unhandled opcode {} ({})", opcodeName(opcode), opcode);
         }
@@ -2800,6 +3215,27 @@ void HIRBuilder::translate(
         }
       }
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (is_entry_bc_block && !entry_guards_emitted) {
+      // The entry block held entry-setup instructions only: a body that
+      // opens with `while True:` has RESUME and the loop's NOP ahead of the
+      // back-edge target, so no ordinary instruction reached the seeding
+      // above.  The block runs exactly once, so seed the observable
+      // localsplus here before leaving it (ahead of the branch a jumping
+      // block already emitted).
+      Instr* terminator = tc.block->GetTerminator();
+      bool reattach = terminator != nullptr && terminator->IsTerminator();
+      if (reattach) {
+        terminator->unlink();
+      }
+      emitLocalsplusWriteback311(tc);
+      if (reattach) {
+        tc.block->Append(terminator);
+      }
+      entry_guards_emitted = true;
+      in_entry_setup = false;
+    }
+#endif
     // Insert jumps for blocks that fall through.
     auto last_instr = tc.block->GetTerminator();
     if ((last_instr == nullptr) || !last_instr->IsTerminator()) {
@@ -2894,6 +3330,13 @@ void HIRBuilder::translate(
         tc.block->GetTerminator() != nullptr &&
             !tc.block->GetTerminator()->IsSnapshot(),
         "opcodes should not end with a snapshot");
+#if PY_VERSION_HEX < 0x030C0000
+    // Handler blocks entered from this block's stubs.
+    for (auto& [handler, frame] : pending_exc_handlers_) {
+      queue.emplace_back(handler, frame);
+    }
+    pending_exc_handlers_.clear();
+#endif
   }
 
   JIT_CHECK(
@@ -3223,6 +3666,9 @@ void HIRBuilder::emitAnyCall(
       call->setFrameState(tc.frame);
 
       tc.frame.stack.push(out);
+#if PY_VERSION_HEX < 0x030C0000
+      emitExcEdge311(tc, bc_instr, call, out);
+#endif
       break;
     }
     case INVOKE_FUNCTION: {
@@ -3338,7 +3784,17 @@ void HIRBuilder::emitBinaryOp(
 #endif
 
   bool float_inplace_fast_path = false;
-  if (getConfig().specialized_opcodes) {
+#if PY_VERSION_HEX < 0x030C0000
+  // At a granted exception-edge site the operation keeps its generic form:
+  // a type guard in front of it would turn the raise into a guard failure
+  // (re-executed by the interpreter, past the compiled handler) instead of
+  // the NULL result the edge tests.
+  bool speculate_types =
+      getConfig().specialized_opcodes && !excEdgeSite311(bc_instr);
+#else
+  bool speculate_types = getConfig().specialized_opcodes;
+#endif
+  if (speculate_types) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
       case BINARY_OP_MULTIPLY_INT:
@@ -3407,7 +3863,7 @@ void HIRBuilder::emitBinaryOp(
           "Unrecognized oparg for BINARY_OP: {}",
           oparg);
       InPlaceOpKind inplace_op_kind = *inplace_opt_op_kind;
-      tc.emit<InPlaceOp>(
+      auto* inplace = tc.emit<InPlaceOp>(
           result,
           inplace_op_kind,
           left,
@@ -3415,6 +3871,11 @@ void HIRBuilder::emitBinaryOp(
           tc.frame,
           float_inplace_fast_path);
       stack.push(result);
+#if PY_VERSION_HEX < 0x030C0000
+      emitExcEdge311(tc, bc_instr, inplace, result);
+#else
+      (void)inplace;
+#endif
       return;
     }
   } else {
@@ -3427,8 +3888,13 @@ void HIRBuilder::emitBinaryOp(
     op_kind = *opt_op_kind;
   }
 
-  tc.emit<BinaryOp>(result, op_kind, left, right, tc.frame);
+  auto* binop = tc.emit<BinaryOp>(result, op_kind, left, right, tc.frame);
   stack.push(result);
+#if PY_VERSION_HEX < 0x030C0000
+  emitExcEdge311(tc, bc_instr, binop, result);
+#else
+  (void)binop;
+#endif
 }
 
 void HIRBuilder::emitInPlaceOp(
@@ -6375,8 +6841,13 @@ bool HIRBuilder::frameLocalsWrittenThrough311() const {
   // they are materialized; a suspended generator's frame is observed in
   // place (gi_frame.f_locals, inspect.getgeneratorlocals), so generator
   // family code keeps localsplus current at every store, as stock does.
+  // A function with a compiled exception edge is observed the same way:
+  // the traceback entry created on entry into a compiled handler exposes the
+  // frame (f_locals, and the references it keeps alive) while the function
+  // keeps running in machine code, as the evaluator does after the deopt the
+  // edge replaces.
   return getConfig().state == State::kRunning && code_ != nullptr &&
-      (code_->co_flags & kCoFlagsAnyGenerator);
+      ((code_->co_flags & kCoFlagsAnyGenerator) || exc_edge_frame_locals_);
 #else
   return false;
 #endif
@@ -6681,6 +7152,28 @@ void HIRBuilder::emitStoreSubscr(
   Register* sub = stack.pop();
   Register* container = stack.pop();
   Register* value = stack.pop();
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (excEdgeSite311(bc_instr)) {
+    // At a granted site the store is the plain PyObject_SetItem call with
+    // its status tested by the edge; the specialised forms' guards would
+    // deopt past the compiled handler.
+    Register* status = temps_.AllocateNonStack();
+    auto call = tc.emit<CallStatic>(
+        3, status, reinterpret_cast<void*>(PyObject_SetItem), TCInt32);
+    call->SetOperand(0, container);
+    call->SetOperand(1, sub);
+    call->SetOperand(2, value);
+    Register* zero = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(zero, Type::fromCInt(0, TCInt32));
+    Register* is_neg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        is_neg, PrimitiveCompareOp::kLessThan, status, zero);
+    emitExcEdge311(
+        tc, bc_instr, nullptr, nullptr, is_neg, /* ok_when_true= */ false);
+    return;
+  }
+#endif
 
   int specialized_opcode = -1;
   if (getConfig().specialized_opcodes) {

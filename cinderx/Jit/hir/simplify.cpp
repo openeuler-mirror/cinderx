@@ -97,6 +97,11 @@ struct Env {
   // Number of new basic blocks added by the simplifier.
   size_t new_blocks{0};
 
+  // True while simplifying an instruction whose exception exit is a CFG
+  // edge; the replacement's generic (raising) arm then carries the mark
+  // instead of a deopt, so its NULL result reaches the edge.
+  bool exc_edge{false};
+
   // Create and insert the specified instruction. If the instruction has an
   // output, a new Register* will be created and returned.
   template <typename T, typename... Args>
@@ -1013,6 +1018,15 @@ Register* simplifySubscript(
   if (lhs->isA(TDictExact)) {
     return env.emit<DictSubscr>(lhs, rhs, *frame_state);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (env.exc_edge) {
+    // Inside a compiled try block the subscript keeps its generic form: the
+    // inline list/tuple/str fast paths raise their IndexError through a
+    // bounds-check deopt, which would skip the compiled handler.  The
+    // generic form raises natively and the edge takes it.
+    return nullptr;
+  }
+#endif
   if (Register* array_result = trySimplifyArraySubscr(env, instr)) {
     return array_result;
   }
@@ -1361,6 +1375,14 @@ Register* trySimplifyFloatInPlace(Env& env, const InPlaceOp* instr) {
 }
 
 Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (env.exc_edge) {
+    // The generic helper leaves NULL for the compiled handler's branch.
+    // Numeric fast paths guard their own errors (or merge through a Phi),
+    // so they cannot inherit this exception edge on just the final result.
+    return nullptr;
+  }
+#endif
   Register* lhs = instr->left();
   Register* rhs = instr->right();
   if (lhs->isA(TLongExact) && rhs->isA(TLongExact)) {
@@ -1507,6 +1529,17 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // True-divide is similar to add/sub/mul, but needs to guard against division
   // by zero as that would raise a ZeroDivisionError in the interpreter.
   if (op == BinaryOpKind::kTrueDivide) {
+#if PY_VERSION_HEX < 0x030C0000
+    const FrameState* frame = instr->frameState();
+    if (frame != nullptr && frame->parent == nullptr &&
+        frame->code == env.func.code &&
+        env.func.excEdgeCapable311(instr->bytecodeOffset())) {
+      // A zero-divide guard does not count as an exception at BINARY_OP.
+      // Keep the helper's exception exit so this site can earn its grant,
+      // including FloatBinaryOp produced by an in-place specialization.
+      return nullptr;
+    }
+#endif
     Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
     Register* unbox_right = env.emit<PrimitiveUnbox>(instr->right(), TCDouble);
     Register* zero = env.emit<LoadConst>(Type::fromCDouble(0.0));
@@ -3382,7 +3415,29 @@ void Simplify::Run(Function& irfunc) {
         env.optimized = false;
         env.cursor = block.iterator_to(instr);
         env.bc_off = instr.bytecodeOffset();
+#if PY_VERSION_HEX < 0x030C0000
+        const DeoptBase* orig_db = instr.asDeoptBase();
+        env.exc_edge = orig_db != nullptr && orig_db->excEdge();
+#endif
         Register* new_output = simplifyInstr(env, &instr);
+#if PY_VERSION_HEX < 0x030C0000
+        if (env.exc_edge && new_output != nullptr &&
+            new_output->instr() != nullptr &&
+            new_output->instr()->output() == new_output &&
+            new_output->type() <= TOptObject) {
+          // The replacement that produces the value is itself the raising
+          // instruction now (DictSubscr, ...): it inherits the edge, and its
+          // output type is refreshed at once -- the register's type was
+          // computed at emission without the mark, and the RefineType on the
+          // fall-through would otherwise be simplified away against that
+          // stale non-null type before the next reflow.
+          if (DeoptBase* new_db = new_output->instr()->asDeoptBase()) {
+            new_db->setExcEdge(true);
+            new_output->set_type(outputType(*new_db));
+          }
+        }
+        env.exc_edge = false;
+#endif
         JIT_CHECK(
             env.cursor == env.block->iterator_to(instr),
             "Simplify functions are expected to leave env.cursor pointing to "

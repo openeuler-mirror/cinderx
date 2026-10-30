@@ -73,6 +73,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -6185,6 +6186,123 @@ void triggerRoiBackoff(
 
 } // namespace
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Per-site exception edges are earned, not eager.  An eager edge at every
+// raising site puts a CondBranch and a stub behind every call, binary op and
+// store, and the value copy it introduces breaks the box look-through of the
+// numeric lowerings (spectral_norm 2.8x, scimark_fft 2.5x, chaos +25% in the
+// eager form).  So a site's exception deopts are counted here; at the eighth
+// the site is granted its edge and the code recompiles in place -- the new
+// artifact is compiled and installed before the deopt hook returns, so the
+// function never reads as uncompiled and no call misses machine code.  Only
+// the sites the builder hooks (CALL, BINARY_OP, BINARY_SUBSCR, STORE_SUBSCR)
+// are eligible.  The state is keyed by code object and dropped with it
+// (every compiled code carries a CodeExtra, whose free function delivers the
+// code-death notification), so a reused address never inherits grants.
+struct ExcEdgeCodeState311 {
+  // Bytecode offsets (the instruction's base offset) whose exit is granted.
+  std::unordered_set<int64_t> granted;
+  // Stop counting rejected sites without enabling frame write-through.
+  std::unordered_set<int64_t> ineligible;
+  // Exception deopts counted per eligible site that is not yet granted.
+  std::unordered_map<int64_t, uint32_t> counts;
+};
+std::unordered_map<PyCodeObject*, ExcEdgeCodeState311> s_exc_edge_311;
+constexpr uint32_t kExcEdgeGrantAfter311 = 8;
+bool s_exc_edge_recompiling_311 = false;
+
+void excEdgeCodeDestroyed311(PyCodeObject* code) {
+  s_exc_edge_311.erase(code);
+}
+
+// Recompile every artifact of `code` with the granted sites: uncompile and
+// compile again synchronously.  Reached from prepareForDeopt with the
+// retiring artifact's machine code still live on the C stack (the artifact
+// then defers itself onto the graveyard, as the ROI backoff relies on).  A
+// by-code artifact (no function object to compile through) is retired and
+// re-earned through the observer's slot instead.
+void recompileCodeForExcEdge311(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyFunctionObject> deopting_func) {
+  FreeThreadedJITEntrypointGuard guard;
+  if (jitCtx() == nullptr) {
+    return;
+  }
+  CodeExtra* extra = codeExtra(code);
+  if (extra != nullptr) {
+    uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+    if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+      // Being withdrawn by the ROI backoff; nothing to recompile.
+      return;
+    }
+  }
+  std::vector<Ref<PyFunctionObject>> funcs;
+  for (auto& entry : jitCtx()->compiledFuncs()) {
+    BorrowedRef<PyFunctionObject> func = entry.first;
+    if (reinterpret_cast<PyCodeObject*>(func->func_code) == code.get()) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+    }
+  }
+  BorrowedRef<CompiledFunction> by_code;
+  if (funcs.empty() && extra != nullptr) {
+    by_code = roiByCodeArtifact311(code, extra);
+  }
+  JIT_DLOG(
+      "exception-edge grant for {}: {} member function(s), by-code artifact "
+      "{}, deopting function {}",
+      codeQualname(code),
+      funcs.size(),
+      by_code != nullptr,
+      deopting_func != nullptr);
+  if (funcs.empty() && by_code == nullptr) {
+    return;
+  }
+  // The hook runs with the raising exception set; compiling must neither
+  // see it nor replace it.
+  PreservePythonError preserve_error;
+  for (auto& func : funcs) {
+    ::uncompileImpl(func);
+  }
+  if (by_code != nullptr) {
+    retireByCodeArtifact311(by_code);
+    // The by-code artifact had no registered member; the deopting
+    // activation's own function object is compiled through instead, and
+    // the publication re-arms the by-code dispatch for the fresh function
+    // objects that follow.  Without one the observer's slot is reopened
+    // for the code to re-earn its compile.
+    if (deopting_func != nullptr &&
+        reinterpret_cast<PyCodeObject*>(deopting_func->func_code) ==
+            code.get()) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(deopting_func.get()));
+    } else {
+      Ci_Observe311_ReopenSlotForCode(code.get());
+    }
+  }
+  for (auto& func : funcs) {
+    // A refusal here leaves the function interpreted until the scheduler
+    // compiles it again; the common outcome is the new artifact installed.
+    // This runs inside prepareForDeopt, below machine code on the C stack:
+    // no C++ exception may leave it.
+    try {
+      Result result = compileFunction(func);
+      JIT_DLOG(
+          "exception-edge recompile of {}: result {}",
+          funcFullname(func),
+          static_cast<int>(result));
+    } catch (const std::exception& exn) {
+      JIT_DLOG(
+          "exception-edge recompile of {} failed: {}",
+          funcFullname(func),
+          exn.what());
+    } catch (...) {
+      JIT_DLOG("exception-edge recompile of {} failed", funcFullname(func));
+    }
+  }
+}
+} // namespace
+#endif
+
 void recordDeoptForRoiBackoff(
     CodeRuntime* code_runtime,
     DeoptReason reason,
@@ -6339,6 +6457,7 @@ int initialize() {
   setCodeDestroyedHook([](PyCodeObject* code) {
     try {
       codeDestroyed(code);
+      excEdgeCodeDestroyed311(code);
       // The bookkeeping above is no-throw by construction; the injection
       // models a fault at the boundary's edge, after cleanup has run.
       throwIfJitPublishStepArmedForTest(11);
@@ -6636,6 +6755,7 @@ void finalize() {
     mod_state->code_allocator.reset();
     setCodeDestroyedHook(nullptr);
 #if PY_VERSION_HEX < 0x030C0000
+    s_exc_edge_311.clear();
     Ci_QuickenWarmupStep_311 = 1;
 #endif
     ciSetJitState(State::kNotInitialized);
@@ -6730,6 +6850,7 @@ void finalize() {
   setCodeDestroyedHook(nullptr);
 
 #if PY_VERSION_HEX < 0x030C0000
+  s_exc_edge_311.clear();
   Ci_QuickenWarmupStep_311 = 1;
 #endif
   ciSetJitState(State::kNotInitialized);
@@ -7384,3 +7505,79 @@ Result compilePreloaderImpl(
 }
 
 } // namespace jit
+
+#if PY_VERSION_HEX < 0x030C0000
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code) {
+  if (jit::s_exc_edge_311.empty()) {
+    return 0;
+  }
+  auto it = jit::s_exc_edge_311.find(code);
+  return it != jit::s_exc_edge_311.end() && !it->second.granted.empty();
+}
+
+int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset) {
+  if (jit::s_exc_edge_311.empty()) {
+    return 0;
+  }
+  auto it = jit::s_exc_edge_311.find(code);
+  return it != jit::s_exc_edge_311.end() &&
+      it->second.granted.count(bc_offset) != 0;
+}
+
+void Ci_ExcEdgeDeopt311(
+    PyCodeObject* code,
+    int64_t bc_offset,
+    int guard_failure,
+    PyObject* func) {
+  if (code == nullptr || bc_offset < 0 ||
+      (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
+          0) {
+    return;
+  }
+  jit::BytecodeInstruction instr{code, BCOffset{bc_offset}};
+  switch (instr.opcode()) {
+    case BINARY_SUBSCR:
+      // Both exits count here: the inline bounds check of a list/tuple/str
+      // subscript is a guard (the interpreter re-executes the subscript and
+      // raises), the generic form an exception exit.
+      break;
+    case CALL:
+    case BINARY_OP:
+    case STORE_SUBSCR:
+      // Guard failures at these sites belong to the type speculation.
+      if (guard_failure) {
+        return;
+      }
+      break;
+    default:
+      return;
+  }
+  jit::ExcEdgeCodeState311& state = jit::s_exc_edge_311[code];
+  if (state.granted.count(bc_offset) != 0 ||
+      state.ineligible.count(bc_offset) != 0) {
+    // Already classified. A granted site can still deopt if
+    // instrumentation declined its edge.
+    return;
+  }
+  uint32_t fails = ++state.counts[bc_offset];
+  if (fails < jit::kExcEdgeGrantAfter311 || jit::s_exc_edge_recompiling_311) {
+    return;
+  }
+  state.counts.erase(bc_offset);
+  if (!jit::hir::excEdgeCapable311(code, bc_offset)) {
+    state.ineligible.insert(bc_offset);
+    JIT_DLOG(
+        "exception-edge site {}+{} is not edge-capable",
+        codeQualname(code),
+        bc_offset);
+    // Under a row the builder does not compile (with, finally, a handler's
+    // own body) or under no row at all: stop counting without a grant.
+    // The deopt exit stays and spends the ROI budget as before.
+    return;
+  }
+  state.granted.insert(bc_offset);
+  jit::s_exc_edge_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_exc_edge_recompiling_311 = false);
+  jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});
+}
+#endif

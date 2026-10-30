@@ -107,12 +107,63 @@ PyObject* JITRT_ReenterAfterBind(
 // Transfer the current 3.11 JIT frame's recursion slot to the interpreter
 // before deopt resume. The interpreter will Enter/Leave the same real frame.
 void JITRT_TransferRecursionToInterpreter311();
+
+// CPython 3.11 port of ceval's static import_from() for the IMPORT_FROM
+// opcode: attribute lookup on the module, the sys.modules fallback for
+// circular relative imports, the stock ImportError otherwise.  Returns a new
+// reference, or NULL with the exception set.
+PyObject*
+JITRT_ImportFrom311(PyThreadState* tstate, PyObject* module, PyObject* name);
+// IMPORT_NAME with the compiled function's own builtins: the evaluator
+// resolves __import__ from the frame's f_builtins, which a function made with
+// exec() or types.FunctionType() over a private builtins dict may redefine.
+PyObject* JITRT_ImportName311(
+    PyThreadState* tstate,
+    PyObject* builtins,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level);
+
+// Per-site exception edges are earned: an eligible site's exception deopts
+// are counted and at the grant the code recompiles with the edge.  Both are
+// CPython 3.11 only and live in pyjit.cpp.
+int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset);
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code);
+void Ci_ExcEdgeDeopt311(
+    PyCodeObject* code,
+    int64_t bc_offset,
+    int guard_failure,
+    PyObject* func);
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,
     int* boundary_active,
     int* jit_entries);
 #endif
+
+// The exception exit of a raising instruction inside a try block whose
+// `except` handler is compiled becomes a CFG edge, and these helpers replay
+// the evaluator's error path and the handler opcodes.  CPython 3.11 only;
+// declared on every version because the CallCFunc table names them (the
+// other versions carry aborting stubs).
+//
+// Entry into a compiled handler.  Mirrors ceval's `error:` and the handler
+// arm of `exception_unwind:` for a non-lasti entry: publishes the raising
+// instruction's position, adds the traceback entry for this frame, then
+// fetches the normalized exception with its traceback attached.  Returns a
+// new reference to the exception instance (what the evaluator pushes for the
+// handler), or NULL with the original exception still set when a trace
+// function is installed -- the 'exception' trace event and the rest of the
+// tracing protocol stay with the evaluator, so the caller deopts.
+PyObject* JITRT_EnterExceptHandler311(uint64_t published_idx);
+// PUSH_EXC_INFO: makes `exc` the handled exception; returns the previously
+// handled exception (a new reference; None when there was none).
+PyObject* JITRT_PushExcInfo311(PyObject* exc);
+// POP_EXCEPT: restores `prev` as the handled exception.
+uint64_t JITRT_PopExcInfo311(PyObject* prev);
+// CHECK_EXC_MATCH: 1 when `exc` matches `type`, 0 when not, -1 with a
+// TypeError set when `type` is not an exception class (or tuple of them).
+int64_t JITRT_ExcMatch311(PyObject* exc, PyObject* type);
 
 // On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a
 // hidden first parameter for the return pointer, shifting all visible

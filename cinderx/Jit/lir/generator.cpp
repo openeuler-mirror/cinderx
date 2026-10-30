@@ -4116,6 +4116,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kGuard:
       case Opcode::kGuardIs: {
         const auto& instr = static_cast<const DeoptBase&>(i);
+#if PY_VERSION_HEX < 0x030C0000
+        // A CheckExc on an exception edge is a plain pass-through; the
+        // following CondBranch is the test.
+        if (instr.IsCheckExc() && instr.excEdge()) {
+          break;
+        }
+#endif
         auto kind = InstrGuardKind::kNotZero;
         if (instr.IsCheckNeg()) {
           kind = InstrGuardKind::kNotNegative;
@@ -5878,6 +5885,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             env_->asm_tstate,
             instr->module(),
             name);
+#elif PY_VERSION_HEX < 0x030C0000
+        // CPython 3.11 has no exported import_from; JITRT_ImportFrom311 is
+        // its port.
+        auto instr = static_cast<const ImportFrom*>(&i);
+        Instruction* name = getNameFromIdx(bbb, instr);
+        bbb.appendCallInstruction(
+            i.output(),
+            JITRT_ImportFrom311,
+            env_->asm_tstate,
+            instr->module(),
+            name);
 #else
         JIT_ABORT(
             "IMPORT_FROM is not supported, LIRGenerator has no access to "
@@ -5888,6 +5906,23 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kImportName: {
         auto instr = static_cast<const ImportName*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
+#if PY_VERSION_HEX < 0x030C0000
+        // __import__ comes from the function's own builtins (the frame's
+        // f_builtins), which the compilation key fixed for this artifact.
+        Instruction* builtins = bbb.appendInstr(
+            OutVReg{},
+            Instruction::kMove,
+            Imm{reinterpret_cast<uint64_t>(env_->code_rt->builtins().get()),
+                OperandBase::kObject});
+        bbb.appendCallInstruction(
+            i.output(),
+            JITRT_ImportName311,
+            env_->asm_tstate,
+            builtins,
+            name,
+            instr->GetFromList(),
+            instr->GetLevel());
+#else
         bbb.appendCallInstruction(
             i.output(),
             JITRT_ImportName,
@@ -5895,6 +5930,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             name,
             instr->GetFromList(),
             instr->GetLevel());
+#endif
         break;
       }
       case Opcode::kEagerImportName: {
@@ -6298,6 +6334,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
 #endif
         default: {
+#if PY_VERSION_HEX < 0x030C0000
+          // An instruction on an exception edge: the exit is the CondBranch
+          // that follows (it tests the NULL output), so no guard.  Only this
+          // generic lowering and CheckExc honour the mark; a self-guarding
+          // lowering (the cases above) keeps its guard, and the edge is then
+          // simply never taken.
+          if (db->excEdge()) {
+            break;
+          }
+#endif
           emitExceptionCheck(*db, bbb);
           break;
         }
@@ -6842,6 +6888,12 @@ bool LIRGenerator::canInlineNormalFrame() const {
 #endif
   BorrowedRef<PyCodeObject> code = func_->code;
   if (kPyDebug || code == nullptr) {
+    return false;
+  }
+  if (func_->frame_locals_written_through_311) {
+    // The frame's localsplus hold owned references (the builder writes the
+    // locals through for the compiled exception edges); the inline exit
+    // assumes empty slots, so the C unlink releases them.
     return false;
   }
   if (code->co_ncellvars == 0 && code->co_nfreevars == 0) {

@@ -621,6 +621,154 @@ void JITRT_TransferRecursionToInterpreter311() {
   _Py_LeaveRecursiveCallTstate(_PyThreadState_GET());
 }
 
+// Near-verbatim port of import_from() from the 3.11 ceval.c (the function
+// is static there).  Ownership follows stock: the looked-up attribute or
+// sys.modules entry is returned as a new reference; every failure path
+// leaves an ImportError set and returns NULL.
+PyObject*
+JITRT_ImportFrom311(PyThreadState* tstate, PyObject* v, PyObject* name) {
+  DEFINE_STATIC_STRING(__name__);
+  DEFINE_STATIC_STRING(__spec__);
+  PyObject* x = nullptr;
+  if (_PyObject_LookupAttr(v, name, &x) != 0) {
+    return x;
+  }
+  PyObject* pkgpath = nullptr;
+  PyObject* pkgname_or_unknown = nullptr;
+  PyObject* errmsg = nullptr;
+  // Issue #17636: a circular relative import may have failed the attribute
+  // lookup although the submodule is already in sys.modules.
+  PyObject* pkgname = PyObject_GetAttr(v, s___name__);
+  if (pkgname == nullptr) {
+    goto error;
+  }
+  if (!PyUnicode_Check(pkgname)) {
+    Py_CLEAR(pkgname);
+    goto error;
+  }
+  {
+    PyObject* fullmodname = PyUnicode_FromFormat("%U.%U", pkgname, name);
+    if (fullmodname == nullptr) {
+      Py_DECREF(pkgname);
+      return nullptr;
+    }
+    x = PyImport_GetModule(fullmodname);
+    Py_DECREF(fullmodname);
+    if (x == nullptr && !_PyErr_Occurred(tstate)) {
+      goto error;
+    }
+    Py_DECREF(pkgname);
+    return x;
+  }
+error:
+  pkgpath = PyModule_GetFilenameObject(v);
+  if (pkgname == nullptr) {
+    pkgname_or_unknown = PyUnicode_FromString("<unknown module name>");
+    if (pkgname_or_unknown == nullptr) {
+      Py_XDECREF(pkgpath);
+      return nullptr;
+    }
+  } else {
+    pkgname_or_unknown = pkgname;
+  }
+  if (pkgpath == nullptr || !PyUnicode_Check(pkgpath)) {
+    _PyErr_Clear(tstate);
+    errmsg = PyUnicode_FromFormat(
+        "cannot import name %R from %R (unknown location)",
+        name,
+        pkgname_or_unknown);
+    // NULL checks for errmsg and pkgname are done by PyErr_SetImportError.
+    PyErr_SetImportError(errmsg, pkgname, nullptr);
+  } else {
+    PyObject* spec = PyObject_GetAttr(v, s___spec__);
+    const char* fmt = _PyModuleSpec_IsInitializing(spec)
+        ? "cannot import name %R from partially initialized module %R "
+          "(most likely due to a circular import) (%S)"
+        : "cannot import name %R from %R (%S)";
+    Py_XDECREF(spec);
+    errmsg = PyUnicode_FromFormat(fmt, name, pkgname_or_unknown, pkgpath);
+    PyErr_SetImportError(errmsg, pkgname, pkgpath);
+  }
+  Py_XDECREF(errmsg);
+  Py_XDECREF(pkgname_or_unknown);
+  Py_XDECREF(pkgpath);
+  return nullptr;
+}
+
+// See jit_rt.h.
+PyObject* JITRT_EnterExceptHandler311(uint64_t published_idx) {
+  PyThreadState* tstate = _PyThreadState_GET();
+  if (tstate->c_tracefunc != nullptr) {
+    // Tracing: the evaluator owns the 'exception' event; the caller deopts
+    // with the exception untouched.
+    return nullptr;
+  }
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  // The evaluator's error path publishes the faulting position before the
+  // traceback entry; the compiled code's own cursor stores may lag it.
+  frame->prev_instr = _PyCode_CODE(frame->f_code) + published_idx;
+  if (!_PyErr_Occurred(tstate)) {
+    _PyErr_SetString(
+        tstate, PyExc_SystemError, "error return without exception set");
+  }
+  if (!_PyFrame_IsIncomplete(frame)) {
+    PyFrameObject* f = _PyFrame_GetFrameObject(frame);
+    if (f != nullptr) {
+      PyTraceBack_Here(f);
+    }
+  }
+  PyObject* exc;
+  PyObject* val;
+  PyObject* tb;
+  _PyErr_Fetch(tstate, &exc, &val, &tb);
+  _PyErr_NormalizeException(tstate, &exc, &val, &tb);
+  if (tb != nullptr) {
+    PyException_SetTraceback(val, tb);
+  } else {
+    PyException_SetTraceback(val, Py_None);
+  }
+  Py_XDECREF(tb);
+  Py_XDECREF(exc);
+  return val;
+}
+
+PyObject* JITRT_PushExcInfo311(PyObject* exc) {
+  _PyErr_StackItem* exc_info = _PyThreadState_GET()->exc_info;
+  PyObject* prev = exc_info->exc_value;
+  if (prev == nullptr) {
+    prev = Py_NewRef(Py_None);
+  }
+  exc_info->exc_value = Py_NewRef(exc);
+  return prev;
+}
+
+uint64_t JITRT_PopExcInfo311(PyObject* prev) {
+  _PyErr_StackItem* exc_info = _PyThreadState_GET()->exc_info;
+  PyObject* old = exc_info->exc_value;
+  exc_info->exc_value = Py_NewRef(prev);
+  Py_XDECREF(old);
+  return 0;
+}
+
+int64_t JITRT_ExcMatch311(PyObject* exc, PyObject* type) {
+  static const char* kCannotCatchMsg =
+      "catching classes that do not inherit from BaseException is not allowed";
+  PyThreadState* tstate = _PyThreadState_GET();
+  if (PyTuple_Check(type)) {
+    Py_ssize_t length = PyTuple_GET_SIZE(type);
+    for (Py_ssize_t i = 0; i < length; i++) {
+      if (!PyExceptionClass_Check(PyTuple_GET_ITEM(type, i))) {
+        _PyErr_SetString(tstate, PyExc_TypeError, kCannotCatchMsg);
+        return -1;
+      }
+    }
+  } else if (!PyExceptionClass_Check(type)) {
+    _PyErr_SetString(tstate, PyExc_TypeError, kCannotCatchMsg);
+    return -1;
+  }
+  return PyErr_GivenExceptionMatches(exc, type) ? 1 : 0;
+}
+
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,
@@ -665,6 +813,21 @@ PyObject* JITRT_ReenterAfterBind(
 
 #else
 #define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
+
+// The compiled-handler helpers are CPython 3.11 only; the CallCFunc table
+// references them on every version.
+PyObject* JITRT_EnterExceptHandler311(uint64_t) {
+  JIT_ABORT("JITRT_EnterExceptHandler311 is CPython 3.11 only");
+}
+PyObject* JITRT_PushExcInfo311(PyObject*) {
+  JIT_ABORT("JITRT_PushExcInfo311 is CPython 3.11 only");
+}
+uint64_t JITRT_PopExcInfo311(PyObject*) {
+  JIT_ABORT("JITRT_PopExcInfo311 is CPython 3.11 only");
+}
+int64_t JITRT_ExcMatch311(PyObject*, PyObject*) {
+  JIT_ABORT("JITRT_ExcMatch311 is CPython 3.11 only");
+}
 #endif
 
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
@@ -3499,25 +3662,33 @@ int8_t JITRT_UnboxI8(PyObject* obj) {
   return checkedUnboxImpl<int8_t>(obj);
 }
 
-PyObject* JITRT_ImportName(
+namespace {
+// The evaluator's import_name: __import__ is looked up in `builtins`, a
+// lookup that can run Python (a non-string key comparing equal to
+// "__import__") and so can raise -- that exception propagates; only a
+// plain miss is the "__import__ not found" ImportError.  With
+// `frame_locals`, the importing frame's locals dict is handed to a custom
+// __import__ when the frame has one, read after the lookup (the lookup's
+// Python can be the first to materialize it), and None otherwise; nothing
+// materializes one for the import.
+PyObject* importNameWithBuiltins(
     PyThreadState* tstate,
+    PyObject* builtins,
+    bool frame_locals,
     PyObject* name,
     PyObject* fromlist,
     PyObject* level) {
   DEFINE_STATIC_STRING(__import__);
   PyObject* globals = PyEval_GetGlobals();
-  PyObject* builtins = tstate->interp->builtins;
 
-  auto import_func =
-      Ref<>::create(PyDict_GetItemWithError(builtins, s___import__));
-
-  JIT_DCHECK(
-      import_func || !PyErr_Occurred(),
-      "_PyDict_GetItemIdWithError should only fail with invalid identifiers");
-  if (import_func == nullptr) {
-    PyErr_SetString(PyExc_ImportError, "__import__ not found");
+  PyObject* import_func_raw = PyDict_GetItemWithError(builtins, s___import__);
+  if (import_func_raw == nullptr) {
+    if (!_PyErr_Occurred(tstate)) {
+      _PyErr_SetString(tstate, PyExc_ImportError, "__import__ not found");
+    }
     return nullptr;
   }
+  auto import_func = Ref<>::create(import_func_raw);
 
   /* Fast path for not overloaded __import__. */
   if (import_func == CI_INTERP_IMPORT_FIELD(tstate->interp, import_func)) {
@@ -3535,16 +3706,48 @@ PyObject* JITRT_ImportName(
         ilevel);
   }
 
+  PyObject* locals = Py_None;
+  if (frame_locals) {
+    _PyInterpreterFrame* frame = currentFrame(tstate);
+    if (frame != nullptr && frame->f_locals != nullptr) {
+      locals = frame->f_locals;
+    }
+  }
+  return PyObject_CallFunctionObjArgs(
+      import_func, name, globals, locals, fromlist, level, nullptr);
+}
+} // namespace
+
+PyObject* JITRT_ImportName(
+    PyThreadState* tstate,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level) {
   // In this implementation we always pass None for locals as it's easier than
   // fully materializing them now. The CPython interpreter has strange (probably
   // broken) behavior - it will only pass a dictionary of locals to
   // __builtins__.__import__() if the locals have been materialized already, for
   // example by a call to locals(). Reliance on this behavior is unlikely.
-  PyObject* locals = Py_None;
-
-  return PyObject_CallFunctionObjArgs(
-      import_func, name, globals, locals, fromlist, level, nullptr);
+  return importNameWithBuiltins(
+      tstate, tstate->interp->builtins, false, name, fromlist, level);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// See jit_rt.h.  The frame's f_builtins is the function's builtins, which
+// the compilation key fixed for this artifact.  The evaluator hands a
+// custom __import__ the frame's locals dict when one has been materialized
+// (a prior f_locals read) and None otherwise, without materializing one for
+// the import; the compiled frame is the current frame, so the same rule
+// applies.
+PyObject* JITRT_ImportName311(
+    PyThreadState* tstate,
+    PyObject* builtins,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level) {
+  return importNameWithBuiltins(tstate, builtins, true, name, fromlist, level);
+}
+#endif
 
 void JITRT_SetCurrentAwaiter(PyObject* awaitable, PyThreadState* ts) {
 #ifdef ENABLE_GENERATOR_AWAITER
@@ -4196,6 +4399,40 @@ int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op) {
   int fast_result = 0;
   if (JITRT_TryCompactLongCompareBool(v, w, op, &fast_result)) {
     return fast_result;
+  }
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // Two shapes that dominate the generic arm.  (1) exact float vs exact
+  // float: compare the doubles (C ordering matches Python for exact floats,
+  // NaN included).  (2) EQ / NE between objects whose types both keep
+  // object's own tp_richcompare: object_richcompare answers by identity and
+  // NotImplemented resolves to identity too, so the outcome is the pointer
+  // test.  A type overriding __eq__/__ne__ (slot_tp_richcompare) or
+  // inheriting a C base's compare is excluded by the slot identity check.
+  if (PyFloat_CheckExact(v) && PyFloat_CheckExact(w)) {
+    double a = PyFloat_AS_DOUBLE(v);
+    double b = PyFloat_AS_DOUBLE(w);
+    switch (op) {
+      case Py_LT:
+        return a < b;
+      case Py_LE:
+        return a <= b;
+      case Py_EQ:
+        return a == b;
+      case Py_NE:
+        return a != b;
+      case Py_GT:
+        return a > b;
+      case Py_GE:
+        return a >= b;
+      default:
+        break;
+    }
+  }
+  if ((op == Py_EQ || op == Py_NE) &&
+      Py_TYPE(v)->tp_richcompare == PyBaseObject_Type.tp_richcompare &&
+      Py_TYPE(w)->tp_richcompare == PyBaseObject_Type.tp_richcompare) {
+    return (v == w) == (op == Py_EQ);
   }
 #endif
 
