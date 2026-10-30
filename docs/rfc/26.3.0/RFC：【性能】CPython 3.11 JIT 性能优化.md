@@ -1,12 +1,12 @@
 # RFC：【性能】CPython 3.11 JIT 性能优化
 
-**状态（Status）：** Draft
+**状态（Status）：** Accepted（待合入）
 
 **作者（Authors）：** jiabiao_o
 
 **创建日期（Created）：** 2026-09-07
 
-**更新日期（Updated）：** 2026-10-23
+**更新日期（Updated）：** 2026-10-30
 
 ---
 
@@ -1191,8 +1191,8 @@ PGO 构建各阶段应明确报告失败状态与原因，失败即终止，避�
 
 ## A. 参考文档
 
-- [RFC：CPython 3.11 可构建运行与自定义解释器循环](<RFC：【兼容性】CPython 3.11 可构建运行与自定义解释器循环.md>)。
-- [RFC：CPython 3.11 JIT 执行语义正确性](<RFC：【兼容性】CPython 3.11 JIT 执行语义正确性.md>)。
+- [RFC：CPython 3.11 可构建运行与自定义解释器循环](<../26.2.0/RFC：【兼容性】CPython 3.11 可构建运行与自定义解释器循环.md>)。
+- [RFC：CPython 3.11 JIT 执行语义正确性](<../26.2.0/RFC：【兼容性】CPython 3.11 JIT 执行语义正确性.md>)。
 
 ## B. 术语表
 
