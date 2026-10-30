@@ -1540,6 +1540,101 @@ def test(perm, k):
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, ExcEdgeRejectDoesNotEnableFrameWriteThrough311) {
+  const char* src = R"(
+def test(callback):
+    callback()
+    try:
+        return callback()
+    except ValueError:
+        return -1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  // The real deopt path always has a CodeExtra. Keep its code-death hook
+  // active when driving the grant hook directly as well.
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> calls;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == CALL) {
+      calls.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(calls.size(), 2);
+  ASSERT_FALSE(excEdgeCapable311(code, calls[0]));
+  ASSERT_TRUE(excEdgeCapable311(code, calls[1]));
+
+  for (int i = 0; i < 64; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[0], 0, nullptr);
+  }
+  EXPECT_FALSE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  EXPECT_FALSE(Ci_ExcEdgeCodeHasGrant311(code));
+  auto rejected = buildHIR(func);
+  ASSERT_NE(rejected, nullptr);
+  EXPECT_FALSE(rejected->frame_locals_written_through_311);
+
+  // Rejecting one site must not prevent a protected site in the same code
+  // from earning its real grant at the eighth exception.
+  for (int i = 0; i < 7; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[1], 0, nullptr);
+  }
+  EXPECT_FALSE(Ci_ExcEdgeCodeHasGrant311(code));
+  Ci_ExcEdgeDeopt311(code, calls[1], 0, nullptr);
+  EXPECT_TRUE(Ci_ExcEdgeSiteGranted311(code, calls[1]));
+  EXPECT_FALSE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  auto granted = buildHIR(func);
+  ASSERT_NE(granted, nullptr);
+  EXPECT_EQ(
+      granted->frame_locals_written_through_311,
+      getConfig().state == State::kRunning);
+}
+
+TEST_F(HIRBuildTest, FloatDivideUsesBuilderExceptionEligibility311) {
+  const char* src = R"(
+def test(zero):
+    denominator = 0.0 if zero else 2.0
+    outside = 64.0 / denominator
+    try:
+        a = 8.0 / denominator
+        b = 16.0 / denominator
+        c = 32.0 / denominator
+        return outside + a + b + c
+    except ZeroDivisionError:
+        return -1.0
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  auto table = analyzeExcTable311(code);
+  ASSERT_FALSE(table.entries.empty());
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    EXPECT_EQ(
+        irfunc->excEdgeCapable311(instr.baseOffset()),
+        table.edgeCapable(instr.baseIndex().value()));
+  }
+  EXPECT_FALSE(irfunc->excEdgeCapable311(BCOffset{-2}));
+  EXPECT_FALSE(irfunc->excEdgeCapable311(BCOffset{_PyCode_NBYTES(code)}));
+
+  SSAify{}.Run(*irfunc);
+  reflowTypes(*irfunc);
+  Simplify{}.Run(*irfunc);
+  auto hir = fullPrinter().ToString(*irfunc);
+  // Three protected divides retain the raising helper before any grant.
+  // The unprotected divide still uses the unboxed, guarded fast path.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kFloatBinaryOp), 3) << hir;
+  EXPECT_EQ(countSubstring(hir, "DoubleBinaryOp<TrueDivide>"), 1) << hir;
+  for (const auto& block : irfunc->cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsFloatBinaryOp()) {
+        EXPECT_TRUE(irfunc->excEdgeCapable311(instr.bytecodeOffset()));
+      }
+    }
+  }
+}
+
 TEST_F(HIRBuildTest, NoArgSuperMethodCall311LowersToLoadMethodSuper) {
   const char* src = R"(
 class A:

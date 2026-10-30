@@ -59,6 +59,20 @@ class Function {
   // release them (the inline unlink assumes empty slots).
   bool frame_locals_written_through_311{false};
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Builder analysis for the root code, indexed by code unit. Reused by
+  // Simplify so each float divide does not rescan the exception table and
+  // bytecode. Empty when no handler is eligible; inlined bodies do not use it.
+  std::vector<bool> exc_edge_capable_311;
+
+  bool excEdgeCapable311(BCOffset offset) const {
+    int index = offset.asIndex().value();
+    return index >= 0 &&
+        static_cast<size_t>(index) < exc_edge_capable_311.size() &&
+        exc_edge_capable_311[index];
+  }
+#endif
+
   CFG cfg;
 
   Environment env;

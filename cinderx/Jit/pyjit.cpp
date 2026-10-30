@@ -6203,6 +6203,8 @@ namespace {
 struct ExcEdgeCodeState311 {
   // Bytecode offsets (the instruction's base offset) whose exit is granted.
   std::unordered_set<int64_t> granted;
+  // Stop counting rejected sites without enabling frame write-through.
+  std::unordered_set<int64_t> ineligible;
   // Exception deopts counted per eligible site that is not yet granted.
   std::unordered_map<int64_t, uint32_t> counts;
 };
@@ -7551,27 +7553,29 @@ void Ci_ExcEdgeDeopt311(
       return;
   }
   jit::ExcEdgeCodeState311& state = jit::s_exc_edge_311[code];
-  if (state.granted.count(bc_offset) != 0) {
-    // Granted, yet it still deopts: no edge could be emitted there (a row
-    // the builder does not compile, or instrumentation declined it).
+  if (state.granted.count(bc_offset) != 0 ||
+      state.ineligible.count(bc_offset) != 0) {
+    // Already classified. A granted site can still deopt if
+    // instrumentation declined its edge.
     return;
   }
   uint32_t fails = ++state.counts[bc_offset];
   if (fails < jit::kExcEdgeGrantAfter311 || jit::s_exc_edge_recompiling_311) {
     return;
   }
-  state.granted.insert(bc_offset);
   state.counts.erase(bc_offset);
   if (!jit::hir::excEdgeCapable311(code, bc_offset)) {
+    state.ineligible.insert(bc_offset);
     JIT_DLOG(
-        "exception-edge site {}+{} granted but not edge-capable",
+        "exception-edge site {}+{} is not edge-capable",
         codeQualname(code),
         bc_offset);
     // Under a row the builder does not compile (with, finally, a handler's
-    // own body) or under no row at all: the grant only silences the
-    // counting, the deopt exit stays and spends the ROI budget as before.
+    // own body) or under no row at all: stop counting without a grant.
+    // The deopt exit stays and spends the ROI budget as before.
     return;
   }
+  state.granted.insert(bc_offset);
   jit::s_exc_edge_recompiling_311 = true;
   SCOPE_EXIT(jit::s_exc_edge_recompiling_311 = false);
   jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});

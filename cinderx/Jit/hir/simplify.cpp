@@ -14,7 +14,6 @@
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/array_specialize.h"
-#include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -1533,9 +1532,8 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
 #if PY_VERSION_HEX < 0x030C0000
     const FrameState* frame = instr->frameState();
     if (frame != nullptr && frame->parent == nullptr &&
-        frame->code != nullptr &&
-        PyBytes_GET_SIZE(frame->code->co_exceptiontable) != 0 &&
-        excEdgeCapable311(frame->code, instr->bytecodeOffset().value())) {
+        frame->code == env.func.code &&
+        env.func.excEdgeCapable311(instr->bytecodeOffset())) {
       // A zero-divide guard does not count as an exception at BINARY_OP.
       // Keep the helper's exception exit so this site can earn its grant,
       // including FloatBinaryOp produced by an in-place specialization.

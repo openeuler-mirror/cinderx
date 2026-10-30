@@ -2085,6 +2085,19 @@ BasicBlock* HIRBuilder::buildHIRImpl(
     // Inlined bodies keep the deopt model: their handler would run in the
     // caller's real frame, which the entry helper cannot tell apart.
     exc_table_ = analyzeExcTable311(code_);
+    auto& capable = irfunc->exc_edge_capable_311;
+    capable.clear();
+    if (!exc_table_.entries.empty()) {
+      int units = static_cast<int>(exc_table_.handler_region.size());
+      capable.resize(units, false);
+      for (const auto& entry : exc_table_.entries) {
+        for (int index = std::max(entry.start, 0);
+             index < std::min(entry.end, units);
+             ++index) {
+          capable[index] = true;
+        }
+      }
+    }
     // With an edge in this function the frame can be exposed by the
     // traceback while machine code keeps running: keep its locals current
     // (see frameLocalsWrittenThrough311), and tell the LIR exit to release
