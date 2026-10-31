@@ -4,6 +4,7 @@
 
 #include "ceval.h"
 
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/python_runtime.h"
 
@@ -544,7 +545,18 @@ bool hasArraySubscrStoreFastPathEvidence(
     Register* container,
     Register* sub,
     Register* value,
-    Type array_type) {
+    Type array_type,
+    bool subscr_adaptive_stuck) {
+  // SPIKE(ARRAYSTUCK): a store site the 3.11 specializer tried and failed
+  // to specialize is evidence in itself -- list/dict receivers would have
+  // taken a *_LIST_INT/_DICT verdict, so a stuck site in array-using code
+  // is worth the guarded array fast path (scimark: 8 stores per FFT
+  // butterfly stayed on the generic helper over this).
+  static const bool spike_array_stuck =
+      Ci_SpikeGetenv("SPIKE_ARRAYSTUCK") != nullptr;
+  if (spike_array_stuck && subscr_adaptive_stuck) {
+    return true;
+  }
   return container->isA(array_type) ||
       (registerHasTypeEvidence(sub, TLongExact) &&
        registerHasTypeEvidence(value, TFloatExact));
@@ -1633,8 +1645,13 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // A timestamp calculation in an otherwise generic constructor is not a
   // numeric kernel. Scope the extension to repeated work or container updates.
   // All evidence comes from normal-flow-reachable instructions.
-  bool allow_subscripts = has_numeric_kernel_shape &&
-      (has_float_arithmetic || (has_float_constant && has_arithmetic));
+  // SIM(SUBSCR): the spike admitted every subscript-bearing function; dev's
+  // numeric-kernel heuristic below refuses the rest (deepcopy, chameleon,
+  // ...).  With the switch set the heuristic is bypassed for measurement.
+  static const bool sim_subscr_all = Ci_SpikeGetenv("SPIKE_SUBSCR") != nullptr;
+  bool allow_subscripts = sim_subscr_all ||
+      (has_numeric_kernel_shape &&
+       (has_float_arithmetic || (has_float_constant && has_arithmetic)));
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
@@ -2287,6 +2304,17 @@ void HIRBuilder::translate(
     BytecodeInstruction prev_bc_instr{code_, BCOffset{-2}};
     for (auto bc_it = bc_block.begin(); bc_it != bc_block.end(); ++bc_it) {
       BytecodeInstruction bc_instr = *bc_it;
+
+#if PY_VERSION_HEX < 0x030C0000
+      // SPIKE(SLICEFAST): the subscript was emitted together with its
+      // BUILD_SLICE; nothing left to translate for it.
+      if (spike_skip_bc_offset_ >= 0 &&
+          bc_instr.baseOffset().value() == spike_skip_bc_offset_) {
+        spike_skip_bc_offset_ = -1;
+        prev_bc_instr = bc_instr;
+        continue;
+      }
+#endif
 
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
@@ -3888,7 +3916,18 @@ void HIRBuilder::emitBinaryOp(
     op_kind = *opt_op_kind;
   }
 
-  auto* binop = tc.emit<BinaryOp>(result, op_kind, left, right, tc.frame);
+  // SPIKE(ARRAYSTUCK): carry the stuck-specialization evidence onto the
+  // HIR instruction for the simplify-stage array fast path.
+  bool subscr_stuck = op_kind == BinaryOpKind::kSubscript &&
+      getConfig().specialized_opcodes && bc_instr.isSubscrAdaptiveStuck();
+  auto* binop = tc.emit<BinaryOp>(
+      result,
+      op_kind,
+      left,
+      right,
+      tc.frame,
+      /* array_subscr_slow_path= */ false,
+      subscr_stuck);
   stack.push(result);
 #if PY_VERSION_HEX < 0x030C0000
   emitExcEdge311(tc, bc_instr, binop, result);
@@ -3996,6 +4035,64 @@ void HIRBuilder::emitBuildSlice(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   std::size_t num_operands = static_cast<std::size_t>(bc_instr.oparg());
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(SLICEFAST): BUILD_SLICE immediately consumed by BINARY_SUBSCR /
+  // STORE_SUBSCR is translated as one helper call that never materialises
+  // the slice object (fannkuch: PySlice_New / Unpack / AdjustIndices plus the
+  // index conversions were ~20% of the profile).  The subscript bytecode is
+  // then skipped by the translation loop.  The helper raises exactly what
+  // the slice-object path would, so the deopt points are exception-only.
+  static const bool spike_slicefast =
+      Ci_SpikeGetenv("SPIKE_SLICEFAST") != nullptr;
+  if (spike_slicefast) {
+    BytecodeInstruction next = bc_instr.nextInstr();
+    int next_op = next.opcode();
+    if (next_op == BINARY_SUBSCR || next_op == STORE_SUBSCR) {
+      auto& stack = tc.frame.stack;
+      Register* step = nullptr;
+      if (num_operands == 3) {
+        step = stack.pop();
+      }
+      Register* stop = stack.pop();
+      Register* start = stack.pop();
+      if (step == nullptr) {
+        step = temps_.AllocateNonStack();
+        tc.emit<LoadConst>(step, Type::fromObject(Py_None));
+      }
+      Register* container = stack.pop();
+      tc.frame.cur_instr_offs = next.baseOffset();
+      if (next_op == BINARY_SUBSCR) {
+        Register* raw = temps_.AllocateNonStack();
+        auto call = tc.emit<CallStatic>(
+            4,
+            raw,
+            reinterpret_cast<void*>(JITRT_GetSlice311),
+            TObject | TNullptr);
+        call->SetOperand(0, container);
+        call->SetOperand(1, start);
+        call->SetOperand(2, stop);
+        call->SetOperand(3, step);
+        Register* result = temps_.AllocateStack();
+        tc.emit<CheckExc>(result, raw, tc.frame);
+        stack.push(result);
+      } else {
+        Register* value = stack.pop();
+        Register* status = temps_.AllocateNonStack();
+        auto call = tc.emit<CallStatic>(
+            5, status, reinterpret_cast<void*>(JITRT_SetSlice311), TCInt64);
+        call->SetOperand(0, container);
+        call->SetOperand(1, start);
+        call->SetOperand(2, stop);
+        call->SetOperand(3, step);
+        call->SetOperand(4, value);
+        Register* checked = temps_.AllocateNonStack();
+        tc.emit<IsNegativeAndErrOccurred>(checked, status, tc.frame);
+      }
+      spike_skip_bc_offset_ = next.baseOffset().value();
+      return;
+    }
+  }
+#endif
   tc.emitVariadic<BuildSlice>(temps_, num_operands);
 }
 
@@ -6996,6 +7093,18 @@ Register* HIRBuilder::emitArrayIndexGuard(
   tc.block = idx_ok;
   tc.emit<RefineType>(sub, TLongExact, sub);
   Register* unboxed_idx = temps_.AllocateStack();
+  // SPIKE(ARRIDX): compact ints unbox inline, wider ints take the generic
+  // store; the helper form paid a PyLong_AsSsize_t call plus an error probe.
+  static const bool spike_arridx = Ci_SpikeGetenv("SPIKE_ARRIDX") != nullptr;
+  if (spike_arridx) {
+    BasicBlock* idx_compact = cfg.AllocateBlock();
+    Register* is_compact = temps_.AllocateStack();
+    tc.emit<IsCompactLong>(is_compact, sub);
+    tc.emit<CondBranch>(is_compact, idx_compact, slow_path);
+    tc.block = idx_compact;
+    tc.emit<CompactLongUnbox>(unboxed_idx, sub);
+    return unboxed_idx;
+  }
   // Sequence indices overflow with IndexError, not numeric OverflowError.
   tc.emit<IndexUnbox>(unboxed_idx, sub);
   Register* neg_check = temps_.AllocateStack();
@@ -7188,7 +7297,11 @@ void HIRBuilder::emitStoreSubscr(
     if (array_type != nullptr) {
       Type array_type_guard = Type::fromTypeExact(array_type);
       if (!hasArraySubscrStoreFastPathEvidence(
-              container, sub, value, array_type_guard)) {
+              container,
+              sub,
+              value,
+              array_type_guard,
+              bc_instr.isSubscrAdaptiveStuck())) {
         tc.emit<StoreSubscr>(container, sub, value, tc.frame);
         return;
       }
@@ -7260,6 +7373,18 @@ bool HIRBuilder::tryStoreSubscrArray(
 
   // typecode matched — bounds check + store
   tc.block = tc_ok;
+  // SPIKE(ARRIDX): the bounds check below is a helper whose own FrameState
+  // has the operands popped, which is right for its exception exit.
+  // Simplify replaces it with an inline compare + Guard, and a Guard replays
+  // the whole STORE_SUBSCR in the interpreter, so it needs the state from
+  // before the pops; record that state here for Simplify to find.
+  {
+    FrameState pre_pop = tc.frame;
+    pre_pop.stack.push(value);
+    pre_pop.stack.push(container);
+    pre_pop.stack.push(sub);
+    tc.emit<Snapshot>(pre_pop);
+  }
   auto adjusted_idx = temps_.AllocateStack();
   tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
   auto ob_item = temps_.AllocateStack();

@@ -141,12 +141,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
   // install.  Its answer is what lets the compile entry stop reporting OK
-  // for a function that was never installed.  BINARY_SUBSCR is on the
-  // execute whitelist but outside the numeric-kernel admission policy, so
-  // obj[0] is still refused before the compiler runs.  An empty data block
+  // for a function that was never installed. BUILD_SLICE is still outside
+  // normal-flow admission after MR7 enables subscripts. An empty data block
   // exercises the same early-return paths an allocation failure would take.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(obj): return obj[0]", "func"));
+      compileAndGet("def func(obj): return obj[1:]", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;
@@ -1263,24 +1262,25 @@ foo = "hello"
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
-#if PY_VERSION_HEX < 0x030C0000
-  // The body reads globals, loads an attribute and makes calls -- opcodes
-  // the canary execute surface has not opened (MR-06 and later), so
-  // publication refuses this compile.  While the publication verdict was
-  // swallowed this case reported OK, ran the call through the interpreter,
-  // and was green without asserting anything; the honest verdict is what
-  // it can assert until the surface opens, at which point the OK branch
-  // below takes over and the builtins-watchability contract it was
-  // written for becomes checkable again.
-  ASSERT_EQ(comp_result, jit::Result::CANNOT_SPECIALIZE);
-  ASSERT_FALSE(jit_ctx_->didCompile(func));
-#else
   ASSERT_EQ(comp_result, jit::Result::OK);
+  ASSERT_TRUE(jit_ctx_->didCompile(func));
+#if PY_VERSION_HEX < 0x030C0000
+  auto entries_before = jit::triggerStatsSnapshot().machine_code_entries;
 #endif
 
   auto empty_tuple = Ref<>::steal(PyTuple_New(0));
   auto result = Ref<>::steal(PyObject_Call(func, empty_tuple, nullptr));
   ASSERT_EQ(result, Py_None);
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entries_before);
+#endif
+  EXPECT_EQ(PyDict_GetItemString(func->func_globals, "foo"), nullptr);
+  auto key = Ref<>::steal(PyLong_FromLong(42));
+  ASSERT_NE(key, nullptr);
+  BorrowedRef<> stored = PyDict_GetItem(func->func_builtins, key);
+  ASSERT_NE(stored, nullptr);
+  EXPECT_EQ(PyLong_AsLong(stored), 42);
+  EXPECT_FALSE(PyErr_Occurred());
 }
 
 class JITConfigTest : public RuntimeTest {};

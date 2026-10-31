@@ -10,6 +10,7 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/property.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/type.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/analysis.h"
@@ -280,6 +281,13 @@ Register* simplifyCheck(const CheckBase* instr) {
   return nullptr;
 }
 
+Register* tryEmitInlineBoundsCheck(
+    Env& env,
+    const FrameState* dominating_fs,
+    Register* container,
+    Register* unboxed_index);
+bool spikeArrIdx();
+
 Register* simplifyCheckSequenceBounds(
     Env& env,
     const CheckSequenceBounds* instr) {
@@ -302,6 +310,21 @@ Register* simplifyCheckSequenceBounds(
       } else {
         return idx;
       }
+    }
+  }
+  // SPIKE(ARRIDX): the builder's array.array store path (and any other
+  // helper-form bounds check on a var-sized exact container) lowers to a
+  // JITRT_CheckSequenceBounds call; replace it with the inline form.
+  PyTypeObject* stdlib_array = getStdlibArrayType();
+  if (spikeArrIdx() && idx->isA(TCInt64) &&
+      ((stdlib_array != nullptr &&
+        sequence->isA(Type::fromTypeExact(stdlib_array))) ||
+       sequence->isA(TListExact) || sequence->isA(TTupleExact))) {
+    Register* normalized = tryEmitInlineBoundsCheck(
+        env, instr->getDominatingFrameState(), sequence, idx);
+    if (normalized != nullptr) {
+      env.emit<UseType>(sequence, sequence->type().unspecialized());
+      return normalized;
     }
   }
   return nullptr;
@@ -915,6 +938,124 @@ Register* unboxAndCheckListOrTupleIndex(
 // fires after earlier type propagation has had a chance to prove either the
 // container or index shape. Subscripts on statically-typed list/tuple/dict/str
 // containers are already lowered by simplifyBinaryOp and never reach here.
+// SPIKE(ARRIDX): inline bounds check for a list/tuple/array.array container
+// and an unboxed CInt64 index: normalise a negative index by ob_size, then
+// Guard on unsigned index < length.  The Guard binds to the Snapshot emitted
+// here from the dominating FrameState (operands still on the stack), so a
+// deopt re-executes the subscript in the interpreter and raises the native
+// IndexError.  Returns nullptr when no dominating FrameState is available.
+Register* tryEmitInlineBoundsCheck(
+    Env& env,
+    const FrameState* dominating_fs,
+    Register* container,
+    Register* unboxed_index) {
+  if (dominating_fs == nullptr) {
+    return nullptr;
+  }
+  Register* length = nullptr;
+  PyTypeObject* array_type = getStdlibArrayType();
+  if (array_type != nullptr &&
+      container->isA(Type::fromTypeExact(array_type))) {
+    // array.array is a PyVarObject; TArray in emitGetLengthInt64 is the
+    // static-Python array type, not the stdlib one.
+    length = env.emit<LoadField>(
+        container, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
+  } else {
+    length = emitGetLengthInt64(env, container);
+  }
+  if (length == nullptr) {
+    return nullptr;
+  }
+  Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+  Register* is_negative = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThan, unboxed_index, zero);
+  Register* normalized_index = env.emitCond(
+      [&](BasicBlock* true_bb, BasicBlock* false_bb) {
+        env.emit<CondBranch>(is_negative, true_bb, false_bb);
+      },
+      [&] {
+        return env.emit<IntBinaryOp>(BinaryOpKind::kAdd, unboxed_index, length);
+      },
+      [&] { return unboxed_index; });
+  env.emit<Snapshot>(*dominating_fs);
+  Register* in_bounds = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThanUnsigned, normalized_index, length);
+  env.emit<Guard>(in_bounds);
+  return normalized_index;
+}
+
+bool spikeArrIdx() {
+  static const bool on = Ci_SpikeGetenv("SPIKE_ARRIDX") != nullptr;
+  return on;
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(STRCHR): str[i] on a compact-ASCII string with an in-range index is
+// a byte load and a table lookup.  The table holds CPython's own latin-1
+// character singletons (permanent objects), so the fetched value is a
+// borrowed reference and the refcount pass makes it owned only where it
+// escapes, exactly as for a list item.  Other storage kinds keep sq_item.
+PyObject* const* spikeLatin1Table() {
+  // Compile workers share the main thread's GIL, but must serialize writes
+  // with each other. Protect both table publication and the reference-count
+  // writes in PyUnicode_FromOrdinal with the same lock used by the compiler.
+  ThreadedCompileSerialize guard;
+  static PyObject* table[256];
+  static bool init = false;
+  if (!init) {
+    for (int i = 0; i < 256; ++i) {
+      // New references to the singletons, held for the life of the process.
+      table[i] = PyUnicode_FromOrdinal(i);
+      JIT_CHECK(table[i] != nullptr, "latin-1 singleton table");
+    }
+    init = true;
+  }
+  return table;
+}
+
+Register* emitUnicodeCharFetch(
+    Env& env,
+    Register* str,
+    Register* adjusted_idx,
+    const FrameState& frame) {
+  static const bool spike_strchr = Ci_SpikeGetenv("SPIKE_STRCHR") != nullptr;
+  if (!spike_strchr || !adjusted_idx->isA(TCInt64)) {
+    return env.emit<UnicodeSubscr>(str, adjusted_idx, frame);
+  }
+  Register* state = env.emit<LoadField>(
+      str, "state", offsetof(PyASCIIObject, state), TCUInt8);
+  Register* mask = env.emit<LoadConst>(Type::fromCUInt(0x60, TCUInt8));
+  Register* bits = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, state, mask);
+  Register* compact_ascii =
+      env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, bits, mask);
+  return env.emitCond(
+      [&](BasicBlock* t, BasicBlock* f) {
+        env.emit<CondBranch>(compact_ascii, t, f);
+      },
+      [&] {
+        Register* data_off =
+            env.emit<LoadConst>(Type::fromCInt(sizeof(PyASCIIObject), TCInt64));
+        Register* data = env.emit<LoadFieldAddress>(str, data_off);
+        Register* ch = env.emit<LoadArrayItem>(
+            data, adjusted_idx, str, static_cast<intptr_t>(0), TCUInt8);
+        Register* ch_idx = env.emit<PrimitiveConvert>(ch, TCInt64);
+        Register* table = env.emit<LoadConst>(
+            Type::fromCPtr(const_cast<PyObject**>(spikeLatin1Table())));
+        return env.emit<LoadArrayItem>(
+            table, ch_idx, str, static_cast<intptr_t>(0), TUnicodeExact);
+      },
+      [&] { return env.emit<UnicodeSubscr>(str, adjusted_idx, frame); });
+}
+#else
+Register* emitUnicodeCharFetch(
+    Env& env,
+    Register* str,
+    Register* adjusted_idx,
+    const FrameState& frame) {
+  return env.emit<UnicodeSubscr>(str, adjusted_idx, frame);
+}
+#endif
+
 Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   if (!getConfig().specialized_opcodes) {
     return nullptr;
@@ -941,6 +1082,10 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   }
 
   const FrameState& frame = *instr->frameState();
+  // SPIKE(ARRIDX): capture the dominating FrameState before the block is
+  // split below -- afterwards the instruction heads the tail block and has no
+  // preceding Snapshot to find.
+  const FrameState* dominating_fs = instr->getDominatingFrameState();
   CFG& cfg = env.func.cfg;
 
   BasicBlock* arr_ok = cfg.AllocateBlock();
@@ -963,9 +1108,22 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   env.block = idx_ok;
   env.cursor = idx_ok->end();
   Register* idx = env.emit<RefineType>(TLongExact, sub);
-  // Match array indexing's IndexError for integers outside Py_ssize_t.
-  Register* unboxed_idx = env.emit<IndexUnbox>(idx);
-  env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
+  Register* unboxed_idx;
+  if (spikeArrIdx()) {
+    // SPIKE(ARRIDX): a compact int unboxes inline; anything wider takes the
+    // generic subscript (no deopt, no PyLong_AsSsize_t call).
+    BasicBlock* idx_compact = cfg.AllocateBlock();
+    env.new_blocks += 1;
+    Register* is_compact = env.emit<IsCompactLong>(idx);
+    env.emit<CondBranch>(is_compact, idx_compact, slow);
+    env.block = idx_compact;
+    env.cursor = idx_compact->end();
+    unboxed_idx = env.emit<CompactLongUnbox>(idx);
+  } else {
+    // Match array indexing's IndexError for integers outside Py_ssize_t.
+    unboxed_idx = env.emit<IndexUnbox>(idx);
+    env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
+  }
   Register* descr = env.emit<LoadField>(
       arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
   Register* typecode = env.emit<LoadField>(
@@ -978,35 +1136,92 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   // --- tc_ok: bounds check, then inlined native load + box ---
   env.block = tc_ok;
   env.cursor = tc_ok->end();
-  Register* adjusted_idx =
-      env.emit<CheckSequenceBounds>(arr, unboxed_idx, frame);
+  Register* adjusted_idx = nullptr;
+  if (spikeArrIdx()) {
+    adjusted_idx =
+        tryEmitInlineBoundsCheck(env, dominating_fs, arr, unboxed_idx);
+  }
+  if (adjusted_idx == nullptr) {
+    adjusted_idx = env.emit<CheckSequenceBounds>(arr, unboxed_idx, frame);
+  }
   Register* ob_item = env.emit<LoadField>(
       arr, "ob_item", offsetof(StdlibArrayObject, ob_item), TCPtr);
   Register* raw_double = env.emit<LoadArrayItem>(
       ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCDouble);
   Register* fast_result = env.emit<PrimitiveBox>(raw_double, TCDouble, frame);
+  // The inline bounds check may have split tc_ok; the block that actually
+  // branches to `done` is wherever the cursor ended up.
+  BasicBlock* tc_ok_end = env.block;
   env.emit<Branch>(done);
 
   // --- slow: generic subscript (PyObject_GetItem) ---
   env.block = slow;
   env.cursor = slow->end();
-  BinaryOp* slow_instr =
-      env.emitInstr<BinaryOp>(
-          BinaryOpKind::kSubscript,
-          container,
-          sub,
-          frame,
-          /* array_subscr_slow_path= */ true);
-  Register* slow_result = slow_instr->output();
+  std::unordered_map<BasicBlock*, Register*> phi_srcs{
+      {tc_ok_end, fast_result},
+  };
+  BasicBlock* generic = slow;
+  // SPIKE(STRSPEC): a site the 3.11 specializer tried and gave up on names
+  // exact str as readily as array.array (it has no str[int] form either), so
+  // on that evidence the array miss tries str next: exact str container,
+  // compact int index, inline bounds check, direct character fetch.
+  // Anything else takes the generic subscript.  No deopt is involved; a miss
+  // costs the type checks.  The weaker int-index-only evidence does not get
+  // the extra arm: it would add blocks to every such site for nothing.
+  static const bool spike_strspec = Ci_SpikeGetenv("SPIKE_STRSPEC") != nullptr;
+  if (spike_strspec && spikeArrIdx() && instr->isSubscrAdaptiveStuck() &&
+      container->type().couldBe(TUnicodeExact)) {
+    BasicBlock* str_ok = cfg.AllocateBlock();
+    BasicBlock* str_idx_ok = cfg.AllocateBlock();
+    BasicBlock* str_compact = cfg.AllocateBlock();
+    generic = cfg.AllocateBlock();
+    env.new_blocks += 4;
+    env.emit<CondBranchCheckType>(container, TUnicodeExact, str_ok, generic);
+
+    env.block = str_ok;
+    env.cursor = str_ok->end();
+    Register* str = env.emit<RefineType>(TUnicodeExact, container);
+    env.emit<CondBranchCheckType>(sub, TLongExact, str_idx_ok, generic);
+
+    env.block = str_idx_ok;
+    env.cursor = str_idx_ok->end();
+    Register* str_idx = env.emit<RefineType>(TLongExact, sub);
+    Register* str_idx_compact = env.emit<IsCompactLong>(str_idx);
+    env.emit<CondBranch>(str_idx_compact, str_compact, generic);
+
+    env.block = str_compact;
+    env.cursor = str_compact->end();
+    Register* str_unboxed = env.emit<CompactLongUnbox>(str_idx);
+    Register* str_adjusted = nullptr;
+    if (dominating_fs != nullptr) {
+      str_adjusted =
+          tryEmitInlineBoundsCheck(env, dominating_fs, str, str_unboxed);
+    }
+    if (str_adjusted == nullptr) {
+      str_adjusted = env.emit<CheckSequenceBounds>(str, str_unboxed, frame);
+    }
+    Register* str_result = emitUnicodeCharFetch(env, str, str_adjusted, frame);
+    phi_srcs.emplace(env.block, str_result);
+    env.emit<Branch>(done);
+
+    env.block = generic;
+    env.cursor = generic->end();
+  }
+
+  // --- generic subscript (PyObject_GetItem) ---
+  BinaryOp* slow_instr = env.emitInstr<BinaryOp>(
+      BinaryOpKind::kSubscript,
+      container,
+      sub,
+      frame,
+      /* array_subscr_slow_path= */ true);
+  phi_srcs.emplace(generic, slow_instr->output());
   env.emit<Branch>(done);
 
   // --- done: merge the fast and slow results ---
   env.block = done;
   env.cursor = done->begin();
-  return env.emit<Phi>(std::unordered_map<BasicBlock*, Register*>{
-      {tc_ok, fast_result},
-      {slow, slow_result},
-  });
+  return env.emit<Phi>(phi_srcs);
 }
 
 Register* simplifySubscript(
@@ -1115,9 +1330,26 @@ Register* simplifySubscript(
       env.emit<UseType>(rhs, TLongExact);
       Register* unboxed_idx = env.emit<IndexUnbox>(rhs);
       env.emit<IsNegativeAndErrOccurred>(unboxed_idx, *frame_state);
-      Register* adjusted_idx =
-          env.emit<CheckSequenceBounds>(lhs, unboxed_idx, *frame_state);
-      return env.emit<UnicodeSubscr>(lhs, adjusted_idx, *frame_state);
+      // SPIKE(ARRIDX): str[int] takes the same inline bounds check as list
+      // and tuple (the length sits in PyASCIIObject); the helper call stays
+      // for the cases the inline form cannot express.
+      Register* adjusted_idx = nullptr;
+      if (spikeArrIdx()) {
+        // The inline form's Guard replays the whole subscript, so it needs
+        // the Snapshot taken before the operands were popped; the
+        // instruction's own FrameState has them popped.  Without one the
+        // helper form stays.
+        const FrameState* dominating_fs = instr->getDominatingFrameState();
+        if (dominating_fs != nullptr) {
+          adjusted_idx =
+              tryEmitInlineBoundsCheck(env, dominating_fs, lhs, unboxed_idx);
+        }
+      }
+      if (adjusted_idx == nullptr) {
+        adjusted_idx =
+            env.emit<CheckSequenceBounds>(lhs, unboxed_idx, *frame_state);
+      }
+      return emitUnicodeCharFetch(env, lhs, adjusted_idx, *frame_state);
     }
   }
   return nullptr;

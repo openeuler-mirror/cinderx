@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/lir/generator.h"
+
+#include "cinderx/Common/spike_env.h"
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #endif
@@ -3470,6 +3472,64 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto op_kind = static_cast<int>(bin_op->op());
 
         if (bin_op->op() != BinaryOpKind::kPower) {
+#if PY_VERSION_HEX < 0x030C0000
+          // SPIKE(GISUB): generic subscripts go through a per-site cache
+          // that calls a Python __getitem__ directly.  The cache entry's
+          // `generic` word is tested inline: once the site has proven it
+          // never sees a Python-class receiver, the plain helper is called
+          // with no extra call level (the 3.11 interpreter shipped here
+          // never emits BINARY_SUBSCR_GETITEM, so there is no static
+          // evidence to gate on).
+          static const bool spike_gisub =
+              Ci_SpikeGetenv("SPIKE_GISUB") != nullptr;
+          if (spike_gisub && bin_op->op() == BinaryOpKind::kSubscript &&
+              func_->code != nullptr) {
+            auto* cache = env_->code_rt->allocateSubscrCache311();
+            Instruction* cache_reg = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Imm{reinterpret_cast<uint64_t>(cache)});
+            Instruction* generic_flag = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Ind{cache_reg,
+                    static_cast<int>(
+                        offsetof(JITRT_SubscrSiteCache311, generic))});
+            BasicBlock* generic_bb = bbb.allocateBlock();
+            BasicBlock* cached_bb = bbb.allocateBlock();
+            BasicBlock* done_bb = bbb.allocateBlock();
+            bbb.appendBranch(
+                Instruction::kCondBranch, generic_flag, generic_bb, cached_bb);
+
+            bbb.switchBlock(cached_bb);
+            Instruction* cached_res = bbb.appendCallInstruction(
+                OutVReg{DataType::kObject},
+                JITRT_SubscrCached311,
+                cache,
+                bin_op->left(),
+                bin_op->right());
+            BasicBlock* cached_pred = bbb.curBlock();
+            bbb.appendBranch(Instruction::kBranch, done_bb);
+
+            bbb.switchBlock(generic_bb);
+            Instruction* generic_res = bbb.appendCallInstruction(
+                OutVReg{DataType::kObject},
+                JITRT_GetItem311,
+                bin_op->left(),
+                bin_op->right());
+            BasicBlock* generic_pred = bbb.curBlock();
+            bbb.appendBranch(Instruction::kBranch, done_bb);
+
+            bbb.switchBlock(done_bb);
+            Instruction* phi =
+                bbb.appendInstr(bin_op->output(), Instruction::kPhi);
+            phi->allocateLabelInput(cached_pred);
+            phi->allocateLinkedInput(cached_res);
+            phi->allocateLabelInput(generic_pred);
+            phi->allocateLinkedInput(generic_res);
+            break;
+          }
+#endif
           auto* call = bbb.appendCallInstruction(
               bin_op->output(),
               helpers[op_kind],
@@ -5039,12 +5099,66 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kStoreSubscr: {
         auto instr = static_cast<const StoreSubscr*>(&i);
-        Instruction* result = bbb.appendCallInstruction(
-            OutVReg{OperandBase::k32bit},
-            PyObject_SetItem,
-            instr->GetOperand(0),
-            instr->GetOperand(1),
-            instr->GetOperand(2));
+        Instruction* result = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+        // SPIKE(GISUB): see the kBinaryOp subscript counterpart.
+        static const bool spike_gisub_store =
+            Ci_SpikeGetenv("SPIKE_GISUB") != nullptr;
+        if (spike_gisub_store && func_->code != nullptr) {
+          auto* cache = env_->code_rt->allocateSubscrCache311();
+          Instruction* cache_reg = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(cache)});
+          Instruction* generic_flag = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Ind{cache_reg,
+                  static_cast<int>(
+                      offsetof(JITRT_SubscrSiteCache311, generic))});
+          BasicBlock* generic_bb = bbb.allocateBlock();
+          BasicBlock* cached_bb = bbb.allocateBlock();
+          BasicBlock* done_bb = bbb.allocateBlock();
+          bbb.appendBranch(
+              Instruction::kCondBranch, generic_flag, generic_bb, cached_bb);
+
+          bbb.switchBlock(cached_bb);
+          Instruction* cached_res = bbb.appendCallInstruction(
+              OutVReg{OperandBase::k32bit},
+              JITRT_StoreSubscrCached311,
+              cache,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+          BasicBlock* cached_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_bb);
+
+          bbb.switchBlock(generic_bb);
+          Instruction* generic_res = bbb.appendCallInstruction(
+              OutVReg{OperandBase::k32bit},
+              PyObject_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+          BasicBlock* generic_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_bb);
+
+          bbb.switchBlock(done_bb);
+          result =
+              bbb.appendInstr(OutVReg{OperandBase::k32bit}, Instruction::kPhi);
+          result->allocateLabelInput(cached_pred);
+          result->allocateLinkedInput(cached_res);
+          result->allocateLabelInput(generic_pred);
+          result->allocateLinkedInput(generic_res);
+        }
+        if (result == nullptr)
+#endif
+          result = bbb.appendCallInstruction(
+              OutVReg{OperandBase::k32bit},
+              PyObject_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
         appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, result);
         break;
       }

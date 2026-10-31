@@ -55,6 +55,11 @@ class BytecodeInstruction {
   uint16_t cacheU16(int instruction_offset) const;
   uint32_t cacheU32(int instruction_offset) const;
   uint32_t attrCacheTypeVersion() const;
+  // SPIKE(ARRAYSTUCK): true when this (BINARY|STORE)_SUBSCR site sits in
+  // the ADAPTIVE form with a nonzero backoff -- the specializer tried and
+  // failed (array.array receivers, the scimark shape), so the site will
+  // never carry a *_LIST_INT verdict for the builder to consume.
+  bool isSubscrAdaptiveStuck() const;
   uint16_t attrCacheIndex() const;
 
   // Check if this instruction is a branch, a return, or a general basic block

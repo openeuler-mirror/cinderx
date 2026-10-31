@@ -2,9 +2,9 @@
 
 #include <gtest/gtest.h>
 
-#include "cinderx/RuntimeTests/fixtures.h"
-
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/RuntimeTests/fixtures.h"
 
 using ArrayStoreTest = RuntimeTest;
 
@@ -19,6 +19,23 @@ def store_array_double(a):
       "store_array_double",
       irfunc);
   ASSERT_NE(irfunc, nullptr);
+  if (Ci_SpikeGetenv("SPIKE_ARRIDX") != nullptr) {
+    bool compact_fallback = false;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (!instr.IsCondBranch() ||
+            !instr.GetOperand(0)->instr()->IsIsCompactLong()) {
+          continue;
+        }
+        auto* slow = static_cast<const jit::hir::CondBranch&>(instr).false_bb();
+        for (auto& fallback : *slow) {
+          compact_fallback |= fallback.IsStoreSubscr();
+        }
+      }
+    }
+    EXPECT_TRUE(compact_fallback);
+    return;
+  }
   bool found = false;
   for (auto& block : irfunc->cfg.blocks) {
     for (auto& instr : block) {

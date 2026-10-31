@@ -226,6 +226,24 @@ int BytecodeInstruction::specializedOpcode() const {
   }
 }
 
+bool BytecodeInstruction::isSubscrAdaptiveStuck() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_SUBSCR_ADAPTIVE && raw != STORE_SUBSCR_ADAPTIVE) {
+    return false;
+  }
+  // 3.11 zeroes the adaptive counter at quicken time and the first
+  // execution attempts to specialize: success replaces the opcode, and
+  // failure (or a later miss-driven despecialization) sets a nonzero
+  // backoff.  ADAPTIVE form with nonzero backoff therefore means "tried
+  // and failed", excluding never-executed cold sites.
+  uint16_t counter = cacheU16(kInlineCacheStartInstructionOffset);
+  return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
+#else
+  return false;
+#endif
+}
+
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;
