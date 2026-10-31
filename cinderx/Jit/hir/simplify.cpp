@@ -996,6 +996,10 @@ bool spikeArrIdx() {
 // borrowed reference and the refcount pass makes it owned only where it
 // escapes, exactly as for a list item.  Other storage kinds keep sq_item.
 PyObject* const* spikeLatin1Table() {
+  // Compile workers share the main thread's GIL, but must serialize writes
+  // with each other. Protect both table publication and the reference-count
+  // writes in PyUnicode_FromOrdinal with the same lock used by the compiler.
+  ThreadedCompileSerialize guard;
   static PyObject* table[256];
   static bool init = false;
   if (!init) {

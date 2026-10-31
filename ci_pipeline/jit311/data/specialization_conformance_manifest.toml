@@ -13,8 +13,7 @@ expected_outcome = "jit"
 name = "BINARY_SUBSCR"
 witness = "binary-subscr-list"
 expected_specialized_opcodes = ["BINARY_SUBSCR_LIST_INT"]
-expected_outcome = "safe-refuse"
-expected_reason = "REFUSE_SHAPE_SUBSCRIPT_ADMISSION"
+expected_outcome = "jit"
 
 [[family]]
 name = "CALL"
@@ -98,8 +97,7 @@ expected_outcome = "jit"
 name = "STORE_SUBSCR"
 witness = "store-subscr-list"
 expected_specialized_opcodes = ["STORE_SUBSCR_LIST_INT"]
-expected_outcome = "safe-refuse"
-expected_reason = "REFUSE_SHAPE_SUBSCRIPT_ADMISSION"
+expected_outcome = "jit"
 
 [[family]]
 name = "UNPACK_SEQUENCE"

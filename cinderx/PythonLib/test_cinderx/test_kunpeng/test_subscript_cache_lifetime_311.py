@@ -1,7 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 """Artifact ownership and concurrent compilation of generic subscript caches."""
 
+import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -68,6 +70,61 @@ for cycle in range(2):
     assert not any(ref() is not None for ref in refs)
     assert cache_count() == baseline, cache_count()
 print('batch caches reclaimed')
+"""
+
+LATIN1_FIRST_COMPILE_PROBE = r"""
+import array
+import dis
+import gc
+import json
+import sys
+import _cinderx, cinderx
+cinderx.init()
+_cinderx.install_frame_evaluator()
+import cinderjit
+assert cinderjit.is_enabled()
+assert cinderjit._jit311_multithreaded_compile_test_enabled()
+
+def array_load(obj):
+    return obj[0]
+
+# Compile cold: the integer literal primes only the array type cache. Warming
+# this function first would also request STRCHR and hide first-use races.
+assert cinderjit.force_compile(array_load)
+assert array_load(array.array('d', [3.5])) == 3.5
+assert cinderjit.force_uncompile(array_load)
+characters = tuple(map(chr, range(256)))
+units = []
+for index in range(256):
+    namespace = {'__name__': 'latin1_batch'}
+    exec(compile('def unit(obj): return obj[0]', f'latin1_{index}.py', 'exec'), namespace)
+    func = namespace['unit']
+    for _ in range(300):
+        assert func('Alpha') == 'A'
+    assert not cinderjit.is_jit_compiled(func)
+    assert 'BINARY_SUBSCR_ADAPTIVE' in [i.opname for i in dis.get_instructions(func, adaptive=True)]
+    units.append(func)
+    assert cinderjit._jit311_register_for_compile(func)
+gc.collect()
+before = tuple(map(sys.getrefcount, characters))
+cinderjit._jit311_multithreaded_compile_test()
+assert all(cinderjit.is_jit_compiled(func) for func in units)
+after = tuple(map(sys.getrefcount, characters))
+delta = [a - b for a, b in zip(after, before)]
+assert delta == [1] * 256, delta
+entries = _cinderx._get_trigger_stats()['machine_code_entries']
+for func in units:
+    for value in ('Alpha', '\x00tail', '\x7ftail', '\u00e9tail', '\u03bbtail', '\U0001f642tail'):
+        answer = func(value)
+        assert answer == value[0] and type(answer) is str
+    del answer
+assert _cinderx._get_trigger_stats()['machine_code_entries'] - entries == len(units) * 6
+for func in units:
+    assert cinderjit.force_uncompile(func)
+gc.collect()
+assert tuple(map(sys.getrefcount, characters)) == after
+print('latin1 first compile ' + json.dumps(
+    {'units': len(units), 'refcount_delta': delta, 'entries': len(units) * 6}))
 """
 
 FAILURE_PROBE = PREAMBLE + """
@@ -251,6 +308,36 @@ class SubscriptCacheLifetime311Tests(unittest.TestCase):
                                  PYTHONJITBATCHCOMPILEWORKERS=str(workers))
                 if workers == 8:
                     self.assertIn("compiles attempted: 2048", proc.stderr)
+
+    def test_first_parallel_latin1_table_initialization(self):
+        serial = None
+        for workers in (1, 8, 8, 8):
+            with self.subTest(workers=workers):
+                proc = self._run(
+                    LATIN1_FIRST_COMPILE_PROBE, "latin1 first compile ",
+                    PYTHONJITMULTITHREADEDCOMPILETEST="1",
+                    PYTHONJITBATCHCOMPILEWORKERS=str(workers),
+                    PYTHONJITDUMPFINALHIR="1")
+                report = json.loads(proc.stdout.split("latin1 first compile ", 1)[1])
+                if serial is None:
+                    serial = report
+                else:
+                    self.assertEqual(report, serial)
+                sections = re.split(
+                    r"JIT: [^\n]* -- Optimized HIR for ", proc.stderr)[1:]
+                array_hir = [s for s in sections if s.startswith("__main__:array_load:")]
+                self.assertEqual(len(array_hir), 1)
+                self.assertNotRegex(array_hir[0], r"UnicodeExact = LoadArrayItem")
+                units = [s for s in sections if s.startswith("latin1_batch:unit:")]
+                self.assertEqual(len(units), 256)
+                tables = set()
+                for hir in units:
+                    self.assertRegex(hir, r"CUInt8 = LoadArrayItem")
+                    self.assertRegex(hir, r"UnicodeExact = LoadArrayItem")
+                    tables.update(re.findall(r"LoadConst<CPtr\[(0x[0-9a-f]+)\]>", hir))
+                self.assertEqual(len(tables), 1)
+                if workers == 8:
+                    self.assertIn("compiles attempted: 256, compiles retried: 0", proc.stderr)
 
     def test_failed_compilation_reclaims_caches(self):
         for workers in (1, 8):
