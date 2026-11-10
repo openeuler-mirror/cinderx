@@ -50,6 +50,7 @@ enum PassConfig : uint64_t {
   kPrimitiveUnboxCSE = 1 << 12,
   kFloatComparisonSimplification = 1 << 13,
   kTreeIterStateMachine = 1 << 14,
+  kHirCSE = 1 << 15,
 
   // Run all the passes.
   kAll = ~uint64_t{0},

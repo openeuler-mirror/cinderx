@@ -12,6 +12,13 @@
 
 namespace jit::hir {
 
+// True when the bytecode offset lies inside a range covered by the code
+// object's exception table (a handler or cleanup would run for an exception
+// raised there).
+bool isInExceptionProtectedRange(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset target_offset);
+
 class Function {
  public:
   using InlineFailureStats =
@@ -46,6 +53,41 @@ class Function {
   Type return_type{TObject};
 
   FrameMode frameMode{FrameMode::kNormal};
+  // CPython 3.11: the builder writes every local-variable store through to
+  // the materialized frame (MR-08 frame observability), so the frame's
+  // localsplus hold owned references while the body runs and the exit must
+  // release them (the inline unlink assumes empty slots).
+  bool frame_locals_written_through_311{false};
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Builder analysis for the root code, indexed by code unit. Reused by
+  // Simplify so each float divide does not rescan the exception table and
+  // bytecode. Empty when no handler is eligible; inlined bodies do not use it.
+  std::vector<bool> exc_edge_capable_311;
+
+  bool excEdgeCapable311(BCOffset offset) const {
+    int index = offset.asIndex().value();
+    return index >= 0 &&
+        static_cast<size_t>(index) < exc_edge_capable_311.size() &&
+        exc_edge_capable_311[index];
+  }
+#endif
+
+  // Cells belong to this compilation, never to a process-wide code-address map.
+  // LIR retains their storage in CodeRuntime before HIR is destroyed.
+#if PY_VERSION_HEX < 0x030C0000
+  mutable std::unordered_map<int64_t, std::shared_ptr<void>>
+      predicate_caches_311;
+
+  template <typename T>
+  T* predicateCache311(int64_t offset, int kind) const {
+    auto& cell = predicate_caches_311[offset * 3 + kind];
+    if (!cell) {
+      cell = std::make_shared<T>();
+    }
+    return static_cast<T*>(cell.get());
+  }
+#endif
 
   CFG cfg;
 
@@ -70,6 +112,12 @@ class Function {
 
   // Set code and a number of other members that are derived from it.
   void setCode(BorrowedRef<PyCodeObject> code);
+
+  // Total number of HIR basic blocks in the function.
+  std::size_t numBlocks() const;
+
+  // Total number of HIR instructions in the function.
+  std::size_t numInstrs() const;
 
   // Count the number of instructions that match the predicate
   std::size_t CountInstrs(InstrPredicate pred) const;

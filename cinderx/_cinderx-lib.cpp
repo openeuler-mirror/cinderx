@@ -17,6 +17,7 @@
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 #include "cinderx/Jit/anextawaitable.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
@@ -818,6 +819,7 @@ void module_free(void* raw_mod) {
   Ci_Observe311_Finalize();
 #endif
 
+  jit::finiAutoJitStabilityCodeExtraIndex();
   jit::finiOSRCodeExtraIndex();
   finiCodeExtraIndex();
 
@@ -905,6 +907,28 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 // available regardless of whether the JIT initialized: on capability-gated
 // builds the report asserts these stay zero, on execution-capable builds it
 // asserts they moved.
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" uint64_t* const Ci_JitActiveFrames311Ptr;
+extern "C" size_t Ci_JitShell311_GraveyardSize(void);
+
+static PyObject* jit311_lifetime_stats(PyObject*, PyObject*) {
+  auto result = Ref<>::steal(PyDict_New());
+  if (result == nullptr) {
+    return nullptr;
+  }
+  auto active =
+      Ref<>::steal(PyLong_FromUnsignedLongLong(*Ci_JitActiveFrames311Ptr));
+  auto graveyard =
+      Ref<>::steal(PyLong_FromSize_t(Ci_JitShell311_GraveyardSize()));
+  if (active == nullptr || graveyard == nullptr ||
+      PyDict_SetItemString(result, "active_frames", active) < 0 ||
+      PyDict_SetItemString(result, "graveyard", graveyard) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+#endif
+
 static PyObject* get_trigger_stats(PyObject*, PyObject*) {
   jit::TriggerStats stats = jit::triggerStatsSnapshot();
   return Py_BuildValue(
@@ -1087,6 +1111,13 @@ PyMethodDef _cinderx_methods[] = {
      native_recursion_probe_operand_for_test,
      METH_NOARGS,
      PyDoc_STR("Test-only number operand whose add slot probes recursion.")},
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+    {"_jit311_lifetime_stats",
+     jit311_lifetime_stats,
+     METH_NOARGS,
+     PyDoc_STR("CPython 3.11 direct-entry artifact lifetime: live counted "
+               "machine-code frames and artifacts awaiting reclamation.")},
 #endif
     {"_get_trigger_stats",
      get_trigger_stats,
@@ -1534,6 +1565,7 @@ int _cinderx_exec_impl(PyObject* m) {
   // interpreter and try to use it.
   initCodeExtraIndex();
   jit::initOSRCodeExtraIndex();
+  jit::initAutoJitStabilityCodeExtraIndex();
 
   if (watcher_state.init() < 0) {
     return -1;

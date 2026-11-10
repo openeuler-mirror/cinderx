@@ -234,6 +234,10 @@ void inlineFunctionCall(Function& caller, AbstractCall* call_instr) {
     return;
   }
 
+  // Keep the callee alive even if optimization removes its inline markers.
+  // Environment references are transferred to the compiled CodeRuntime.
+  caller.env.addReference(callee);
+
   // This logging is parsed by jitlist_bisect.py to find inlined functions.
   JIT_LOGIF(
       getConfig().log.debug_inliner || getConfig().log.debug,

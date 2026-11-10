@@ -3,6 +3,7 @@
 #include "cinderx/Jit/trigger_stats.h"
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/spike_env.h"
 
 #include <atomic>
 #include <map>
@@ -13,12 +14,27 @@
 
 namespace jit {
 
+const bool g_spike_coldsink = Ci_SpikeGetenv("SPIKE_COLDSINK") != nullptr;
+const bool g_spike_deoptsink = Ci_SpikeGetenv("SPIKE_DEOPTSINK") != nullptr;
+
 namespace {
 
 std::atomic<uint64_t> s_executable_alloc_calls{0};
 std::atomic<uint64_t> s_executable_alloc_bytes{0};
 std::atomic<uint64_t> s_compiled_function_creations{0};
-std::atomic<uint64_t> s_machine_code_entries{0};
+// The machine-code entry counter and the live-frame counter of the CPython
+// 3.11 direct entry sit in one block: the generated frame link materializes
+// the block's address once and bumps both through it.
+struct EntryCounters {
+  std::atomic<uint64_t> machine_code_entries{0};
+  uint64_t active_frames{0};
+};
+static_assert(
+    offsetof(EntryCounters, active_frames) == 8,
+    "codegen addresses active_frames at +8 from machine_code_entries");
+EntryCounters s_entry_counters;
+std::atomic<uint64_t>& s_machine_code_entries =
+    s_entry_counters.machine_code_entries;
 std::atomic<uint64_t> s_shadow_compile_success{0};
 std::atomic<uint64_t> s_shadow_specialized_opcodes_consumed{0};
 std::atomic<uint64_t> s_shadow_codegen_bytes{0};
@@ -70,9 +86,35 @@ void triggerStatsOnCompiledFunctionCreate() {
   s_compiled_function_creations.fetch_add(1, std::memory_order_relaxed);
 }
 
+uint64_t* triggerStatsMachineCodeEntriesAddress() {
+  static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t));
+  return reinterpret_cast<uint64_t*>(&s_entry_counters.machine_code_entries);
+}
+
+uint64_t* triggerStatsActiveFramesAddress() {
+  return &s_entry_counters.active_frames;
+}
+
+// C-side view (the 3.11 evaluator's graveyard check).
+extern "C" uint64_t* const Ci_JitActiveFrames311Ptr =
+    &s_entry_counters.active_frames;
+
+#if PY_VERSION_HEX < 0x030C0000
+const uint8_t* triggerStatsEntryLedgerEnabledAddress() {
+  static_assert(sizeof(std::atomic<bool>) == sizeof(uint8_t));
+  return reinterpret_cast<const uint8_t*>(&s_entry_ledger_enabled);
+}
+#endif
+
 void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   s_machine_code_entries.fetch_add(1, std::memory_order_relaxed);
 #if PY_VERSION_HEX < 0x030C0000
+  triggerStatsOnMachineCodeEntryLedger(code);
+#endif
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+void triggerStatsOnMachineCodeEntryLedger(PyCodeObject* code) {
   if (code == nullptr ||
       !s_entry_ledger_enabled.load(std::memory_order_relaxed)) {
     return;
@@ -95,10 +137,8 @@ void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   } catch (const std::bad_alloc&) {
     s_entry_ledger_dropped.fetch_add(1, std::memory_order_relaxed);
   }
-#else
-  (void)code;
-#endif
 }
+#endif
 
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
@@ -172,16 +212,19 @@ TriggerStats triggerStatsSnapshot() {
 void executionEntryLedgerReset() {
 #if PY_VERSION_HEX < 0x030C0000
   s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  updateGenDirectGate();
   s_entry_ledger.clear();
   s_entry_ledger_archived.clear();
   s_entry_ledger_dropped.store(0, std::memory_order_relaxed);
   s_entry_ledger_enabled.store(true, std::memory_order_relaxed);
+  updateGenDirectGate();
 #endif
 }
 
 void executionEntryLedgerDisable() {
 #if PY_VERSION_HEX < 0x030C0000
   s_entry_ledger_enabled.store(false, std::memory_order_relaxed);
+  updateGenDirectGate();
   s_entry_ledger.clear();
   s_entry_ledger_archived.clear();
 #endif
@@ -201,12 +244,14 @@ PyObject* executionEntryLedgerSnapshot() {
     }
   } catch (const std::bad_alloc&) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     PyErr_NoMemory();
     return nullptr;
   }
   Ref<> entries = Ref<>::steal(PyList_New(0));
   if (entries == nullptr) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     return nullptr;
   }
   for (const auto& [key, count] : rows) {
@@ -223,6 +268,7 @@ PyObject* executionEntryLedgerSnapshot() {
         static_cast<unsigned long long>(count)));
     if (item == nullptr || PyList_Append(entries, item) < 0) {
       s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+      updateGenDirectGate();
       return nullptr;
     }
   }
@@ -233,9 +279,11 @@ PyObject* executionEntryLedgerSnapshot() {
       PyDict_SetItemString(result, "entries", entries) < 0 ||
       PyDict_SetItemString(result, "dropped", dropped) < 0) {
     s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+    updateGenDirectGate();
     return nullptr;
   }
   s_entry_ledger_enabled.store(was_enabled, std::memory_order_relaxed);
+  updateGenDirectGate();
   return result.release();
 #else
   PyErr_SetString(

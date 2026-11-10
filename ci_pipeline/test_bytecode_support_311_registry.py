@@ -35,6 +35,14 @@ def test_shape_registry_covers_mr3_eligibility_reasons():
     }
 
 
+def test_retired_accumulator_reason_is_not_an_expected_runtime_refusal():
+    registry = checker.load_reason_registry(SUPPORT_LIST)
+    reason = "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY"
+    assert registry["shape"][reason].startswith("retired:")
+    capabilities = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    assert reason not in capabilities["expected_refusal"]["reasons"]
+
+
 def test_missing_shape_registry_is_detected():
     rows = checker.load_rows(SUPPORT_LIST)
     registry = mutate_registry(checker.load_reason_registry(SUPPORT_LIST))

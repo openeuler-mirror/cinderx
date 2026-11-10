@@ -12,6 +12,7 @@
 namespace jit {
 class CodeRuntime;
 struct GenDataFooter;
+struct GlobalLoadCell311;
 struct JitGenObject;
 } // namespace jit
 
@@ -49,6 +50,11 @@ void JITRT_InitFrameCellVars(
 
 std::pair<jit::JitGenObject*, jit::GenDataFooter*>
 JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate);
+
+// Initial-yield unlink taking the footer directly (CPython 3.11).
+std::pair<jit::JitGenObject*, jit::GenDataFooter*> JITRT_UnlinkGenFrame311(
+    PyThreadState* tstate,
+    jit::GenDataFooter* footer);
 
 void JITRT_MarkGeneratorCompleted();
 
@@ -101,12 +107,63 @@ PyObject* JITRT_ReenterAfterBind(
 // Transfer the current 3.11 JIT frame's recursion slot to the interpreter
 // before deopt resume. The interpreter will Enter/Leave the same real frame.
 void JITRT_TransferRecursionToInterpreter311();
+
+// CPython 3.11 port of ceval's static import_from() for the IMPORT_FROM
+// opcode: attribute lookup on the module, the sys.modules fallback for
+// circular relative imports, the stock ImportError otherwise.  Returns a new
+// reference, or NULL with the exception set.
+PyObject*
+JITRT_ImportFrom311(PyThreadState* tstate, PyObject* module, PyObject* name);
+// IMPORT_NAME with the compiled function's own builtins: the evaluator
+// resolves __import__ from the frame's f_builtins, which a function made with
+// exec() or types.FunctionType() over a private builtins dict may redefine.
+PyObject* JITRT_ImportName311(
+    PyThreadState* tstate,
+    PyObject* builtins,
+    PyObject* name,
+    PyObject* fromlist,
+    PyObject* level);
+
+// Per-site exception edges are earned: an eligible site's exception deopts
+// are counted and at the grant the code recompiles with the edge.  Both are
+// CPython 3.11 only and live in pyjit.cpp.
+int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset);
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code);
+void Ci_ExcEdgeDeopt311(
+    PyCodeObject* code,
+    int64_t bc_offset,
+    int guard_failure,
+    PyObject* func);
 void JITRT_GetRecursionState311(
     int* remaining,
     int* headroom,
     int* boundary_active,
     int* jit_entries);
 #endif
+
+// The exception exit of a raising instruction inside a try block whose
+// `except` handler is compiled becomes a CFG edge, and these helpers replay
+// the evaluator's error path and the handler opcodes.  CPython 3.11 only;
+// declared on every version because the CallCFunc table names them (the
+// other versions carry aborting stubs).
+//
+// Entry into a compiled handler.  Mirrors ceval's `error:` and the handler
+// arm of `exception_unwind:` for a non-lasti entry: publishes the raising
+// instruction's position, adds the traceback entry for this frame, then
+// fetches the normalized exception with its traceback attached.  Returns a
+// new reference to the exception instance (what the evaluator pushes for the
+// handler), or NULL with the original exception still set when a trace
+// function is installed -- the 'exception' trace event and the rest of the
+// tracing protocol stay with the evaluator, so the caller deopts.
+PyObject* JITRT_EnterExceptHandler311(uint64_t published_idx);
+// PUSH_EXC_INFO: makes `exc` the handled exception; returns the previously
+// handled exception (a new reference; None when there was none).
+PyObject* JITRT_PushExcInfo311(PyObject* exc);
+// POP_EXCEPT: restores `prev` as the handled exception.
+uint64_t JITRT_PopExcInfo311(PyObject* prev);
+// CHECK_EXC_MATCH: 1 when `exc` matches `type`, 0 when not, -1 with a
+// TypeError set when `type` is not an exception class (or tuple of them).
+int64_t JITRT_ExcMatch311(PyObject* exc, PyObject* type);
 
 // On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a
 // hidden first parameter for the return pointer, shifting all visible
@@ -163,12 +220,6 @@ PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name);
 
 #if PY_VERSION_HEX < 0x030C0000
-PyObject* JITRT_LoadGlobalModuleValue(
-    PyObject* globals,
-    PyObject* name,
-    uint32_t keys_version,
-    Py_ssize_t index);
-
 // Returns 1 when this visit should take the deopt stub because a test
 // armed the site.  The subsequent Guard/AlwaysFail uses the same
 // DeoptMetadata, so forced and organic hits share one restore.
@@ -178,6 +229,199 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
 // localsplus slot (MR-08 frame observability; value may be nullptr for
 // DELETE_FAST).  Returns 0.
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
+
+// 3.11 LOAD_GLOBAL per-site cell (jit::GlobalLoadCell311): the slow arm.
+// Performs the interpreter's lookup, then pins the cell for the next call
+// when the dicts allow it (combined, unicode-keyed, versionable) or leaves
+// it unpinned.  Returns a pointer to storage holding the value as a
+// borrowed reference: the pinned entry slot, the cell's own held reference
+// when it could not pin, or NULL storage with NameError set when absent.
+PyObject** JITRT_LoadGlobalRepin311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name);
+#if PY_VERSION_HEX < 0x030C0000
+// Artifact-owned per-site cache for subscripts on heap types whose
+// __getitem__ / __setitem__ resolve to a Python function.  A hit (same type,
+// same tp_version_tag) calls the function directly, skipping
+// slot_mp_subscript -> lookup_maybe_method -> _PyType_Lookup ->
+// vectorcall_method; everything else takes the generic path.  The cached
+// function pointer is borrowed: the version check proves the class dict is
+// unchanged, hence the function is still referenced by it.
+struct JITRT_SubscrSiteCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  // Unfillable receivers (non-heap type, or __getitem__/__setitem__ not a
+  // Python function) seen while the entry was still empty.
+  uint32_t misses;
+  PyObject* func;
+  // Set once `misses` reaches its threshold: the site never saw a Python-
+  // class receiver, so the machine code tests this word inline and calls
+  // the plain generic helper, avoiding the extra call level on str/list
+  // sites (measured +5% tomli_loads without it).
+  int64_t generic;
+};
+PyObject* JITRT_SubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key);
+int JITRT_StoreSubscrCached311(
+    JITRT_SubscrSiteCache311* cache,
+    PyObject* container,
+    PyObject* key,
+    PyObject* value);
+
+// SPIKE(ISINSTCACHE): per-site isinstance cache.  The answer for a receiver
+// type and a class depends only on the receiver type's MRO and its __class__
+// resolution (both covered by the type's version tag) as long as the class's
+// metatype is exactly `type` (no __instancecheck__ override), so one entry
+// keyed by (receiver type, version tag, class) replays it.
+struct JITRT_IsInstanceSiteCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  int32_t result;
+  PyObject* cls;
+  uint32_t cls_version;
+};
+int JITRT_IsInstanceCached311(
+    JITRT_IsInstanceSiteCache311* cache,
+    PyObject* obj,
+    PyObject* cls);
+
+// SPIKE(ISINSTGEN): per-site cache for the isinstance calls the inline type
+// test does not take: a class tuple, or a class operand whose type is not
+// known at compile time (a module attribute, a class with a custom
+// metatype).  The answer is replayed for the receiver type while that type's
+// version tag holds, provided every class is a type whose metatype resolves
+// __instancecheck__ to type.__instancecheck__ (checked on fill; a heap
+// metatype's version tag is replayed on every hit) and the receiver's
+// __class__ resolves to object's descriptor.  Class keys are borrowed and
+// checked against non-reused class version tags before their metadata is read.
+constexpr int kIsInstanceGenMaxKeys311 = 4;
+struct JITRT_IsInstanceGenCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  int32_t result;
+  int32_t nkeys;
+  // The keys came from a tuple operand (compared element-wise) rather than
+  // a single class operand (compared by identity).
+  int32_t is_tuple;
+  PyObject* keys[kIsInstanceGenMaxKeys311];
+  // Version tag of each key's metatype, or 0 when the metatype is `type`.
+  uint32_t meta_version[kIsInstanceGenMaxKeys311];
+  uint32_t key_version[kIsInstanceGenMaxKeys311];
+};
+// Returns a new reference to Py_True or Py_False, or NULL with an exception.
+PyObject* JITRT_IsInstanceGen311(
+    JITRT_IsInstanceGenCache311* cache,
+    PyObject* obj,
+    PyObject* cls);
+
+// SPIKE(GETATTRDFL): getattr(obj, name, default) for a constant name.  When
+// the name resolves on a generic-getattro type to an object slot member
+// (T_OBJECT_EX) of the receiver's class, an empty slot answers the default
+// without creating the AttributeError that the member getter raises and
+// _PyObject_LookupAttr then clears.  Every other case goes through
+// _PyObject_LookupAttr, the path builtin getattr takes for the default form.
+// The per-site entry records, for one receiver type and version tag, either
+// the slot offset or that the generic path applies, so a hit repeats no
+// type lookup.
+struct JITRT_GetAttrDefaultCache311 {
+  PyTypeObject* type;
+  PyObject* name;
+  uint32_t version;
+  // 1: `offset` is an object slot member; 0: use _PyObject_LookupAttr.
+  int32_t slot;
+  Py_ssize_t offset;
+};
+PyObject* JITRT_GetAttrDefault311(
+    JITRT_GetAttrDefaultCache311* cache,
+    PyObject* obj,
+    PyObject* name,
+    PyObject* dflt);
+
+// SPIKE(ISINSTFAST): PyObject_IsInstance with a cheap negative answer.  When
+// `cls` is an exact type (no metaclass __instancecheck__) and the object's
+// type resolves __class__ to object's own descriptor through the generic
+// getattr, a failed PyType_IsSubtype is the final answer; stock CPython
+// still performs a full __class__ attribute lookup (generic getattr +
+// descriptor call) on every False result.
+int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls);
+
+// SPIKE(RANGEITER): iter(range(*args)) for 1 <= nargs <= 3 positional
+// arguments (the unused ones NULL).  Exact ints that fit in a C long, with
+// the length and the last value representable, give the rangeiterobject
+// range_iter would build; everything else calls range(...) and then iter(),
+// so errors and the arbitrary-precision iterator are the interpreter's.
+PyObject*
+JITRT_RangeIter311(int64_t nargs, PyObject* a0, PyObject* a1, PyObject* a2);
+#endif
+// SPIKE(FLOATSPEC feedback): an evidence-free float diamond
+// (SPIKE_FLOATSPEC=all) took its generic arm at `bc_offset`; past a per-site
+// threshold the site is marked "no float speculation" and the code's
+// functions are uncompiled and rescheduled so the recompile drops the
+// speculation there.  Ci_SpikeNoFloatSpec311 is the builder's query for that
+// mark.  All of this per-site state is dropped with the code object and is
+// safe to use from concurrent compile workers.
+extern "C" void Ci_SpikeFloatSpecMiss311(PyCodeObject* code, int64_t bc_offset);
+extern "C" int Ci_SpikeNoFloatSpec311(PyCodeObject* code, int64_t bc_offset);
+// SPIKE(LONGSPEC): per-site fuse for the compact-long speculation guards.
+// Simplify registers each speculated site; the deopt path reports guard
+// failures at registered sites; after a few failures the site is marked and
+// the code recompiled without the speculation at that site only.
+extern "C" void Ci_SpikeLongSpecRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+extern "C" int Ci_SpikeNoLongSpec311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeLongSpecGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+// SPIKE(ARRTC): per-site fuse for the array.array typecode speculation of
+// subscript sites (see pyjit.cpp); same protocol as the LONGSPEC fuse.
+extern "C" void Ci_SpikeArrTcRegister311(PyCodeObject* code, int64_t bc_offset);
+extern "C" int Ci_SpikeNoArrTc311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeArrTcGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+// SPIKE(BINTYPED): per-site fuse for the *_FLOAT specialisation guards of
+// binary ops.  The builder registers each guarded site; the deopt path
+// reports guard failures; after a few failures the site is marked and the
+// code recompiled with a type-check diamond at that site only.
+extern "C" void Ci_SpikeFloatGuardRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+extern "C" int Ci_SpikeNoFloatGuard311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeFloatGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+// Stable per-site counter pair {hits, misses}; the compiled fast arm bumps
+// hits inline, the slow arm reports misses through Ci_SpikeFloatSpecMiss311.
+extern "C" uint64_t* Ci_SpikeFloatSpecSiteCounters311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+// SPIKE(SLICEFAST): container[start:stop:step] / container[start:stop:step] =
+// value without materialising a slice object.  Exact list / tuple / str with a
+// None step take PyList_GetSlice / PyTuple_GetSlice / PyUnicode_Substring
+// (and PyList_SetSlice for the store); everything else builds the slice and
+// goes through PyObject_GetItem / PyObject_SetItem exactly as before.
+PyObject* JITRT_GetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step);
+Py_ssize_t JITRT_SetSlice311(
+    PyObject* container,
+    PyObject* start,
+    PyObject* stop,
+    PyObject* step,
+    PyObject* value);
+PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
+    PyFunctionObject* func);
+void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
+PyObject* JITRT_GetItem311(PyObject* container, PyObject* index);
+PyObject* JITRT_UnicodeEqualsBoxed311(PyObject* s1, PyObject* s2, int op);
+PyObject* JITRT_UnicodeContainsBoxed311(PyObject* haystack, PyObject* needle);
 #endif
 
 /*
@@ -217,6 +461,11 @@ int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
 PyObject*
 JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
 
+// Completes an AttributeError raised by a cached descriptor's getter with
+// the name and the receiver (PyObject_GetAttr's context) and returns NULL;
+// the attribute load stub leaves through it on a raising getter.
+PyObject* JITRT_LoadAttrError311(PyObject* obj, PyObject* name);
+
 PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
     PyObject* obj,
     PyObject* name,
@@ -249,6 +498,21 @@ PyObject* JITRT_Call(
  * Performs a function call with a vectorcall. Will check and handle any
  * eval breaker events after the call.
  */
+#if PY_VERSION_HEX < 0x030C0000
+// STORE_ATTR_WITH_HINT fast helper: 1 when the store was done in place, 0 to
+// take the generic path.
+int JITRT_StoreAttrWithHint311(
+    PyObject* owner,
+    PyObject* name,
+    Py_ssize_t hint,
+    PyObject* value);
+// STORE_ATTR_INSTANCE_VALUE insertion into an unset split-values slot.
+void JITRT_StoreSplitValueInsert311(
+    PyObject* values_raw,
+    Py_ssize_t index,
+    PyObject* value);
+#endif
+
 PyObject* JITRT_VectorcallTstate(
     PyThreadState* tstate,
     PyObject* callable,
@@ -262,6 +526,39 @@ PyObject* JITRT_VectorcallTstate(
 // comes from a Python function or one of these adapters.
 extern "C" void* g_JITRT_Vectorcall311_slot;
 extern "C" void* g_JITRT_Call311_slot;
+
+// Runs the periodic work the eval breaker requested after a C callable
+// returned `res` through the direct dispatch stub (handle_periodic_activities
+// semantics): returns `res`, or NULL with `res` released when the pending
+// work raised.
+PyObject* JITRT_HandlePendingAfterCall311(PyObject* res);
+
+// Call-site entry-cache miss helper (see jit::CallSiteEntryCache).  The
+// cache rides in the kwnames argument slot, which is NULL at probed sites.
+extern "C" PyObject* JITRT_CallSiteEntryMiss311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw);
+
+// Constructor arm of the call-site probe: the callable is a heap class.
+extern "C" PyObject* JITRT_ConstructSite311(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw);
+
+// Compiled entry of a code object's artifact for a function object that was
+// never attached to it (NULL when none applies), and the entry itself: it
+// takes the artifact when one applies, else the function's own vectorcall.
+// Safe for any exact function object.
+extern "C" vectorcallfunc Ci_JitShell311_CodeArtifactEntry(
+    PyFunctionObject* func);
+extern "C" PyObject* Ci_JitShell311_CodeArtifactVectorcall(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
 #endif
 
 /*
@@ -311,6 +608,30 @@ PyObject* JITRT_GetAttrFromSuper(
     PyObject* self,
     PyObject* name,
     bool no_args_in_super_call);
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace jit {
+struct SuperSiteCache311;
+} // namespace jit
+
+// Per-site cached forms of the two lookups above (see
+// jit::SuperSiteCache311); the generic helper is the fallback for anything
+// but builtin super() on a receiver type with a valid version tag.
+LoadMethodResult JITRT_GetMethodFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call);
+PyObject* JITRT_GetAttrFromSuperCached311(
+    jit::SuperSiteCache311* cache,
+    PyObject* global_super,
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    bool no_args_in_super_call);
+#endif
 
 /*
  * Mimics the behavior of the UNARY_NOT opcode.
@@ -405,6 +726,38 @@ PyObject* JITRT_BoxBool(uint32_t i);
 PyObject* JITRT_BoxI64(int64_t i);
 PyObject* JITRT_BoxU64(uint64_t i);
 PyObject* JITRT_BoxDouble(double_t d);
+
+#if PY_VERSION_HEX < 0x030C0000
+// Tail of an inlined tp_iternext call that returned NULL: StopIteration (or
+// no exception) yields the done sentinel, anything else propagates as NULL.
+PyObject* JITRT_IterNextExhausted311();
+
+// Finish a direct generator resume from JIT code whose outcome was not a
+// plain yield (defined in generators_rt.cpp).
+PyObject* JITRT_GenNextFinish311(PyObject* gen, PyObject* value);
+
+// Resume a plain JIT generator suspended at a yield-from from a JIT'd loop
+// by walking its delegation chain (defined in generators_rt.cpp).
+// tp_iternext contract.
+PyObject* JITRT_GenDelegateNext311(PyObject* gen, PyThreadState* tstate);
+// Pieces of the walker the generated routine leaves to C++.
+PyObject* JITRT_GenDelegateFinish311(
+    PyObject* innermost,
+    PyObject* value,
+    PyThreadState* tstate);
+void JITRT_GenUnwindDelegators311(PyObject* from, PyThreadState* tstate);
+PyObject* JITRT_GenIterNext311(PyObject* gen);
+// SPIKE(FLOATFL): float freelist fast paths for the CPython 3.11 delivery.
+// JITRT_BoxDoubleFast311 pops the interpreter's float freelist directly
+// (falling back to PyFloat_FromDouble when it is empty or tracemalloc is
+// tracing); JITRT_FloatDeallocExact311 is the tp_dealloc-equivalent for an
+// object statically known to be an exact float; JITRT_DeallocMaybeFloat311
+// replaces _Py_Dealloc for objects of unknown type, taking the float freelist
+// push inline and deferring everything else to _Py_Dealloc.
+PyObject* JITRT_BoxDoubleFast311(double_t d);
+void JITRT_FloatDeallocExact311(PyObject* op);
+void JITRT_DeallocMaybeFloat311(PyObject* op);
+#endif
 
 PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right);
 

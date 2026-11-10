@@ -9,6 +9,7 @@
 #include "cinderx/Jit/lir/operand.h"
 
 #include <iterator>
+#include <utility>
 
 namespace jit::lir {
 
@@ -189,6 +190,12 @@ bool canPairLoads(
       !getPairableLoad(second, second_load) ||
       first_load.base->getPhyRegister() != second_load.base->getPhyRegister()) {
     return false;
+  }
+
+  // LDP names destinations in increasing address order.  Scalar loads may
+  // appear in either order; neither destination may overwrite the base.
+  if (first_load.offset > second_load.offset) {
+    std::swap(first_load, second_load);
   }
 
   const int64_t lower_offset = first_load.offset;

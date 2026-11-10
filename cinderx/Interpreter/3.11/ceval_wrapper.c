@@ -49,24 +49,55 @@
 // callee would otherwise observe a caller position different from Stock.
 // Route only evaluator-local vectorcalls through this cursor shim: ordinary
 // raising opcodes and calls to C objects keep their original opcode position.
+//
+// WITH_EXCEPT_START passes the traceback borrowed from the exception value
+// (PyException_GetTraceback followed by Py_XDECREF) and relies on the callee
+// frame owning its arguments, which stock Python frames do.  A JIT-compiled
+// __exit__ borrows its arguments instead, so `val.with_traceback(None)` inside
+// it (unittest's assertRaises does exactly this) would free the traceback
+// while the compiled frame still uses it.  Hold that argument for the
+// duration of the call so the caller owns everything it passes.
+//
+// An exact function object is dispatched through the code artifact entry: a
+// function object that was never attached to its code's compiled artifact
+// (fresh comprehension / closure objects beyond the attach budget) takes the
+// artifact, any other function its own vectorcall (pyjit_311_gate.cpp).
+extern PyObject* Ci_JitShell311_CodeArtifactVectorcall(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
 static PyObject* Ci_PyObject_Vectorcall_311(
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  if (PyFunction_Check(callable)) {
-    PyThreadState* tstate = _PyThreadState_GET();
-    _PyInterpreterFrame* frame = tstate->cframe->current_frame;
-    if (frame != NULL && frame->prev_instr >= _PyCode_CODE(frame->f_code) &&
-        frame->prev_instr <
-            _PyCode_CODE(frame->f_code) + Py_SIZE(frame->f_code)) {
-      int opcode = _Py_OPCODE(*frame->prev_instr);
-      if (_PyOpcode_Deopt[opcode] == CALL) {
-        frame->prev_instr += INLINE_CACHE_ENTRIES_CALL;
-      }
+  PyObject* held_tb = NULL;
+  PyThreadState* tstate = _PyThreadState_GET();
+  _PyInterpreterFrame* frame = tstate->cframe->current_frame;
+  if (frame != NULL && frame->prev_instr >= _PyCode_CODE(frame->f_code) &&
+      frame->prev_instr <
+          _PyCode_CODE(frame->f_code) + Py_SIZE(frame->f_code)) {
+    int opcode = _Py_OPCODE(*frame->prev_instr);
+    if (PyFunction_Check(callable) && _PyOpcode_Deopt[opcode] == CALL) {
+      frame->prev_instr += INLINE_CACHE_ENTRIES_CALL;
+    } else if (
+        opcode == WITH_EXCEPT_START && kwnames == NULL &&
+        PyVectorcall_NARGS(nargsf) == 3) {
+      held_tb = args[2];
+      Py_XINCREF(held_tb);
     }
   }
-  return PyObject_Vectorcall(callable, args, nargsf, kwnames);
+  PyObject* res;
+  if (PyFunction_Check(callable)) {
+    res =
+        Ci_JitShell311_CodeArtifactVectorcall(callable, args, nargsf, kwnames);
+  } else {
+    res = PyObject_Vectorcall(callable, args, nargsf, kwnames);
+  }
+  Py_XDECREF(held_tb);
+  return res;
 }
 
 extern int Ci_QuickenWarmupStep_311;

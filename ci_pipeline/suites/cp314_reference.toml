@@ -4,7 +4,8 @@
 # the scheduler must pass the merge-base SHA explicitly via
 # RT314_BASE_REF (a fork-local branch name is not a safe default).  Braces are doubled
 # because job commands pass through Python str.format() first.  This is the operative
-# definition of "the 3.14 reference line stays unchanged" -- import-level
+# definition of legacy 3.14 neutrality plus explicitly reviewed test additions;
+# import-level
 # smoke is not a substitute.
 
 fail_fast = true

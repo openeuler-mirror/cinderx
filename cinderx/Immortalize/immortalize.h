@@ -4,6 +4,10 @@
 
 #include "cinderx/python.h"
 
+#if PY_VERSION_HEX >= 0x030E0000
+#include "internal/pycore_object.h"
+#endif
+
 #include <stdbool.h>
 
 /*
@@ -13,7 +17,9 @@
 #if defined(Py_IMMORTAL_INSTANCES)
 #define IMMORTALIZE(OBJ) Py_SET_IMMORTAL(OBJ)
 #elif PY_VERSION_HEX >= 0x030E0000
-#define IMMORTALIZE(OBJ) Py_SET_REFCNT((OBJ), _Py_IMMORTAL_INITIAL_REFCNT)
+// Set both the refcount and stack-reference flags without unlinking GC nodes.
+// Heap immortalization traverses the permanent generation and needs its links.
+#define IMMORTALIZE(OBJ) _Py_SetImmortalUntracked(_PyObject_CAST(OBJ))
 #elif PY_VERSION_HEX >= 0x030C0000
 #define IMMORTALIZE(OBJ) Py_SET_REFCNT((OBJ), _Py_IMMORTAL_REFCNT)
 #else

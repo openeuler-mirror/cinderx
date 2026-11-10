@@ -2,17 +2,21 @@
 
 #include "cinderx/Jit/codegen/gen_asm.h"
 
+#include "cinderx/Common/spike_env.h"
+
 #include <structmember.h>
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
+#include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/bytecode.h"
@@ -21,6 +25,7 @@
 #include "cinderx/Jit/codegen/autogen.h"
 #include "cinderx/Jit/codegen/code_section.h"
 #include "cinderx/Jit/codegen/gen_asm_utils.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
@@ -33,6 +38,16 @@
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_gdb_support.h"
 #include "cinderx/Jit/jit_rt.h"
+#include "cinderx/Jit/threaded_compile.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Jit/direct_entry_gate_311.h"
+extern "C" int32_t Ci_JitShell311_CStackSoftLimitTlsOffset(void);
+extern "C" void Ci_JitShell311_InitCStackLimits(void);
+extern "C" int Ci_JitShell311_CStackSoftLimitReached(void);
+extern "C" PyObject*
+Ci_JitShell311_CStackOverflow(PyObject*, PyObject* const*, size_t, PyObject*);
+#endif
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/postalloc.h"
@@ -43,6 +58,7 @@
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
+#include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
@@ -163,6 +179,38 @@ void restoreSyntheticResumeCallEvents(PyThreadState* tstate) {
 // Scratch register used by the various deopt trampolines.
 [[maybe_unused]] const auto deopt_scratch_reg = arch::reg_scratch_deopt;
 
+// Raise an exception if an LIR function exceeds a reasonable size.
+void checkLirSize(const lir::Function& func) {
+  auto name = [&] {
+    auto hir_func = func.hirFunc();
+    return hir_func != nullptr ? hir_func->fullname : "<unknown func>";
+  };
+
+  auto num_blocks = func.getNumBasicBlocks();
+  auto max_blocks = getConfig().max_lir_blocks;
+  if (num_blocks > max_blocks) {
+    throwCompileBudgetExceeded(
+        kRefuseLirSizeLimit,
+        fmt::format(
+            "LIR function '{}' has too many basic blocks ({}, max={})",
+            name(),
+            num_blocks,
+            max_blocks));
+  }
+
+  auto num_instrs = func.getNumInstrs();
+  auto max_instrs = getConfig().max_lir_instrs;
+  if (num_instrs > max_instrs) {
+    throwCompileBudgetExceeded(
+        kRefuseLirSizeLimit,
+        fmt::format(
+            "LIR function '{}' has too many instructions ({}, max={})",
+            name(),
+            num_instrs,
+            max_instrs));
+  }
+}
+
 void raiseUnboundLocalError(BorrowedRef<> name) {
   // name is converted into a `char*` in format_exc_check_arg
 
@@ -240,6 +288,15 @@ DeoptResult prepareForDeopt(
   }
 #endif
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
+#if PY_VERSION_HEX < 0x030C0000
+  // Inline-recursion-ledger deopt repayment.  The deopt exit
+  // bypasses the epilogue's repayment; repay here per compilation-unit
+  // flag.  The interpreted resume that follows carries its own
+  // Enter/Leave pair, so the two ledgers do not interfere.
+  if (code_runtime->entryGuardInlined()) {
+    tstate->recursion_remaining++;
+  }
+#endif
   bool is_patched_instrumentation = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
@@ -286,6 +343,20 @@ DeoptResult prepareForDeopt(
     }
     setCurrentFrame(tstate, frame);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The interpreter will clear (or hand to a frame
+  // object) the compiled activation's own frame with stock ownership
+  // semantics; give it the references the inline link did not take.
+  if (code_runtime->frameNoRef()) {
+    _PyInterpreterFrame* outer = frame;
+    for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
+      outer = outer->previous;
+    }
+    Py_INCREF(outer->f_func);
+    Py_INCREF(outer->f_code);
+  }
+#endif
 
   _PyInterpreterFrame* frame_iter = frame;
 
@@ -345,13 +416,37 @@ DeoptResult prepareForDeopt(
   // Clear our references now that we've transferred them to the frame
   MemoryView mem{regs};
   Ref<> deopt_obj;
-  if (!is_instrumentation_deopt) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Primitive reconstruction can fail while preparing an ordinary guard
+  // exit. Preserve that first exception across optional profiling and ref
+  // cleanup; profiling must not allocate another guilty-value box over it.
+  PyObject *saved_type = nullptr, *saved_value = nullptr, *saved_tb = nullptr;
+  const bool had_exception = PyErr_Occurred() != nullptr;
+  if (had_exception) {
+    PyErr_Fetch(&saved_type, &saved_value, &saved_tb);
+  }
+  auto restore_exception = [&]() {
+    if (saved_type != nullptr) {
+      PyErr_Restore(saved_type, saved_value, saved_tb);
+      saved_type = saved_value = saved_tb = nullptr;
+    }
+  };
+  SCOPE_EXIT(restore_exception());
+#endif
+  if (!is_instrumentation_deopt
+#if PY_VERSION_HEX < 0x030C0000
+      && !had_exception
+#endif
+  ) {
     // TODO(T262342844): Add USDT support for instrumentation-related deopts.
     deopt_obj = profileDeopt(deopt_meta, mem);
   }
   auto ctx = getContext();
   ctx->recordDeopt(code_runtime, deopt_idx, deopt_obj);
   releaseRefs(deopt_meta, mem);
+#if PY_VERSION_HEX < 0x030C0000
+  restore_exception();
+#endif
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
     BorrowedRef<PyGenObject> base_gen = _PyGen_GetGeneratorFromFrame(frame);
     JitGenObject* gen = JitGenObject::cast(base_gen.get());
@@ -390,7 +485,68 @@ DeoptResult prepareForDeopt(
   if (!is_forced_deopt) {
     jit::recordDeoptForRoiBackoff(
         code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+#if PY_VERSION_HEX < 0x030C0000
+    // An eligible site's exception exits are counted; at the grant the code
+    // recompiles with the exit as a CFG edge (see Ci_ExcEdgeDeopt311).
+    if ((deopt_meta.reason == DeoptReason::kUnhandledException ||
+         deopt_meta.reason == DeoptReason::kGuardFailure) &&
+        !is_instrumentation_deopt && deopt_meta.inline_depth() == 0) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        // The deopting activation's function object: a by-code artifact
+        // (fresh function objects dispatched by code) has no registered
+        // member to recompile through, but this one is live on the stack.
+        PyObject* func = frame->f_func != nullptr &&
+                reinterpret_cast<PyCodeObject*>(frame->f_func->func_code) ==
+                    fm.code
+            ? reinterpret_cast<PyObject*>(frame->f_func)
+            : nullptr;
+        Ci_ExcEdgeDeopt311(
+            fm.code,
+            BCOffset(fm.cause_instr_idx).value(),
+            deopt_meta.reason == DeoptReason::kGuardFailure,
+            func);
+      }
+    }
+#endif
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Feed only organic guard failures to the per-site speculation fuses.
+  // The forced flag is consumed in this function and is no longer available
+  // when resumeInInterpreter runs.
+  // SPIKE(INTBITSPEC) registers its bitwise sites with the same fuse.
+  if (deopt_meta.reason == DeoptReason::kGuardFailure &&
+      !is_instrumentation_deopt && !is_forced_deopt) {
+    static const bool longspec = Ci_SpikeGetenv("SPIKE_LONGSPEC") != nullptr ||
+        Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr ||
+        Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+    if (longspec) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeLongSpecGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+    // SPIKE(BINTYPED): same for the *_FLOAT binary-op guard sites.
+    static const bool bintyped = Ci_SpikeGetenv("SPIKE_BINTYPED") != nullptr;
+    if (bintyped) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeFloatGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+    // SPIKE(ARRTC): and for the array.array typecode speculation sites.
+    static const bool arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+    if (arrtc) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeArrTcGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+  }
+#endif
   return {frame, is_instrumentation_deopt};
 }
 
@@ -469,6 +625,21 @@ PyObject* resumeInInterpreter(
   } else {
     err_occurred = shouldResumeInterpreterInErrorHandler(deopt_meta.reason);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (err_occurred == 0 && PyErr_Occurred()) {
+    // A guard normally resumes its PRE-instruction state. If reification
+    // itself failed, do not execute that opcode with a live MemoryError.
+    // The evaluator's error entry needs the faulting opcode's cursor, not
+    // the preceding cursor used for normal re-execution. Leave the original
+    // exception/CALL resume protocol and shared site metadata unchanged.
+    const auto& inner = deopt_meta.innermostFrame();
+    BytecodeInstruction cause{inner.code, inner.cause_instr_idx};
+    frame->prev_instr =
+        _PyCode_CODE(frameCode(frame)) + cause.opcodeIndex().value();
+    err_occurred = 1;
+  }
+#endif
 
   PyObject* result = nullptr;
 #if PY_VERSION_HEX < 0x030C0000
@@ -748,11 +919,13 @@ void flushAarch64NearDeoptBranches(Environ* env, bool has_fallthrough) {
 #endif
 }
 
+} // namespace
+
 void emitLIRBlocks(
     Environ* env,
     lir::Function* lir_func,
-    const asmjit::CodeHolder* code = nullptr,
-    CodeHolderMetadata* metadata = nullptr) {
+    const asmjit::CodeHolder* code,
+    CodeHolderMetadata* metadata) {
   auto* as = env->as;
   auto& blocks = lir_func->basicblocks();
 
@@ -762,6 +935,24 @@ void emitLIRBlocks(
 
   std::string pending_annotation;
   asmjit::BaseNode* annotation_cursor = nullptr;
+
+  // SPIKE(DEOPTSINK): the near-deopt stubs (b.cond/cbz to a `b deopt`
+  // stub) are flushed after every block, and a block that falls through
+  // pays a taken jump over its stubs.  Their branches reach +-1MB, so for
+  // any function whose LIR is far below that the stubs can be emitted once
+  // after the last block.  Offsets are unknown while building, hence the
+  // LIR instruction count bound (worst case tens of bytes per instruction).
+  bool defer_near_deopt = false;
+#if defined(CINDER_AARCH64)
+  if (g_spike_deoptsink && !getConfig().multiple_code_sections) {
+    constexpr size_t kDeferNearDeoptMaxLirInstrs = 8192;
+    size_t lir_instrs = 0;
+    for (lir::BasicBlock* block : blocks) {
+      lir_instrs += block->instructions().size();
+    }
+    defer_near_deopt = lir_instrs <= kDeferNearDeoptMaxLirInstrs;
+  }
+#endif
 
   for (size_t i = 0; i < blocks.size(); ++i) {
     lir::BasicBlock* basicblock = blocks[i];
@@ -813,9 +1004,17 @@ void emitLIRBlocks(
           std::find(successors.begin(), successors.end(), blocks[i + 1]) !=
           successors.end();
     }
-    flushAarch64NearDeoptBranches(env, has_fallthrough);
+    if (!defer_near_deopt) {
+      flushAarch64NearDeoptBranches(env, has_fallthrough);
+    }
+  }
+  if (defer_near_deopt) {
+    // Nothing falls through past the last block.
+    flushAarch64NearDeoptBranches(env, /*has_fallthrough=*/false);
   }
 }
+
+namespace {
 
 // Emit LIR blocks to machine code, finalize, register debug/perf symbols, and
 // return the entry address.  Shared by all standalone trampoline generators.
@@ -855,6 +1054,178 @@ static void* emitAndRegisterTrampoline(
 #endif
   return result;
 }
+
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+// the yield-from delegation walker as a generated routine.
+// PyObject* walker(PyObject* top, PyThreadState* tstate), tp_iternext
+// contract.  Mirrors jit::genDelegateNext311: link each delegator (frame,
+// exception stack, EXECUTING, back-pointer), enter the innermost
+// generator's resume entry, and on a yield unlink the chain innermost-first.
+// A finish/raise/deopt goes to JITRT_GenDelegateFinish311; anything the
+// walker does not handle undoes its links and takes the generic path.
+static void* generateGenDelegateWalker() {
+  const char* name = "gen_delegate_walker";
+  auto mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    throw std::runtime_error{
+        fmt::format("CinderX not initialized, cannot generate {}", name)};
+  }
+  CodeHolder code;
+  ICodeAllocator* code_allocator = mod_state->code_allocator.get();
+  ASM_CHECK(code.init(code_allocator->asmJitEnvironment()), name);
+  arch::Builder a(&code);
+
+  constexpr int kOrigin = offsetof(PyGenObject, gi_origin_or_finalizer);
+  constexpr int kFrameOff = offsetof(PyGenObject, gi_iframe);
+  constexpr int kPrevOff = offsetof(_PyInterpreterFrame, previous);
+  constexpr int kExcStateOff = offsetof(PyGenObject, gi_exc_state);
+  constexpr int kPrevItemOff = offsetof(PyGenObject, gi_exc_state) +
+      offsetof(_PyErr_StackItem, previous_item);
+  constexpr int kStateOff = offsetof(PyGenObject, gi_frame_state);
+  constexpr int kCframeOff = offsetof(PyThreadState, cframe);
+  constexpr int kCurFrameOff = offsetof(_PyCFrame, current_frame);
+  constexpr int kExcInfoOff = offsetof(PyThreadState, exc_info);
+  constexpr int kTypeOff = offsetof(PyObject, ob_type);
+  constexpr int kYfSub = offsetof(GenDataFooter, yf_sub);
+  constexpr int kDelegator = offsetof(GenDataFooter, delegator);
+  constexpr int kDirectOk = offsetof(GenDataFooter, direct_ok);
+  constexpr int kTreeIter = offsetof(GenDataFooter, tree_iter_state);
+  constexpr int kResumeEntry = offsetof(GenDataFooter, resumeEntry);
+  constexpr int kMaxDepth = 64;
+
+  asmjit::Label loop = a.newLabel();
+  asmjit::Label innermost = a.newLabel();
+  asmjit::Label unwind = a.newLabel();
+  asmjit::Label done = a.newLabel();
+  asmjit::Label finish = a.newLabel();
+  asmjit::Label fallback = a.newLabel();
+  asmjit::Label epilogue = a.newLabel();
+
+  // Prologue: frame + callee-saved x19..x24.
+  a.stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -64));
+  a.mov(a64::x29, a64::sp);
+  a.stp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
+  a.stp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
+  a.stp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
+  a.mov(a64::x19, a64::x0); // top
+  a.mov(a64::x20, a64::x1); // tstate
+  a.mov(a64::x21, a64::x0); // cur
+  a.ldr(a64::x22, a64::ptr(a64::x21, kOrigin)); // footer(cur)
+  a.mov(a64::w24, 0); // depth
+
+  a.bind(loop);
+  a.ldr(a64::x0, a64::ptr(a64::x22, kYfSub)); // sub
+  a.cbz(a64::x0, fallback);
+  a.ldr(a64::x2, a64::ptr(a64::x0, kTypeOff));
+  a.mov(a64::x3, asmjit::Imm(reinterpret_cast<uint64_t>(&g_jitgen_type)));
+  a.ldr(a64::x3, a64::ptr(a64::x3));
+  a.cmp(a64::x2, a64::x3);
+  a.b_ne(fallback);
+  a.ldr(a64::x2, a64::ptr(a64::x22, kTreeIter));
+  a.cbnz(a64::x2, fallback);
+  a.cmp(a64::w24, kMaxDepth);
+  a.b_ge(fallback);
+  a.ldr(a64::x23, a64::ptr(a64::x0, kOrigin)); // footer(sub)
+  a.ldrb(a64::w2, a64::ptr(a64::x23, kDirectOk));
+  a.cbz(a64::w2, fallback);
+  // link cur as the running delegator.
+  a.add(a64::x4, a64::x21, kFrameOff); // frame
+  a.ldr(a64::x5, a64::ptr(a64::x20, kCframeOff));
+  a.ldr(a64::x6, a64::ptr(a64::x5, kCurFrameOff));
+  a.str(a64::x6, a64::ptr(a64::x4, kPrevOff)); // frame->previous = current
+  a.str(a64::x4, a64::ptr(a64::x5, kCurFrameOff)); // current = frame
+  a.ldr(a64::x6, a64::ptr(a64::x20, kExcInfoOff));
+  a.str(a64::x6, a64::ptr(a64::x21, kPrevItemOff)); // previous_item = exc_info
+  a.add(a64::x7, a64::x21, kExcStateOff);
+  a.str(a64::x7, a64::ptr(a64::x20, kExcInfoOff)); // exc_info = &gi_exc_state
+  a.strb(a64::wzr, a64::ptr(a64::x21, kStateOff)); // FRAME_EXECUTING
+  a.strb(a64::wzr, a64::ptr(a64::x22, kDirectOk)); // cur: not resumable
+  a.str(
+      a64::x21, a64::ptr(a64::x23, kDelegator)); // footer(sub)->delegator = cur
+  a.add(a64::w24, a64::w24, 1);
+  a.cmp(a64::w2, 2);
+  a.b_ne(innermost);
+  a.mov(a64::x21, a64::x0); // cur = sub
+  a.mov(a64::x22, a64::x23);
+  a.b(loop);
+
+  a.bind(innermost);
+  a.mov(a64::x21, a64::x0); // keep sub / footer(sub) across the call
+  a.mov(a64::x22, a64::x23);
+  a.ldr(a64::x8, a64::ptr(a64::x23, kResumeEntry));
+  a.mov(a64::x1, asmjit::Imm(reinterpret_cast<uint64_t>(Py_None)));
+  a.mov(a64::x2, 0);
+  a.mov(a64::x3, a64::x20);
+  a.blr(a64::x8); // value = resumeEntry(sub, None, 0, tstate)
+  a.cbz(a64::x0, finish);
+  a.ldr(a64::x2, a64::ptr(a64::x21, kTypeOff));
+  a.mov(a64::x3, asmjit::Imm(reinterpret_cast<uint64_t>(&g_jitgen_type)));
+  a.ldr(a64::x3, a64::ptr(a64::x3));
+  a.cmp(a64::x2, a64::x3);
+  a.b_ne(finish);
+  a.ldrb(a64::w2, a64::ptr(a64::x22, kDirectOk));
+  a.cbz(a64::w2, finish);
+  // Yielded: unlink the delegators innermost-first.  x4 = footer(level).
+  a.mov(a64::x4, a64::x22);
+  a.bind(unwind);
+  a.ldr(a64::x5, a64::ptr(a64::x4, kDelegator));
+  a.cbz(a64::x5, done);
+  a.str(a64::xzr, a64::ptr(a64::x4, kDelegator));
+  a.mov(a64::w6, 0xff); // FRAME_SUSPENDED
+  a.strb(a64::w6, a64::ptr(a64::x5, kStateOff));
+  a.ldr(a64::x6, a64::ptr(a64::x5, kPrevItemOff));
+  a.str(a64::x6, a64::ptr(a64::x20, kExcInfoOff));
+  a.str(a64::xzr, a64::ptr(a64::x5, kPrevItemOff));
+  a.add(a64::x6, a64::x5, kFrameOff);
+  a.ldr(a64::x7, a64::ptr(a64::x6, kPrevOff));
+  a.ldr(a64::x8, a64::ptr(a64::x20, kCframeOff));
+  a.str(a64::x7, a64::ptr(a64::x8, kCurFrameOff));
+  a.str(a64::xzr, a64::ptr(a64::x6, kPrevOff));
+  a.ldr(a64::x4, a64::ptr(a64::x5, kOrigin)); // footer(d)
+  a.mov(a64::w6, 2); // suspended at its yield-from again
+  a.strb(a64::w6, a64::ptr(a64::x4, kDirectOk));
+  a.b(unwind);
+
+  a.bind(finish); // x0 = value or NULL, x21 = sub
+  a.mov(a64::x1, a64::x0);
+  a.mov(a64::x0, a64::x21);
+  a.mov(a64::x2, a64::x20);
+  a.mov(
+      a64::x9,
+      asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenDelegateFinish311)));
+  a.blr(a64::x9);
+  a.b(epilogue);
+
+  a.bind(fallback); // undo links from cur outward, generic path for top
+  a.mov(a64::x0, a64::x21);
+  a.mov(a64::x1, a64::x20);
+  a.mov(
+      a64::x9,
+      asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenUnwindDelegators311)));
+  a.blr(a64::x9);
+  a.mov(a64::x0, a64::x19);
+  a.mov(a64::x9, asmjit::Imm(reinterpret_cast<uint64_t>(JITRT_GenIterNext311)));
+  a.blr(a64::x9);
+  a.b(epilogue);
+
+  a.bind(done);
+  a.bind(epilogue);
+  a.ldp(a64::x23, a64::x24, a64::ptr(a64::sp, 48));
+  a.ldp(a64::x21, a64::x22, a64::ptr(a64::sp, 32));
+  a.ldp(a64::x19, a64::x20, a64::ptr(a64::sp, 16));
+  a.ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 64));
+  a.ret(a64::x30);
+
+  void* result = finalizeCode(a, name);
+  auto code_size = code.codeSize();
+  register_raw_debug_symbol(name, __FILE__, __LINE__, result, code_size, 0);
+  std::vector<std::pair<void*, std::size_t>> code_sections;
+  populateCodeSections(code_sections, code, result);
+  code_sections.emplace_back(result, code_size);
+  perf::registerFunction(code_sections, name);
+  return result;
+}
+#endif
 
 void* generateDeoptTrampoline(bool generator_mode) {
   lir::Function lir_func;
@@ -900,6 +1271,17 @@ class ThrowableErrorHandler : public ErrorHandler {
 };
 
 } // namespace
+
+void* NativeGeneratorFactory::genDelegateWalker() {
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  if (gen_delegate_walker_ == nullptr) {
+    gen_delegate_walker_ = generateGenDelegateWalker();
+  }
+  return gen_delegate_walker_;
+#else
+  return nullptr;
+#endif
+}
 
 NativeGenerator::NativeGenerator(
     const hir::Function* func,
@@ -1038,6 +1420,20 @@ void* NativeGenerator::compile(bool shadow) {
     env_.code_rt = env_.ctx->allocateCodeRuntime(
         func->code.get(), func->builtins.get(), func->globals.get());
   }
+#if PY_VERSION_HEX < 0x030C0000
+  bool runtime_ready = false;
+  SCOPE_EXIT({
+    if (!shadow && !runtime_ready && env_.code_rt != nullptr) {
+      if (getThreadedCompileContext().compileRunning()) {
+        env_.ctx->deferCodeRuntimeRelease(env_.code_rt);
+      } else {
+        env_.code_rt->releaseReferences();
+        env_.ctx->recycleCodeRuntime(env_.code_rt);
+      }
+      env_.code_rt = nullptr;
+    }
+  });
+#endif
   SCOPE_EXIT(if (shadow) {
     if (env_.code_rt != nullptr) {
       env_.code_rt->releaseReferences();
@@ -1057,6 +1453,11 @@ void* NativeGenerator::compile(bool shadow) {
     env_.code_rt->addReference(ref);
   }
 
+  // Shadow compiles never run, so they take the C++ walker and allocate no
+  // executable memory for the generated one.
+  env_.gen_delegate_walker =
+      is_shadow_compile_ ? nullptr : factory_.genDelegateWalker();
+
   lir::LIRGenerator lirgen(GetFunction(), &env_);
   std::unique_ptr<lir::Function> lir_func;
 
@@ -1071,6 +1472,30 @@ void* NativeGenerator::compile(bool shadow) {
       GetFunction()->compilation_phase_timer,
       "Lowering into LIR",
       lir_func = lirgen.TranslateFunction())
+  try {
+    checkLirSize(*lir_func);
+  } catch (const CompileBudgetExceeded&) {
+    // The CodeRuntime was allocated before the LIR existed, and no artifact
+    // will ever adopt it, so nothing else would release the references it
+    // holds.  Give it back the way an artifact does when it dies.  A shadow
+    // compile owns its CodeRuntime and is cleaned up by the scope exit above.
+    if (!shadow && env_.code_rt != nullptr) {
+      if (getThreadedCompileContext().compileRunning()) {
+        // A compile worker must not drop the references itself: the
+        // decrements touch objects shared with the other workers.  Hand the
+        // runtime to the context, which releases it on the main thread once
+        // the workers have joined.
+        env_.ctx->deferCodeRuntimeRelease(env_.code_rt);
+      } else {
+        env_.code_rt->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+        env_.ctx->recycleCodeRuntime(env_.code_rt);
+#endif
+      }
+      env_.code_rt = nullptr;
+    }
+    throw;
+  }
 
   JIT_LOGIF(
       getConfig().log.dump_lir,
@@ -1135,6 +1560,10 @@ void* NativeGenerator::compile(bool shadow) {
       "LIR for {} after register allocation:\n{}",
       GetFunction()->fullname,
       *lir_func);
+
+  if (g_spike_coldsink) {
+    lir_func->sinkColdBlocks();
+  }
 
   PostRegAllocRewrite post_rewrite(lir_func.get(), &env_);
   COMPILE_TIMER(
@@ -1213,6 +1642,9 @@ void* NativeGenerator::compile(bool shadow) {
     env_.code_rt->setSpillWords(
         env_.shadow_frames_and_spill_size / kPointerSize);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  runtime_ready = true;
+#endif
   return shadow ? nullptr : vectorcall_entry_;
 }
 
@@ -1298,6 +1730,42 @@ int32_t osrLocalsplusOffset(int localsplus_index) {
 
 void NativeGenerator::emitOSRFrameSetup(const jit::OSRMetadata& metadata) {
   generateFunctionEntry();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  if (env_.code_rt->entryGuardInlined()) {
+    // An OSR entry bypasses the frame-build recursion debit,
+    // while the exit goes through the epilogue repayment (or the deopt
+    // repayment) -- debit here to balance.  The interpreter-side Enter for
+    // this call is repaid by its own Leave; the two ledgers do not
+    // interfere.
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->sub(a64::w10, a64::w10, 1);
+    as_->str(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+  }
+  if (env_.code_rt->activeFrameCounted()) {
+    // An OSR entry bypasses the inline frame link's count-in while its exit
+    // goes through the counted hard-exit epilogue -- count in here.
+    as_->mov(
+        a64::x9, reinterpret_cast<uint64_t>(triggerStatsActiveFramesAddress()));
+    as_->ldr(a64::x10, a64::ptr(a64::x9));
+    as_->add(a64::x10, a64::x10, 1);
+    as_->str(a64::x10, a64::ptr(a64::x9));
+  }
+#endif
   arch::sub_immediate(
       as_,
       a64::sp,
@@ -1664,15 +2132,26 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
 #endif
 }
 
-void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
+// 3.11 aarch64 inline hit path for LoadAttrCache.
+// Mirrors LoadAttrCache::doInvoke + SplitMutator::getAttr exactly: tagged
+// entry type compare, kind must be kSplit (the only kind 3.11 set_split
+// produces), pull-validated tp_version_tag, live inline values (-4
+// preheader slot), bounded val_offset, non-null slot value.  Everything
+// else tail-calls LoadAttrCache::invoke, which also owns stats and
+// entry reset semantics.  ABI: x0=cache, x1=obj, x2=name; scratch
+// x9-x15 are free at call-like sites (postalloc contract).
+void NativeGenerator::emitAarch64LoadAttrInvokeStub311(
     const asmjit::CodeHolder& code) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
-    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+    PY_VERSION_HEX < 0x030C0000
   if (!env_.load_attr_invoke_stub.isValid()) {
     return;
   }
 
   CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label descr_call = as_->newLabel();
+
   Label slow_path = as_->newLabel();
   Label hit = as_->newLabel();
 
@@ -1685,25 +2164,25 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
       static_cast<int>(jit::AttributeMutator::typeVersionOffset());
   constexpr int kValOffsetOff =
       static_cast<int>(jit::AttributeMutator::splitValOffsetOffset());
-  constexpr int kSplitKeysOff =
-      static_cast<int>(jit::AttributeMutator::splitKeysOffset());
-  constexpr int kDictHintOff =
-      static_cast<int>(jit::AttributeMutator::dictHintOffset());
   constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
-  constexpr uint64_t kDictKind = jit::AttributeMutator::dictKind();
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
   constexpr uint64_t kMemberDescrKind =
       jit::AttributeMutator::memberDescrKind();
   constexpr int kMemberdefOff =
       static_cast<int>(jit::AttributeMutator::memberDescrMemberdefOffset());
   constexpr int kMemberTypeOff = offsetof(PyMemberDef, type);
   constexpr int kMemberOffsetOff = offsetof(PyMemberDef, offset);
-  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
-  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
-  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
-  constexpr int kValuesPreheaderOffset =
-      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr uint64_t kDictKind = jit::AttributeMutator::dictKind();
+  constexpr int kDictHintOff =
+      static_cast<int>(jit::AttributeMutator::dictHintOffset());
+  constexpr int kSplitKeysOff =
+      static_cast<int>(jit::AttributeMutator::splitKeysOffset());
   constexpr int kDictPreheaderOffset = -3 * static_cast<int>(sizeof(PyObject*));
-  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
   constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
   constexpr int kMaValuesOffset = offsetof(PyDictObject, ma_values);
   constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
@@ -1711,6 +2190,49 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
       offsetof(PyDictKeysObject, dk_log2_index_bytes);
   constexpr int kDkNentriesOffset = offsetof(PyDictKeysObject, dk_nentries);
   constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  // constants.
+  constexpr uint64_t kCvarKind = jit::AttributeMutator::descrOrClassVarKind();
+  constexpr int kCvarDescrOff =
+      static_cast<int>(jit::AttributeMutator::descrOrClassVarDescrOffset());
+  constexpr int kCvarKeysVerOff = static_cast<int>(
+      jit::AttributeMutator::descrOrClassVarKeysVersionOffset());
+  constexpr int kTpDescrGetOffset = offsetof(PyTypeObject, tp_descr_get);
+  constexpr int kTpGetattroOffset = offsetof(PyTypeObject, tp_getattro);
+  constexpr int kTpDescrSetOffset = offsetof(PyTypeObject, tp_descr_set);
+  constexpr int kTpDictoffsetOffset = offsetof(PyTypeObject, tp_dictoffset);
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kHtCachedKeysOffset =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
+  constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
+  constexpr int kDkLog2SizeOffset = offsetof(PyDictKeysObject, dk_log2_size);
+  constexpr int kUnicodeHashOffset = offsetof(PyASCIIObject, hash);
+  // Direct descriptor calls from the stub.  A kDataDescr
+  // entry (property, getset) and a kDescrOrClassVar entry whose descriptor
+  // has __get__ (a function or method descriptor accessed as an attribute,
+  // a classmethod) call tp_descr_get(descr, obj, type) in place instead of
+  // taking the helper; the descriptor is held across the call exactly as
+  // DataDescrMutator::getAttr holds it.
+  // A kDescrOrClassVar entry whose name also lives in
+  // the receivers' shared keys (a class default that some instances
+  // override: the entry carries keys_version 0, or the keys grew since
+  // the fill) is served in place: the shared keys are probed for the name
+  // and the instance's values slot decides -- a live slot is the answer,
+  // an empty one proves the class side wins.  A dict-form receiver that
+  // holds the name reads the entry value the same way.  Mirrors
+  // peekInstanceAttr311; the helper keeps the general-key and twin cases.
+  constexpr uint64_t kDataDescrKind = jit::AttributeMutator::dataDescrKind();
+  constexpr int kDdDescrOff =
+      static_cast<int>(jit::AttributeMutator::dataDescrDescrOffset());
+  constexpr int kDdTypeOff =
+      static_cast<int>(jit::AttributeMutator::dataDescrTypeOffset());
+  constexpr int kDdTypeVerOff =
+      static_cast<int>(jit::AttributeMutator::dataDescrTypeVersionOffset());
+  // Entry walk: the receiver's tp_version_tag is loaded once (w17) instead
+  // of once per entry, the kind mask is a logical immediate, no empty-entry
+  // cbz (a zero type word never equals a live type pointer), and the kind
+  // dispatch sits outside the kSplit hit path: an entry that matches type
+  // and version falls straight into the split-values read, other kinds
+  // branch out once.
 
   if (is_shadow_compile_) {
     ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
@@ -1718,38 +2240,60 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
     ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   }
   as_->bind(env_.load_attr_invoke_stub);
-  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
-  auto emit_entry = [&](uint32_t index, Label next) {
-    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+  as_->ldr(
+      a64::w17,
+      arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+
+  auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int off = kEntriesOff + static_cast<int>(entry_index) * kEntrySize;
+    // Kind dispatch: kSplit (0) inline below; kMemberDescr (slots) and
+    // kDict (late attrs, hint-indexed) in their own arms; anything else
+    // takes the helper.
+    Label member_arm = as_->newLabel();
+    Label kdict_arm = as_->newLabel();
+    Label cvar_arm = as_->newLabel();
+    Label ddescr_arm = as_->newLabel();
+    Label kind_dispatch = as_->newLabel();
+    auto emit_kind_dispatch = [&](bool kind_known_nonzero) {
+      arch::cmp_immediate(as_, a64::x14, kMemberDescrKind);
+      as_->b_eq(member_arm);
+      arch::cmp_immediate(as_, a64::x14, kDictKind);
+      as_->b_eq(kdict_arm);
+      arch::cmp_immediate(as_, a64::x14, kCvarKind);
+      as_->b_eq(cvar_arm);
+      arch::cmp_immediate(as_, a64::x14, kDataDescrKind);
+      as_->b_eq(ddescr_arm);
+      if (kind_known_nonzero) {
+        as_->b(slow_path);
+      } else {
+        as_->cbnz(a64::x14, slow_path);
+      }
+    };
     as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
-    as_->cbz(a64::x12, next);
-    as_->mov(a64::x13, ~kKindMask);
-    as_->and_(a64::x13, a64::x12, a64::x13);
+    as_->and_(a64::x13, a64::x12, ~kKindMask);
     as_->cmp(a64::x13, a64::x11);
-    as_->b_ne(next);
-    as_->ldr(
-        a64::w14,
-        arch::ptr_offset(a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->b_ne(next_entry);
     as_->ldr(
         a64::w15,
         arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
-    as_->cmp(a64::w14, a64::w15);
+    as_->cmp(a64::w17, a64::w15);
     as_->b_ne(slow_path);
-
-    Label member_descr = as_->newLabel();
-    Label kdict = as_->newLabel();
     as_->and_(a64::x14, a64::x12, kKindMask);
-    arch::cmp_immediate(as_, a64::x14, kMemberDescrKind);
-    as_->b_eq(member_descr);
-    arch::cmp_immediate(as_, a64::x14, kDictKind);
-    as_->b_eq(kdict);
-    as_->cbnz(a64::x14, slow_path);
-    Label split_materialized = as_->newLabel();
+    as_->cbnz(a64::x14, kind_dispatch);
+    // kSplit entries exist only for managed-dict types, so the
+    // preheader is dereferenceable.  Live inline values read below; a
+    // materialized receiver that still shares the captured keys reads
+    // ma_values at the same offset (split_mat).
+    Label split_mat = as_->newLabel();
     as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x15, split_materialized);
+    as_->cbz(a64::x15, split_mat);
     as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kValOffsetOff));
     as_->tbnz(a64::x14, 63, slow_path);
+    // Capacity guard: shared keys can grow after this instance was
+    // created; values prefix byte [-1] bounds the array as
+    // val_offset + 2 < prefix_size (pycore_dict.h invariant).
     as_->ldrb(a64::w9, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
     arch::add_immediate(as_, a64::x10, a64::x14, 2);
     as_->cmp(a64::x10, a64::x9);
@@ -1759,8 +2303,27 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
     as_->ldr(a64::x9, a64::ptr(a64::x15));
     as_->cbz(a64::x9, slow_path);
     as_->b(hit);
+    as_->bind(kind_dispatch);
+    emit_kind_dispatch(true);
 
-    as_->bind(split_materialized);
+    // kMemberDescr: mirror PyMember_GetOne for T_OBJECT_EX only (the
+    // only member type CPython 3.11 specializes for __slots__).  fill()
+    // already fail-closed audited members, so a cached entry is
+    // audit-free.  An empty slot raises through the helper.
+    as_->bind(member_arm);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kMemberdefOff));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x14, kMemberTypeOff, arch::AccessSize::k32));
+    arch::cmp_immediate(as_, a64::x15, T_OBJECT_EX);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMemberOffsetOff));
+    as_->ldr(a64::x9, a64::ptr(a64::x1, a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(hit);
+
+    // split_mat: materialized receiver still sharing the captured keys.
+    as_->bind(split_mat);
     as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
     as_->cbz(a64::x15, slow_path);
     as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kSplitKeysOff));
@@ -1781,19 +2344,9 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
     as_->cbz(a64::x9, slow_path);
     as_->b(hit);
 
-    as_->bind(member_descr);
-    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kMemberdefOff));
-    as_->ldr(
-        a64::w15,
-        arch::ptr_offset(a64::x14, kMemberTypeOff, arch::AccessSize::k32));
-    arch::cmp_immediate(as_, a64::x15, T_OBJECT_EX);
-    as_->b_ne(slow_path);
-    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMemberOffsetOff));
-    as_->ldr(a64::x9, a64::ptr(a64::x1, a64::x15));
-    as_->cbz(a64::x9, slow_path);
-    as_->b(hit);
-
-    as_->bind(kdict);
+    // kdict_arm: hint-indexed read of the receiver dict, key-identity
+    // validated; the helper owns misses and hint refresh.
+    as_->bind(kdict_arm);
     as_->ldr(a64::x14, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
     as_->cbz(a64::x14, slow_path);
     as_->ldr(a64::x13, arch::ptr_offset(a64::x14, kMaKeysOffset));
@@ -1814,12 +2367,12 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
     as_->add(a64::x10, a64::x13, a64::x10);
     arch::add_immediate(as_, a64::x10, a64::x10, kDkIndicesOffset);
     as_->add(a64::x10, a64::x10, a64::x12, a64::lsl(4));
-    as_->ldr(a64::x9, a64::ptr(a64::x10));
+    as_->ldr(a64::x9, a64::ptr(a64::x10)); // me_key
     as_->cmp(a64::x9, a64::x2);
     as_->b_ne(slow_path);
-    Label combined = as_->newLabel();
+    Label kdict_combined = as_->newLabel();
     as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kMaValuesOffset));
-    as_->cbz(a64::x15, combined);
+    as_->cbz(a64::x15, kdict_combined);
     as_->ldrb(a64::w9, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
     arch::add_immediate(as_, a64::x14, a64::x12, 2);
     as_->cmp(a64::x14, a64::x9);
@@ -1829,30 +2382,348 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
     as_->ldr(a64::x9, a64::ptr(a64::x15));
     as_->cbz(a64::x9, slow_path);
     as_->b(hit);
-    as_->bind(combined);
-    as_->ldr(a64::x9, arch::ptr_offset(a64::x10, 8));
+    as_->bind(kdict_combined);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x10, 8)); // me_value
     as_->cbz(a64::x9, slow_path);
     as_->b(hit);
+
+    // cvar_arm: kDescrOrClassVar entry holding a PLAIN
+    // class variable (descriptor protocol absent on its type).  Mirrors
+    // DescrOrClassVarMutator::getAttr: the class side is pinned by the
+    // type version above; the instance side must not shadow the name --
+    // values-form receivers prove absence by the shared keys version the
+    // entry captured, dict-form receivers by the inline negative probe
+    // (as in the method stub), receivers without instance storage trivially.
+    as_->bind(cvar_arm);
+    Label cvar_dict = as_->newLabel();
+    Label cvar_probe2 = as_->newLabel();
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kCvarDescrOff));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x9, kObTypeOffset));
+    // x16 carries the descriptor's tp_descr_get through the shadow proof
+    // (the probe below never touches x16): zero means a plain class
+    // variable (x9 is the answer), non-zero a non-data descriptor whose
+    // __get__ runs once absence is proved.  A data descriptor (both
+    // slots) takes precedence over the instance and needs no proof,
+    // mirroring DescrOrClassVarMutator::getAttr.
+    Label cvar_ok = as_->newLabel();
+    as_->ldr(a64::x16, arch::ptr_offset(a64::x14, kTpDescrGetOffset));
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x14, kTpDescrSetOffset));
+    Label cvar_no_setter = as_->newLabel();
+    as_->cbz(a64::x15, cvar_no_setter);
+    as_->cbz(a64::x16, slow_path); // setter without getter: helper
+    as_->b(descr_call);
+    as_->bind(cvar_no_setter);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+    Label cvar_managed = as_->newLabel();
+    as_->tbnz(a64::x14, 4, cvar_managed); // Py_TPFLAGS_MANAGED_DICT
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpDictoffsetOffset));
+    as_->cbnz(a64::x14, slow_path); // legacy __dict__ layout: helper
+    as_->b(cvar_ok); // no instance storage at all
+    as_->bind(cvar_managed);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, cvar_dict);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x0, off + kCvarKeysVerOff, arch::AccessSize::k32));
+    Label cvar_values_probe = as_->newLabel();
+    as_->cbz(a64::w14, cvar_values_probe);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(cvar_values_probe);
+    as_->b(cvar_ok);
+    // Values-form receiver whose shared keys may hold
+    // the name: probe ht_cached_keys (unicode keys, int8 indices, two
+    // probe steps like the dict form), then read the values slot.
+    // x17 keeps the entry index across the entry-address arithmetic.
+    as_->bind(cvar_values_probe);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w14, slow_path); // DICT_KEYS_GENERAL
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x13, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->ldrb(
+        a64::w15,
+        arch::ptr_offset(a64::x13, kDkLog2SizeOffset, arch::AccessSize::k8));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path); // wider than int8 indices
+    as_->mov(a64::x14, 1);
+    as_->lsl(a64::x15, a64::x14, a64::x15);
+    as_->sub(a64::x15, a64::x15, 1); // mask
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x2, kUnicodeHashOffset));
+    as_->cmn(a64::x10, 1);
+    as_->b_eq(slow_path);
+    as_->and_(a64::x12, a64::x10, a64::x15);
+    Label vp_found = as_->newLabel();
+    as_->add(a64::x14, a64::x13, a64::x12);
+    as_->ldrsb(
+        a64::w14,
+        arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+    as_->cmn(a64::w14, 1);
+    as_->b_eq(cvar_ok); // EMPTY: not shadowed
+    as_->tbnz(a64::w14, 31, slow_path); // DUMMY
+    as_->sxtw(a64::x17, a64::w14);
+    as_->add(a64::x14, a64::x14, a64::x14);
+    as_->lsl(a64::x14, a64::x14, 3);
+    as_->add(a64::x14, a64::x14, a64::x13);
+    as_->add(a64::x14, a64::x14, a64::x15);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kDkIndicesOffset + 1));
+    as_->cmp(a64::x14, a64::x2);
+    as_->b_eq(vp_found);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kUnicodeHashOffset));
+    as_->cmp(a64::x14, a64::x10);
+    as_->b_eq(slow_path); // same hash, non-identical key: helper
+    as_->lsr(a64::x10, a64::x10, 5);
+    as_->add(a64::x14, a64::x12, a64::x12, a64::lsl(2));
+    as_->add(a64::x14, a64::x14, a64::x10);
+    as_->add(a64::x14, a64::x14, 1);
+    as_->and_(a64::x12, a64::x14, a64::x15);
+    as_->add(a64::x14, a64::x13, a64::x12);
+    as_->ldrsb(
+        a64::w14,
+        arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+    as_->cmn(a64::w14, 1);
+    as_->b_eq(cvar_ok); // EMPTY after one perturbation: absent
+    as_->tbnz(a64::w14, 31, slow_path);
+    as_->sxtw(a64::x17, a64::w14);
+    as_->add(a64::x14, a64::x14, a64::x14);
+    as_->lsl(a64::x14, a64::x14, 3);
+    as_->add(a64::x14, a64::x14, a64::x13);
+    as_->add(a64::x14, a64::x14, a64::x15);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kDkIndicesOffset + 1));
+    as_->cmp(a64::x14, a64::x2);
+    as_->b_ne(slow_path); // deeper chain or a twin: helper
+    // vp_found: x17 = entry index; the instance's values array bounds
+    // it (prefix byte [-1], as in the kSplit arm); a live slot is the
+    // instance's own value, an empty one leaves the class side.
+    // x9 stays the class-side answer for cvar_ok; the slot value moves
+    // into x9 only on the way to hit.
+    as_->bind(vp_found);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->ldrb(a64::w10, arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x12, a64::x17, 2);
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(cvar_ok); // slot beyond this instance's values: absent
+    arch::add_immediate(as_, a64::x15, a64::x15, kValuesValuesOffset);
+    as_->add(a64::x15, a64::x15, a64::x17, a64::lsl(3));
+    as_->ldr(a64::x12, a64::ptr(a64::x15));
+    as_->cbz(a64::x12, cvar_ok);
+    as_->mov(a64::x9, a64::x12);
+    as_->b(hit);
+    as_->bind(cvar_dict);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x13, cvar_ok); // neither values nor dict
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x13, kMaKeysOffset));
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w14, slow_path); // DICT_KEYS_GENERAL
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x13, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->ldrb(
+        a64::w15,
+        arch::ptr_offset(a64::x13, kDkLog2SizeOffset, arch::AccessSize::k8));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path); // wider than int8 indices
+    as_->mov(a64::x14, 1);
+    as_->lsl(a64::x15, a64::x14, a64::x15);
+    as_->sub(a64::x15, a64::x15, 1); // mask
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x2, kUnicodeHashOffset));
+    as_->cmn(a64::x10, 1);
+    as_->b_eq(slow_path);
+    as_->and_(a64::x12, a64::x10, a64::x15);
+    as_->add(a64::x14, a64::x13, a64::x12);
+    as_->ldrsb(
+        a64::w14,
+        arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+    as_->cmn(a64::w14, 1);
+    as_->b_eq(cvar_ok); // EMPTY: not shadowed
+    as_->tbnz(a64::w14, 31, slow_path); // DUMMY
+    as_->add(a64::x14, a64::x14, a64::x14);
+    as_->lsl(a64::x14, a64::x14, 3);
+    as_->add(a64::x14, a64::x14, a64::x13);
+    as_->add(a64::x14, a64::x14, a64::x15);
+    as_->mov(a64::x17, a64::x14); // entry address survives the key load
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kDkIndicesOffset + 1));
+    as_->cmp(a64::x14, a64::x2);
+    // Dict-form receiver holding the name: the entry
+    // value (me_value follows me_key) is the instance's own attribute;
+    // an empty entry (deleted key) leaves the class side.
+    Label dp_found = as_->newLabel();
+    Label dp_probe = as_->newLabel();
+    as_->b_eq(dp_found);
+    as_->ldr(a64::x17, arch::ptr_offset(a64::x14, kUnicodeHashOffset));
+    as_->cmp(a64::x17, a64::x10);
+    as_->b_eq(slow_path); // same hash, non-identical key
+    as_->b(dp_probe);
+    as_->bind(dp_found);
+    // A split table (the materialised __dict__ of an instance, sharing
+    // the class keys) keeps its values in ma_values, indexed by the
+    // entry number; only a combined table stores them in the entry.
+    Label dp_combined = as_->newLabel();
+    Label dp_value = as_->newLabel();
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kMaValuesOffset));
+    as_->cbz(a64::x14, dp_combined);
+    as_->sub(a64::x12, a64::x17, a64::x13);
+    as_->sub(a64::x12, a64::x12, a64::x15);
+    as_->lsr(a64::x12, a64::x12, 4); // entry number
+    as_->ldrb(a64::w10, arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    arch::add_immediate(as_, a64::x15, a64::x12, 2);
+    as_->cmp(a64::x15, a64::x10);
+    as_->b_hs(slow_path); // slot beyond the values array: helper
+    arch::add_immediate(as_, a64::x14, a64::x14, kValuesValuesOffset);
+    as_->ldr(a64::x12, a64::ptr(a64::x14, a64::x12, a64::lsl(3)));
+    as_->b(dp_value);
+    as_->bind(dp_combined);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x17, kDkIndicesOffset + 1 + 8));
+    as_->bind(dp_value);
+    as_->cbz(a64::x12, cvar_ok);
+    as_->mov(a64::x9, a64::x12);
+    as_->b(hit);
+    as_->bind(dp_probe);
+    // A different key object with the same hash may still be EQUAL to
+    // the name (sqlalchemy builds its options keys as "_" + argname, so
+    // the instance dict holds a non-interned twin of the interned name):
+    // identity alone proved nothing, and reading past it declared the
+    // attribute absent while the instance shadowed it.  Equality needs
+    // __eq__: the helper's.  Only a hash mismatch may probe on (the
+    // dict-form path above already settled that).
+    as_->bind(cvar_probe2);
+    as_->lsr(a64::x10, a64::x10, 5);
+    as_->add(a64::x14, a64::x12, a64::x12, a64::lsl(2));
+    as_->add(a64::x14, a64::x14, a64::x10);
+    as_->add(a64::x14, a64::x14, 1);
+    as_->and_(a64::x12, a64::x14, a64::x15);
+    as_->add(a64::x14, a64::x13, a64::x12);
+    as_->ldrsb(
+        a64::w14,
+        arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+    as_->cmn(a64::w14, 1);
+    as_->b_eq(cvar_ok);
+    as_->b(slow_path);
+    // Absence proved (or no instance storage): a plain class variable is
+    // the answer itself, a non-data descriptor is called.
+    as_->bind(cvar_ok);
+    as_->cbz(a64::x16, hit);
+    as_->b(descr_call);
+    // ddescr_arm: kDataDescr entry (property, getset
+    // descriptor).  Mirrors doInvoke's descrVersionMatches plus
+    // DataDescrMutator::getAttr: the descriptor's live type must still be
+    // the captured one at the captured version (a descriptor demoted to
+    // non-data would have to yield to an instance shadow), then its
+    // tp_descr_get runs with the descriptor held.
+    as_->bind(ddescr_arm);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kDdDescrOff));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kDdTypeOff));
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x9, kObTypeOffset));
+    as_->cmp(a64::x14, a64::x15);
+    as_->b_ne(slow_path);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x14, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w12,
+        arch::ptr_offset(a64::x0, off + kDdTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w15, a64::w12);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x16, arch::ptr_offset(a64::x14, kTpDescrGetOffset));
+    as_->cbz(a64::x16, slow_path);
+    as_->b(descr_call);
   };
 
-  const uint32_t count = jit::getConfig().attr_cache_size;
-  if (count == 0) {
+  const uint32_t stub_entries = jit::getConfig().attr_cache_size;
+  if (stub_entries == 0) {
     as_->b(slow_path);
   }
-  for (uint32_t index = 0; index < count; ++index) {
-    const bool more = index + 1 != count;
-    Label next = more ? as_->newLabel() : slow_path;
-    emit_entry(index, next);
-    if (more) {
-      as_->bind(next);
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
     }
   }
 
   as_->bind(hit);
+  // 3.11: plain 64-bit refcount, no immortality.
   as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
   arch::add_immediate(as_, a64::x12, a64::x12, 1);
   as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
   as_->mov(a64::x0, a64::x9);
+  as_->ret(arch::lr);
+
+  // descr_call: x9 = descriptor (borrowed from the type
+  // dict, pinned by the version checks above), x16 = its tp_descr_get,
+  // x1 = receiver, x11 = receiver type.  The descriptor is held across the
+  // call -- the getter may run Python that deletes it from the class --
+  // and released afterwards, the rare last reference through _Py_Dealloc.
+  // The getter's result (a new reference, or NULL with an exception set)
+  // is the stub's answer, exactly what the helper returns for this entry.
+  Label descr_done = as_->newLabel();
+  as_->bind(descr_call);
+  // A receiver type with a __getattr__ hook (tp_getattro ==
+  // slot_tp_getattr_hook, admitted by the fill when __getattribute__ is
+  // generic) routes a getter's AttributeError to the hook that
+  // slot_tp_getattr_hook pinned before the generic lookup; the stub has no
+  // such pin, so those receivers take the helper, which does
+  // (GetAttrHookSnapshot311).  The getter must not run twice, hence the
+  // check precedes the call rather than following a failure.
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x11, kTpGetattroOffset));
+  as_->mov(a64::x14, reinterpret_cast<uint64_t>(PyObject_GenericGetAttr));
+  as_->cmp(a64::x12, a64::x14);
+  as_->b_ne(slow_path);
+  // Frame: [x29, x30] at sp, the descriptor at sp+16, the receiver and the
+  // name at sp+24 / sp+32 (both are clobbered by the getter and needed by
+  // the error completion below).
+  as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -48));
+  as_->mov(a64::x29, a64::sp);
+  as_->str(a64::x9, arch::ptr_offset(a64::sp, 16));
+  as_->str(a64::x1, arch::ptr_offset(a64::sp, 24));
+  as_->str(a64::x2, arch::ptr_offset(a64::sp, 32));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->mov(a64::x0, a64::x9);
+  as_->mov(a64::x2, a64::x11);
+  as_->blr(a64::x16);
+  as_->ldr(a64::x9, arch::ptr_offset(a64::sp, 16));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->sub(a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->cbnz(a64::x12, descr_done);
+  as_->str(a64::x0, arch::ptr_offset(a64::sp, 16));
+  as_->mov(a64::x0, a64::x9);
+  as_->mov(arch::reg_scratch_br, reinterpret_cast<uint64_t>(_Py_Dealloc));
+  as_->blr(arch::reg_scratch_br);
+  as_->ldr(a64::x0, arch::ptr_offset(a64::sp, 16));
+  as_->bind(descr_done);
+  // A raising getter: the exception is completed with the name and the
+  // receiver (PyObject_GetAttr's AttributeError context) by the helper the
+  // stub leaves through; a result returns as it is.
+  Label descr_ok = as_->newLabel();
+  as_->cbnz(a64::x0, descr_ok);
+  as_->ldr(a64::x0, arch::ptr_offset(a64::sp, 24));
+  as_->ldr(a64::x1, arch::ptr_offset(a64::sp, 32));
+  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 48));
+  as_->mov(
+      arch::reg_scratch_br, reinterpret_cast<uint64_t>(JITRT_LoadAttrError311));
+  as_->br(arch::reg_scratch_br);
+  as_->bind(descr_ok);
+  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 48));
   as_->ret(arch::lr);
 
   as_->bind(slow_path);
@@ -1865,138 +2736,25 @@ void NativeGenerator::emitAarch64LoadAttrNewShapeStub311(
 #endif
 }
 
-void NativeGenerator::emitAarch64LoadMethodStub311(
+// 3.11 aarch64 inline hit path for StoreAttrCache.
+// Mirrors doInvoke + the 3.11 SplitMutator::setAttr overwrite path only:
+// kSplit entry, pull-validated type version, live inline values, bounded
+// val_offset, existing old value with refcount > 1 (a dealloc or an
+// insertion needs the helper's bookkeeping).  Store then decref-old, in
+// stock SETLOCAL order.  ABI: x0=cache, x1=obj, x2=name, x3=value;
+// returns 0 in w0 on the inline path.
+void NativeGenerator::emitAarch64StoreAttrInvokeStub311(
     const asmjit::CodeHolder& code) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
-    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
-  if (!env_.load_method_invoke_stub.isValid()) {
-    return;
-  }
-  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
-  Label slow_path = as_->newLabel();
-  Label materialized = as_->newLabel();
-  Label hit = as_->newLabel();
-  constexpr int kEntriesOff =
-      static_cast<int>(jit::LoadMethodCache::entriesOffset());
-  constexpr int kEntrySize =
-      static_cast<int>(jit::LoadMethodCache::entrySize());
-  constexpr int kTypeOff =
-      static_cast<int>(jit::LoadMethodCache::entryTypeOffset());
-  constexpr int kValueOff =
-      static_cast<int>(jit::LoadMethodCache::entryValueOffset());
-  constexpr int kKeysVerOff =
-      static_cast<int>(jit::LoadMethodCache::entryKeysVersionOffset());
-  constexpr int kTypeVerOff =
-      static_cast<int>(jit::LoadMethodCache::entryTypeVersionOffset());
-  constexpr int kPeekOff =
-      static_cast<int>(jit::LoadMethodCache::entryPeekShadowOffset());
-  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
-  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
-  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
-  constexpr int kHtCachedKeysOffset =
-      offsetof(PyHeapTypeObject, ht_cached_keys);
-  constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
-  constexpr int kValuesPreheaderOffset =
-      -4 * static_cast<int>(sizeof(PyObject*));
-  constexpr int kDictPreheaderOffset = -3 * static_cast<int>(sizeof(PyObject*));
-  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
-
-  if (is_shadow_compile_) {
-    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
-  } else {
-    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
-  }
-  as_->bind(env_.load_method_invoke_stub);
-  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
-
-  auto emit_entry = [&](uint32_t index, Label next) {
-    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
-    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
-    as_->cmp(a64::x12, a64::x11);
-    as_->b_ne(next);
-    as_->ldr(
-        a64::w14,
-        arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
-    as_->ldr(
-        a64::w15,
-        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
-    as_->cmp(a64::w14, a64::w15);
-    as_->b_ne(slow_path);
-    as_->ldrb(
-        a64::w14,
-        arch::ptr_offset(a64::x0, off + kPeekOff, arch::AccessSize::k8));
-    as_->cbnz(a64::w14, slow_path);
-    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
-    as_->cbz(a64::x9, next);
-    as_->ldr(
-        a64::w15,
-        arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
-    as_->cbz(a64::w15, hit);
-    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x13, materialized);
-    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
-    as_->cbz(a64::x13, slow_path);
-    as_->ldr(
-        a64::w14,
-        arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
-    as_->cmp(a64::w14, a64::w15);
-    as_->b_ne(slow_path);
-    as_->b(hit);
-  };
-
-  const uint32_t count =
-      static_cast<uint32_t>(jit::LoadMethodCache::numEntries());
-  for (uint32_t index = 0; index < count; ++index) {
-    const bool more = index + 1 != count;
-    Label next = more ? as_->newLabel() : slow_path;
-    emit_entry(index, next);
-    if (more) {
-      as_->bind(next);
-    }
-  }
-
-  as_->bind(materialized);
-  as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
-  as_->cbz(a64::x13, hit);
-  as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaKeysOffset));
-  as_->ldr(
-      a64::w14,
-      arch::ptr_offset(a64::x14, kDkVersionOffset, arch::AccessSize::k32));
-  as_->cmp(a64::w14, a64::w15);
-  as_->b_ne(slow_path);
-
-  as_->bind(hit);
-  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
-  arch::add_immediate(as_, a64::x12, a64::x12, 1);
-  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
-  as_->ldr(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
-  arch::add_immediate(as_, a64::x12, a64::x12, 1);
-  as_->str(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
-  as_->mov(a64::x0, a64::x9);
-  as_->ret(arch::lr);
-
-  as_->bind(slow_path);
-  as_->mov(
-      arch::reg_scratch_br,
-      reinterpret_cast<uint64_t>(jit::LoadMethodCache::lookupHelper));
-  as_->br(arch::reg_scratch_br);
-#else
-  (void)code;
-#endif
-}
-
-void NativeGenerator::emitAarch64StoreAttrStub311(
-    const asmjit::CodeHolder& code) {
-#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
-    !defined(Py_REF_DEBUG) && PY_VERSION_HEX < 0x030C0000
+    PY_VERSION_HEX < 0x030C0000
   if (!env_.store_attr_invoke_stub.isValid()) {
     return;
   }
 
   CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
   Label slow_path = as_->newLabel();
   Label do_store = as_->newLabel();
-  Label member_store_fresh = as_->newLabel();
 
   constexpr int kEntriesOff =
       static_cast<int>(jit::AttributeCache::entriesOffset());
@@ -2008,6 +2766,12 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
   constexpr int kValOffsetOff =
       static_cast<int>(jit::AttributeMutator::splitValOffsetOffset());
   constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
   constexpr uint64_t kMemberDescrKind =
       jit::AttributeMutator::memberDescrKind();
   constexpr int kMemberdefOff =
@@ -2015,12 +2779,7 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
   constexpr int kMemberTypeOff = offsetof(PyMemberDef, type);
   constexpr int kMemberOffsetOff = offsetof(PyMemberDef, offset);
   constexpr int kMemberFlagsOff = offsetof(PyMemberDef, flags);
-  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
-  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
-  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
-  constexpr int kValuesPreheaderOffset =
-      -4 * static_cast<int>(sizeof(PyObject*));
-  constexpr int kValuesValuesOffset = offsetof(PyDictValues, values);
+  Label member_store_fresh = as_->newLabel();
 
   if (is_shadow_compile_) {
     ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
@@ -2028,16 +2787,17 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
     ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   }
   as_->bind(env_.store_attr_invoke_stub);
+
   as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
-  auto emit_entry = [&](uint32_t index, Label next) {
-    const int off = kEntriesOff + static_cast<int>(index) * kEntrySize;
+  auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int off = kEntriesOff + static_cast<int>(entry_index) * kEntrySize;
     as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
-    as_->cbz(a64::x12, next);
+    as_->cbz(a64::x12, next_entry);
     as_->mov(a64::x13, ~kKindMask);
     as_->and_(a64::x13, a64::x12, a64::x13);
     as_->cmp(a64::x13, a64::x11);
-    as_->b_ne(next);
+    as_->b_ne(next_entry);
     as_->ldr(
         a64::w14,
         arch::ptr_offset(a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
@@ -2046,14 +2806,10 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
         arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
     as_->cmp(a64::w14, a64::w15);
     as_->b_ne(slow_path);
-
-    Label member = as_->newLabel();
+    Label member_arm = as_->newLabel();
     as_->and_(a64::x14, a64::x12, kKindMask);
     arch::cmp_immediate(as_, a64::x14, kMemberDescrKind);
-    as_->b_eq(member);
-    // New kDict and materialized shapes intentionally use the optimized C++
-    // helper, which owns dict versioning and GC tracking. Only live kSplit is
-    // safe for the raw slot store below.
+    as_->b_eq(member_arm);
     as_->cbnz(a64::x14, slow_path);
     as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
     as_->cbz(a64::x15, slow_path);
@@ -2065,14 +2821,18 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
     as_->b_hs(slow_path);
     arch::add_immediate(as_, a64::x15, a64::x15, kValuesValuesOffset);
     as_->add(a64::x10, a64::x15, a64::x14, a64::lsl(3));
-    as_->ldr(a64::x9, a64::ptr(a64::x10));
+    as_->ldr(a64::x9, a64::ptr(a64::x10)); // old value
     as_->cbz(a64::x9, slow_path);
     as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
     arch::cmp_immediate(as_, a64::x12, 1);
     as_->b_eq(slow_path);
     as_->b(do_store);
 
-    as_->bind(member);
+    // kMemberDescr (slots): mirror PyMember_SetOne for a writable
+    // T_OBJECT_EX member.  A fresh slot (old == NULL) is a plain
+    // store+incref; an occupied slot shares do_store, whose reload
+    // keeps the aliased-store accounting right.
+    as_->bind(member_arm);
     as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kMemberdefOff));
     as_->ldr(
         a64::w15,
@@ -2094,19 +2854,24 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
     as_->b(do_store);
   };
 
-  const uint32_t count = jit::getConfig().attr_cache_size;
-  if (count == 0) {
+  const uint32_t stub_entries = jit::getConfig().attr_cache_size;
+  if (stub_entries == 0) {
     as_->b(slow_path);
   }
-  for (uint32_t index = 0; index < count; ++index) {
-    const bool more = index + 1 != count;
-    Label next = more ? as_->newLabel() : slow_path;
-    emit_entry(index, next);
-    if (more) {
-      as_->bind(next);
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
     }
   }
 
+  // x10 = slot address, x9 = old value (pre-checked refcount > 1).
+  // The new value can BE the old value (repeated stores of the same
+  // singleton are richards' bread and butter), so the old refcount must
+  // be re-read after the incref of the new value -- decrementing a
+  // pre-incref copy nets the pair to -1 and frees a live object.
   as_->bind(do_store);
   as_->ldr(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
   arch::add_immediate(as_, a64::x14, a64::x14, 1);
@@ -2118,6 +2883,7 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
   as_->mov(a64::w0, 0);
   as_->ret(arch::lr);
 
+  // Fresh slot member store: no old value to release.
   as_->bind(member_store_fresh);
   as_->ldr(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
   arch::add_immediate(as_, a64::x14, a64::x14, 1);
@@ -2130,6 +2896,538 @@ void NativeGenerator::emitAarch64StoreAttrStub311(
   as_->mov(
       arch::reg_scratch_br,
       reinterpret_cast<uint64_t>(jit::StoreAttrCache::invoke));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
+// Per-function dispatch stub for non-function callables at call sites (the
+// generic arm of translateCallSiteVectorCall).  Entered by blr with
+// x0=callable / x1=args / x2=nargsf / x3=kwnames (NULL at these sites) and
+// x15 = 1 for the method-call form (JITRT_Call's slot protocol applies), 0
+// for the plain form, or the site's entry cache address for the plain form
+// with a constructor arm.  Dispatches the way _PyObject_VectorcallTstate
+// does: tp_flags HAVE_VECTORCALL and the slot at tp_vectorcall_offset are
+// read and the slot is called directly. Result/exception consistency is
+// checked inline; malformed returns go through _Py_CheckFunctionResult so
+// its SystemError, exception chaining and debug-build diagnostics match
+// the interpreter. Ordinary returns need no additional C helper call.
+// After a successful call the eval breaker is tested and pending work runs
+// through JITRT_HandlePendingAfterCall311.  A heap class takes the
+// constructor arm (JITRT_ConstructSite311) when a site cache was supplied;
+// anything without a vectorcall slot tail-calls the slow slot.  Out of line
+// so call sites stay short.
+void NativeGenerator::emitAarch64VcDirectStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  if (!env_.vcdirect_stub.isValid()) {
+    return;
+  }
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow = as_->newLabel();
+  Label slow_call_slot = as_->newLabel();
+  Label have_callable = as_->newLabel();
+  Label check_receiver = as_->newLabel();
+  Label dispatch = as_->newLabel();
+  Label not_type = as_->newLabel();
+  Label out = as_->newLabel();
+  Label null_result = as_->newLabel();
+  Label invalid_result = as_->newLabel();
+
+  as_->bind(env_.vcdirect_stub);
+  // --- method form: JITRT_Call's slot protocol (consuming a slot forfeits
+  // PY_VECTORCALL_ARGUMENTS_OFFSET) ---
+  as_->cmp(a64::x15, 1);
+  as_->b_ne(dispatch);
+  as_->cbnz(a64::x0, have_callable);
+  as_->ldr(a64::x0, a64::ptr(a64::x1));
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+  as_->b(dispatch);
+
+  as_->bind(have_callable);
+  as_->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+  as_->cmp(a64::x0, a64::x11);
+  as_->b_ne(check_receiver);
+  as_->ldr(a64::x14, a64::ptr(a64::x1));
+  as_->cbz(a64::x14, slow_call_slot); // None with an empty receiver slot
+  as_->mov(a64::x0, a64::x14);
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+  as_->b(dispatch);
+
+  as_->bind(check_receiver);
+  as_->ldr(a64::x14, a64::ptr(a64::x1));
+  as_->cbnz(a64::x14, dispatch);
+  as_->add(a64::x1, a64::x1, 8);
+  as_->sub(a64::x2, a64::x2, 1);
+  as_->and_(a64::x2, a64::x2, 0x7fffffffffffffffULL);
+
+  // --- dispatch ---
+  as_->bind(dispatch);
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyObject, ob_type))));
+  as_->mov(a64::x11, reinterpret_cast<uint64_t>(&PyType_Type));
+  as_->cmp(a64::x10, a64::x11);
+  as_->b_ne(not_type);
+  static_assert(Py_TPFLAGS_HEAPTYPE == (1UL << 9), "HEAPTYPE bit");
+  as_->ldr(
+      a64::x11,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyTypeObject, tp_flags))));
+  as_->tbz(a64::x11, 9, not_type);
+  // A heap class.  With a site cache in x15 the constructor arm validates
+  // the class version and the __init__ entry and runs object_new plus a
+  // direct __init__ entry (or falls to the slow slot itself); without one,
+  // the slow slot.  x3 (kwnames) is NULL at every site that reaches this
+  // stub, so it carries the cache.
+  as_->cmp(a64::x15, 1);
+  as_->b_ls(slow);
+  as_->mov(a64::x3, a64::x15);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(JITRT_ConstructSite311));
+  as_->br(a64::x16);
+
+  as_->bind(not_type);
+  static_assert(Py_TPFLAGS_HAVE_VECTORCALL == (1UL << 11), "VECTORCALL bit");
+  as_->ldr(
+      a64::x11,
+      arch::ptr_offset(
+          a64::x10, static_cast<int32_t>(offsetof(PyTypeObject, tp_flags))));
+  as_->tbz(a64::x11, 11, slow);
+  as_->ldr(
+      a64::x12,
+      arch::ptr_offset(
+          a64::x10,
+          static_cast<int32_t>(offsetof(PyTypeObject, tp_vectorcall_offset))));
+  as_->ldr(a64::x14, a64::ptr(a64::x0, a64::x12));
+  as_->cbz(a64::x14, slow);
+
+  // Keep the callable for the error diagnostic across the vectorcall;
+  // x0 becomes the result and all argument/scratch registers may be lost.
+  as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -32));
+  as_->mov(a64::x29, a64::sp);
+  as_->str(a64::x0, a64::ptr(a64::sp, 16));
+  as_->blr(a64::x14);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                      ->runtime->gilstate.tstate_current));
+  as_->ldr(a64::x9, a64::ptr(a64::x9));
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x9, static_cast<int32_t>(offsetof(PyThreadState, curexc_type))));
+  as_->cbz(a64::x0, null_result);
+  as_->cbnz(a64::x10, invalid_result);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(
+          &ThreadedCompileContext::interpreter()->ceval.eval_breaker));
+  as_->ldr(a64::w9, a64::ptr(a64::x9));
+  as_->cbz(a64::w9, out);
+  as_->mov(
+      a64::x9, reinterpret_cast<uint64_t>(JITRT_HandlePendingAfterCall311));
+  as_->blr(a64::x9);
+  as_->bind(out);
+  as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 32));
+  as_->ret(a64::x30);
+
+  as_->bind(null_result);
+  // NULL with an exception is a legitimate error return. NULL without
+  // one, or a non-NULL result with an exception, must be audited before
+  // the caller's exception guard or any pending work can run.
+  as_->cbnz(a64::x10, out);
+  as_->bind(invalid_result);
+  as_->mov(a64::x2, a64::x0);
+  as_->ldr(a64::x1, a64::ptr(a64::sp, 16));
+  as_->mov(a64::x0, a64::x9);
+  as_->mov(a64::x3, 0);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(_Py_CheckFunctionResult));
+  as_->blr(a64::x16);
+  as_->b(out);
+
+  // --- slow: tail-call the plain vectorcall helper.  The slot protocol has
+  // already been applied above, so JITRT_Call must not see the shifted
+  // arguments again: with zero remaining arguments its empty-receiver-slot
+  // test would read past the argument vector.  Only the unresolved
+  // None-with-empty-receiver shape keeps the Call slot.
+  as_->bind(slow);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot));
+  as_->ldr(a64::x16, a64::ptr(a64::x16));
+  as_->br(a64::x16);
+  as_->bind(slow_call_slot);
+  as_->mov(a64::x16, reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot));
+  as_->ldr(a64::x16, a64::ptr(a64::x16));
+  as_->br(a64::x16);
+#else
+  (void)code;
+#endif
+}
+
+void NativeGenerator::emitAarch64LoadMethodInvokeStub311(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  if (!env_.load_method_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow_path = as_->newLabel();
+  Label hit = as_->newLabel();
+
+  constexpr int kEntriesOffset =
+      static_cast<int>(jit::LoadMethodCache::entriesOffset());
+  constexpr int kEntrySize =
+      static_cast<int>(jit::LoadMethodCache::entrySize());
+  constexpr int kTypeOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeOffset());
+  constexpr int kValueOff =
+      static_cast<int>(jit::LoadMethodCache::entryValueOffset());
+  constexpr int kKeysVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryKeysVersionOffset());
+  constexpr int kTypeVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeVersionOffset());
+  constexpr int kPeekOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekShadowOffset());
+  constexpr int kPeekKeysOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekKeysOffset());
+  constexpr int kPeekNentriesOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekNentriesOffset());
+  constexpr int kPeekKeysVersionOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekKeysVersionOffset());
+  constexpr int kPeekHintOff =
+      static_cast<int>(jit::LoadMethodCache::entryPeekHintOffset());
+  constexpr int kInstAttrOff =
+      static_cast<int>(jit::LoadMethodCache::entryInstAttrOffset());
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkNentriesOffset = offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkLog2SizeOffset = offsetof(PyDictKeysObject, dk_log2_size);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  constexpr int kUnicodeHashOffset = offsetof(PyASCIIObject, hash);
+  static_assert(sizeof(PyDictUnicodeEntry) == 16, "entry size");
+  static_assert(DKIX_EMPTY == -1 && DKIX_DUMMY == -2, "dkix sentinels");
+  static_assert(Py_TPFLAGS_MANAGED_DICT == (1UL << 4), "flag bit moved");
+  // inline arm for peek entries whose memo pins the
+  // name's ABSENCE (peek_hint == kPeekAbsent) -- the LoadMethodCache::lookup
+  // fast answers for values-form (type cached keys anchor) and
+  // materialized-dict receivers (instance dict keys anchor).  Everything
+  // else about a peek entry (hint >= 0, inst_attr, split-materialized dict)
+  // keeps going to the helper.
+  // The receiver's tp_version_tag is hoisted into w17 (see the LoadAttr
+  // stub); the entry walk otherwise keeps its shape.
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kTpDictoffsetOffset = offsetof(PyTypeObject, tp_dictoffset);
+  constexpr int kHtCachedKeysOffset =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
+  constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset = -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+
+  if (is_shadow_compile_) {
+    ASM_CHECK_THROW(as_->align(AlignMode::kCode, 8));
+  } else {
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  }
+  as_->bind(env_.load_method_invoke_stub);
+
+  // x0=cache, x1=obj, x2=name
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+  as_->ldr(
+      a64::w17,
+      arch::ptr_offset(a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+
+  Label mat_check = as_->newLabel();
+
+  auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int off = kEntriesOffset + static_cast<int>(entry_index) * kEntrySize;
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
+    as_->cmp(a64::x12, a64::x11);
+    as_->b_ne(next_entry);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w17, a64::w15);
+    as_->b_ne(slow_path);
+    // peek entries prove no-shadow per hit in the helper.
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x0, off + kPeekOff, arch::AccessSize::k8));
+    Label not_peek = as_->newLabel();
+    Label peek_mat = as_->newLabel();
+    Label peek_cmp = as_->newLabel();
+    as_->cbz(a64::w14, not_peek);
+    // peek entry: only the pinned-absent, class-side form is inlined.
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x0, off + kInstAttrOff, arch::AccessSize::k8));
+    {
+      // the instance-attribute callable form (a bound
+      // method stored by __init__: pickle's _Unpickler.read / append,
+      // 17M lookups per unpickle_pure_python run in the helper).  The
+      // memo pins the slot index into the values-form storage: live
+      // cached keys identical to the anchor, same entry count, the entry
+      // at the hint still keyed by this name, the slot within the
+      // instance's used range and non-NULL.  Result is {None, slot},
+      // both references taken here as the helper does.
+      Label class_side = as_->newLabel();
+      as_->cbz(a64::w14, class_side);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+      as_->tbz(a64::x14, 4, slow_path); // Py_TPFLAGS_MANAGED_DICT
+      as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+      as_->cbz(a64::x13, slow_path); // materialized: helper
+      as_->ldr(a64::x9, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+      as_->cbz(a64::x9, slow_path);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+      as_->cmp(a64::x9, a64::x14);
+      as_->b_ne(slow_path);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x9, kDkNentriesOffset));
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+      as_->cmp(a64::x14, a64::x15);
+      as_->b_ne(slow_path);
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekHintOff));
+      as_->tbnz(a64::x15, 63, slow_path); // hint >= 0
+      // entries = keys + indices + (1 << dk_log2_index_bytes); me_key at
+      // entries[hint].
+      as_->ldrb(
+          a64::w14,
+          arch::ptr_offset(
+              a64::x9, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+      as_->mov(a64::x12, 1);
+      as_->lsl(a64::x12, a64::x12, a64::x14);
+      as_->add(a64::x12, a64::x12, a64::x9);
+      as_->add(a64::x12, a64::x12, a64::x15, a64::lsl(4));
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x12, kDkIndicesOffset));
+      as_->cmp(a64::x14, a64::x2);
+      as_->b_ne(slow_path);
+      // hint + 2 < values[-1] (the instance's used-slot count byte)
+      as_->ldrb(a64::w14, arch::ptr_offset(a64::x13, -1, arch::AccessSize::k8));
+      as_->add(a64::x12, a64::x15, 2);
+      as_->cmp(a64::x12, a64::x14);
+      as_->b_hs(slow_path);
+      as_->ldr(a64::x9, a64::ptr(a64::x13, a64::x15, a64::lsl(3)));
+      as_->cbz(a64::x9, slow_path);
+      as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+      arch::add_immediate(as_, a64::x12, a64::x12, 1);
+      as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+      as_->mov(a64::x0, reinterpret_cast<uint64_t>(Py_None));
+      as_->ldr(a64::x12, arch::ptr_offset(a64::x0, kRefcountOffset));
+      arch::add_immediate(as_, a64::x12, a64::x12, 1);
+      as_->str(a64::x12, arch::ptr_offset(a64::x0, kRefcountOffset));
+      as_->mov(a64::x1, a64::x9);
+      as_->ret(arch::lr);
+      as_->bind(class_side);
+    }
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+    Label non_managed = as_->newLabel();
+    as_->tbz(a64::x14, 4, non_managed); // Py_TPFLAGS_MANAGED_DICT
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekHintOff));
+    as_->cmn(a64::x15, 2); // peek_hint == kPeekAbsent (-2)
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x13, peek_mat);
+    // values form: anchor is the live type's cached keys.
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->b(peek_cmp);
+    as_->bind(peek_mat);
+    // materialized form: anchor is the instance dict's own keys table;
+    // split-materialized dicts (ma_values set) and non-unicode keys keep
+    // the helper's probing path.
+    // (split-materialized dicts -- ma_values set -- share the anchor for
+    // the absent-name form inlined here.)
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x13, kMaKeysOffset));
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w14, slow_path); // DICT_KEYS_GENERAL
+    {
+      // Anchor mismatch (many instances, each with its own combined
+      // keys table) falls into an inline negative probe instead of the
+      // helper: up to two steps of the unicode-key probe sequence on an
+      // int8 index table; an EMPTY slot proves absence (the class-side
+      // method stands), a matching key is a shadow, anything else --
+      // DUMMY, collision, wider tables, uncached hash -- is the helper's.
+      Label probe = as_->newLabel();
+      Label probe2 = as_->newLabel();
+      Label probe_check = as_->newLabel();
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+      as_->cmp(a64::x13, a64::x14);
+      as_->b_ne(probe);
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kDkNentriesOffset));
+      as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+      as_->cmp(a64::x14, a64::x15);
+      as_->b_ne(probe);
+      // A combined-keys table freed by dict.clear() and reallocated at
+      // the same address with the same dk_nentries must not satisfy the
+      // anchor: the anchor also records the table's keys version, which
+      // a fresh table lacks (0) and any key-set change resets.
+      as_->ldr(
+          a64::w14,
+          arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+      as_->cbz(a64::w14, probe);
+      as_->ldr(
+          a64::w15,
+          arch::ptr_offset(
+              a64::x0, off + kPeekKeysVersionOff, arch::AccessSize::k32));
+      as_->cmp(a64::w14, a64::w15);
+      as_->b_eq(hit);
+      as_->bind(probe);
+      as_->ldrb(
+          a64::w14,
+          arch::ptr_offset(
+              a64::x13, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+      as_->ldrb(
+          a64::w15,
+          arch::ptr_offset(a64::x13, kDkLog2SizeOffset, arch::AccessSize::k8));
+      as_->cmp(a64::w14, a64::w15); // int8 indices <=> index_bytes == size
+      as_->b_ne(slow_path);
+      as_->mov(a64::x14, 1);
+      as_->lsl(a64::x15, a64::x14, a64::x15); // size
+      as_->sub(a64::x15, a64::x15, 1); // mask
+      as_->ldr(a64::x10, arch::ptr_offset(a64::x2, kUnicodeHashOffset));
+      as_->cmn(a64::x10, 1);
+      as_->b_eq(slow_path); // hash not cached
+      as_->and_(a64::x12, a64::x10, a64::x15); // i = hash & mask
+      as_->bind(probe_check);
+      as_->add(a64::x14, a64::x13, a64::x12);
+      as_->ldrsb(
+          a64::w14,
+          arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+      as_->cmn(a64::w14, 1);
+      as_->b_eq(hit); // DKIX_EMPTY: absent
+      as_->tbnz(a64::w14, 31, slow_path); // DKIX_DUMMY: keep probing in C++
+      // occupied: entries start after the index table (size bytes).
+      as_->add(a64::x14, a64::x14, a64::x14); // ix*2
+      as_->lsl(a64::x14, a64::x14, 3); // ix*16
+      as_->add(a64::x14, a64::x14, a64::x13);
+      as_->add(a64::x14, a64::x14, a64::x15); // + mask (size - 1)
+      as_->ldr(
+          a64::x14, arch::ptr_offset(a64::x14, kDkIndicesOffset + 1)); // me_key
+      as_->cmp(a64::x14, a64::x2);
+      as_->b_eq(slow_path); // shadowed by the instance
+      // Non-identical key: equal iff __eq__ says so, which only the
+      // helper can ask; probe on only when the cached hashes differ.
+      as_->ldr(a64::x14, arch::ptr_offset(a64::x14, kUnicodeHashOffset));
+      as_->cmp(a64::x14, a64::x10);
+      as_->b_eq(slow_path); // same hash, non-identical key
+      // second step: perturb >>= 5; i = (i*5 + perturb + 1) & mask
+      as_->bind(probe2);
+      as_->lsr(a64::x10, a64::x10, 5);
+      as_->add(a64::x14, a64::x12, a64::x12, a64::lsl(2)); // i*5
+      as_->add(a64::x14, a64::x14, a64::x10);
+      as_->add(a64::x14, a64::x14, 1);
+      as_->and_(a64::x12, a64::x14, a64::x15);
+      as_->add(a64::x14, a64::x13, a64::x12);
+      as_->ldrsb(
+          a64::w14,
+          arch::ptr_offset(a64::x14, kDkIndicesOffset, arch::AccessSize::k8));
+      as_->cmn(a64::w14, 1);
+      as_->b_eq(hit);
+      as_->b(slow_path);
+    }
+    as_->bind(peek_cmp);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x0, off + kPeekKeysOff));
+    as_->cmp(a64::x13, a64::x14);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kDkNentriesOffset));
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x0, off + kPeekNentriesOff));
+    as_->cmp(a64::x14, a64::x15);
+    as_->b_ne(slow_path);
+    as_->b(hit);
+    // a peek entry on a receiver type without a
+    // managed dict -- the non-heap types that still carry an instance
+    // __dict__ slot (_io.BytesIO / StringIO, the unpickle and logging
+    // method receivers), which the fill could not prove shadow-free.
+    // The instance dict lives at tp_dictoffset; an instance that never
+    // grew one cannot shadow the class-side method, so the entry value
+    // stands.  A present dict (or an object-relative offset) keeps the
+    // helper's probe.
+    as_->bind(non_managed);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kTpDictoffsetOffset));
+    as_->cmp(a64::x13, 0);
+    as_->b_le(slow_path);
+    as_->ldr(a64::x13, a64::ptr(a64::x1, a64::x13));
+    as_->cbz(a64::x13, hit);
+    as_->b(slow_path);
+    as_->bind(not_peek);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, next_entry);
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
+    as_->cbz(a64::w15, hit);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x13, mat_check);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+    as_->b(hit);
+  };
+
+  const uint32_t stub_entries =
+      static_cast<uint32_t>(jit::LoadMethodCache::numEntries());
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
+    }
+  }
+
+  // Materialized receiver: no dict cannot shadow; a dict whose keys
+  // version equals the entry version proves absence the same way
+  // isValidKeysVersion does.  Anything else goes to the helper.
+  // Entry state on arrival: x9=entry value, w15=entry keys_version.
+  as_->bind(mat_check);
+  as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+  as_->cbz(a64::x13, hit);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaKeysOffset));
+  as_->ldr(
+      a64::w14,
+      arch::ptr_offset(a64::x14, kDkVersionOffset, arch::AccessSize::k32));
+  as_->cmp(a64::w14, a64::w15);
+  as_->b_ne(slow_path);
+
+  as_->bind(hit);
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  as_->mov(a64::x0, a64::x9);
+  // x1 is already obj (self), the second LoadMethodResult member.
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::LoadMethodCache::lookupHelper));
   as_->br(arch::reg_scratch_br);
 #else
   (void)code;
@@ -2179,8 +3477,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   auto emit_load_attr_entry = [&](uint32_t entry_index, Label next_entry) {
     const int entry_offset = static_cast<int>(entry_index) * kEntrySize;
     as_->ldr(
-        a64::x12,
-        arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
+        a64::x12, arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
     as_->cbz(a64::x12, next_entry);
 
     as_->mov(a64::x13, ~kKindMask);
@@ -2201,8 +3498,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->cbz(a64::w14, slow_path);
 
     as_->ldr(
-        a64::x14,
-        arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+        a64::x14, arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
     arch::add_immediate(as_, a64::x15, a64::x15, kInlineValuesValuesOffset);
     as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
     as_->ldr(a64::x9, a64::ptr(a64::x15));
@@ -2529,6 +3825,195 @@ void NativeGenerator::generateCode(
     generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
   }
 
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  // The generated vectorcall entry is installed directly (no guarded C
+  // shell), so it is the only place left to re-prove the per-call
+  // invariants the shell owned.  The entry guard: a divert stub (tail jump
+  // into the stock interpreter entry with x0-x3 still in raw vectorcall
+  // form), a mandatory __code__ identity check, and a tracing + recursion
+  // pre-check.  The stub sits before the reentry stub: the reentry-stub to
+  // vectorcall-entry distance is the JITRT_CALL_REENTRY_OFFSET hard
+  // invariant and nothing may be inserted between them.
+  Label entry_guard_divert = as_->newLabel();
+  Label entry_guard_cstack_overflow = as_->newLabel();
+  const int32_t cstack_tls_offset = Ci_JitShell311_CStackSoftLimitTlsOffset();
+  {
+    auto divert_cursor = as_->cursor();
+    as_->bind(entry_guard_divert);
+    as_->mov(a64::x16, reinterpret_cast<uint64_t>(&_PyFunction_Vectorcall));
+    as_->br(a64::x16);
+    env_.addAnnotation("Entry guard divert", divert_cursor);
+    // C-stack overflow stub: raises RecursionError like the shell.
+    auto cstack_cursor = as_->cursor();
+    as_->bind(entry_guard_cstack_overflow);
+    as_->mov(
+        a64::x16, reinterpret_cast<uint64_t>(&Ci_JitShell311_CStackOverflow));
+    as_->br(a64::x16);
+    env_.addAnnotation("Entry guard C-stack stubs", cstack_cursor);
+  }
+  // Tracing + recursion pre-check, shared by the vectorcall entry and the
+  // direct call entry.  Read-only, before any frame is built; only x9/x10
+  // clobbered, x0-x3 untouched.  Tracing active or recursion budget about
+  // to overflow diverts the whole call: the interpreter carries its own
+  // recursion accounting and CheckRecursiveCall semantics, so the failure
+  // path needs no bookkeeping on this side.
+  auto emit_entry_guard = [&]() {
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    // Preserve the thread state for the LIR entry bind.
+    as_->mov(a64::x11, a64::x9);
+    // Match InstalledArtifact's tracing contract even inside a callback:
+    // CPython suppresses recursive events by clearing use_tracing while
+    // c_tracefunc/c_profilefunc remain installed. Entering the binder there
+    // would select an interpreted reentry for an already-bound argument array.
+    for (int32_t offset :
+         {static_cast<int32_t>(offsetof(PyThreadState, c_tracefunc)),
+          static_cast<int32_t>(offsetof(PyThreadState, c_profilefunc))}) {
+      as_->ldr(a64::x10, arch::ptr_offset(a64::x9, offset));
+      as_->cbnz(a64::x10, entry_guard_divert);
+    }
+    // Fail closed when the JIT is paused or disabled (the usable byte
+    // follows every JIT state transition) or when the frame evaluator is
+    // not ours: another PEP 523 client can take the interpreter's slot
+    // without going through our install/remove, so the slot itself is read
+    // on every entry, exactly as the shell re-proved it
+    // (Ci_EvalHook311_IsInstalled).  One materialized address serves both
+    // reads.  x12 is free at the vectorcall entry; x11 carries the thread
+    // state.
+    {
+      // Gate address from the constant pool: one PC-relative load.
+      const uint64_t gate =
+          reinterpret_cast<uint64_t>(&Ci_JitDirectEntryGate311);
+      auto it = env_.const_pool_labels.find(gate);
+      if (it == env_.const_pool_labels.end()) {
+        it = env_.const_pool_labels.emplace(gate, as_->newLabel()).first;
+      }
+      as_->ldr(a64::x12, a64::ptr(it->second));
+    }
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x12,
+            static_cast<int32_t>(
+                offsetof(Ci_JitDirectEntryGate311Layout, usable)),
+            arch::AccessSize::k8));
+    as_->cbz(a64::w10, entry_guard_divert);
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(
+            a64::x12,
+            static_cast<int32_t>(
+                offsetof(Ci_JitDirectEntryGate311Layout, eval_frame))));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, interp))));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x10,
+            static_cast<int32_t>(offsetof(PyInterpreterState, eval_frame))));
+    as_->cmp(a64::x10, a64::x12);
+    as_->b_ne(entry_guard_divert);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->cmp(a64::w10, 0);
+    as_->b_le(entry_guard_divert);
+    // C-stack soft limit (the shell's cStackSoftLimitReached311): compare
+    // the stack pointer with this thread's limit.  Zero means the thread has
+    // not established its limits yet.
+    if (cstack_tls_offset >= 0) {
+      Label have_limit = as_->newLabel();
+      as_->mrs(a64::x10, a64::Predicate::SysReg::kTPIDR_EL0);
+      as_->mov(a64::x16, static_cast<uint64_t>(cstack_tls_offset));
+      as_->ldr(a64::x10, a64::ptr(a64::x10, a64::x16));
+      as_->cbnz(a64::x10, have_limit);
+      // First compiled call on this thread: establish its limits (the
+      // vectorcall registers are preserved around the C call), then
+      // re-read and continue into the function.
+      as_->stp(a64::x0, a64::x1, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x2, a64::x3, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x9, a64::x11, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -16));
+      as_->mov(a64::x29, a64::sp);
+      as_->mov(
+          a64::x16,
+          reinterpret_cast<uint64_t>(&Ci_JitShell311_InitCStackLimits));
+      as_->blr(a64::x16);
+      as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x9, a64::x11, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x2, a64::x3, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x0, a64::x1, a64::ptr_post(a64::sp, 16));
+      as_->mrs(a64::x10, a64::Predicate::SysReg::kTPIDR_EL0);
+      as_->mov(a64::x16, static_cast<uint64_t>(cstack_tls_offset));
+      as_->ldr(a64::x10, a64::ptr(a64::x10, a64::x16));
+      as_->bind(have_limit);
+      as_->mov(a64::x16, a64::sp);
+      as_->cmp(a64::x16, a64::x10);
+      as_->b_lo(entry_guard_cstack_overflow);
+    } else {
+      as_->stp(a64::x0, a64::x1, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x2, a64::x3, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x9, a64::x11, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -16));
+      as_->mov(a64::x29, a64::sp);
+      as_->mov(
+          a64::x16,
+          reinterpret_cast<uint64_t>(&Ci_JitShell311_CStackSoftLimitReached));
+      as_->blr(a64::x16);
+      as_->mov(a64::w10, a64::w0);
+      as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x9, a64::x11, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x2, a64::x3, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x0, a64::x1, a64::ptr_post(a64::sp, 16));
+      as_->cbnz(a64::w10, entry_guard_cstack_overflow);
+    }
+  };
+  // Direct call entry: the jump target of a call-site entry-cache hit.  The
+  // __code__ identity check is carried by the caller's cached func_code
+  // guard, and the argument-count / defaults / kwnames chain is proven once
+  // by the cache fill conditions (no varargs or keyword-only parameters,
+  // site argument count equal to co_argcount, kwnames NULL).  Tracing,
+  // evaluator and recursion semantics are re-proved by the shared entry
+  // guard; the frame record is built here and the body joined directly, so
+  // a hit pays neither the prologue nor the reentry trampoline.  Sits in
+  // the safe zone before the reentry stub, leaving the
+  // JITRT_CALL_REENTRY_OFFSET span untouched.
+  Label direct_call_entry_label = as_->newLabel();
+  {
+    auto direct_cursor = as_->cursor();
+    as_->bind(direct_call_entry_label);
+    emit_entry_guard();
+    generateFunctionEntry();
+    as_->b(env_.correct_arg_count);
+    env_.addAnnotation("Direct-call entry", direct_cursor);
+  }
+  // Helper reentry (JITRT_CallWithIncorrectArgcount and
+  // the keyword path jump to the stub after binding arguments) arrives
+  // without the entry guard, so the thread state is loaded on the way in.
+  // The stub keeps its fixed JITRT_CALL_REENTRY_OFFSET shape; only its
+  // branch target moves to this trampoline in the safe zone.
+  Label reentry_tstate_trampoline = as_->newLabel();
+  {
+    auto trampoline_cursor = as_->cursor();
+    as_->bind(reentry_tstate_trampoline);
+    as_->mov(
+        a64::x11,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x11, a64::ptr(a64::x11));
+    as_->b(env_.correct_arg_count);
+    env_.addAnnotation("Reentry tstate trampoline", trampoline_cursor);
+  }
+#endif
+
   // Reentry point: dispatched to from JITRT_CallWithIncorrectArgcount and
   // JITRT_CallWithKeywordArgs after argument binding. Must be exactly
   // JITRT_CALL_REENTRY_OFFSET bytes before the vectorcall entry.
@@ -2540,7 +4025,11 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_X86_64)
   as_->short_().jmp(env_.correct_arg_count);
 #elif defined(CINDER_AARCH64)
+#if PY_VERSION_HEX < 0x030C0000
+  as_->b(reentry_tstate_trampoline);
+#else
   as_->b(env_.correct_arg_count);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -2555,6 +4044,43 @@ void NativeGenerator::generateCode(
   // list, so the vectorcall entry falls through to them.
   Label vectorcall_entry_label = as_->newLabel();
   as_->bind(vectorcall_entry_label);
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  {
+    // __code__ identity check (mandatory under direct entry): 3.11 has no
+    // function watcher and a function may replace its __code__ at runtime
+    // (networkx argmap lazy compilation is exactly the swap-after-first-call
+    // pattern), while the compiled artifact is bound to the compile-time
+    // code object.  Compare func->func_code against the baked code pointer
+    // and divert the whole call to the stock interpreter entry on mismatch
+    // (which then executes the new code correctly).  The bound-args reentry
+    // path enters after this check; the outer call has already been checked.
+    {
+      auto code_check_cursor = as_->cursor();
+      as_->ldr(
+          a64::x9,
+          arch::ptr_offset(
+              a64::x0,
+              static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+      as_->mov(a64::x10, reinterpret_cast<uint64_t>(GetFunction()->code.get()));
+      as_->cmp(a64::x9, a64::x10);
+      as_->b_ne(entry_guard_divert);
+      env_.addAnnotation("Code identity check", code_check_cursor);
+    }
+    // Tracing + recursion pre-check, read-only and before any frame is
+    // built (only x9/x10 clobbered, x0-x3 untouched).  Tracing active or
+    // recursion budget about to overflow diverts the whole call: the
+    // interpreter carries its own recursion accounting and
+    // CheckRecursiveCall semantics, so the failure path needs no
+    // bookkeeping on this side.
+    {
+      auto guard_cursor = as_->cursor();
+      emit_entry_guard();
+      env_.addAnnotation(
+          "Entry guard (tracing + recursion precheck)", guard_cursor);
+    }
+  }
+#endif
 
   // Append suffix blocks to the block list. These come after the body's exit
   // block but before code emission.
@@ -2582,13 +4108,11 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_X86_64)
     if (GetFunction()->returnsPrimitive()) {
       if (GetFunction()->returnsPrimitiveDouble()) {
-        as_->call(
-            reinterpret_cast<uint64_t>(
-                JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn));
+        as_->call(reinterpret_cast<uint64_t>(
+            JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn));
       } else {
-        as_->call(
-            reinterpret_cast<uint64_t>(
-                JITRT_ReportStaticArgTypecheckErrorsWithPrimitiveReturn));
+        as_->call(reinterpret_cast<uint64_t>(
+            JITRT_ReportStaticArgTypecheckErrorsWithPrimitiveReturn));
       }
     } else {
       as_->call(
@@ -2638,9 +4162,10 @@ void NativeGenerator::generateCode(
 
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
-  emitAarch64LoadAttrNewShapeStub311(codeholder);
-  emitAarch64LoadMethodStub311(codeholder);
-  emitAarch64StoreAttrStub311(codeholder);
+  emitAarch64LoadAttrInvokeStub311(codeholder);
+  emitAarch64LoadMethodInvokeStub311(codeholder);
+  emitAarch64StoreAttrInvokeStub311(codeholder);
+  emitAarch64VcDirectStub311(codeholder);
   emitAarch64ExactLongAddSubStubs(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
@@ -2734,6 +4259,8 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
   artifact_guarded_entry_311_ = static_cast<char*>(code_start_) +
       codeholder.labelOffsetFromBase(artifact_guarded_entry_label);
+  direct_call_entry_311_ = static_cast<char*>(code_start_) +
+      codeholder.labelOffsetFromBase(direct_call_entry_label);
 #endif
 
   for (auto& entry : env_.unresolved_gen_entry_labels) {

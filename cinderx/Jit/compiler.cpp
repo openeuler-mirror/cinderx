@@ -3,8 +3,10 @@
 #include "cinderx/Jit/compiler.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/analysis.h"
@@ -16,9 +18,11 @@
 #include "cinderx/Jit/hir/float_accumulator_promotion.h"
 #include "cinderx/Jit/hir/float_comparison_simplification.h"
 #include "cinderx/Jit/hir/guard_removal.h"
+#include "cinderx/Jit/hir/hir_cse.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
+#include "cinderx/Jit/hir/loop_phi_unbox.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/primitive_box_remat.h"
 #include "cinderx/Jit/hir/primitive_unbox_cse.h"
@@ -30,9 +34,12 @@
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/osr.h"
 
+#include <fmt/format.h>
+
 #include <chrono>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 #if PY_VERSION_HEX < 0x030C0000
 // Records a refusal reason the scheduling gate reports; defined in
@@ -46,6 +53,37 @@ void setLast311ExecuteRefusal(const char* reason) {
 #endif
 
 namespace jit {
+
+namespace {
+
+// Raise an exception if an HIR function exceeds a reasonable size.
+void checkHirSize(const hir::Function& func) {
+  auto num_blocks = func.numBlocks();
+  auto max_blocks = getConfig().max_hir_blocks;
+  if (num_blocks > max_blocks) {
+    throwCompileBudgetExceeded(
+        kRefuseHirSizeLimit,
+        fmt::format(
+            "HIR function '{}' has too many basic blocks ({}, max={})",
+            func.fullname,
+            num_blocks,
+            max_blocks));
+  }
+
+  auto num_instrs = func.numInstrs();
+  auto max_instrs = getConfig().max_hir_instrs;
+  if (num_instrs > max_instrs) {
+    throwCompileBudgetExceeded(
+        kRefuseHirSizeLimit,
+        fmt::format(
+            "HIR function '{}' has too many instructions ({}, max={})",
+            func.fullname,
+            num_instrs,
+            max_instrs));
+  }
+}
+
+} // namespace
 
 template <typename T>
 static void runPass(T&& pass, hir::Function& func, PostPassFunction callback) {
@@ -95,6 +133,11 @@ void Compiler::runPasses(
     jit::hir::Function& irfunc,
     PassConfig config,
     PostPassFunction callback) {
+  // Bail out before doing any work if the freshly-built HIR is already too
+  // large to be worth compiling.  Checked once here rather than before every
+  // pass to avoid repeatedly walking the CFG.
+  checkHirSize(irfunc);
+
   // SSAify must come first; nothing but SSAify should ever see non-SSA HIR.
   runPass(jit::hir::SSAify{}, irfunc, callback);
 
@@ -134,6 +177,14 @@ void Compiler::runPasses(
   // PrimitiveUnboxCSE makes more of those boxes frame-state-only by merging
   // repeated unboxes before remat looks at direct uses.
   runPassIf(hir::PrimitiveUnboxCSE{}, PassConfig::kPrimitiveUnboxCSE);
+  // SPIKE(HIRCSE): dominance-based CSE of pure primitive instructions and
+  // dominated-guard elimination; enabled by the SPIKE_HIRCSE switch.
+  {
+    static const bool spike_hir_cse = Ci_SpikeGetenv("SPIKE_HIRCSE") != nullptr;
+    if (spike_hir_cse) {
+      runPassIf(hir::HirCSE{}, PassConfig::kHirCSE);
+    }
+  }
 #if defined(CINDER_AARCH64)
   // ARM-only: relies on fcmp + signed GT/GE for correct NaN semantics.
   runPassIf(
@@ -143,6 +194,9 @@ void Compiler::runPasses(
   // Deopt correctness also requires the backend trampoline to save FP
   // registers in regs[]; that support is currently implemented for AArch64.
 #if defined(CINDER_AARCH64)
+  // SPIKE(PHIUNBOX): unbox loop-carried int Phis so that the boxes feeding
+  // their back edges become frame-state-only and the remat below drops them.
+  runPassIf(hir::LoopPhiUnbox{}, PassConfig::kPrimitiveBoxRemat);
   runPassIf(hir::PrimitiveBoxRemat{}, PassConfig::kPrimitiveBoxRemat);
 #endif
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
@@ -209,6 +263,53 @@ void insertInstrumentationPolls311(hir::Function& irfunc) {
   }
 }
 
+// The default placement of the instrumentation poll: a frame that was
+// running when sys.settrace / sys.setprofile was switched on must leave
+// machine code where the interpreter would next report an event, and the
+// interpreter reports at line granularity -- a `line` event when a source
+// line starts and a `return` event when the frame returns.  A poll before
+// the first instruction of every source line and before every Return
+// therefore delivers exactly the events the interpreter delivers from the
+// transition on, at a fraction of the per-bytecode placement's cost
+// (which PYTHONJITSUPPORTINSTRUMENTATION=1 still selects).  A line start is
+// recognised through the line table: the instruction's line differs from
+// the preceding code unit's.  The function entry and a code object without
+// line information poll at offset 0.
+void insertLineInstrumentationPolls311(hir::Function& irfunc) {
+  BorrowedRef<PyCodeObject> code = irfunc.code;
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      hir::Instr& instr = *it;
+      ++it;
+      if (instr.opcode() != hir::Opcode::kSnapshot || it == block.end()) {
+        continue;
+      }
+      auto& snapshot = static_cast<hir::Snapshot&>(instr);
+      hir::FrameState* state = snapshot.frameState();
+      if (state == nullptr) {
+        continue;
+      }
+      bool poll = it->opcode() == hir::Opcode::kReturn;
+      if (!poll) {
+        int offset = state->cur_instr_offs.value();
+        if (offset <= 0) {
+          poll = true;
+        } else {
+          poll = PyCode_Addr2Line(code, offset) !=
+              PyCode_Addr2Line(
+                     code, offset - static_cast<int>(sizeof(_Py_CODEUNIT)));
+        }
+      }
+      if (!poll) {
+        continue;
+      }
+      hir::Instr* check = hir::CheckInstrumentation::create(*state);
+      check->copyBytecodeOffset(instr);
+      check->InsertBefore(*it);
+    }
+  }
+}
+
 PassConfig createConfig();
 
 std::unique_ptr<hir::Function> compileToFinalHIRForTest(
@@ -222,8 +323,14 @@ std::unique_ptr<hir::Function> compileToFinalHIRForTest(
   if (irfunc == nullptr) {
     return nullptr;
   }
+  // The poll insertion was unconditional; honour the config
+  // (PYTHONJITSUPPORTINSTRUMENTATION).
   if (getConfig().state == State::kRunning) {
-    insertInstrumentationPolls311(*irfunc);
+    if (getConfig().support_instrumentation) {
+      insertInstrumentationPolls311(*irfunc);
+    } else {
+      insertLineInstrumentationPolls311(*irfunc);
+    }
   }
   Compiler::runPasses(*irfunc, createConfig());
   return irfunc;
@@ -286,6 +393,7 @@ PassConfig createConfig() {
   set(hir_opts.phi_elim, PassConfig::kPhiElim);
   set(hir_opts.primitive_box_remat, PassConfig::kPrimitiveBoxRemat);
   set(hir_opts.primitive_unbox_cse, PassConfig::kPrimitiveUnboxCSE);
+  set(hir_opts.hir_cse, PassConfig::kHirCSE);
   set(hir_opts.float_comparison_simplification,
       PassConfig::kFloatComparisonSimplification);
   set(hir_opts.simplify, PassConfig::kSimplify);
@@ -412,8 +520,14 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
+  // The poll insertion was unconditional; honour the config
+  // (PYTHONJITSUPPORTINSTRUMENTATION).
   if (getConfig().state == State::kRunning) {
-    insertInstrumentationPolls311(*irfunc);
+    if (getConfig().support_instrumentation) {
+      insertInstrumentationPolls311(*irfunc);
+    } else {
+      insertLineInstrumentationPolls311(*irfunc);
+    }
   }
 #endif
 
@@ -493,6 +607,7 @@ std::optional<CompiledFunctionData> Compiler::Compile(
 #if PY_VERSION_HEX < 0x030C0000
   compiled_data.artifact_guarded_entry =
       reinterpret_cast<vectorcallfunc>(ngen->getArtifactGuardedEntry311());
+  compiled_data.direct_call_entry = ngen->getDirectCallEntry311();
 #endif
   compiled_data.stack_size = stack_size;
   compiled_data.spill_stack_size = spill_stack_size;

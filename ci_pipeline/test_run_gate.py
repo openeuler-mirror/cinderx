@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import textwrap
@@ -18,12 +19,14 @@ def test_runtime_tests_disable_lto_for_gcc_builds():
 
 def test_pr_pipeline_selects_cp311_gate_for_python311():
     assert run_gate.pipeline_for_python("pr", (3, 11)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
     )
 
 
 def test_pr_pipeline_keeps_existing_suites_for_python314():
     assert run_gate.pipeline_for_python("pr", (3, 14)) == (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False),
     )
@@ -40,6 +43,7 @@ def test_pr_pipeline_rejects_unsupported_python():
 
 def test_daily_pipeline_selects_cp311_gate_and_daily_for_python311():
     assert run_gate.pipeline_for_python("daily", (3, 11)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
         ("cp311_daily", False),
     )
@@ -47,6 +51,7 @@ def test_daily_pipeline_selects_cp311_gate_and_daily_for_python311():
 
 def test_daily_pipeline_keeps_existing_suites_for_python314():
     assert run_gate.pipeline_for_python("daily", (3, 14)) == (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     )
@@ -63,6 +68,7 @@ def test_daily_pipeline_rejects_unsupported_python():
 
 def test_legacy_daily311_pipeline_remains_available():
     assert run_gate.pipeline_for_python("daily311", (3, 14)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
         ("cp311_daily", False),
     )
@@ -219,7 +225,11 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_attr_cache_new_shape_load_311",
         "test_attr_cache_new_shape_store_311",
         "test_early_quicken_311",
+        "test_load_method_descriptor_fallback",
         "test_list_extend_refcount_311",
+        "test_jit_size_args",
+        "test_jit_immortalize",
+        "test_admission_semantics_311",
         "test_lightweight_frames",
     ):
         assert script.count(module) == 1
@@ -269,6 +279,7 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
         first_rc=$?
         set -e
         test "$first_rc" -ne 0
+        test -f "$LOG_DIR/fail_fast_probe.log"
         ! grep -q SHOULD_NOT_RUN "$LOG_DIR/fail_fast_probe.log"
 
         DAILY_FAILURES=()
@@ -305,6 +316,68 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "SECOND_STEP_RAN" in completed.stdout
+
+
+def test_cp311_execute_gates_propagate_failures(tmp_path):
+    script = (
+        Path(run_gate.REPO_ROOT) / "ci_pipeline/scripts/run_cp311_stage.sh"
+    ).read_text(encoding="utf-8")
+    body = script.split("test_kunpeng() {", 1)[1].split("\n}\n", 1)[0]
+    definition = "test_kunpeng() {" + body + "\n}\n"
+    (tmp_path / "cinderx/PythonLib").mkdir(parents=True)
+    harness = textwrap.dedent(
+        """\
+        set -u
+        PYTHON=fake_python
+        export CINDERX_JIT_MODE=off CINDERX_OSR_ENABLED=1
+        fake_python() {
+            printf '%s\t%s\t%s\n' "$CINDERX_JIT_MODE" "$CINDERX_OSR_ENABLED" "$*"
+            case " $* " in
+                *test_cinderx.test_kunpeng.test_jit_immortalize*) return "$IMMORTAL_RC" ;;
+                *test_cinderx.test_kunpeng.test_admission_semantics_311*)
+                    test "$CINDERX_PLUGIN_ENABLE" = 1 || return 90
+                    test "$CINDERX_EVAL_MODE" = cinder || return 91
+                    test "$PYTHONJITAUTO" = 1000000 || return 92
+                    test "$AUTO_JIT" = 1000000 || return 93
+                    return "$ADMISSION_RC" ;;
+                *) return "$BASE_RC" ;;
+            esac
+        }
+        """
+    ) + definition + "test_kunpeng\n"
+    for base_rc, immortal_rc, admission_rc in ((0, 0, 0), (7, 0, 0), (0, 9, 0), (0, 0, 11)):
+        completed = subprocess.run(
+            ["bash"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "REPO_ROOT": tmp_path.as_posix(),
+                "BASE_RC": str(base_rc),
+                "IMMORTAL_RC": str(immortal_rc),
+                "ADMISSION_RC": str(admission_rc),
+            },
+        )
+        assert completed.returncode == (base_rc or immortal_rc or admission_rc), completed.stderr
+        calls = completed.stdout.splitlines()
+        assert len(calls) == (1 if base_rc else 2 if immortal_rc else 3), completed.stderr
+        assert calls[0].startswith("off\t1\t"), calls
+        if not base_rc:
+            mode, osr, arguments = calls[1].split("\t", 2)
+            assert (mode, osr) == ("execute", "0"), calls
+            assert arguments.split() == [
+                "-m", "unittest", "-v",
+                "test_cinderx.test_kunpeng.test_jit_immortalize",
+            ]
+        if not base_rc and not immortal_rc:
+            mode, osr, arguments = calls[2].split("\t", 2)
+            assert (mode, osr) == ("execute", "0"), calls
+            assert arguments.split() == [
+                "-m", "unittest", "-v",
+                "test_cinderx.test_kunpeng.test_admission_semantics_311",
+            ]
 
 
 def test_cp311_test_support_preflight_reports_missing_module():
@@ -434,14 +507,15 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert "--no-index" in refleak_script
     assert "THRESHOLD=${PYTHONJITAUTO:-20}" in refleak_script
     assert "ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}" in refleak_script
+    assert "CINDERX_JIT_STARTUP_GRACE_MS=0" in refleak_script
     assert 'for MODULE in "${MODULES[@]}"' in refleak_script
     assert '"$VENV_PY" -m test -R "$ROUNDS" "$MODULE"' in refleak_script
-    assert 'FAILED_MODULES+=("$MODULE")' in refleak_script
-    assert "comm -3" in refleak_script
-    assert '--original-log-dir "$MODULE_LOG_DIR"' in refleak_script
-    assert "any global SUCCESS epilogue" in refleak_script
+    assert '"$MODULE_LOG_DIR/$MODULE.exitcode"' in refleak_script
+    assert 'ci_pipeline.jit311.refleak_verdict' in refleak_script
+    assert '--logs "$MODULE_LOG_DIR" "${MODULES[@]}"' in refleak_script
+    assert 'quickened_artifact.py' not in refleak_script
     assert 'PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}"' not in refleak_script
-    assert refleak_script.count('PYTHONPATH="$START"') == 2
+    assert refleak_script.count('PYTHONPATH="$START"') == 1
 
 
 def test_cp311_container_scripts_resolve_bare_executable_names():

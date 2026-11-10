@@ -64,8 +64,9 @@ run_step() {
   (
     set -e
     "$@"
-  ) > >(tee "$LOG_DIR/$name.log") 2>&1
+  ) > "$LOG_DIR/$name.log" 2>&1
   rc=$?
+  cat "$LOG_DIR/$name.log"
   if [ "$had_errexit" -eq 1 ]; then
     set -e
   else
@@ -258,17 +259,44 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_observe_311 \
     test_cinderx.test_kunpeng.test_canary_execute_311 \
     test_cinderx.test_kunpeng.test_execute_311 \
+    test_cinderx.test_kunpeng.test_scheduling_policy_311 \
+    test_cinderx.test_kunpeng.test_speculation_feedback_311 \
+    test_cinderx.test_kunpeng.test_range_lowering_311 \
+    test_cinderx.test_kunpeng.test_loop_phi_identity_311 \
+    test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
+    test_cinderx.test_kunpeng.test_subscript_cache_lifetime_311 \
+    test_cinderx.test_kunpeng.test_predicates_311 \
+    test_cinderx.test_kunpeng.test_quickened_count_311 \
+    test_cinderx.test_kunpeng.test_exception_handler_semantics_311 \
+    test_cinderx.test_kunpeng.test_execute_surface_coverage_311 \
+    test_cinderx.test_kunpeng.test_instrumentation_polls_311 \
     test_cinderx.test_kunpeng.test_attr_cache_method_peek_311 \
     test_cinderx.test_kunpeng.test_attr_cache_combined_keys_311 \
     test_cinderx.test_kunpeng.test_attr_cache_new_shape_load_311 \
     test_cinderx.test_kunpeng.test_attr_cache_new_shape_store_311 \
+    test_cinderx.test_kunpeng.test_attr_cache_semantics_311 \
+    test_cinderx.test_kunpeng.test_method_cache_semantics_311 \
+    test_cinderx.test_kunpeng.test_call_dispatch_semantics_311 \
     test_cinderx.test_kunpeng.test_early_quicken_311 \
+    test_cinderx.test_kunpeng.test_load_method_descriptor_fallback \
     test_cinderx.test_kunpeng.test_list_extend_refcount_311 \
+    test_cinderx.test_kunpeng.test_jit_size_args \
     test_cinderx.test_kunpeng.test_exact_float_inplace_311 \
     test_cinderx.test_kunpeng.test_float_box_sink_311 \
     test_cinderx.test_kunpeng.test_float_power_exact_311 \
     test_cinderx.test_kunpeng.test_subscript_profitability_311 \
-    test_cinderx.test_kunpeng.test_lightweight_frames)
+    test_cinderx.test_kunpeng.test_locals_reading_builtins \
+    test_cinderx.test_kunpeng.test_global_load_repin_311 \
+    test_cinderx.test_kunpeng.test_global_call_optimizations_311 \
+    test_cinderx.test_kunpeng.test_lightweight_frames &&
+    # This regression must execute JIT code; the parent PR suite defaults to off.
+    CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 "$PYTHON" -m unittest -v \
+      test_cinderx.test_kunpeng.test_jit_immortalize &&
+    # Admission assertions must not silently run in the parent's off mode.
+    CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+    CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 \
+    PYTHONJITAUTO=1000000 AUTO_JIT=1000000 "$PYTHON" -m unittest -v \
+      test_cinderx.test_kunpeng.test_admission_semantics_311)
 }
 
 generator_refcount_matrix() {
@@ -315,7 +343,7 @@ driver_selftests() {
     ci_pipeline/test_execution_report.py \
     ci_pipeline/test_jit311_report_reasons.py \
     ci_pipeline/test_lifecycle_acceptance.py \
-    ci_pipeline/test_quickened_artifact.py \
+    ci_pipeline/test_refleak_verdict.py \
     ci_pipeline/test_runtime_transition_report.py \
     ci_pipeline/test_semantic_naming.py \
     ci_pipeline/test_shutdown_stability.py \

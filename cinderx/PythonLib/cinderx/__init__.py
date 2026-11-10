@@ -920,10 +920,20 @@ def init() -> None:
     if _is_init:
         return
 
-    maybe_enable_parallel_gc()
-    _install_autojit_import_provider()
-    _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
-    _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+    # The 3.11 native module installs its evaluator before this Python setup
+    # runs. Keep configuration helpers interpreted even when broad subscript
+    # admission makes os.environ lookups eligible for automatic compilation.
+    suppress_setup = sys.version_info[:2] == (3, 11)
+    if suppress_setup:
+        _autojit_setup_enter()
+    try:
+        maybe_enable_parallel_gc()
+        _install_autojit_import_provider()
+        _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
+        _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+    finally:
+        if suppress_setup:
+            _autojit_setup_leave()
 
     _is_init = True
 

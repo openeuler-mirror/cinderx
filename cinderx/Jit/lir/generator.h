@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <variant>
 
 namespace jit::lir {
@@ -81,6 +82,10 @@ class LIRGenerator {
   jit::codegen::Environ* env_{nullptr};
 
   bool is_gen_{false};
+  // SPIKE(FLOATFL): the HIR contains unboxed double arithmetic, so values
+  // of unknown static type being released are plausibly floats.  Gates the
+  // inline float dealloc dispatch.
+  bool code_has_float_ops_{false};
 
   BasicBlock* entry_block_{nullptr};
   BasicBlock* frame_setup_block_{nullptr};
@@ -187,6 +192,51 @@ class LIRGenerator {
       Instruction* instr,
       const hir::DeoptBase& hir_instr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 normal-frame inline link/unlink.
+  bool canInlineNormalFrame() const;
+#if PY_VERSION_HEX < 0x030C0000
+  void emitInlineFloatBox311(
+      BasicBlockBuilder& bbb,
+      const hir::PrimitiveBox* instr,
+      lir::Instruction* src);
+  void emitInlineFloatDealloc311(
+      BasicBlockBuilder& bbb,
+      lir::Instruction* obj,
+      lir::BasicBlock* end);
+  // SPIKE(TUPLEFL): inline tuple freelist pop (MakeTuple whose elements are
+  // stored by the InitTupleElements that follows) and inline tupledealloc
+  // for a tuple of statically known size.
+  void emitInlineTupleNew311(
+      BasicBlockBuilder& bbb,
+      const hir::MakeTuple* instr);
+  void emitInlineTupleDealloc311(
+      BasicBlockBuilder& bbb,
+      lir::Instruction* obj,
+      size_t nvalues,
+      lir::BasicBlock* end);
+  // MakeTuple instructions eligible for the inline pop.
+  std::unordered_set<const hir::Instr*> inline_tuple_news_;
+#endif
+  void emitActiveFrameCountIn(BasicBlockBuilder& bbb);
+  // Inline InitFrameCellVars for the inline-linked frame.
+  void emitInlineInitFrameFreeVars(
+      BasicBlockBuilder& bbb,
+      const hir::InitFrameCellVars& instr);
+  // Returns the linked frame's LIR value (a phi over the inline fast path
+  // and the C slow path), else nullptr.
+  Instruction* emitInlineLinkNormalFrame(BasicBlockBuilder& bbb);
+  void emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb);
+  // Inline recursion ledger
+  // inlining.  Enter decrements tstate->recursion_remaining at frame
+  // build, Leave repays it at the epilogue; the overflow pre-check lives
+  // in the generated vectorcall entry (gen_asm) and diverts to the
+  // interpreter without touching the ledger.
+  bool emitsInlineEntryGuard() const;
+  void emitRecursionEnter(BasicBlockBuilder& bbb);
+  void emitRecursionLeave(BasicBlockBuilder& bbb);
+#endif
+
   void makeIncref(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
@@ -201,7 +251,8 @@ class LIRGenerator {
       lir::Instruction* instr,
       std::optional<destructor> destructor,
       bool xdecref = false,
-      bool possible_immortal = true);
+      bool possible_immortal = true,
+      size_t inline_tuple_n = 0);
   void makeDecref(
       BasicBlockBuilder& bbb,
       const jit::hir::Instr& instr,
@@ -227,7 +278,8 @@ class LIRGenerator {
       lir::Instruction* instr,
       BasicBlock* end_decref,
       std::optional<destructor> destructor,
-      bool possible_immortal);
+      bool possible_immortal,
+      size_t inline_tuple_n = 0);
 #if defined(CINDER_AARCH64)
   void updateDeoptIndex(
       BasicBlockBuilder& bbb,

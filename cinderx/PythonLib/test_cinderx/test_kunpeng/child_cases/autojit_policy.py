@@ -7,8 +7,11 @@ def run_compile_smoke():
     def straight_compute(a, b):
         return (a + b) * 2
 
-    for value in range(16):
-        straight_compute(value, value + 1)
+    # The default IC gate may defer compilation for 256 calls after auto:2.
+    for value in range(512):
+        assert straight_compute(value, value + 1) == 4 * value + 2
+        if jit.is_jit_compiled(straight_compute):
+            break
     assert jit.is_jit_compiled(straight_compute), (
         "AutoJIT smoke target did not compile",
         jit.count_interpreted_calls(straight_compute),

@@ -1126,6 +1126,8 @@ def cmd_execute_gate(args: argparse.Namespace) -> int:
 
     execute_env = [
         "CINDERX_JIT_MODE=execute",
+        # This is compiled-execution coverage, not a startup benchmark.
+        "CINDERX_JIT_STARTUP_GRACE_MS=0",
         f"PYTHONJITAUTO={args.threshold}",
         f"CINDERX_EXECUTE_TRIGGER_LEDGER={ledger}",
     ]

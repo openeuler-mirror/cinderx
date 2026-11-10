@@ -10,9 +10,14 @@
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+
+#if PY_VERSION_HEX < 0x030C0000
+struct JITRT_SubscrSiteCache311;
+#endif
 
 namespace jit {
 
@@ -28,7 +33,10 @@ class GenYieldPoint {
     return offsetof(GenYieldPoint, resume_target_);
   }
 
-  GenYieldPoint(std::size_t deopt_idx, ptrdiff_t yield_from_offset);
+  GenYieldPoint(
+      std::size_t deopt_idx,
+      ptrdiff_t yield_from_offset,
+      bool handler_free = false);
 
   // Get and set what address the yield should resume from.
   uintptr_t resumeTarget() const;
@@ -37,11 +45,17 @@ class GenYieldPoint {
   std::size_t deoptIdx() const;
   bool isYieldFrom() const;
   ptrdiff_t yieldFromOffset() const;
+  // No exception-table entry covers this suspend point, so a GeneratorExit
+  // raised here runs no code in this frame.
+  bool handlerFree() const {
+    return handler_free_;
+  }
 
  private:
   uintptr_t resume_target_{0};
   const std::size_t deopt_idx_;
   const ptrdiff_t yield_from_offset_;
+  const bool handler_free_;
 };
 
 // Runtime data for a PyCodeObject object, containing caches and any other data
@@ -53,6 +67,23 @@ class alignas(16) CodeRuntime {
       BorrowedRef<PyCodeObject> code,
       BorrowedRef<PyDictObject> builtins,
       BorrowedRef<PyDictObject> globals);
+
+  ~CodeRuntime();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Each lowering owns a separate cell. Its address remains stable until
+  // the artifact's runtime references are released, including active frames.
+  JITRT_SubscrSiteCache311* allocateSubscrCache311();
+  void retainPredicateCache311(const std::shared_ptr<void>& cell) {
+    predicate_caches_311_.push_back(cell);
+  }
+  size_t predicateCacheCount311() const {
+    return predicate_caches_311_.size();
+  }
+  size_t subscrCacheCount311() const {
+    return subscr_caches_311_.size();
+  }
+#endif
 
   // Ensure that this CodeRuntime owns a reference to the given borrowed
   // object, keeping it alive for use by the compiled code. Make CodeRuntime a
@@ -119,6 +150,37 @@ class alignas(16) CodeRuntime {
   // Check if this is a generator/coroutine/async generator.
   bool isGen() const;
 
+  // Set at LIR generation when this compilation emitted the
+  // inline recursion ledger (decrement at frame build, increment at the
+  // epilogue).  Deopt and OSR exits consult it to keep the ledger balanced:
+  // a deopt exit bypasses the epilogue's repayment, and an OSR entry
+  // bypasses the frame-build decrement.
+  bool entryGuardInlined() const {
+    return entry_guard_inlined_;
+  }
+  void setEntryGuardInlined(bool value) {
+    entry_guard_inlined_ = value;
+  }
+  // Set at LIR generation when this compilation counts its live frames in
+  // Ci_JitActiveFrames311 (inline frame link and OSR entry count in, the
+  // hard-exit epilogue counts out).  The deferred artifact reclamation keys
+  // on that counter.
+  bool activeFrameCounted() const {
+    return active_frame_counted_;
+  }
+  void setActiveFrameCounted(bool value) {
+    active_frame_counted_ = value;
+  }
+  // The inline-linked 3.11 frame of this compilation
+  // holds no references of its own to f_func / f_code; every path that
+  // hands the frame to code expecting owned references adds them first.
+  bool frameNoRef() const {
+    return frame_no_ref_;
+  }
+  void setFrameNoRef(bool value) {
+    frame_no_ref_ = value;
+  }
+
   BorrowedRef<PyCodeObject> code() const;
   BorrowedRef<PyDictObject> builtins() const;
   BorrowedRef<PyDictObject> globals() const;
@@ -181,8 +243,15 @@ class alignas(16) CodeRuntime {
   BorrowedRef<PyDictObject> globals_;
 
 #if PY_VERSION_HEX < 0x030C0000
+  std::vector<std::shared_ptr<void>> predicate_caches_311_;
   CompiledFunction* compiled_function_{nullptr};
+  std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> subscr_caches_311_;
 #endif
+  // See entryGuardInlined().
+  bool entry_guard_inlined_{false};
+  // See activeFrameCounted().
+  bool active_frame_counted_{false};
+  bool frame_no_ref_{false};
 
   // References owned by this CodeRuntime.
   std::unordered_set<ThreadedRef<PyObject>> references_;

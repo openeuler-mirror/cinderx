@@ -70,7 +70,12 @@ void BasicBlockSorter::calculateSCC() {
   scc_blocks_.clear();
   index_ = 0;
 
-  for (auto& block : basic_blocks_) {
+  // Pointer hash order must not determine code layout.
+  std::vector<BasicBlock*> ordered(basic_blocks_.begin(), basic_blocks_.end());
+  std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) {
+    return a->id() < b->id();
+  });
+  for (auto* block : ordered) {
     dfsSearch(block);
   }
 }
@@ -120,7 +125,12 @@ int BasicBlockSorter::dfsSearch(BasicBlock* block) {
 }
 
 void BasicBlockSorter::calcEntryBlocks() {
-  for (auto block : basic_blocks_) {
+  // Pointer hash order must not determine code layout.
+  std::vector<BasicBlock*> ordered(basic_blocks_.begin(), basic_blocks_.end());
+  std::sort(ordered.begin(), ordered.end(), [](auto* a, auto* b) {
+    return a->id() < b->id();
+  });
+  for (auto* block : ordered) {
     auto cur_scc = map_get(block_to_scc_map_, block);
     for (auto succ : block->successors()) {
       if (!basic_blocks_.count(succ) || succ == entry_) {

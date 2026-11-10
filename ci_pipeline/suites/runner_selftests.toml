@@ -1,0 +1,14 @@
+# Required runner checks shared by CPython 3.11 and 3.14, without native builds.
+fail_fast = true
+
+[[jobs]]
+name = "runner_selftest_manifest"
+command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_runner_selftest_gate'
+
+[[jobs]]
+name = "runner_tempfiles"
+command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_runner_tempfiles'
+
+[[jobs]]
+name = "ref314_contract"
+command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_ref314_contract'

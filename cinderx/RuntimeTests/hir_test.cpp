@@ -11,11 +11,13 @@
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/parser.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
+#include "cinderx/Jit/hir/primitive_box_remat.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
@@ -24,7 +26,9 @@
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <cwchar>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -68,20 +72,28 @@ void expectColdGlobalGuardShape(
     const Function& func,
     const std::string& hir,
     size_t expected_guard_type,
-    size_t expected_guard_is) {
+    size_t expected_guard_is,
+    size_t expected_pin_guard_is_311 = 0) {
 #if PY_VERSION_HEX < 0x030C0000
-  // Combined unicode globals take the module-value fast path (CallStatic
-  // + Guard).  Cold split dictionaries still emit LoadGlobal.  Neither
-  // shape uses GuardType/GuardIs; those are the 3.14 cached-global
-  // sentinels this helper originally described.
+  // Combined unicode globals go through the per-site cell: the fast arm
+  // compares the live keys version(s) with the cell and reads the entry
+  // slot, the slow arm is one CallStatic to the re-pin helper; neither is
+  // a deopt point.  Cold split dictionaries still emit LoadGlobal.
+  // GuardType is a 3.14 cached-global sentinel; GuardIs appears on 3.11
+  // only as the identity pin of a builtin the simplifier opens (len /
+  // isinstance / type) or of a callable in call position.
   (void)expected_guard_type;
   (void)expected_guard_is;
   size_t load_global = countOpcode(func, Opcode::kLoadGlobal);
-  size_t guards = countOpcode(func, Opcode::kGuard);
-  EXPECT_TRUE(load_global == 1 || guards >= 1) << hir;
+  size_t repin_calls = countOpcode(func, Opcode::kCallStatic);
+  bool cell_shape =
+      repin_calls >= 1 && countSubstring(hir, "globals_keys_version") >= 1;
+  EXPECT_TRUE(load_global == 1 || cell_shape) << hir;
+  EXPECT_EQ(countOpcode(func, Opcode::kGuard), 0) << hir;
   EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
-  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), expected_pin_guard_is_311) << hir;
 #else
+  (void)expected_pin_guard_is_311;
   (void)func;
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), expected_guard_type)
       << hir;
@@ -283,6 +295,23 @@ TEST(BasicBlockTest, SplitAfterSplitsBlockAfterInstruction) {
   EXPECT_TRUE(head->GetTerminator()->IsLoadConst());
   ASSERT_NE(nullptr, tail->GetTerminator());
   EXPECT_TRUE(tail->GetTerminator()->IsReturn());
+}
+
+TEST(DeoptBaseTest, SortLiveRegsRejectsDuplicateRegister) {
+  Environment env;
+  auto v0 = env.AllocateRegister();
+  std::unique_ptr<Deopt> deopt(Deopt::create());
+  deopt->emplaceLiveReg(v0, RefKind::kOwned, ValueKind::kObject);
+  deopt->emplaceLiveReg(v0, RefKind::kOwned, ValueKind::kObject);
+  if constexpr (kDebug) {
+    // A CinderX debug build checks for duplicates regardless of whether
+    // the Python runtime is a debug build.
+    EXPECT_DEATH(deopt->sortLiveRegs(), "Register v0 is live twice");
+  } else {
+    // Release builds compile the check out.
+    deopt->sortLiveRegs();
+    EXPECT_EQ(deopt->live_regs().size(), 2);
+  }
 }
 
 TEST(CFGIterTest, IteratingEmptyCFGReturnsEmptyTraversal) {
@@ -725,6 +754,57 @@ fun foo {
 }
 )";
   EXPECT_EQ(HIRPrinter{}.ToString(*func), expected);
+}
+
+TEST(RemoveUnreachableInstructions, RefinedTypeOnlyReachesBlocksItDominates) {
+  // bb 4 is unreachable, so the type check in bb 1 becomes a branch to bb 3
+  // behind a RefineType placed in bb 1.  bb 3 is also entered from bb 2,
+  // where nothing refined v0: its use must keep v0, not the RefineType that
+  // does not dominate it.
+  const char* hir = R"(fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    CondBranch<1, 2> v1
+  }
+
+  bb 1 (preds 0) {
+    CondBranchCheckType<3, 4, LongExact> v0
+  }
+
+  bb 2 (preds 0) {
+    Branch<3>
+  }
+
+  bb 3 (preds 1, 2) {
+    Return v0
+  }
+
+  bb 4 (preds 1) {
+    v2:Bottom = LoadConst<Bottom>
+    Return v2
+  }
+}
+)";
+
+  std::unique_ptr<Function> func = HIRParser{}.ParseHIR(hir);
+  ASSERT_NE(func, nullptr);
+
+  reflowTypes(*func);
+  ASSERT_TRUE(removeUnreachableInstructions(*func));
+  auto hir_text = HIRPrinter{}.ToString(*func);
+  ASSERT_EQ(countOpcode(*func, Opcode::kCondBranchCheckType), 0) << hir_text;
+  ASSERT_EQ(countOpcode(*func, Opcode::kReturn), 1) << hir_text;
+
+  std::ostringstream err;
+  EXPECT_TRUE(checkFunc(*func, err)) << err.str() << hir_text;
+  for (const auto& block : func->cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsReturn()) {
+        EXPECT_TRUE(instr.GetOperand(0)->instr()->IsLoadArg()) << hir_text;
+      }
+    }
+  }
 }
 
 template <class T>
@@ -1448,7 +1528,8 @@ def test():
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  expectColdGlobalGuardShape(*irfunc, hir, 0, 1);
+  // 3.11 pins len by identity so the simplifier can open len(x).
+  expectColdGlobalGuardShape(*irfunc, hir, 0, 1, 1);
 }
 
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
@@ -1513,6 +1594,542 @@ def test(perm, k):
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, ExcEdgeRejectDoesNotEnableFrameWriteThrough311) {
+  const char* src = R"(
+def test(callback):
+    callback()
+    try:
+        return callback()
+    except ValueError:
+        return -1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  // The real deopt path always has a CodeExtra. Keep its code-death hook
+  // active when driving the grant hook directly as well.
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> calls;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == CALL) {
+      calls.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(calls.size(), 2);
+  ASSERT_FALSE(excEdgeCapable311(code, calls[0]));
+  ASSERT_TRUE(excEdgeCapable311(code, calls[1]));
+
+  for (int i = 0; i < 64; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[0], 0, nullptr);
+  }
+  EXPECT_FALSE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  EXPECT_FALSE(Ci_ExcEdgeCodeHasGrant311(code));
+  auto rejected = buildHIR(func);
+  ASSERT_NE(rejected, nullptr);
+  EXPECT_FALSE(rejected->frame_locals_written_through_311);
+
+  // Rejecting one site must not prevent a protected site in the same code
+  // from earning its real grant at the eighth exception.
+  for (int i = 0; i < 7; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[1], 0, nullptr);
+  }
+  EXPECT_FALSE(Ci_ExcEdgeCodeHasGrant311(code));
+  Ci_ExcEdgeDeopt311(code, calls[1], 0, nullptr);
+  EXPECT_TRUE(Ci_ExcEdgeSiteGranted311(code, calls[1]));
+  EXPECT_FALSE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  auto granted = buildHIR(func);
+  ASSERT_NE(granted, nullptr);
+  EXPECT_EQ(
+      granted->frame_locals_written_through_311,
+      getConfig().state == State::kRunning);
+}
+
+TEST_F(HIRBuildTest, NumericGuardFuseTakesDownOnlyTheFailingSite311) {
+  const char* src = R"(
+def test(a, b, c):
+    return a * b + c
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  // Keep the code-death hook that drops the fuse state active, as on the
+  // real deopt path.
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> ops;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == BINARY_OP) {
+      ops.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(ops.size(), 2);
+
+  // A site whose guard no artifact emitted is not counted.
+  for (int i = 0; i < 64; ++i) {
+    Ci_SpikeFloatGuardFail311(code, ops[0]);
+  }
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+
+  Ci_SpikeFloatGuardRegister311(code, ops[0]);
+  Ci_SpikeFloatGuardRegister311(code, ops[1]);
+  for (int i = 0; i < 7; ++i) {
+    Ci_SpikeFloatGuardFail311(code, ops[0]);
+  }
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+  Ci_SpikeFloatGuardFail311(code, ops[0]);
+  EXPECT_TRUE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+  // The other site in the same code, and the compact-long fuse of the same
+  // site, are untouched.
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[1]));
+  EXPECT_FALSE(Ci_SpikeNoLongSpec311(code, ops[0]));
+
+  Ci_SpikeLongSpecRegister311(code, ops[1]);
+  for (int i = 0; i < 8; ++i) {
+    Ci_SpikeLongSpecGuardFail311(code, ops[1]);
+  }
+  EXPECT_TRUE(Ci_SpikeNoLongSpec311(code, ops[1]));
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[1]));
+}
+
+TEST_F(HIRBuildTest, FloatDivideUsesBuilderExceptionEligibility311) {
+  const char* src = R"(
+def test(zero):
+    denominator = 0.0 if zero else 2.0
+    outside = 64.0 / denominator
+    try:
+        a = 8.0 / denominator
+        b = 16.0 / denominator
+        c = 32.0 / denominator
+        return outside + a + b + c
+    except ZeroDivisionError:
+        return -1.0
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  auto table = analyzeExcTable311(code);
+  ASSERT_FALSE(table.entries.empty());
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    EXPECT_EQ(
+        irfunc->excEdgeCapable311(instr.baseOffset()),
+        table.edgeCapable(instr.baseIndex().value()));
+  }
+  EXPECT_FALSE(irfunc->excEdgeCapable311(BCOffset{-2}));
+  EXPECT_FALSE(irfunc->excEdgeCapable311(BCOffset{_PyCode_NBYTES(code)}));
+
+  SSAify{}.Run(*irfunc);
+  reflowTypes(*irfunc);
+  Simplify{}.Run(*irfunc);
+  auto hir = fullPrinter().ToString(*irfunc);
+  // Three protected divides retain the raising helper before any grant.
+  // The unprotected divide still uses the unboxed, guarded fast path.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kFloatBinaryOp), 3) << hir;
+  EXPECT_EQ(countSubstring(hir, "DoubleBinaryOp<TrueDivide>"), 1) << hir;
+  for (const auto& block : irfunc->cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsFloatBinaryOp()) {
+        EXPECT_TRUE(irfunc->excEdgeCapable311(instr.bytecodeOffset()));
+      }
+    }
+  }
+}
+
+namespace {
+
+// The operators still lowered to the generic BinaryOp.  (Counting
+// IntBinaryOp kinds says nothing: unboxing an int is itself a sequence of
+// and/or/xor/shift register operations.)
+std::vector<BinaryOpKind> genericBinaryOps(const Function& func) {
+  std::vector<BinaryOpKind> ops;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsBinaryOp()) {
+        ops.push_back(static_cast<const BinaryOp&>(instr).op());
+      }
+    }
+  }
+  return ops;
+}
+
+std::unique_ptr<Function> simplified(std::unique_ptr<Function> irfunc) {
+  if (irfunc != nullptr) {
+    SSAify{}.Run(*irfunc);
+    reflowTypes(*irfunc);
+    Simplify{}.Run(*irfunc);
+  }
+  return irfunc;
+}
+
+} // namespace
+
+TEST_F(HIRBuildTest, IntBitwiseChainRunsOnRegisters311) {
+  const char* src = R"(
+def test(a, b):
+    return ((a >> 3) & 255) ^ b
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  // No generic operation is left: the three operators run on registers
+  // behind exact-int guards on the two unknown operands.
+  EXPECT_TRUE(genericBinaryOps(*irfunc).empty()) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 2) << hir;
+
+  // The intermediate boxes only feed frame states; deopt re-creates them,
+  // so only the returned value is allocated.
+  PrimitiveBoxRemat{}.Run(*irfunc);
+  hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kPrimitiveBox), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseStaysGenericOutsideInt64311) {
+  // A constant operand that does not fit in int64 keeps the generic path.
+  const char* src = R"(
+def test(a):
+    return a & 0x10000000000000000000
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(genericBinaryOps(*irfunc), std::vector{BinaryOpKind::kAnd}) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseStaysGenericWithoutSmallIntEvidence311) {
+  // Neither operand is a constant or the result of an int operation, so
+  // either may be arbitrarily wide (`int(a) & int(b)`): no guard is emitted.
+  const char* src = R"(
+def test(a, b):
+    return (a & b, a << b, a ^ b)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(
+      genericBinaryOps(*irfunc),
+      (std::vector{
+          BinaryOpKind::kAnd, BinaryOpKind::kLShift, BinaryOpKind::kXor}))
+      << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuard), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseSiteFuseRestoresGenericOperation311) {
+  const char* src = R"(
+def test(a, b):
+    return (a & 15) | (b >> 2)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> ops;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == BINARY_OP) {
+      ops.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(ops.size(), 3);
+
+  auto before = simplified(buildHIR(func));
+  ASSERT_NE(before, nullptr);
+  EXPECT_TRUE(genericBinaryOps(*before).empty())
+      << fullPrinter().ToString(*before);
+
+  // Blow the fuse of the `&` site only: that operator goes back to the
+  // generic operation, the other two stay on registers (`|` still has the
+  // unboxed `b >> 2` as its small-int evidence).
+  Ci_SpikeLongSpecRegister311(code, ops[0]);
+  for (int i = 0; i < 8; ++i) {
+    Ci_SpikeLongSpecGuardFail311(code, ops[0]);
+  }
+  ASSERT_TRUE(Ci_SpikeNoLongSpec311(code, ops[0]));
+  auto after = simplified(buildHIR(func));
+  ASSERT_NE(after, nullptr);
+  auto hir = fullPrinter().ToString(*after);
+  EXPECT_EQ(genericBinaryOps(*after), std::vector{BinaryOpKind::kAnd}) << hir;
+}
+
+TEST_F(HIRBuildTest, RangeIterationFusionUsesPrimitiveIndexStores311) {
+  for (const char* arguments : {"n", "1, n", "1, n, 2"}) {
+    SCOPED_TRACE(arguments);
+    std::string source =
+        "def test(n):\n    total = 0\n    for value in range(" +
+        std::string(arguments) +
+        "):\n        total += value\n    return total\n"
+        "for _ in range(100):\n    test(7)\n";
+    Ref<PyFunctionObject> func(compileAndGet(source.c_str(), "test"));
+    ASSERT_NE(func, nullptr);
+    auto irfunc = simplified(buildHIR(func));
+    ASSERT_NE(irfunc, nullptr);
+    const auto hir = fullPrinter().ToString(*irfunc);
+    EXPECT_EQ(
+        countStaticCallsTo(
+            *irfunc, reinterpret_cast<void*>(JITRT_RangeIter311)),
+        1u)
+        << hir;
+    size_t index_stores = 0;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (!instr.IsStoreField()) {
+          continue;
+        }
+        const auto& store = static_cast<const StoreField&>(instr);
+        if (store.name() == "index") {
+          ++index_stores;
+          EXPECT_EQ(store.type(), TCInt64) << hir;
+          EXPECT_TRUE(store.value()->type() <= TCInt64) << hir;
+          EXPECT_TRUE(store.GetOperand(2)->type() <= TNullptr) << hir;
+        }
+      }
+    }
+    EXPECT_EQ(index_stores, 1u) << hir;
+    EXPECT_TRUE(checkFunc(*irfunc, std::cerr)) << hir;
+  }
+}
+
+TEST_F(HIRBuildTest, RangeFusionKeepsUnsupportedCallsGeneric311) {
+  for (const char* source :
+       {"def test(n, range):\n    for value in range(n):\n        pass\n",
+        "def test(n):\n    for value in range(stop=n):\n        pass\n"}) {
+    SCOPED_TRACE(source);
+    Ref<PyFunctionObject> func(compileAndGet(source, "test"));
+    ASSERT_NE(func, nullptr);
+    auto irfunc = simplified(buildHIR(func));
+    ASSERT_NE(irfunc, nullptr);
+    EXPECT_EQ(
+        countStaticCallsTo(
+            *irfunc, reinterpret_cast<void*>(JITRT_RangeIter311)),
+        0u)
+        << fullPrinter().ToString(*irfunc);
+    EXPECT_GE(countOpcode(*irfunc, Opcode::kVectorCall), 1u)
+        << fullPrinter().ToString(*irfunc);
+  }
+}
+
+TEST_F(HIRBuildTest, RangeFusionKeepsGrantedExceptionEdgeGeneric311) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test(n):
+    try:
+        for value in range(n):
+            pass
+    except TypeError:
+        return -1
+    return 1
+for _ in range(100):
+    test(3)
+)",
+      "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> calls;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == CALL) {
+      calls.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(calls.size(), 1u);
+  ASSERT_TRUE(excEdgeCapable311(code, calls[0]));
+  auto before = simplified(buildHIR(func));
+  ASSERT_NE(before, nullptr);
+  ASSERT_EQ(
+      countStaticCallsTo(*before, reinterpret_cast<void*>(JITRT_RangeIter311)),
+      1u);
+  for (int i = 0; i < 8; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[0], 0, nullptr);
+  }
+  ASSERT_TRUE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  auto after = simplified(buildHIR(func));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(
+      countStaticCallsTo(*after, reinterpret_cast<void*>(JITRT_RangeIter311)),
+      0u)
+      << fullPrinter().ToString(*after);
+  EXPECT_GE(countOpcode(*after, Opcode::kVectorCall), 1u)
+      << fullPrinter().ToString(*after);
+}
+
+TEST_F(HIRBuildTest, WideIntAddRunsInInt64311) {
+  // Both operands are ints in registers and the shifted one can exceed the
+  // compact range, so the add is done in int64 behind an overflow check
+  // instead of deoptimizing on two digits.
+  const char* src = R"(
+def test(a, b):
+    return (a << 24) + (b & 255)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_TRUE(genericBinaryOps(*irfunc).empty()) << hir;
+  // The compact-long form would test both operands for compactness.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsCompactLong), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, UntypedIntAddStaysGeneric311) {
+  // Without type evidence or a wide operand the add is not speculated.
+  const char* src = R"(
+def test(a, b):
+    return a + b
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(genericBinaryOps(*irfunc), std::vector{BinaryOpKind::kAdd}) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kPrimitiveConvert), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, FloatDiamondConvertsCompactIntPartner311) {
+  // A float constant against an unknown operand: the diamond's int arm
+  // converts a compact int to double instead of taking the generic path.
+  const char* src = R"(
+def test(a):
+    return a * 2.5
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCompactLongUnbox), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveConvert), 1) << hir;
+  // A non-compact int and any other operand still reach the generic
+  // operation.
+  for (BinaryOpKind op : genericBinaryOps(*irfunc)) {
+    EXPECT_EQ(op, BinaryOpKind::kMultiply) << hir;
+  }
+}
+
+TEST_F(HIRBuildTest, NonNegativeMaskBoundsAndOfNegativeValue311) {
+  // `x & mask` with a non-negative mask lies in [0, mask] whatever the sign
+  // of x: a negative x << 2 masked by INT64_MAX needs 63 bits, so the add
+  // keeps its overflow guard; a 62-bit mask bounds the add without one.
+  auto guards = [&](const char* src) {
+    Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+    EXPECT_NE(func, nullptr);
+    if (func == nullptr) {
+      return size_t{0};
+    }
+    auto irfunc = simplified(buildHIR(func));
+    EXPECT_NE(irfunc, nullptr);
+    if (irfunc == nullptr) {
+      return size_t{0};
+    }
+    EXPECT_TRUE(genericBinaryOps(*irfunc).empty())
+        << fullPrinter().ToString(*irfunc);
+    return countOpcode(*irfunc, Opcode::kGuard);
+  };
+  size_t wide = guards(R"(
+def test(x):
+    return ((x << 2) & 0x7fffffffffffffff) + 4
+)");
+  size_t narrow = guards(R"(
+def test(x):
+    return ((x << 2) & 0x3fffffffffffffff) + 4
+)");
+  EXPECT_EQ(wide, narrow + 1);
+}
+
+TEST_F(HIRBuildTest, SlowArmKeepsBoxNamedByLaterFrameState311) {
+  // The slow arm of the float diamond re-boxes a known float operand only
+  // while no later FrameState names the box: once the generic operation has
+  // handed a fresh object to a reflected method, a traceback taken at the
+  // call after it must show that same object for the local holding it.
+  auto build = [](const std::string& call_locals) {
+    std::string hir = R"(
+fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = LoadArg<2>
+    v3 = RefineType<FloatExact> v1
+    v4 = PrimitiveUnbox<CDouble> v3
+    v5 = PrimitiveBox<CDouble> v4
+    Snapshot {
+      CurInstrOffset 2
+      Locals<4> v0 v1 v2 v1
+      Stack<2> v5 v0
+    }
+    v6 = BinaryOp<Add> v5 v0 {
+      FrameState {
+        CurInstrOffset 4
+        Locals<4> v0 v1 v2 v1
+      }
+    }
+    v7 = VectorCall<0> v2 {
+      FrameState {
+        CurInstrOffset 6
+        )" +
+        call_locals +
+        R"(
+      }
+    }
+    Return v6
+  }
+}
+)";
+    auto irfunc = HIRParser{}.ParseHIR(hir.c_str());
+    if (irfunc != nullptr) {
+      reflowTypes(*irfunc);
+      Simplify{}.Run(*irfunc);
+    }
+    return irfunc;
+  };
+  // Whether every generic add the diamond left behind received the original
+  // box (true), or every one received a fresh box (false).
+  auto slow_left_is_original = [](Function& irfunc) -> std::optional<bool> {
+    const Instr* original = nullptr;
+    for (const auto& instr : *irfunc.cfg.entry_block) {
+      if (instr.IsPrimitiveBox()) {
+        original = &instr;
+        break;
+      }
+    }
+    std::optional<bool> result;
+    for (const auto& block : irfunc.cfg.blocks) {
+      for (const auto& instr : block) {
+        if (!instr.IsBinaryOp()) {
+          continue;
+        }
+        const Instr* def = static_cast<const BinaryOp&>(instr).left()->instr();
+        while (def != nullptr && def->IsAssign()) {
+          def = def->GetOperand(0)->instr();
+        }
+        bool same = def == original;
+        if (result.has_value() && *result != same) {
+          return std::nullopt;
+        }
+        result = same;
+      }
+    }
+    return result;
+  };
+
+  // A temporary: the call's FrameState holds the sum, not the box.
+  auto temporary = build("Locals<4> v0 v1 v2 v6");
+  ASSERT_NE(temporary, nullptr);
+  EXPECT_EQ(slow_left_is_original(*temporary), std::optional<bool>{false})
+      << fullPrinter().ToString(*temporary);
+
+  // A local still live at the call: the slow arm passes the original box.
+  auto local = build("Locals<4> v0 v1 v2 v5");
+  ASSERT_NE(local, nullptr);
+  EXPECT_EQ(slow_left_is_original(*local), std::optional<bool>{true})
+      << fullPrinter().ToString(*local);
+}
+
 TEST_F(HIRBuildTest, NoArgSuperMethodCall311LowersToLoadMethodSuper) {
   const char* src = R"(
 class A:
@@ -1615,7 +2232,14 @@ def test(x):
       << hir;
   ASSERT_NE(call->self(), nullptr);
   ASSERT_NE(call->self()->instr(), nullptr);
-  EXPECT_TRUE(call->self()->instr()->IsLoadGlobal()) << hir;
+  // The builtin arrives through the per-site cell: before SSA the merge
+  // of the fast arm's slot read and the slow arm's re-pin helper result is
+  // an Assign into the result register (a Phi after SSA); the helper form
+  // (LoadGlobal) is the fallback for cold split dictionaries.
+  EXPECT_TRUE(
+      call->self()->instr()->IsAssign() || call->self()->instr()->IsPhi() ||
+      call->self()->instr()->IsLoadGlobal())
+      << hir;
   EXPECT_NE(call->frameState(), nullptr);
 }
 
@@ -1767,7 +2391,7 @@ TEST_F(HIRBuildTest, InPlaceBinaryOpSpecialization311DoesNotGuardLongs) {
   EXPECT_EQ(inplace_op_count, 1);
 }
 
-TEST_F(HIRBuildTest, LoadGlobalModule311UsesIndexedValueGuard) {
+TEST_F(HIRBuildTest, LoadGlobalModule311ReadsTheCellSlot) {
   const char* src = R"(
 value = object()
 
@@ -1804,13 +2428,20 @@ def test():
     }
   }
 
-  EXPECT_EQ(call_static_count, 1);
-  EXPECT_EQ(guard_count, 1);
-  EXPECT_EQ(load_global_count, 0);
-  EXPECT_EQ(load_global_cached_count, 0);
+  // The load goes through the per-site cell: the fast arm compares the
+  // globals keys version with the cell and reads the entry slot, the slow
+  // arm is the one CallStatic to the re-pin helper; no deopt point.  A
+  // module-resolved name checks the globals version only.
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(call_static_count, 1) << hir;
+  EXPECT_EQ(guard_count, 0) << hir;
+  EXPECT_EQ(load_global_count, 0) << hir;
+  EXPECT_EQ(load_global_cached_count, 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "globals_keys_version"), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "builtins_keys_version"), 0) << hir;
 }
 
-TEST_F(HIRBuildTest, ColdLoadGlobalModule311UsesTheSharedVersionAllocator) {
+TEST_F(HIRBuildTest, ColdLoadGlobalModule311TakesTheCellPath) {
   const char* src = R"(
 value = object()
 
@@ -1841,15 +2472,16 @@ def test():
     }
   }
 
-  // A cold 3.11 dict starts with an unassigned keys version, but since
-  // MR-09 the JIT shares the vendored specializer's allocator
-  // (Ci_GetDictKeysVersion_311, issuing from the top half of the 32-bit
-  // range), so even a cold module global load can version the keys and
-  // take the guarded fast path.
-  EXPECT_EQ(call_static_count, 1);
-  EXPECT_EQ(guard_count, 1);
-  EXPECT_EQ(load_global_count, 0);
-  EXPECT_EQ(load_global_cached_count, 0);
+  // A cold 3.11 dict starts with an unassigned keys version.  The cell
+  // path does not need one at compile time: the site is emitted unpinned
+  // and the slow arm's helper assigns the version (through the vendored
+  // specializer's allocator, Ci_GetDictKeysVersion_311) and pins the cell
+  // on the first call.
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(call_static_count, 1) << hir;
+  EXPECT_EQ(guard_count, 0) << hir;
+  EXPECT_EQ(load_global_count, 0) << hir;
+  EXPECT_EQ(load_global_cached_count, 0) << hir;
 }
 
 static void expectCompactLongInPlaceFastPath(Function& irfunc) {
@@ -1998,16 +2630,22 @@ def make_arange(n):
 TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
 #if PY_VERSION_HEX < 0x030C0000
   EXPECT_TRUE(isExecuteOpcodeSupported311(LOAD_ATTR));
-  // Backend support does not imply profitable admission for every function.
   EXPECT_TRUE(isExecuteOpcodeSupported311(BINARY_SUBSCR));
+  Ref<PyFunctionObject> subscr(
+      compileAndGet("def subscr(values):\n    return values[0]", "subscr"));
+  ASSERT_NE(subscr, nullptr);
+  EXPECT_EQ(unsupportedExecuteDetail311(subscr->func_code).reason, nullptr);
 
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BUILD_SLICE));
+  EXPECT_TRUE(isExecuteOpcodeSupported311(FORMAT_VALUE));
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BUILD_STRING));
+  EXPECT_FALSE(isExecuteOpcodeSupported311(IMPORT_STAR));
   Ref<PyFunctionObject> func(
-      compileAndGet("def test(values):\n    return values[0]", "test"));
+      compileAndGet("def test(values):\n    return values[1:]", "test"));
   ASSERT_NE(func, nullptr);
   ExecuteRefusal311 detail = unsupportedExecuteDetail311(func->func_code);
-  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_SUBSCRIPT_ADMISSION");
-  EXPECT_EQ(detail.opcode, BINARY_SUBSCR);
-  EXPECT_GE(detail.offset, 0);
+  EXPECT_EQ(detail.reason, nullptr);
+  EXPECT_NE(buildHIR(func), nullptr);
 #endif
 }
 
@@ -2101,7 +2739,7 @@ TEST_F(HIRBuildTest, OversizedBytecode311RefusesCodegenSpan) {
   EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 
-TEST_F(HIRBuildTest, IntAccumulator311HasStableShapeReason) {
+TEST_F(HIRBuildTest, IntAccumulator311UsesExistingArithmeticLowering) {
   const char* src = R"(
 def test(value):
     value *= 2
@@ -2110,10 +2748,8 @@ def test(value):
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  EXPECT_STREQ(
-      unsupportedShapeReason311(func->func_code),
-      "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY");
-  EXPECT_THROW(buildHIR(func), std::runtime_error);
+  EXPECT_EQ(unsupportedShapeReason311(func->func_code), nullptr);
+  EXPECT_NE(buildHIR(func), nullptr);
 }
 #endif
 
@@ -2255,9 +2891,6 @@ def test(seq):
 }
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadAndStoreUseFieldOps) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
-#endif
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2295,7 +2928,16 @@ def test(obj):
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11: the slot is read behind the receiver's type-version compare and
+  // an unset slot (or a receiver of another version) takes the generic
+  // LoadAttr arm, so no CheckField is emitted; the store writes the slot
+  // and then releases the old value and the receiver, in that order.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCheckField), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kUseObj), 2) << hir;
+#else
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 2) << hir;
+#endif
   EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 2) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 2) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
@@ -2303,7 +2945,8 @@ def test(obj):
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadMethodUsesFieldOps) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
+  GTEST_SKIP() << "CPython 3.11 compiles obj.fn() to LOAD_METHOD, which has "
+                  "no slot specialisation";
 #endif
   const char* src = R"(
 def target():
@@ -2348,9 +2991,6 @@ def test(obj):
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotSpecializedLoadAttrUnsetSlotUsesCheckField) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
-#endif
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2380,19 +3020,29 @@ def test(obj):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11: an unset slot and a receiver of another type version each take
+  // a generic LoadAttr arm (the former raises the AttributeError the
+  // interpreter raises), so there are two and no CheckField.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 2) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCheckField), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 2) << hir;
+#else
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
+#endif
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 2) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 1) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
+  GTEST_SKIP() << "CPython 3.11 does not specialise LOAD_ATTR on a type with "
+                  "__getattr__ (tp_getattro is not the generic one)";
 #endif
   const char* src = R"(
 class SlotValue:
@@ -2437,6 +3087,60 @@ def test(obj):
       1)
       << hir;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// LOAD_ATTR_INSTANCE_VALUE / STORE_ATTR_INSTANCE_VALUE: a managed-dict
+// instance still in values form reads and writes its values slot behind
+// the receiver's type-version compare.  A receiver of another version (or
+// one whose dict was materialised) takes the generic LoadAttr / StoreAttr
+// arm, a store into an unset slot takes the insertion helper (CallStatic),
+// and the inline store releases the old value and the receiver after the
+// write.
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InstanceValueSpecializedLoadAndStoreUseFieldOps311) {
+  const char* src = R"(
+class Point:
+    def __init__(self):
+        self.value = 0
+
+obj = Point()
+
+def test(obj):
+    obj.value = obj.value + 1
+    return obj.value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, i + 1));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_INSTANCE_VALUE));
+  ASSERT_TRUE(hasSpecializedOpcode(func, STORE_ATTR_INSTANCE_VALUE));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 2) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCallStatic), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 3) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 4) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kUseObj), 3) << hir;
+}
+#endif
 
 #if PY_VERSION_HEX >= 0x030E0000
 TEST_F(HIRBuildTest, SlotSpecializedLoadAttrWithHeaderOffsetFallsBack) {
@@ -2620,6 +3324,36 @@ obj = InlineBox()
 #endif
 
 #if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED)
+TEST_F(HIRBuildTest, LoadAttrInstanceValueKeepsGenericLoadAttr) {
+  const char* src = R"(
+class InstanceValue:
+    def __init__(self):
+        self.value = 42
+
+obj = InstanceValue()
+
+def test(obj):
+    return obj.value
+
+for _ in range(128):
+    assert test(obj) == 42
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_INSTANCE_VALUE));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  std::string hir = fullPrinter().ToString(*irfunc);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "inline_values.valid"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "LoadField<value@"), 0) << hir;
+}
+#endif
+
 TEST_F(HIRBuildTest, LoadAttrMethodWithValuesLowersToHelperCall) {
   const char* src = R"(
 class MethodValue:
@@ -3592,6 +4326,165 @@ def f():
       Ref<>::steal(PyObject_Call(pyfunc, empty_tuple, /*kwargs=*/nullptr));
   EXPECT_TRUE(isIntEquals(call_result2, 2));
 }
+
+TEST_F(CppInlinerTest, CallerEnvironmentPinsInlinedCallee) {
+  std::unique_ptr<Function> func;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(
+      R"(
+def callee():
+    return 42
+
+def caller(func):
+    return func()
+)",
+      "caller",
+      func));
+  ASSERT_NE(func, nullptr);
+  auto callee = getGlobal("callee");
+  ASSERT_NE(callee, nullptr);
+  // Preload the independent known callee without introducing a caller global
+  // or constant that already owns it.
+  auto callee_hir = buildHIR(BorrowedRef<PyFunctionObject>{callee});
+  ASSERT_NE(callee_hir, nullptr);
+  for (auto& ref : func->env.references()) {
+    ASSERT_NE(ref.get(), callee);
+  }
+  Compiler::runPasses(*func, PassConfig::kSimplify);
+  // Model a known call target without adding a constant/Environment owner.
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsVectorCall()) {
+        static_cast<VectorCall&>(instr).func()->set_type(
+            Type::fromObject(callee));
+      }
+    }
+  }
+  InlineFunctionCalls{}.Run(*func);
+  bool inlined = false;
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      inlined |= instr.IsBeginInlinedFunction();
+    }
+  }
+  ASSERT_TRUE(inlined) << fullPrinter().ToString(*func);
+  bool owned = false;
+  for (auto& ref : func->env.references()) {
+    owned |= ref.get() == callee;
+  }
+  EXPECT_TRUE(owned);
+  auto marker_block = func->cfg.AllocateBlock();
+  BeginInlinedFunction* copied_begin = nullptr;
+  for (auto& block : func->cfg.blocks) {
+    if (&block == marker_block) {
+      continue;
+    }
+    for (auto& instr : block) {
+      if (instr.IsBeginInlinedFunction()) {
+        copied_begin = static_cast<BeginInlinedFunction*>(instr.clone());
+        break;
+      }
+    }
+    if (copied_begin != nullptr) {
+      break;
+    }
+  }
+  ASSERT_NE(copied_begin, nullptr);
+  marker_block->Append(copied_begin);
+  marker_block->Append(EndInlinedFunction::create(copied_begin));
+  BeginInlinedFunctionElimination{}.Run(*func);
+  EXPECT_TRUE(marker_block->empty());
+  owned = false;
+  for (auto& ref : func->env.references()) {
+    owned |= ref.get() == callee;
+  }
+  EXPECT_TRUE(owned);
+}
+
+TEST_F(CppInlinerTest, RejectedCalleeDoesNotAddEnvironmentOwner) {
+  std::unique_ptr<Function> func;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(
+      R"(
+def callee(*args):
+    return 42
+
+def caller(func):
+    return func()
+)",
+      "caller",
+      func));
+  ASSERT_NE(func, nullptr);
+  auto callee = getGlobal("callee");
+  ASSERT_NE(callee, nullptr);
+  // Preload the independent known callee without introducing a caller global
+  // or constant that already owns it.
+  auto callee_hir = buildHIR(BorrowedRef<PyFunctionObject>{callee});
+  ASSERT_NE(callee_hir, nullptr);
+  for (auto& ref : func->env.references()) {
+    ASSERT_NE(ref.get(), callee);
+  }
+  Compiler::runPasses(*func, PassConfig::kSimplify);
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsVectorCall()) {
+        static_cast<VectorCall&>(instr).func()->set_type(
+            Type::fromObject(callee));
+      }
+    }
+  }
+  auto before = func->env.references().size();
+  InlineFunctionCalls{}.Run(*func);
+  EXPECT_EQ(func->env.references().size(), before);
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      EXPECT_FALSE(instr.IsBeginInlinedFunction());
+    }
+  }
+}
+
+// Executable HIR inlining is supported only by the 3.14+ lightweight-frame
+// runtime. Do not register a permanently skipped 3.11 canary test.
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(CppInlinerTest, ChangingInlinedCalleeCodePreservesInterpreterResult) {
+  if (!getConfig().hir_opts.inliner) {
+    GTEST_SKIP() << "Executable inlining requires supported lightweight frames";
+  }
+  Ref<> caller(compileAndGet(
+      R"(
+def callee():
+    return 42
+
+def replacement():
+    return 99
+
+def caller():
+    return callee()
+)",
+      "caller"));
+  ASSERT_NE(caller, nullptr);
+  BorrowedRef<PyFunctionObject> caller_func{caller};
+  auto caller_hir = buildHIR(caller_func);
+  ASSERT_NE(caller_hir, nullptr);
+  ASSERT_EQ(jit::compileFunction(caller_func), jit::Result::OK);
+  auto compiled = getContext()->lookupFunc(caller_func);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_GT(compiled->inlinedFunctionsStats().num_inlined_functions, 0);
+  auto first = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(first, nullptr);
+  EXPECT_TRUE(isIntEquals(first, 42));
+  runCode("callee.__code__ = replacement.__code__\n");
+  PyGC_Collect();
+  auto second = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(second, nullptr);
+  EXPECT_TRUE(isIntEquals(second, 99));
+  jit::uncompile(caller_func);
+  EXPECT_EQ(getContext()->lookupFunc(caller_func), nullptr);
+  PyGC_Collect();
+  auto interpreted = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(interpreted, nullptr);
+  EXPECT_TRUE(isIntEquals(interpreted, 99));
+}
+
+#endif
 
 TEST_F(CppInlinerTest, ColdCallThresholdZeroDoesNotPruneAll) {
   struct RestoreFlag {
@@ -4722,3 +5615,270 @@ def multi_ret(x):
   auto irfunc = buildHIR(func);
   ASSERT_NE(irfunc, nullptr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, StringLiteralCompareHIRAndLegacyHelperFallback) {
+  // Build the local pass input explicitly: the branch form quickens to
+  // COMPARE_OP_STR_JUMP, which does not establish exact-string types here.
+  auto irfunc = HIRParser{}.ParseHIR(R"(
+fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    Return v0
+  }
+}
+)");
+  ASSERT_NE(irfunc, nullptr);
+  auto* block = irfunc->cfg.entry_block;
+  auto* old_return = block->GetTerminator();
+  auto* arg = old_return->GetOperand(0);
+  old_return->unlink();
+  delete old_return;
+  FrameState frame;
+  auto* exact = irfunc->env.AllocateRegister();
+  block->append<GuardType>(exact, TUnicodeExact, arg, frame);
+  auto literal = Ref<>::steal(PyUnicode_FromString("needle"));
+  ASSERT_NE(literal, nullptr);
+  auto* constant = irfunc->env.AllocateRegister();
+  block->append<LoadConst>(constant, Type::fromObject(literal));
+  auto* result = irfunc->env.AllocateRegister();
+  block->append<CompareBool>(result, CompareOp::kEqual, exact, constant, frame);
+  block->append<Return>(result, TCBool);
+  reflowTypes(*irfunc);
+  Simplify{}.Run(*irfunc);
+  std::string hir = fullPrinter().ToString(*irfunc);
+  // Check the inline literal loads and the helper-form fallback directly.
+  EXPECT_GE(countSubstring(hir, "state"), 1) << hir;
+  EXPECT_GE(countSubstring(hir, "data"), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCompareBool), 1) << hir;
+
+  // Exercise the fallback helper separately with genuinely non-ready input.
+  // This checks helper semantics, not execution of the parsed HIR above.
+  for (const wchar_t* text : {L"needle", L"different", L"n\u00e9edle"}) {
+    Py_ssize_t length = static_cast<Py_ssize_t>(std::wcslen(text));
+    auto legacy = Ref<>::steal(PyUnicode_FromUnicode(nullptr, length));
+    ASSERT_NE(legacy, nullptr);
+    ASSERT_FALSE(PyUnicode_IS_READY(legacy.get()));
+    // Access the original wide buffer without making the string ready.
+    std::wmemcpy(
+        reinterpret_cast<PyASCIIObject*>(legacy.get())->wstr, text, length);
+    int result = JITRT_UnicodeEquals(legacy, literal, Py_EQ);
+    EXPECT_EQ(result, std::wcscmp(text, L"needle") == 0 ? 1 : 0);
+    ASSERT_FALSE(PyErr_Occurred());
+  }
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, PredicateBuiltinCallsUseSpecializedHelpers) {
+  const char* src = R"(
+def inst(value, cls):
+    return isinstance(value, cls)
+
+def attr(value, default):
+    return getattr(value, "field", default)
+
+for _ in range(128):
+    inst(1, (int, str))
+    attr(object(), None)
+)";
+  Ref<PyFunctionObject> inst(compileAndGet(src, "inst"));
+  ASSERT_NE(inst, nullptr);
+  auto inst_hir = buildHIR(inst);
+  ASSERT_NE(inst_hir, nullptr);
+  Compiler::runPasses(*inst_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *inst_hir, reinterpret_cast<void*>(JITRT_IsInstanceGen311)),
+      1)
+      << fullPrinter().ToString(*inst_hir);
+  Ref<PyFunctionObject> attr(getGlobal("attr"));
+  ASSERT_NE(attr, nullptr);
+  auto attr_hir = buildHIR(attr);
+  ASSERT_NE(attr_hir, nullptr);
+  Compiler::runPasses(*attr_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *attr_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      1)
+      << fullPrinter().ToString(*attr_hir);
+}
+
+TEST_F(HIRBuildTest, PredicateBuiltinTypeArgumentsRemainPinned) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def check(value):
+    return isinstance(value, int)
+)",
+      "check"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardIs), 2)
+      << fullPrinter().ToString(*irfunc);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsInstance), 1)
+      << fullPrinter().ToString(*irfunc);
+}
+
+TEST_F(HIRBuildTest, PredicateTypePinsKeepDirectConstructorsGeneric) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def masked(address, mask):
+    packed = int(address)
+    return (packed & int(mask)) != packed
+)",
+      "masked"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardIs), 0)
+      << fullPrinter().ToString(*irfunc);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsCompactLong), 0)
+      << fullPrinter().ToString(*irfunc);
+}
+
+TEST_F(HIRBuildTest, PredicateBuiltinCallsKeepUnsupportedCallsGeneric) {
+  const char* src = R"(
+def dynamic_name(value, name, default):
+    return getattr(value, name, default)
+
+def keyword_default(value, default):
+    return getattr(value, "field", default=default)
+
+def shadowed(isinstance, value, cls):
+    return isinstance(value, cls)
+
+for _ in range(128):
+    dynamic_name(object(), "field", None)
+)";
+  Ref<PyFunctionObject> dynamic(compileAndGet(src, "dynamic_name"));
+  ASSERT_NE(dynamic, nullptr);
+  auto dynamic_hir = buildHIR(dynamic);
+  ASSERT_NE(dynamic_hir, nullptr);
+  Compiler::runPasses(*dynamic_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *dynamic_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      0)
+      << fullPrinter().ToString(*dynamic_hir);
+  Ref<PyFunctionObject> keyword(getGlobal("keyword_default"));
+  ASSERT_NE(keyword, nullptr);
+  auto keyword_hir = buildHIR(keyword);
+  ASSERT_NE(keyword_hir, nullptr);
+  Compiler::runPasses(*keyword_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *keyword_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      0)
+      << fullPrinter().ToString(*keyword_hir);
+  Ref<PyFunctionObject> shadowed(getGlobal("shadowed"));
+  ASSERT_NE(shadowed, nullptr);
+  auto shadowed_hir = buildHIR(shadowed);
+  ASSERT_NE(shadowed_hir, nullptr);
+  Compiler::runPasses(*shadowed_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *shadowed_hir, reinterpret_cast<void*>(JITRT_IsInstanceGen311)),
+      0)
+      << fullPrinter().ToString(*shadowed_hir);
+  EXPECT_EQ(countOpcode(*shadowed_hir, Opcode::kIsInstance), 0);
+}
+
+TEST_F(HIRBuildTest, IsInstanceCacheInvalidatesClassResolution) {
+  runCode(R"(
+class Receiver:
+    pass
+class Other:
+    pass
+obj = Receiver()
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> other(getGlobal("Other"));
+  JITRT_IsInstanceSiteCache311 site{};
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 0);
+  EXPECT_NE(site.version, 0);
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 0);
+  runCode(R"(
+Receiver.__getattribute__ = lambda self, name: (
+    Other if name == "__class__" else object.__getattribute__(self, name)
+)
+)");
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 1);
+  ASSERT_FALSE(PyErr_Occurred());
+}
+
+TEST_F(HIRBuildTest, IsInstanceGenericCacheInvalidatesMetaclass) {
+  runCode(R"(
+class Meta(type):
+    pass
+class Target(metaclass=Meta):
+    pass
+obj = object()
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> target(getGlobal("Target"));
+  JITRT_IsInstanceGenCache311 site{};
+  auto miss = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(miss, nullptr);
+  EXPECT_EQ(miss.get(), Py_False);
+  EXPECT_EQ(site.nkeys, 1);
+  auto hit = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(hit, nullptr);
+  EXPECT_EQ(hit.get(), Py_False);
+  runCode("Meta.__instancecheck__ = lambda cls, value: True");
+  auto changed = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(changed, nullptr);
+  EXPECT_EQ(changed.get(), Py_True);
+}
+
+TEST_F(HIRBuildTest, GetAttrDefaultCacheKeysNameAndInvalidatesDescriptor) {
+  runCode(R"(
+class Slots:
+    __slots__ = ("first", "second")
+obj = Slots()
+first = object()
+second = object()
+obj.first = first
+obj.second = second
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> first(getGlobal("first"));
+  Ref<> second(getGlobal("second"));
+  auto first_name = Ref<>::steal(PyUnicode_FromString("first"));
+  auto second_name = Ref<>::steal(PyUnicode_FromString("second"));
+  ASSERT_NE(first_name, nullptr);
+  ASSERT_NE(second_name, nullptr);
+  JITRT_GetAttrDefaultCache311 site{};
+  auto first_result =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, first_name, Py_None));
+  ASSERT_NE(first_result, nullptr);
+  EXPECT_EQ(first_result.get(), first.get());
+  EXPECT_EQ(site.slot, 1);
+  auto second_result =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  ASSERT_NE(second_result, nullptr);
+  EXPECT_EQ(second_result.get(), second.get());
+  runCode(R"(
+def missing(self):
+    raise AttributeError("absent")
+Slots.second = property(missing)
+)");
+  auto missing =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  ASSERT_NE(missing, nullptr);
+  EXPECT_EQ(missing.get(), Py_None);
+  EXPECT_EQ(site.slot, 0);
+  runCode(R"(
+def failing(self):
+    raise ValueError("failure")
+Slots.second = property(failing)
+)");
+  auto error =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  EXPECT_EQ(error.get(), nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+  PyErr_Clear();
+}
+#endif

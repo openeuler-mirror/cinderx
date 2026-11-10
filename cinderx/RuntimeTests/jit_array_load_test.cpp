@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -101,6 +102,28 @@ def load_array_double(a):
       irfunc);
   ASSERT_NE(irfunc, nullptr);
   runArrayFastPath(irfunc);
+  if (Ci_SpikeGetenv("SPIKE_ARRIDX") != nullptr) {
+    // A noncompact constant either folds directly to the generic path or
+    // retains a compactness check whose false edge reaches that path.
+    bool compact_fallback = false;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (!instr.IsCondBranch() ||
+            !instr.GetOperand(0)->instr()->IsIsCompactLong()) {
+          continue;
+        }
+        auto* slow = static_cast<const jit::hir::CondBranch&>(instr).false_bb();
+        for (auto& fallback : *slow) {
+          compact_fallback |= fallback.IsBinaryOp() &&
+              static_cast<const jit::hir::BinaryOp&>(fallback).op() ==
+                  jit::hir::BinaryOpKind::kSubscript;
+        }
+      }
+    }
+    EXPECT_GT(countBinarySubscrs(*irfunc), 0);
+    EXPECT_TRUE(compact_fallback || countDoubleArrayLoads(*irfunc) == 0);
+    return;
+  }
   bool found = false;
   for (auto& block : irfunc->cfg.blocks) {
     for (auto& instr : block) {

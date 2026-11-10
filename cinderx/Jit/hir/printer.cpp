@@ -871,6 +871,9 @@ void HIRPrinter::Print(std::ostream& os, const Instr& instr) {
     if (!db->descr().empty()) {
       Indented(os) << fmt::format("Descr '{}'\n", db->descr());
     }
+    if (db->excEdge()) {
+      Indented(os) << "ExcEdge\n";
+    }
     if (Register* guilty_reg = db->guiltyReg()) {
       Indented(os) << fmt::format("GuiltyReg {}\n", *guilty_reg);
     }
@@ -909,6 +912,12 @@ void HIRPrinter::Print(std::ostream& os, const FrameState& state) {
         os << " <null>";
       } else {
         os << " " << reg->name();
+        // SPIKE(PHIUNBOX): `value?flag` for a local whose binding is
+        // carried by a separate flag register.
+        if (static_cast<size_t>(i) < state.local_bound.size() &&
+            state.local_bound[i] != nullptr) {
+          os << "?" << state.local_bound[i]->name();
+        }
       }
     }
     os << '\n';

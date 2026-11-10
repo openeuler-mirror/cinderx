@@ -13,6 +13,7 @@ CodeAllocatorTest
 CopyGraphTest
 CopyPropagationTest
 DataFlowTest
+DeoptBaseTest
 DeoptSiteIdTest
 FloatInPlaceBoxSinkTest
 FuncTypeCheckTest
@@ -24,10 +25,19 @@ LIRTargetSelectOperandTest
 LIRTest
 LIRTypeTest
 LinearScanAllocatorTest
+QuickenedCount311Test
 RemoveTrampolineBlocksTest
 RemoveUnreachableBlocks
+SchedulingPolicyBuildTest
+SchedulingPolicyStateTest
 ShadowCompileTest
 SlabArenaTest
 SortedVecMapTest
 SplitCriticalEdgesTest
 UtilTestNoFixture
+LoopPhiUnboxTest
+LoopBoxing311Test
+LoopAllocationFailure311Test
+TupleLayout311Test
+HirCSENonceTest
+CodeLayoutTest

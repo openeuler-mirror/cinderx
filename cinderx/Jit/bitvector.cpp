@@ -228,12 +228,18 @@ void BitVector::SetBitWidth(size_t size) {
   // need to clear the unused upper bits
   // could use BZHI instruction, but this function is not frequently called,
   // so it is okay.
-  auto high_mask = (uint64_t(1) << (num_bits_ % PTR_WIDTH)) - 1;
-  if (new_short) {
-    bits_.bits &= high_mask;
-  } else {
-    auto& chunk = *bits_.bit_vec->rbegin();
-    chunk &= high_mask;
+  // A width that is a nonzero multiple of PTR_WIDTH leaves the last chunk
+  // fully used, so nothing is cleared; a zero width keeps no bits at all.
+  if (num_bits_ == 0) {
+    bits_.bits = 0;
+  } else if (auto remainder = num_bits_ % PTR_WIDTH; remainder != 0) {
+    auto high_mask = (uint64_t(1) << remainder) - 1;
+    if (new_short) {
+      bits_.bits &= high_mask;
+    } else {
+      auto& chunk = *bits_.bit_vec->rbegin();
+      chunk &= high_mask;
+    }
   }
 }
 

@@ -123,6 +123,12 @@ struct DeoptFrameMetadata {
   // `PyFrameObject`.
   FrozenList<int> localsplus;
 
+  // SPIKE(PHIUNBOX): either empty or parallel to `localsplus`.  An entry other
+  // than -1 is the index into live_values of a 0/1 int64 flag saying whether
+  // that local is bound; while the flag is 0 the local is reified as unbound
+  // and its own live value is ignored.
+  FrozenList<int> localsplus_bound;
+
   // Index into live_values for each entry in the operand stack.
   FrozenList<int> stack;
 
@@ -179,6 +185,14 @@ struct DeoptMetadata {
   int32_t force_countdown{0};
   bool consumed_forced{false};
 
+  // If not -1, this row belongs to the slow-path guard of a forced-deopt
+  // check and the value is the index of the site row it forces.  The slow
+  // path is a separate guard with its own register assignment, and live
+  // value locations are recorded per row, so it cannot deopt through the
+  // row shared by the site's ordinary guards.  Arming state lives on the
+  // site row; this row is never listed as a site of its own.
+  int64_t forced_site_row{-1};
+
   BorrowedRef<PyCodeObject> code() const {
     return innermostFrame().code;
   }
@@ -208,6 +222,20 @@ struct DeoptMetadata {
   // Returns nullptr if local `i` is dead
   const LiveValue* getLocalValue(int i, const DeoptFrameMetadata& frame) const {
     int v = frame.localsplus[i];
+    if (v == -1) {
+      return nullptr;
+    }
+    return &live_values[v];
+  }
+
+  // SPIKE(PHIUNBOX): the bound flag of local `i`, or nullptr when the local's
+  // binding is not carried by a separate flag.
+  const LiveValue* getLocalBoundFlag(int i, const DeoptFrameMetadata& frame)
+      const {
+    if (static_cast<size_t>(i) >= frame.localsplus_bound.size()) {
+      return nullptr;
+    }
+    int v = frame.localsplus_bound[i];
     if (v == -1) {
       return nullptr;
     }
@@ -289,6 +317,12 @@ struct MemoryView {
 
   BorrowedRef<> readBorrowed(const LiveValue& value) const;
   Ref<> readOwned(const LiveValue& value) const;
+
+  // SPIKE(PHIUNBOX): a local's 0/1 bound flag (see
+  // DeoptFrameMetadata::localsplus_bound).
+  bool readBoundFlag(const LiveValue& value) const {
+    return readRaw(value) != 0;
+  }
 
  private:
   uint64_t readRaw(const LiveValue& value) const {

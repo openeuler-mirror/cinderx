@@ -129,6 +129,11 @@ class RuntimeTest : public ::testing::Test {
     }
     ASSERT_NE(mod_state, nullptr) << "Could not load the CinderX module state, "
                                      "CinderX has not initialized properly";
+#if PY_VERSION_HEX < 0x030C0000
+    // Runtime cases test compilation deterministically. Grace-policy cases
+    // explicitly configure and re-arm their own startup window.
+    jit::getMutableConfig().auto_jit_startup_grace_ms = 0;
+#endif
 
     // Generally the first failure we see when the JIT is incorrectly
     // initialized is trying to use the code allocator and crashing, so check

@@ -7,6 +7,8 @@
 #include "cinderx/Jit/lir/function.h"
 #include "cinderx/Jit/lir/instruction.h"
 
+#include <algorithm>
+
 namespace jit::lir {
 
 DataType hirTypeToDataType(hir::Type tp) {
@@ -52,7 +54,9 @@ BasicBlock* BasicBlockBuilder::allocateBlock() {
 }
 
 void BasicBlockBuilder::appendBlock(BasicBlock* block) {
-  if (cur_bb_->successors().size() < 2) {
+  auto& succs = cur_bb_->successors();
+  if (succs.size() < 2 &&
+      std::find(succs.begin(), succs.end(), block) == succs.end()) {
     cur_bb_->addSuccessor(block);
   }
   switchBlock(block);

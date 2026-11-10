@@ -62,14 +62,17 @@ COVERAGE_MIN_PERCENT = {
 }
 PIPELINES = {
     "pr": (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False),
     ),
     "daily": (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     ),
     "daily311": (
+        ("runner_selftests", False),
         ("cp311_gate", False),
         ("cp311_daily", False),
     ),
@@ -78,7 +81,7 @@ PIPELINES = {
 }
 PIPELINES_BY_PYTHON = {
     "pr": {
-        "3.11": (("cp311_gate", False),),
+        "3.11": (("runner_selftests", False), ("cp311_gate", False)),
         "3.14": PIPELINES["pr"],
     },
     "daily": {

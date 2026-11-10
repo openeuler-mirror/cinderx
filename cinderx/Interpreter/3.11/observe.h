@@ -82,6 +82,15 @@ struct _PyInterpreterFrame;
 // `function.__code__` can be reassigned afterwards while a suspended
 // generator keeps resuming the frame it already has.  Passing it in keeps
 // the decision with the only party that can see the frame layout.
+// Reopen the code's scheduling slot (counting restarts from zero) after its
+// by-code artifact was retired by the ROI backoff.
+void Ci_Observe311_ReopenSlotForCode(PyCodeObject* code);
+uint64_t Ci_Observe311_CallCount(PyCodeObject* code);
+
+// Offer a fresh function object over a dispatched code to the fresh-attach
+// entry point from the by-code artifact entry; 1 when it attached.
+int Ci_Observe311_OfferFreshAttach(PyFunctionObject* func);
+
 void Ci_Observe311_OnFrame(
     PyFunctionObject* func,
     PyCodeObject* code,
@@ -163,6 +172,12 @@ int Ci_JitShell311_CodeHasArtifact(PyCodeObject* code);
 // spending it -- and a function that only ever runs under one (a workload
 // that lives entirely inside a coverage tracer) simply stays interpreted.
 int Ci_JitShell311_DispatchDeferred(void);
+// -1: frozen, 1: waiting for rewarm, 0: scheduling may proceed.
+int Ci_JitShell311_CodeBackoffHold(PyCodeObject* code, uint64_t calls);
+// Optional size-scaled threshold with saturating arithmetic.
+uint64_t Ci_JitShell311_RoiGateNeed(PyCodeObject* code, uint64_t threshold);
+// Re-arm the transient startup window at initialization or after fork.
+void Ci_JitShell311_ResetStartupGrace(void);
 
 // Execute mode: attach a fresh function object to the artifact already
 // published for its code object, within the per-code attachment budget.

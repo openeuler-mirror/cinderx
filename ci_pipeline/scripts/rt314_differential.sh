@@ -2,7 +2,8 @@
 # The 3.14 reference-line neutrality differential (dev plan v2.1 §3.5).
 #
 # Builds runtime_tests for the merge base and for HEAD with identical flags,
-# runs both, and requires the normalized failure sets to be isomorphic.
+# runs both, verifies reviewed test additions, and requires legacy normalized
+# failure/skip sets and diagnostics to be isomorphic.
 # import-level smoke is NOT a substitute for this check.
 #
 # Usage: rt314_differential.sh <base-ref> <work-dir>
@@ -177,7 +178,7 @@ build_and_run() {
   "$bin" --gtest_list_tests 2>/dev/null \
     | awk '/^[A-Za-z_][A-Za-z0-9_]*\./ { suite = $1 }
            /^  [A-Za-z_]/ { print suite $1 }' \
-    | sort -u > "$WORK/$tag-registered.txt"
+    | sort > "$WORK/$tag-registered.txt"
   # The run must cover the full enabled population: base/head equality
   # alone would accept a filter or shard that shrank both sides alike.
   ENABLED=$(grep -cv 'DISABLED_' "$WORK/$tag-registered.txt")
@@ -203,18 +204,13 @@ if [ -f "$_gtest_cmake" ]; then
   sed -i -E 's/[0-9a-f]{40}[[:space:]]+# tag (v[0-9.]+)/\1/' "$_gtest_cmake"
 fi
 
-# Golden texts first (cheap, fail-fast): hir_test golden output IS observed
-# behavior, and a change that also updates the goldens keeps both failure
-# sets equal -- the differential is structurally blind to it.  Any golden
-# delta therefore refuses mechanical certification and demands explicit
-# reconciliation in the MR.
-if ! diff -r "$WORK/base-tree/cinderx/RuntimeTests/hir_tests" \
-     "$REPO_ROOT/cinderx/RuntimeTests/hir_tests" > "$WORK/golden.diff" 2>&1; then
-  echo "rt314-differential: NON-ZERO -- hir_test golden texts changed;"
-  echo "golden change is behavior change and must be reconciled explicitly"
-  head -n 40 "$WORK/golden.diff"
-  exit 1
-fi
+# Reviewed additions are hash/identity pinned. Existing goldens still must
+# byte-match; a missing or unreviewed addition fails before either build.
+CONTRACT="$REPO_ROOT/ci_pipeline/jit311/data/rt314_test_additions.json"
+CHECKER="$REPO_ROOT/ci_pipeline/ref314_contract.py"
+python3.14 "$CHECKER" goldens "$CONTRACT" \
+  "$WORK/base-tree/cinderx/RuntimeTests/hir_tests" \
+  "$REPO_ROOT/cinderx/RuntimeTests/hir_tests"
 
 # The environment allowlist may grow only by registering failures that
 # already fail identically on both sides (documenting a reference-line
@@ -250,16 +246,13 @@ fi
 build_and_run "$WORK/base-tree" base
 build_and_run "$REPO_ROOT" head
 
-# Identical failure sets are not enough on their own: a test that silently
-# disappears while green keeps the failure sets equal but shrinks coverage.
-if ! diff "$WORK/base-registered.txt" "$WORK/head-registered.txt"; then
-  echo "rt314-differential: NON-ZERO -- registered test identity changed"
-  exit 1
-fi
-if ! diff "$WORK/base-ran.txt" "$WORK/head-ran.txt"; then
-  echo "rt314-differential: NON-ZERO -- total test count changed"
-  exit 1
-fi
+# Each build already proved ran == its full enabled population. Reconcile
+# exact additions, then require each new test to execute with its pinned
+# outcome. Existing tests retain the original strict differential.
+python3.14 "$CHECKER" execution "$CONTRACT" \
+  "$WORK/base-registered.txt" "$WORK/head-registered.txt" \
+  --log "$WORK/head-tests.log" --legacy-log "$WORK/head-legacy-tests.log"
+
 if [ -s "$WORK/allowlist-grown.txt" ]; then
   comm -12 "$WORK/base-failed.txt" "$WORK/head-failed.txt" \
     > "$WORK/symmetric-failed.txt"
@@ -271,7 +264,7 @@ if [ -s "$WORK/allowlist-grown.txt" ]; then
     exit 1
   fi
 fi
-compare_run_logs "$WORK/base-tests.log" "$WORK/head-tests.log" \
+compare_run_logs "$WORK/base-tests.log" "$WORK/head-legacy-tests.log" \
   "$REPO_ROOT/ci_pipeline/jit311/data/rt314_env_allowed_failures.txt" || exit 1
-echo "rt314-differential: ZERO (identity equal, failure/skip sets isomorphic,"
+echo "rt314-differential: ZERO (reviewed additions executed, legacy failure/skip sets isomorphic,"
 echo "allowlisted, diagnostics aligned)"

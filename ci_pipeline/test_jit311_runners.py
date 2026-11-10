@@ -868,14 +868,74 @@ def test_unexpected_organic_deopt_turns_red():
 
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
-    # The shared-3.11 gate and its matching CPython test support path pin
-    # the current invocation at 333; any drift must still turn red.
-    errors = [
-        error
-        for judge in runners.stdlib_canary_runner().judges
-        for error in judge({"organic_deopt_hits": 334})
-    ]
-    assert any("organic_deopt_hits == 333" in error for error in errors)
+    for drift in (36, 225, 289, 294, 356, 357, 359):
+        errors = [
+            error
+            for judge in runners.stdlib_canary_runner().judges
+            for error in judge({"organic_deopt_hits": drift})
+        ]
+        assert any("organic_deopt_hits == 358" in error for error in errors)
+
+
+def test_stdlib_canary_has_real_entries_and_exact_deopt_sites(monkeypatch):
+    # Import coverage must not wait on the product's wall-clock grace period,
+    # including a longer grace requested by the parent environment.
+    monkeypatch.setenv("CINDERX_JIT_STARTUP_GRACE_MS", "60000")
+    result = runners.run(runners.stdlib_canary_runner())
+    assert result.ok, result.summary()
+    assert result.report["organic_deopt_hits"] == 358
+    assert result.report["machine_code_entries"] > 0
+
+
+def test_stdlib_canary_retry_opt_out_restores_previous_fingerprint(tmp_path):
+    spec = runners.stdlib_canary_runner(
+        judges=runners.execute_holds(expected_organic_deopts=294)
+        + [runners.expect("target_modules_attempted", "==", 72)]
+    )
+    spec.env["CINDERX_JIT_DESPECIALIZE"] = "0"
+    spec.asserted_env["CINDERX_JIT_DESPECIALIZE"] = "0"
+    manifest = json.loads(spec.deopt_manifest.read_text())
+    retry_site = {
+        "filename": "re/_parser.py",
+        "qualname": "SubPattern.__getitem__",
+        "reason": "UnhandledException",
+        "cause_offset": 61,
+        "resume_offset": 124,
+        "count": 64,
+    }
+    assert manifest["sites"].count(retry_site) == 1
+    manifest["sites"].remove(retry_site)
+    manifest["total"] = 294
+    spec.deopt_manifest = tmp_path / "without-generic-retry.json"
+    spec.deopt_manifest.write_text(json.dumps(manifest))
+    result = runners.run(spec)
+    assert result.ok, result.summary()
+    assert result.report["organic_deopt_hits"] == 294
+
+
+def test_stdlib_deopt_fingerprint_rejects_equal_total_drift():
+    from copy import deepcopy
+    from ci_pipeline.jit311.deopt_fingerprint import check
+    manifest = json.loads(runners.stdlib_canary_runner().deopt_manifest.read_text())
+    rows = []
+    for site in manifest["sites"]:
+        row = dict(site, transition="deopt", deopt_reason=site["reason"],
+                   forced=False, instrumentation=False)
+        rows.extend(deepcopy(row) for _ in range(site["count"]))
+    ledger = {"dropped": 0, "rows": rows}
+    assert check(ledger, manifest, 358) == []
+    drift = deepcopy(ledger)
+    drift["rows"][0]["deopt_reason"] = "UnexpectedReason"
+    assert check(drift, manifest, 358)
+    for field in ("filename", "qualname", "cause_offset", "resume_offset"):
+        drift = deepcopy(ledger)
+        drift["rows"][0][field] = 99999 if field.endswith("offset") else "unexpected"
+        assert check(drift, manifest, 358)
+    for bad in ({"dropped": 1, "rows": rows}, {"dropped": 0, "rows": rows[:-1]}, {}, None):
+        assert check(bad, manifest, 358)
+    drift = deepcopy(ledger)
+    drift["rows"][0]["forced"] = True
+    assert check(drift, manifest, 358)
 
 
 def test_green_gate_refuses_skips(tmp_path):

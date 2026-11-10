@@ -1075,6 +1075,133 @@ TEST_F(AttrCache311Test, TypeAttrCacheRetiresOnOwnerAndMetaclassMutation) {
   EXPECT_EQ(PyUnicode_CompareWithASCIIString(after_meta, "meta-descr"), 0);
 }
 
+// A class attribute served by a cached non-data descriptor (the kDescrGet
+// form, whose __get__ runs on every hit) raises AttributeError with the
+// name and the receiver filled in, as PyObject_GetAttr fills them.
+TEST_F(AttrCache311Test, TypeReceiverDescrGetErrorCarriesContext) {
+  Ref<PyObject> g(MakeGlobals());
+  auto f = makeTypeFixture(
+      g,
+      "    class Flaky:\n"
+      "        calls = 0\n"
+      "        def __get__(self, obj, owner):\n"
+      "            type(self).calls += 1\n"
+      "            if type(self).calls > 1:\n"
+      "                raise AttributeError('gone')\n"
+      "            return 'first'\n"
+      "    prop = Flaky()\n");
+  ASSERT_NE(f.type, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("prop"));
+  auto recv = reinterpret_cast<PyObject*>(f.type.get());
+
+  auto cache = makeLoadAttrCache();
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), recv, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(first, "first"), 0);
+
+  // The second access is the cached hit; its getter raises.
+  auto second =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), recv, name));
+  ASSERT_EQ(second, nullptr);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_AttributeError));
+  PyObject *type = nullptr, *value = nullptr, *tb = nullptr;
+  PyErr_Fetch(&type, &value, &tb);
+  PyErr_NormalizeException(&type, &value, &tb);
+  auto exc = Ref<>::steal(value);
+  Py_XDECREF(type);
+  Py_XDECREF(tb);
+  ASSERT_NE(exc, nullptr);
+  auto exc_name = Ref<>::steal(PyObject_GetAttrString(exc, "name"));
+  auto exc_obj = Ref<>::steal(PyObject_GetAttrString(exc, "obj"));
+  ASSERT_NE(exc_name, nullptr);
+  ASSERT_NE(exc_obj, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(exc_name, "prop"), 0);
+  EXPECT_EQ(exc_obj.get(), recv);
+}
+
+// A stale type-version entry is not served: the class gains a same-named
+// value, the next access takes the slow path and answers from the class.
+TEST_F(AttrCache311Test, TypeReceiverEntryRetiresOnOwnerMutation) {
+  Ref<PyObject> g(MakeGlobals());
+  auto f = makeTypeFixture(g, "    CONST = 1\n");
+  ASSERT_NE(f.type, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("CONST"));
+  auto recv = reinterpret_cast<PyObject*>(f.type.get());
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  auto cache = makeLoadAttrCache();
+  auto first =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), recv, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 1);
+  uint64_t hits = stats.load_attr.hits;
+  auto again =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), recv, name));
+  ASSERT_NE(again, nullptr);
+  ASSERT_EQ(stats.load_attr.hits, hits + 1) << "the class receiver never hit";
+
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_EQ(PyObject_SetAttr(recv, name, two), 0);
+  uint64_t misses = stats.load_attr.misses;
+  auto after =
+      Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), recv, name));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 2);
+  EXPECT_EQ(stats.load_attr.misses, misses + 1)
+      << "the stale entry was served after the class changed";
+}
+
+// The store cache writes the new value before releasing the old one: an old
+// value whose destructor reads the attribute sees the new value.
+TEST_F(AttrCache311Test, StoreReleasesTheOldValueAfterTheWrite) {
+  const char* src = R"(
+seen = []
+
+class Probe:
+    def __init__(self, owner):
+        self.owner = owner
+    def __del__(self):
+        seen.append(self.owner.x)
+
+class P:
+    def __init__(self):
+        self.x = None
+
+inst = P()
+inst.x = Probe(inst)
+)";
+  Ref<PyObject> globals(MakeGlobals());
+  ASSERT_NE(globals, nullptr);
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<> inst = PyDict_GetItemString(globals, "inst");
+  BorrowedRef<> seen = PyDict_GetItemString(globals, "seen");
+  ASSERT_NE(inst, nullptr);
+  ASSERT_NE(seen, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+  auto cache = makeStoreAttrCache();
+
+  auto marker = Ref<>::steal(PyLong_FromLong(7));
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, marker), 0);
+  ASSERT_EQ(PyList_GET_SIZE(seen.get()), 1);
+  EXPECT_EQ(PyList_GET_ITEM(seen.get(), 0), marker.get())
+      << "the old value's destructor saw the attribute before the write";
+  // The cached form, with the entry filled by the first store.
+  BorrowedRef<> probe_type = PyDict_GetItemString(globals, "Probe");
+  ASSERT_NE(probe_type, nullptr);
+  auto probe = Ref<>::steal(
+      PyObject_CallFunctionObjArgs(probe_type, inst.get(), nullptr));
+  ASSERT_NE(probe, nullptr);
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, probe), 0);
+  probe.reset();
+  auto marker2 = Ref<>::steal(PyLong_FromLong(8));
+  ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, marker2), 0);
+  ASSERT_EQ(PyList_GET_SIZE(seen.get()), 2);
+  EXPECT_EQ(PyList_GET_ITEM(seen.get(), 1), marker2.get());
+}
+
 TEST_F(AttrCache311Test, TypeAttrCacheRetiresWhenValueTypeGainsDescriptor) {
   // A plain class attribute is cachable only because ITS type has no
   // tp_descr_get today.  When that heap type later grows __get__, stock
@@ -1133,7 +1260,19 @@ TEST_F(AttrCache311Test, TypeMethodCacheRetiresOnMetaclassDataDescriptor) {
   jit::LoadTypeMethodCache cache;
   const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
 
+  // A class without a version tag is served without a fill: the entry
+  // can only pin versions that were valid before the lookups ran, and
+  // 3.11 assigns tags inside _PyType_Lookup itself.  The first lookup
+  // tags the class and its metaclass; the second fills.
   uint64_t fills = stats.load_type_method.fills;
+  ASSERT_FALSE(Ci_Type_HasValidVersionTag(f.type.get()));
+  auto untagged = jit::LoadTypeMethodCache::lookupHelper(&cache, f.type, name);
+  ASSERT_NE(untagged.callable, nullptr);
+  Py_XDECREF(untagged.callable);
+  Py_XDECREF(untagged.self_or_null);
+  ASSERT_EQ(stats.load_type_method.fills, fills)
+      << "an untagged class was cached";
+  ASSERT_TRUE(Ci_Type_HasValidVersionTag(f.type.get()));
   auto filled = jit::LoadTypeMethodCache::lookupHelper(&cache, f.type, name);
   ASSERT_NE(filled.callable, nullptr);
   Py_XDECREF(filled.callable);

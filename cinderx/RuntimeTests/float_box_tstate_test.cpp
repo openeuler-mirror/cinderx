@@ -222,7 +222,14 @@ fun test {
   auto lir = generator.TranslateFunction();
   ASSERT_NE(lir, nullptr);
 
+#if PY_VERSION_HEX < 0x030C0000 && !defined(Py_DEBUG) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_STATS)
+  // SPIKE(FLOATFL, FLOATFLASM): CPython 3.11 pops the float freelist inline;
+  // its fallback is the freelist-aware helper, not PyFloat_FromDouble's.
+  auto expected_helper = reinterpret_cast<uint64_t>(JITRT_BoxDoubleFast311);
+#else
   auto expected_helper = reinterpret_cast<uint64_t>(JITRT_BoxDouble);
+#endif
   size_t calls = 0;
   const jit::lir::Instruction* box_call = nullptr;
   for (const auto* block : lir->basicblocks()) {
@@ -243,6 +250,35 @@ fun test {
     }
   }
   EXPECT_EQ(calls, 1) << *lir;
+#if PY_VERSION_HEX < 0x030C0000 && !defined(Py_DEBUG) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_STATS)
+  // An empty freelist, then an active tracemalloc, each divert to the helper
+  // call; the remaining arm is the call-free inline pop.
+  ASSERT_NE(box_call, nullptr);
+  std::vector<const jit::lir::Instruction*> branches311;
+  for (const auto* block : lir->basicblocks()) {
+    for (const auto& instr : block->instructions()) {
+      if (instr->opcode() == jit::lir::Instruction::kCondBranch) {
+        branches311.push_back(instr.get());
+      }
+    }
+  }
+  ASSERT_EQ(branches311.size(), 2) << *lir;
+  const auto& head_edges311 = branches311[0]->basicblock()->successors();
+  const auto& tracing_edges311 = branches311[1]->basicblock()->successors();
+  ASSERT_EQ(head_edges311.size(), 2);
+  ASSERT_EQ(tracing_edges311.size(), 2);
+  EXPECT_EQ(head_edges311[0], branches311[1]->basicblock());
+  EXPECT_EQ(head_edges311[1], box_call->basicblock());
+  EXPECT_EQ(tracing_edges311[0], box_call->basicblock());
+  const auto* fast311 = tracing_edges311[1];
+  for (const auto& instr : fast311->instructions()) {
+    EXPECT_FALSE(instr->isCall()) << *lir;
+  }
+  ASSERT_EQ(fast311->successors().size(), 1);
+  ASSERT_EQ(box_call->basicblock()->successors().size(), 1);
+  EXPECT_EQ(fast311->successors()[0], box_call->basicblock()->successors()[0]);
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 &&           \
     SIZEOF_VOID_P == 8 && !defined(Py_GIL_DISABLED) && !defined(Py_DEBUG) && \
     !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_STATS)

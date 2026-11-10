@@ -127,7 +127,13 @@ void Printer::print(std::ostream& out, const OperandBase& operand) {
       fmt::print(out, "{0}({0:#x})", operand.getConstant());
       break;
     case OperandBase::kLabel:
-      out << "BB%" << operand.getBasicBlock()->id();
+      // AsmLbl operands (e.g. the generator resume entry) wrap an asmjit
+      // label rather than a basic block.
+      if (operand.getDefine()->hasAsmLabel()) {
+        out << "AsmLabel";
+      } else {
+        out << "BB%" << operand.getBasicBlock()->id();
+      }
       break;
     case OperandBase::kNone:
       out << "<!!!None!!!>";

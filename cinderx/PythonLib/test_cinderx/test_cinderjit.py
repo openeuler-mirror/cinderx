@@ -1806,7 +1806,9 @@ class CinderJitModuleTests(StaticTestBase):
                     encoding=ENCODING,
                     env=subprocess_env(),
                 )
-                self.assertEqual(proc.returncode, -6, proc)
+                # A positive status is a normal failure of "import cinderx"; a
+                # negative one would mean the process was killed by a signal.
+                self.assertGreater(proc.returncode, 0, proc)
                 return proc.stderr
 
             self.assertIn(
@@ -2782,6 +2784,104 @@ class CompileTimeTests(unittest.TestCase):
         self.assertGreater(cinderx.jit.get_compilation_time(), 0)
         # pyre-ignore[16]: Pyre doesn't know about this function.
         self.assertGreater(cinderx.jit.get_function_compilation_time(_compile), 0)
+
+
+@passUnless(cinderx.jit.is_enabled(), "Testing the cinderjit module itself")
+class SimplifyCompileTimeTests(unittest.TestCase):
+    @staticmethod
+    def _make_chain(kind: str, n: int) -> Callable[..., int]:
+        # Distinct args per check so nothing collapses the N isinstance sites.
+        args = ", ".join(f"a{i}" for i in range(n))
+        lines = [f"def f(acc, {args}):"]
+        for i in range(n):
+            cond = f"isinstance(a{i}, str)" if kind == "isinstance" else f"a{i}"
+            lines.append(f"    if {cond}:")
+            lines.append(f"        acc += {i}")
+        lines.append("    return acc")
+        ns: dict[str, object] = {}
+        exec(compile("\n".join(lines), f"<{kind}_{n}>", "exec"), ns, ns)
+        # pyre-ignore[7]: exec-defined function.
+        return ns["f"]
+
+    def test_isinstance_if_chain_compiles_in_linear_time(self) -> None:
+        """
+        Regression test for a quadratic blowup in the HIR Simplify pass: an
+        `if isinstance(x, T):` check made the pass recompute whole-function
+        liveness, and it ran once per such check, so a function with N of
+        them compiled in ~O(N^2).
+
+        Wall-clock thresholds are too fragile here (sanitized/emulated CI hosts
+        run much slower), so we compare the compile time of an isinstance-if
+        chain against a size-matched `if x:` chain: same CFG, but the baseline
+        never triggers the isinstance simplification.  After the fix the two
+        scale together (ratio ~2); before it the isinstance chain was ~15-30x
+        slower, growing with N.
+        """
+
+        n = 128
+        isinstance_fn = self._make_chain("isinstance", n)
+        baseline_fn = self._make_chain("baseline", n)
+
+        force_compile(isinstance_fn)
+        force_compile(baseline_fn)
+
+        isinstance_ms = cinderx.jit.get_function_compilation_time(isinstance_fn)
+        baseline_ms = cinderx.jit.get_function_compilation_time(baseline_fn)
+
+        # The baseline must be large enough for the ratio below to be meaningful.
+        self.assertGreater(baseline_ms, 0, "baseline compile time too small to measure")
+        # Same-size CFGs, so absent the quadratic bug the isinstance chain is
+        # within a small constant factor of the baseline (~2x). Guard well below
+        # the pre-fix ratio (~30x at this size).
+        self.assertLess(
+            isinstance_ms,
+            6 * baseline_ms,
+            f"isinstance-if chain compiled in {isinstance_ms}ms vs {baseline_ms}ms "
+            f"for a size-matched baseline "
+            f"({isinstance_ms / max(baseline_ms, 1):.1f}x); the Simplify pass may "
+            f"have regressed to recomputing liveness per isinstance check.",
+        )
+
+
+@passUnless(cinderx.jit.is_enabled(), "Tests the Simplify pass output shape")
+class SimplifyIsinstanceSemanticsTests(unittest.TestCase):
+    def test_isinstance_if_sites_are_all_simplified_and_correct(self) -> None:
+        """
+        The isinstance-if rewrite is gated on last-use information: it only
+        fires when the isinstance VectorCall's output is consumed by exactly
+        one IsTruthy feeding one CondBranch.  Simplify computes last-uses once
+        per iteration and caches them, so every site of an N-site chain must
+        still be rewritten, and the rewritten function must keep its
+        observable behavior.
+        """
+
+        n = 24
+        fn = SimplifyCompileTimeTests._make_chain("isinstance", n)
+
+        # Behavior before compiling, as the reference.
+        self.assertEqual(fn(0, *[str(i) for i in range(n)]), n * (n - 1) // 2)
+        self.assertEqual(fn(100, *range(n)), 100)
+
+        force_compile(fn)
+        self.assertTrue(is_jit_compiled(fn))
+
+        # Behavior after the rewrite: str arguments take every branch, int
+        # arguments take none.
+        self.assertEqual(fn(0, *[str(i) for i in range(n)]), n * (n - 1) // 2)
+        self.assertEqual(fn(100, *range(n)), 100)
+
+        ops = cinderx.jit.get_function_hir_opcode_counts(fn)
+        assert isinstance(ops, dict)
+        # Every site was rewritten to a primitive type compare with a guarded
+        # slow path: the boxed-bool path is gone, so no IsTruthy or
+        # PrimitiveBoxBool survives, and each site leaves exactly one
+        # PrimitiveCompare (fast path) and one IsInstance (slow path).  If
+        # the cached last-use information were wrong, sites would be skipped
+        # (leaving IsTruthy behind) or misrewritten (wrong results above).
+        self.assertEqual(ops.get("IsTruthy", 0), 0)
+        self.assertEqual(ops.get("PrimitiveBoxBool", 0), 0)
+        self.assertEqual(ops.get("PrimitiveCompare"), n)
+        self.assertEqual(ops.get("IsInstance"), n)
 
 
 @passUnless(cinderx.jit.is_enabled(), "Testing the cinderjit module itself")

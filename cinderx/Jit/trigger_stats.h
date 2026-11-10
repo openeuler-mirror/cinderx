@@ -56,6 +56,29 @@ struct TriggerStats {
 void triggerStatsOnExecutableAlloc(std::size_t bytes);
 void triggerStatsOnCompiledFunctionCreate();
 void triggerStatsOnMachineCodeEntry(PyCodeObject* code = nullptr);
+// Cells the inline frame link (CPython 3.11, AArch64) reads and writes
+// directly: the entry counter is bumped in machine code under the GIL (the
+// C++ side only ever reads it relaxed), and the ledger flag decides whether
+// the entry is handed to triggerStatsOnMachineCodeEntry() instead.
+uint64_t* triggerStatsMachineCodeEntriesAddress();
+// Live counted machine-code frames of the CPython 3.11 direct entry; laid
+// out 8 bytes after the entry counter (see triggerStatsActiveFramesAddress).
+uint64_t* triggerStatsActiveFramesAddress();
+// SPIKE(COLDSINK): mark cold LIR blocks regardless of code sections and lay
+// them out after all hot blocks (after register allocation).
+extern const bool g_spike_coldsink;
+// SPIKE(DEOPTSINK): AArch64 near-deopt branch stubs are emitted once at the
+// end of the function instead of after every block.
+extern const bool g_spike_deoptsink;
+#if PY_VERSION_HEX < 0x030C0000
+const uint8_t* triggerStatsEntryLedgerEnabledAddress();
+// Ledger half of triggerStatsOnMachineCodeEntry() for entries the machine
+// code already counted (generator resumes through the in-code protocol).
+void triggerStatsOnMachineCodeEntryLedger(PyCodeObject* code);
+// Defined in generators_rt.cpp: the direct-resume gate depends on whether an
+// entry ledger is armed, so every ledger transition recomputes it.
+void updateGenDirectGate();
+#endif
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
     uint64_t specialized_opcodes);

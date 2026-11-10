@@ -31,6 +31,8 @@ _cinderx.install_frame_evaluator()
 
 
 def run_child(source, **env):
+    # These cases test call-count boundaries, independently of wall time.
+    env.setdefault("CINDERX_JIT_STARTUP_GRACE_MS", "0")
     env.setdefault("CINDERX_JIT_MODE", "observe")
     env.setdefault("PYTHONJITAUTO", str(THRESHOLD))
     source = source.replace("@T@", str(THRESHOLD))

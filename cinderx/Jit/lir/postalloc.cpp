@@ -408,7 +408,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     return kChanged;
   } else if (
       !instr->isCall() && !instr->isVectorCall() &&
-      !instr->isVectorCallTstate() && !instr->isLoadAttrCachedFastPath() &&
+      !instr->isVectorCallTstate() && !instr->isCallSiteVectorCall() &&
+      !instr->isCallSiteCallMethod() && !instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() &&
       !instr->isStoreAttrCachedFastPath() &&
       !instr->isBinaryOpExactLongAddSubFastPath()) {
@@ -416,10 +417,14 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   }
 
   auto output = instr->output();
+  // Opcode-preserving call forms (fast paths / entry caches) must be in this
+  // early-exit list, or a second rewrite pass reads arguments with the
+  // original operand layout and walks off the end.
   if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
        instr->isLoadMethodCachedFastPath() ||
        instr->isStoreAttrCachedFastPath() ||
-       instr->isBinaryOpExactLongAddSubFastPath()) &&
+       instr->isBinaryOpExactLongAddSubFastPath() ||
+       instr->isCallSiteVectorCall() || instr->isCallSiteCallMethod()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
@@ -427,7 +432,11 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   int rsp_sub = 0;
   auto block = instr->basicblock();
 
-  if (instr->isVectorCall()) {
+  if (instr->isVectorCall() || instr->isCallSiteVectorCall() ||
+      instr->isCallSiteCallMethod()) {
+    // The entry-cache forms share the generic VectorCall operand layout, so
+    // the same argument-move rewrite applies ([0] is the cache address Imm
+    // and is left untouched).
     rsp_sub = rewriteVectorCallFunctions(instr_iter, base_offset);
   } else if (instr->isVectorCallTstate()) {
     rsp_sub = rewriteVectorCallTstateFunctions(instr_iter, base_offset);
@@ -436,10 +445,14 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   }
 
   instr->setNumInputs(1); // leave function self operand only
+  // The entry-cache forms keep their opcode: rewriting to kCall would make
+  // translate call the operand directly instead of emitting the probe
+  // sequence keyed by the cache address.
   if (!instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() &&
       !instr->isStoreAttrCachedFastPath() &&
-      !instr->isBinaryOpExactLongAddSubFastPath()) {
+      !instr->isBinaryOpExactLongAddSubFastPath() &&
+      !instr->isCallSiteVectorCall() && !instr->isCallSiteCallMethod()) {
     instr->setOpcode(Instruction::kCall);
   }
 
@@ -557,7 +570,16 @@ RewriteResult rewriteBranchInstrs(Function* function) {
 
     auto& succs = block->successors();
 
-    if (succs.size() != 1) {
+    // A block whose successor edges all name the same block has a single
+    // control-flow successor even when the edge is recorded more than once
+    // (a conditional branch folded onto one target, or a builder that added
+    // the edge twice); it still needs a branch when it cannot fall through,
+    // which matters once the successor lives in another code section.
+    bool single_successor = !succs.empty() &&
+        std::all_of(succs.begin(), succs.end(), [&](BasicBlock* succ) {
+          return succ == succs[0];
+        });
+    if (!single_successor) {
       // skip conditional branches for now.
       continue;
     }
@@ -1021,6 +1043,13 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kOr:
     case Instruction::kXor:
     case Instruction::kMul:
+    // SPIKE(INTBITSPEC): a register shift count (aarch64 lsl/asr/lsr take
+    // one) may be spilled; codegen reads a non-register count as an
+    // immediate, and a stack slot there is a bad_variant_access that
+    // silently fails the whole compile.
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
     case Instruction::kDiv:
     case Instruction::kDivUn:
     case Instruction::kNegate:
@@ -1062,6 +1091,8 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kStoreAttrCachedFastPath:
     case Instruction::kBinaryOpExactLongAddSubFastPath:
     case Instruction::kVectorCall:
+    case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
     case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:
@@ -1074,9 +1105,6 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kInt64ToDouble:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLea:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:

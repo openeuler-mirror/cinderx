@@ -45,6 +45,30 @@ python3.14 setup.py build --local=/path/to/cinderx-local-deps
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 -m pip install .
 ```
+
+### PGO 与 LTO 构建开关
+
+`setup.py` 通过两个环境变量控制 PGO（Profile-Guided Optimization，反馈导向优化）和 LTO（Link-Time Optimization，链接时优化）：
+
+| 环境变量 | 未设置时 | 显式设置 |
+|---|---|---|
+| `CINDERX_ENABLE_PGO` | CPython 3.11 开启；CPython 3.14 关闭 | `0` 或空值关闭，其他值开启 |
+| `CINDERX_ENABLE_LTO` | CPython 3.11 开启；CPython 3.14 关闭 | `0` 或空值关闭，其他值开启 |
+
+CPython 3.11 开启 PGO 后，构建分三个阶段：先构建带插桩的 `_cinderx`，再在 JIT 开启的状态下运行仓库内的训练场景（`cinderx/TestScripts/pgo_train_workloads.py`），最后用采集到的 profile 重新构建。构建时间会比普通构建长。
+
+使用注意：
+
+- **构建进程中不能已加载 `_cinderx`**，否则 3.11 PGO 构建会直接报错。已安装 CinderX 且设置了 `CINDERX_PLUGIN_ENABLE=1` 时，`cinderx.pth` 会在 Python 启动时自动导入 CinderX；这种情况下请不要使用 `--no-build-isolation` 构建，或在构建前取消该变量。
+- **3.11 PGO 构建不会自动降级**：训练或 profile 检查任一失败，构建都会报错终止，不会改为普通构建继续。
+- **覆盖率构建默认关闭 PGO 和 LTO**：CMake 不允许覆盖率与 PGO/LTO 同时开启，因此设置 `CINDERX_ENABLE_COVERAGE=1` 且未显式设置两个开关时，PGO 和 LTO 默认关闭；显式开启会在 CMake 配置阶段报错。
+- **PGO 制品不逐字节可复现**：训练是真实运行，每次采集的计数略有差异，同一源码两次 PGO 构建得到的 `_cinderx.so` 哈希不同；不开 PGO 时哈希相同。
+- 需要普通构建（例如快速迭代调试、内存受限的容器）时，显式关闭两个开关：
+
+```bash
+CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 python3.11 -m pip install .
+```
+
 ---
 
 ## 性能测试

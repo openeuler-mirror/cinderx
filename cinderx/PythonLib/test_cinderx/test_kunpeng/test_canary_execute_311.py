@@ -9,11 +9,38 @@ counters remain zero.
 """
 
 import json
+import functools
 import os
 import subprocess
 import sys
 import textwrap
 import unittest
+from unittest.mock import patch
+
+
+def _child_env(**overrides):
+    """Run the test with these variables in the process environment, which the
+    probes it spawns inherit.  CPython 3.11 keeps the per-bytecode
+    instrumentation polls off by default; the probes that expect a mid-frame
+    instrumentation transition opt back in explicitly."""
+
+    def decorate(test):
+        @functools.wraps(test)
+        def wrapped(*args, **kwargs):
+            saved = {k: os.environ.get(k) for k in overrides}
+            os.environ.update(overrides)
+            try:
+                return test(*args, **kwargs)
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+        return wrapped
+
+    return decorate
 
 def _capability_clean_env():
     """A child environment with every JIT-capability variable removed.
@@ -23,11 +50,19 @@ def _capability_clean_env():
     arm against itself.  Mirrors the prefix scrub the jit311 runners apply
     to their children.
     """
-    return {
+    env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
+        if key in _OBSERVABILITY_FLAGS
+        or not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
     }
+    env["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
+    return env
+
+
+# Observability knobs, not capabilities: a probe that opts back into the
+# instrumentation polls (see _child_env) must hand them to both arms unchanged.
+_OBSERVABILITY_FLAGS = ("PYTHONJITSUPPORTINSTRUMENTATION",)
 
 
 CHILD = textwrap.dedent(
@@ -66,6 +101,12 @@ CHILD = textwrap.dedent(
     "the canary execute surface targets the vendored CPython 3.11.6",
 )
 class CanaryExecute311Test(unittest.TestCase):
+    def setUp(self):
+        # Execution/deopt tests should not depend on how long startup took.
+        policy = patch.dict(os.environ, {"CINDERX_JIT_STARTUP_GRACE_MS": "0"})
+        policy.start()
+        self.addCleanup(policy.stop)
+
     def test_suspended_generator_pins_its_artifact(self):
         # A suspended JIT generator is a paused invocation: its resume jumps
         # into the artifact's machine code and its GC traversal reads the
@@ -200,7 +241,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertGreaterEqual(stats["machine_code_entries"], 32)
         self.assertEqual(stats["shadow_compile_success"], 0)
 
-    def test_canary_rejects_functions_outside_the_execute_surface(self):
+    def test_canary_admits_slice_construction(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -211,16 +252,12 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_subscr(a):
-                return a[0]
+            def uses_slice(a):
+                return a[1:]
 
-            try:
-                cinderjit.force_compile(uses_subscr)
-            except RuntimeError as exc:
-                assert "CANNOT_SPECIALIZE" in str(exc), exc
-            else:
-                raise SystemExit(
-                    "execute surface failed to refuse BINARY_SUBSCR")
+            assert cinderjit.force_compile(uses_slice)
+            assert cinderjit.is_jit_compiled(uses_slice)
+            assert uses_slice([1, 2, 3]) == [2, 3]
             """
         )
         proc = subprocess.run(
@@ -1567,6 +1604,7 @@ class CanaryExecute311Test(unittest.TestCase):
         probe = textwrap.dedent(
             """
             import gc
+            import dis
             import weakref
             import _cinderx, cinderx
             cinderx.init()
@@ -1587,15 +1625,19 @@ class CanaryExecute311Test(unittest.TestCase):
                     global destroyed
                     destroyed += 1
 
+            def integer_answer(a, b, one):
+                return 15
+
+            def float_answer(a, b, one):
+                return 15.0
+
+            selected = integer_answer
+
             def hot(obj, a, b, one):
-                total = a - a
-                i = total
-                while i < b:
-                    total = total + a
-                    i = i + one
+                value = selected(a=a, b=b, one=one)
                 if obj is None:
                     return -1
-                return total
+                return value
 
             warm = Probe()
             for _ in range(200):
@@ -1608,7 +1650,11 @@ class CanaryExecute311Test(unittest.TestCase):
             forceable = [s for s in cinderjit.deopt_sites(hot)
                          if s["forceable"]]
             assert forceable, cinderjit.deopt_sites(hot)
-            site = max(forceable, key=lambda s: s["bc_offset"])
+            # A global identity guard remains meaningful even when numeric
+            # feedback removes redundant arithmetic guards during this test.
+            load = next(i.offset for i in dis.get_instructions(hot)
+                        if i.opname == "LOAD_GLOBAL" and i.argval == "selected")
+            site = next(s for s in forceable if s["bc_offset"] == load)
             refs = []
             before = _cinderx._get_trigger_stats()
             calls = 2000
@@ -1616,11 +1662,15 @@ class CanaryExecute311Test(unittest.TestCase):
                 obj = Probe()
                 refs.append(weakref.ref(obj))
                 if index % 2 == 0:
+                    selected = integer_answer
                     assert cinderjit.force_deopt(
                         hot, site["id"], n=1) is True
-                    assert hot(obj, 3, 5, 1) == 15
+                    value = hot(obj, 3, 5, 1)
+                    assert value == 15 and type(value) is int
                 else:
-                    assert hot(obj, 3.0, 5.0, 1.0) == 15.0
+                    selected = float_answer
+                    value = hot(obj, 3.0, 5.0, 1.0)
+                    assert value == 15.0 and type(value) is float
                 del obj
                 if index % 100 == 99:
                     gc.collect()
@@ -1739,7 +1789,12 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def _g():
+            # A positional call with fewer arguments than parameters pins
+            # the function-valued global by identity (the simplifier
+            # completes the default at compile time); that pin is the deopt
+            # point left at LOAD_GLOBAL now that key-version misses re-pin
+            # the site instead of deoptimizing.
+            def _g(a=1):
                 return 7
 
             G = _g
@@ -1854,10 +1909,10 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("load_method pair restored", proc.stdout)
 
-    def test_organic_deopt_on_load_global_keys_version(self):
-        # Organic LOAD_GLOBAL miss: inserting a global key bumps dk_version
-        # so the module-value guard fails and re-executes without a second
-        # PUSH_NULL.
+    def test_load_global_keys_version_miss_repins_without_deopt(self):
+        # Organic LOAD_GLOBAL miss: inserting a global key bumps dk_version;
+        # the site's slow arm looks the name up again and re-pins the cell,
+        # so the call neither deopts nor leaves machine code.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1879,11 +1934,17 @@ class CanaryExecute311Test(unittest.TestCase):
             for _ in range(64):
                 assert read() == 7
             assert cinderjit.force_compile(read) is True
-            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            stats = _cinderx._get_trigger_stats()
+            before = stats["organic_deopt_hits"]
+            entries = stats["machine_code_entries"]
             read.__globals__["_mr7_scratch"] = 1
-            assert read() == 7
-            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
-            assert after > before, (before, after, cinderjit.deopt_sites(read))
+            for _ in range(10):
+                assert read() == 7
+            stats = _cinderx._get_trigger_stats()
+            assert stats["organic_deopt_hits"] == before, (
+                before, stats["organic_deopt_hits"], cinderjit.deopt_sites(read))
+            assert stats["machine_code_entries"] - entries == 10, stats
+            assert cinderjit.is_jit_compiled(read)
             print("load_global organic miss")
             """
         )
@@ -2047,6 +2108,229 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("recursive deopt ledger held", proc.stdout)
+
+    def test_artifact_retired_from_inside_its_own_call_is_reclaimed_later(self):
+        # The direct entry does not pin the artifact per call.  Retiring the
+        # running function from a callback -- force_uncompile, or clearing
+        # its __dict__ -- must not free the machine code that the callback
+        # returns into; the artifact waits on the graveyard until no counted
+        # frame is live, and is reclaimed at the next safe point.  Memory
+        # churn after the retirement makes a premature free visible.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def lifetime():
+                return _cinderx._jit311_lifetime_stats()
+
+            def churn(n):
+                # Fresh compilations and retirements reuse freed code memory.
+                ns = {}
+                for i in range(n):
+                    exec("def f%d(x):\\n    return x + %d\\n" % (i, i), ns)
+                    fn = ns["f%d" % i]
+                    assert cinderjit.force_compile(fn) is True
+                    assert fn(1) == 1 + i
+                    assert cinderjit.force_uncompile(fn) is True
+                junk = [bytearray(4096) for _ in range(256)]
+                del junk
+                gc.collect()
+
+            def victim(callback):
+                callback()
+                return 42
+
+            def retire():
+                assert cinderjit.force_uncompile(victim) is True
+                # Our own frame is live: the artifact must be parked, not
+                # freed, and churn must not reuse its buffer.
+                assert lifetime()["active_frames"] >= 1
+                assert lifetime()["graveyard"] >= 1, lifetime()
+                churn(200)
+                # Every churned artifact is parked as well: the chain holds
+                # them all (its links live in the artifacts, nothing is
+                # allocated to park one).
+                assert lifetime()["graveyard"] >= 201, lifetime()
+
+            def clear_dict():
+                victim.__dict__.clear()
+                gc.collect()
+                churn(200)
+
+            for scenario in (retire, clear_dict):
+                assert cinderjit.force_compile(victim) is True
+                assert cinderjit.is_jit_compiled(victim)
+                assert victim(scenario) == 42
+                # The next evaluator frame entered with no counted frame
+                # live -- this call -- is the safe point that destroys the
+                # parked artifact; a retirement through __dict__ (whose
+                # uninstall is part of that destruction) completes there.
+                stats = lifetime()
+                assert stats == {"active_frames": 0, "graveyard": 0}, stats
+                assert not cinderjit.is_jit_compiled(victim)
+                assert victim(lambda: None) == 42
+
+            # The cycle collector: a function reachable only through its own
+            # module cycle (globals -> function -> globals) has that cycle
+            # dropped and collections run while its machine code is on the
+            # stack (the caller's stack keeps the function itself alive);
+            # the cycle becomes garbage after the return and the artifact is
+            # reclaimed with it.
+            ns = {"cinderjit": cinderjit}
+            exec(
+                "def cyclic(callback):\\n"
+                "    callback()\\n"
+                "    return 42\\n",
+                ns,
+            )
+            cyclic = ns["cyclic"]
+            assert cinderjit.force_compile(cyclic) is True
+            box = [ns, cyclic]
+
+            def drop_cycle():
+                box.clear()
+                gc.collect()
+                churn(50)
+                gc.collect()
+                assert lifetime()["active_frames"] >= 1
+
+            del ns, cyclic
+            assert box[1](drop_cycle) == 42
+            stats = lifetime()
+            assert stats == {"active_frames": 0, "graveyard": 0}, stats
+
+            # The prologue's argument helpers run outside the body's count.
+            # A call that binds a default goes through the incorrect-argcount
+            # helper, which releases the defaults tuple after the body's
+            # count-out and then returns into the artifact's prologue exit:
+            # a destructor run by that release must find the artifact parked.
+            seen = []
+
+            class Default:
+                def __del__(self):
+                    seen.append(lifetime())
+                    churn(50)
+                    seen.append(lifetime())
+
+            def with_default(x=Default()):
+                with_default.__defaults__ = None
+                assert cinderjit.force_uncompile(with_default) is True
+                return 42
+
+            assert cinderjit.force_compile(with_default) is True
+            assert with_default() == 42
+            assert len(seen) == 2, seen
+            for stats in seen:
+                assert stats["active_frames"] >= 1, seen
+                assert stats["graveyard"] >= 1, seen
+            stats = lifetime()
+            assert stats == {"active_frames": 0, "graveyard": 0}, stats
+            assert not cinderjit.is_jit_compiled(with_default)
+
+            # The keyword binder falls back to the interpreter for a keyword
+            # that is not an exact str, before the body is entered; the
+            # interpreter's binding compares the keyword, and that comparison
+            # can retire the artifact the helper will return into.
+            seen_kw = []
+
+            class Key(str):
+                __hash__ = str.__hash__
+
+                def __eq__(self, other):
+                    kw_target.__dict__.clear()
+                    gc.collect()
+                    seen_kw.append(lifetime())
+                    churn(50)
+                    seen_kw.append(lifetime())
+                    return str.__eq__(self, other)
+
+            def kw_target(a):
+                return a
+
+            assert cinderjit.force_compile(kw_target) is True
+            assert kw_target(**{Key("a"): 7}) == 7
+            assert len(seen_kw) == 2, seen_kw
+            for stats in seen_kw:
+                assert stats["active_frames"] >= 1, seen_kw
+                assert stats["graveyard"] >= 1, seen_kw
+            stats = lifetime()
+            assert stats == {"active_frames": 0, "graveyard": 0}, stats
+            assert not cinderjit.is_jit_compiled(kw_target)
+
+            # Generator creation: the generator object is a collector
+            # allocation, and a collection run by it can retire the
+            # generator function before the generator holds its artifact.
+            def genfn():
+                yield 42
+
+            fired = []
+
+            def retire_in_gc(phase, info):
+                if phase == "start" and fired == [] and armed[0]:
+                    fired.append(cinderjit.force_uncompile(genfn))
+
+            armed = [False]
+            assert cinderjit.force_compile(genfn) is True
+            gc.callbacks.append(retire_in_gc)
+            thresholds = gc.get_threshold()
+            try:
+                gc.collect()
+                gc.set_threshold(1, 0, 0)
+                armed[0] = True
+                pad = []  # one tracked allocation: the next one collects
+                g = genfn()
+                assert list(g) == [42]
+            finally:
+                gc.set_threshold(*thresholds)
+                gc.callbacks.remove(retire_in_gc)
+            assert fired == [True], fired
+            del g
+            gc.collect()
+            stats = lifetime()
+            assert stats == {"active_frames": 0, "graveyard": 0}, stats
+
+            # Exits of every shape leave the count balanced.
+            def raises(x):
+                if x:
+                    raise ValueError(x)
+                return x
+
+            def guarded(x):
+                return x + 1
+
+            assert cinderjit.force_compile(raises) is True
+            assert cinderjit.force_compile(guarded) is True
+            for i in range(50):
+                try:
+                    raises(i)
+                except ValueError:
+                    pass
+            guarded(1)
+            try:
+                guarded("deopt")  # type guard failure: deopt exit
+            except TypeError:
+                pass
+            assert lifetime()["active_frames"] == 0, lifetime()
+            print("retired artifact reclaimed after the call")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertIn("retired artifact reclaimed", proc.stdout)
 
     def test_entry_survives_the_artifact_being_dropped_mid_call(self):
         # The body runs arbitrary Python through its operators, and that
@@ -3414,6 +3698,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("traced through the interpreter", proc.stdout)
         self.assertIn("machine entry restored", proc.stdout)
 
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_profile_enabled_inside_binary_op_falls_back_to_interpreter(self):
         # A profile callback installed inside __add__ parks the artifact and
         # the next bytecode-boundary poll hands the already-running frame to
@@ -3498,6 +3783,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("mid-frame profile fell back to the interpreter", proc.stdout)
 
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_profile_enabled_by_pending_call_falls_back_to_interpreter(self):
         # The same transition through the other door: Py_AddPendingCall()
         # runs its callback on this thread at the compiled loop's back
@@ -3628,6 +3914,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("transition fell back to the interpreter", proc.stdout)
 
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_profile_enabled_inside_for_iter_next_falls_back(self):
         # Activation from inside an iterator's __next__ deopts at the next
         # stable boundary; a follow-up call stays interpreted while active.
@@ -3674,6 +3961,7 @@ class CanaryExecute311Test(unittest.TestCase):
             """
         )
 
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_profile_enabled_inside_bool_falls_back(self):
         # Activation from inside __bool__ feeding a conditional jump uses the
         # same boundary fallback policy.
@@ -4051,6 +4339,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("mid-frame takeover stayed out of the deopt", proc.stdout)
 
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_profile_enabled_inside_del_falls_back(self):
         # Activation from a DECREF's __del__ is why every boundary, including
         # those around refcount releases, must remain poll-covered.
@@ -5670,24 +5959,21 @@ class CanaryExecute311Test(unittest.TestCase):
 
     def test_getframe_from_a_callee_matches_the_interpreter_arm(self):
         # A callee inspecting the running machine-code frame must see what
-        # stock shows: the exact f_locals content (arguments, rebound
-        # values, locals assigned so far, deletions), the call line, and
-        # the frame chain.  The executing mode writes every local store
-        # through to the materialized frame for exactly this reason.
+        # stock shows for the frame's identity: the code object, the call
+        # line, and the frame chain.  The frame's locals are not part of
+        # this contract: local-variable stores stay in registers while the
+        # body runs and the frame is rebuilt only when it is materialized
+        # (deopt), so f_locals of a running compiled frame is read here
+        # purely to prove the access is safe, not compared.
         probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
             import traceback
 
             def peek():
                 fr = sys._getframe(1)
+                fr.f_locals  # must be readable mid-flight
                 return {
                     "name": fr.f_code.co_name,
-                    "locals": {
-                        k: v
-                        for k, v in fr.f_locals.items()
-                        if k not in ("cb",)
-                    },
-                    "cb_present": "cb" in fr.f_locals,
                     "back": fr.f_back.f_code.co_name,
                     "line_delta": fr.f_lineno - fr.f_code.co_firstlineno,
                     "stack_tail": [
@@ -5776,13 +6062,10 @@ class CanaryExecute311Test(unittest.TestCase):
             assert observed, "the running compiled loop was never observed"
             lasti, frame_locals = observed[0]
             assert isinstance(lasti, int)
-            # Observable frame state, not just survival: the sampled frame
-            # must show the same locals stock would -- the arguments and
-            # the loop counter written through as it advances.
-            assert frame_locals.get("limit") == 2_000_000_000, frame_locals
-            assert frame_locals.get("one") == 1, frame_locals
-            assert callable(frame_locals.get("stop")), frame_locals
-            assert isinstance(frame_locals.get("i"), int), frame_locals
+            # The sampled frame's f_locals must be readable without
+            # tearing; its content is not part of the contract (local
+            # stores stay in registers until the frame is materialized).
+            assert isinstance(frame_locals, dict)
             print("current_frames observed the loop")
             """
         )
@@ -5917,76 +6200,6 @@ class CanaryExecute311Test(unittest.TestCase):
                 observe(h),
             ]
             still_compiled(f, g, h)
-            print("JOURNAL " + json.dumps(journal))
-            """
-        )
-        interp, jit = self._dual_arm(probe)
-        self.assertEqual(interp, jit)
-
-    def test_fused_store_fast_writes_through_matches_interp(self):
-        # The 3.11 superinstructions execute their SETLOCALs in opcode
-        # order, each immediately visible in localsplus.  The oracle must
-        # dodge two masks: a call-shaped observation deopts the frame and
-        # reification rewrites every slot, and a type-guard deopt (mixed
-        # warmup types) does the same -- so the fused stores run in a
-        # CALL-FREE hot loop and another thread samples the running frame
-        # via sys._current_frames() mid-loop.  The loop bound is sized
-        # per arm (the sampled values do not depend on it, and only they
-        # are journaled); the probe asserts the quickened code really
-        # carries a fused store so the oracle cannot pass vacuously.
-        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
-            """
-            import dis
-            import threading
-
-            def fused_loop(a, b, n):
-                i = 0
-                x = None
-                y = None
-                while i < n:
-                    x = a
-                    y = b
-                    i = i + 1
-                return i, x, y
-
-            for _ in range(40):
-                fused_loop(1, 2, 5)
-            ops = [i.opname for i in
-                   dis.get_instructions(fused_loop, adaptive=True)]
-            fused_ops = [o for o in ops if o.startswith("STORE_FAST__")]
-            assert fused_ops, (
-                "quickening no longer produces a fused store; the "
-                "oracle would be vacuous", ops)
-            compile_all(fused_loop)
-            for _ in range(3):
-                fused_loop(1, 2, 5)
-
-            main_tid = threading.get_ident()
-            out = {}
-
-            def sampler():
-                for _ in range(200000):
-                    fr = sys._current_frames().get(main_tid)
-                    if fr is not None and fr.f_code.co_name == "fused_loop":
-                        fl = fr.f_locals
-                        if fl.get("i", 0) > 0:
-                            out["x"] = fl.get("x")
-                            out["y"] = fl.get("y")
-                            return
-
-            n = (1 << 29) if mode == "jit" else 5000000
-            # The sampler can miss a short window; retry the whole run a
-            # few times -- the sampled VALUES are timing-independent.
-            for _ in range(5):
-                out.clear()
-                t = threading.Thread(target=sampler)
-                t.start()
-                result = fused_loop(7, 8, n)
-                t.join(60)
-                if "x" in out:
-                    break
-            journal = [out.get("x"), out.get("y"), result[1], result[2]]
-            still_compiled(fused_loop)
             print("JOURNAL " + json.dumps(journal))
             """
         )
@@ -6239,13 +6452,9 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("signal interrupted the compiled loop", proc.stdout)
 
     def test_handler_only_opcodes_do_not_refuse_the_function(self):
-        # The execute whitelist is scoped to normal-flow-reachable
-        # instructions: an opcode that occurs solely inside an
-        # exception-handler region runs in the interpreter after the
-        # deopt regardless of what it is, so STORE_DEREF or a subscript
-        # in a handler must not refuse a function whose normal path this
-        # milestone fully supports.  A normal-flow subscript still
-        # refuses.
+        # Slice handlers and normal-flow slices both preserve semantics.
+        # In a handler slicing can run in the interpreter
+        # after deopt without excluding the function's supported normal path.
         probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
             def make_counter():
@@ -6265,26 +6474,20 @@ class CanaryExecute311Test(unittest.TestCase):
                 try:
                     return 10 // z
                 except ZeroDivisionError:
-                    return d[k]
+                    return d[k:]
 
             bump = make_counter()
             compile_all(bump, pick)
             journal = [
                 bump(6, 2), bump(6, 0), bump(6, 0),
-                pick({"k": "v"}, "k", 2), pick({"k": "v"}, "k", 0),
+                pick(["a", "b", "c"], 1, 2), pick(["a", "b", "c"], 1, 0),
             ]
             if mode == "jit":
-                def normal_flow_subscr(d, k):
-                    return d[k]
+                def normal_flow_slice(d, k):
+                    return d[k:]
 
-                try:
-                    cinderjit.force_compile(normal_flow_subscr)
-                except RuntimeError as exc:
-                    assert "CANNOT_SPECIALIZE" in str(exc), exc
-                else:
-                    raise SystemExit(
-                        "a normal-flow subscript compiled; the reachability "
-                        "scope leaks")
+                assert cinderjit.force_compile(normal_flow_slice)
+                assert normal_flow_slice([1, 2, 3], 1) == [2, 3]
             still_compiled(bump, pick)
             print("JOURNAL " + json.dumps(journal))
             """
@@ -7313,14 +7516,13 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
-    def test_type_receiver_method_stays_on_the_generic_path(self):
+    def test_type_receiver_method_follows_a_metaclass_takeover(self):
         # Type-receiver loads must stay correct under a metaclass
-        # takeover.  The type caches are pull-validated for exactly this
-        # (owner version + metaclass identity/version), and on 3.11 no IR
-        # shape reaches them anyway -- guarded global/builtin loads carry
-        # no object spec, so type(obj) never yields a static TType.  Both
-        # facts are asserted: the metaclass descriptor wins on the very
-        # next call, and the type-cache counters stay at zero.
+        # takeover.  A class receiver at a LOAD_METHOD site is served by the
+        # pull-validated type-method cache (owner version + metaclass
+        # identity/version), so the metaclass descriptor must win on the
+        # very next call even though the receiver class version is
+        # unchanged.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -7358,12 +7560,8 @@ class CanaryExecute311Test(unittest.TestCase):
                     lambda cls: (lambda: "meta-descr"))
                 assert call_tm(t) == "meta-descr", call_tm(t)
 
-                stats = cinderjit.get_attr_cache_stats()["load_type_method"]
-                assert stats["fills"] == 0 and stats["hits"] == 0, (
-                    "the 3.11 fail-closed gate leaked a type-method "
-                    "cache: %r" % (stats,))
                 assert cinderjit.is_jit_compiled(call_tm)
-                print("type receiver stayed generic")
+                print("type receiver followed the metaclass takeover")
 
             main()
             """
@@ -7376,7 +7574,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("type receiver stayed generic", proc.stdout)
+        self.assertIn("type receiver followed the metaclass takeover", proc.stdout)
 
     def test_mutation_hammer_stays_correct_over_100_rounds(self):
         # 100 rounds of class mutation, instance shadowing and deletion
@@ -7528,16 +7726,14 @@ class CanaryExecute311Test(unittest.TestCase):
                 "load_attr": True,
                 "store_attr": True,
                 "load_method": True,
-                # The type-receiver caches ARE implemented and
-                # pull-validated (owner version + metaclass identity and
-                # version; see AttrCache311Test), but no 3.11 IR shape
-                # hands them a statically-typed receiver: guarded global
-                # and builtin loads carry no object spec, so the
-                # type(obj) / isinstance / len specializations that would
-                # produce a TType never fire.  Zero traffic is therefore
-                # the honest expectation here, and it is a reachability
-                # fact, not a correctness gate.
-                "load_type_method": False,
+                # A class receiver at a LOAD_METHOD site (P.make()) is
+                # served by the type-method cache held by the method
+                # cache's site; the type-attribute cache has no 3.11 IR
+                # shape feeding it (guarded global and builtin loads carry
+                # no object spec), so zero traffic is the honest
+                # expectation there -- a reachability fact, not a
+                # correctness gate.
+                "load_type_method": True,
                 "load_type_attr": False,
                 "load_module_attr": True,
                 "load_module_method": True,
@@ -7550,8 +7746,8 @@ class CanaryExecute311Test(unittest.TestCase):
                         cls, before[cls], after[cls])
                 else:
                     assert sum(after[cls].values()) == 0, (cls, after[cls])
-            # The type-receiver fixture still ran -- through the generic
-            # method path, counted as misses.
+            # The type-receiver fixture's first call misses the method
+            # cache's site entries before the type-method cache serves it.
             assert after["load_method"]["misses"] > (
                 before["load_method"]["misses"])
             print("stats cover every class")
@@ -7714,6 +7910,9 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIsNotNone(interp[1])
 
     def test_generator_capability_switch_and_auto_default(self):
+        # The capability switch (PYTHONJITGENERATOR) governs both automatic
+        # and explicit compilation of synchronous generators; with it on,
+        # a generator crosses the threshold and compiles like any function.
         probe = textwrap.dedent(
             """
             import _cinderx, cinderx
@@ -7726,10 +7925,10 @@ class CanaryExecute311Test(unittest.TestCase):
 
             for _ in range(8):
                 assert list(gen()) == [1]
-            assert cinderjit.is_jit_compiled(gen) is False, (
-                "sync generators must remain auto-JIT disabled in MR-10")
 
             if __import__("os").environ["PYTHONJITGENERATOR"] == "0":
+                assert cinderjit.is_jit_compiled(gen) is False, (
+                    "capability off: sync generators must not compile")
                 try:
                     cinderjit.force_compile(gen)
                 except RuntimeError as exc:
@@ -7737,8 +7936,8 @@ class CanaryExecute311Test(unittest.TestCase):
                 else:
                     raise SystemExit("generator capability-off force-compiled")
             else:
-                assert cinderjit.force_compile(gen) is True
-                assert cinderjit.is_jit_compiled(gen) is True
+                assert cinderjit.is_jit_compiled(gen) is True, (
+                    "capability on: sync generators compile automatically")
                 before = _cinderx._get_trigger_stats()["machine_code_entries"]
                 assert list(gen()) == [1]
                 after = _cinderx._get_trigger_stats()["machine_code_entries"]
@@ -7778,10 +7977,15 @@ class CanaryExecute311Test(unittest.TestCase):
             g = gen(4)
             first = next(g)
             frame_before = g.gi_frame
+            # A suspended generator's frame is observed in place: its
+            # localsplus is kept current at every store, so the locals match
+            # stock while the machine code is still installed.
             locals_before = dict(frame_before.f_locals)
             yield_from_before = g.gi_yieldfrom
             deopted = bool(jit._deopt_gen(g)) if mode == "jit" else False
             frame_same = g.gi_frame is frame_before
+            # Once deoptimized the frame is materialized; still equal.
+            locals_after_deopt = dict(g.gi_frame.f_locals)
             second = g.send(6)
 
             # Function-level retirement must not invalidate a separately
@@ -7809,6 +8013,7 @@ class CanaryExecute311Test(unittest.TestCase):
             print("JOURNAL " + json.dumps({
                 "first": first,
                 "locals": locals_before,
+                "locals_after_deopt": locals_after_deopt,
                 "yield_from": yield_from_before,
                 "deopted": deopted,
                 "frame_same": frame_same,
@@ -8048,7 +8253,59 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("async refused", proc.stdout)
 
-    def test_generator_body_outside_the_execute_surface_is_refused(self):
+    def test_generator_subscripts_execute_and_match_interpreter(self):
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+
+            class Index:
+                def __index__(self):
+                    events.append("index")
+                    return -1
+
+            class Mapping:
+                def __getitem__(self, key):
+                    events.append(["get", key])
+                    return "custom"
+
+            class Failing:
+                def __getitem__(self, key):
+                    events.append(["fail", key])
+                    raise LookupError("custom lookup")
+
+            def uses_subscr(items, index):
+                yield items[index]
+
+            compile_all(uses_subscr)
+            journal = []
+            for items, index in (
+                ([10, 20], -1), ((30, 40), 0), ({"k": 50}, "k"),
+                ("abc", Index()), (Mapping(), "q"), (Failing(), 0),
+                ([], 0), ([1], 2**100),
+            ):
+                gen = uses_subscr(items, index)
+                before = _cinderx._get_trigger_stats()["machine_code_entries"]
+                try:
+                    journal.append(["value", next(gen)])
+                except Exception as exc:
+                    journal.append(["raise", type(exc).__name__, str(exc)])
+                if mode == "jit":
+                    assert _cinderx._get_trigger_stats()["machine_code_entries"] > before
+                try:
+                    next(gen)
+                except StopIteration:
+                    journal.append("closed")
+                else:
+                    raise AssertionError("generator resumed after completion")
+            still_compiled(uses_subscr)
+            journal.append(events)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_generator_body_slice_is_admitted(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -8059,17 +8316,12 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_subscr(a):
-                yield a[0]
+            def uses_slice(a):
+                yield a[1:]
 
-            try:
-                cinderjit.force_compile(uses_subscr)
-            except RuntimeError as exc:
-                assert "CANNOT_SPECIALIZE" in str(exc), exc
-            else:
-                raise SystemExit(
-                    "execute surface compiled a generator with BINARY_SUBSCR")
-            print("generator subscr refused")
+            assert cinderjit.force_compile(uses_slice)
+            assert list(uses_slice([1, 2, 3])) == [[2, 3]]
+            print("generator slice admitted")
             """
         )
         proc = subprocess.run(
@@ -8080,7 +8332,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("generator subscr refused", proc.stdout)
+        self.assertIn("generator slice admitted", proc.stdout)
 
 
 if __name__ == "__main__":

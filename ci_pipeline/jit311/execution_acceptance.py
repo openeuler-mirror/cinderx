@@ -73,6 +73,9 @@ class ExecutionAcceptanceRunner:
         env = self._stage_env()
         env.update(
             CINDERX_JIT_MODE="canary",
+            # Execution/lifetime probes require publication before observing
+            # their target. Startup grace has dedicated scheduling tests.
+            CINDERX_JIT_STARTUP_GRACE_MS="0",
             PYTHONJITAUTO=threshold,
             PYTHONJITGENERATOR="1",
         )
@@ -355,6 +358,7 @@ class ExecutionAcceptanceRunner:
         if mode == "jit":
             command += [
                 "--env", "CINDERX_JIT_MODE=canary",
+                "--env", "CINDERX_JIT_STARTUP_GRACE_MS=0",
                 "--env", "PYTHONJITAUTO=1000000",
                 "--env", "PYTHONJITGENERATOR=1",
             ]

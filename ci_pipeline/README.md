@@ -6,6 +6,55 @@ This directory maintains the local gate flow for ARM64 Linux CPython 3.11 and
 3.14 CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
 configuration lives in `ci_pipeline/suites/*.toml`.
 
+## CPython 3.14 reference-line test additions
+
+`ref314` builds and fully executes baseline and head through
+`rt314_differential.sh`. `jit311/data/rt314_test_additions.json` records reviewed
+new golden SHA256 hashes, exact test identities and expected outcomes.
+`ref314_contract.py` reconciles only these additions. Existing goldens and test
+identities remain protected against changes or removal. Every added test must
+run exactly once with its declared outcome; missing, filtered, disabled or
+unexpectedly skipped additions fail. Declarations already present at the base
+are inert, so the baseline can advance.
+
+Each side still executes its full enabled population. Only declared additions
+are removed from the legacy log view before the existing failure/skip/diagnostic
+differential; environment-allowlist restrictions remain unchanged. The contract
+explicitly records the one near-deopt boundary skip caused by the CP314 default
+configuration. CP311 AArch64 executes that boundary test. Shared runner self-tests
+cover golden/identity changes, execution outcomes and the legacy-log comparison.
+
+For CP311 tuple lifecycle validation, `TupleLayout311Test` checks fast/fallback
+LIR shape. `TupleRuntime311Test` checks final HIR/LIR for the actual Python
+functions, freelist addresses/counts, targeted OBJ allocation failure, destructor
+reentry, tracemalloc and live-object identity/references across forced deopt.
+Executable cases run in canary mode. CP311 supports normal frames only; a
+lightweight-frame request is validated as a fallback to normal frames, not as
+lightweight execution. CP314 shared CSE/layout checks cover both supported modes.
+Release/ASAN must exercise inline paths; Py_DEBUG/reference/statistics builds
+exercise standard-API fallback and cannot substitute for fast-path validation.
+Tests use existing interpreter state and allocator wrapping, without product hooks.
+
+## CPython 3.11 strict quickening checks
+
+CinderX quickening now credits CPython's native quickened count, paired with
+stock code destruction. Cached `sys._getquickenedcount` aliases observe the
+same count. Runtime regressions cover both evaluators, retained/cyclic code,
+generators, JIT retirement, tracing, recursion and allocation failure.
+
+Daily requires the original Py_DEBUG `-R 10:3` run to succeed for every module.
+All reported reference, memory-block or FD leaks fail; there is no counter
+artifact exemption or successful-rerun substitute. The stdlib import canary
+also checks 358 organic deopts and their complete site/reason fingerprint.
+This import-coverage sweep disables startup grace while retaining the default
+bounded generic retry. Its retry opt-out regression removes the same 64 retry events, retaining the 294-event
+fingerprint; product scheduling tests exercise the normal startup grace.
+Compiled-execution and lifetime probes also disable startup grace to prove
+their target paths immediately; the refleak build-sanity probe compiles
+explicitly, while the original `-R` workers retain their own execution proof.
+The `-R` workers disable grace so compilation can settle during all ten warmup
+repetitions, without changing the measured repetitions or leak verdict.
+
 ## Software Dependencies
 
 Before running `run_gate.py`, prepare the target Python, build toolchain, CMake,
@@ -230,6 +279,38 @@ For native `RuntimeTests`, the default `CC` and `CXX` come from the target
 with the target Python's static `libpython`, including Python builds that embed
 GCC LTO bytecode. If you override `CC` or `CXX`, make sure that compiler can
 link the target Python library.
+
+## CPython 3.11 Scheduling Policy
+
+These options are read during compiler initialization. `-X` takes precedence over
+the environment. They do not change the Python 3.14 defaults.
+
+| Environment variable | `-X` option | Default and behavior |
+|---|---|---|
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`; delay automatic compilation during startup, in milliseconds; accepts `0..4294967294`, with `0` disabling the delay; invalid values fail initialization |
+| `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`; re-arm grace in a fork child while keeping inherited compiled artifacts usable |
+| `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`; allow at most one generic retry after a guard-only round exhausts ordinary ROI backoff; exception/mixed rounds still retire |
+| `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`; preserve the `force_deopt` diagnostic API; explicitly setting `0` omits polls and makes the API reject trigger requests |
+| `CINDERX_JIT_AUTO_SIZE_SCALING` | `jit-auto-size-scaling` | `0`; opt into higher thresholds for large straight-line code, retaining loop thresholds and saturating multiplication |
+
+Grace defers automatic scheduling without spending the code object's attempt or
+budget. Explicit `force_compile` remains available. Initialization and fork reset
+the timer. Exact-threshold regressions explicitly select zero grace; separate
+policy regressions exercise the production default, fork, and explicit compilation.
+The scheduled refcount matrix and lifecycle census also explicitly select zero
+grace while retaining compilation floors, entry evidence, and reclamation checks.
+
+Despecialization state lives in `CodeExtra` and is reclaimed with its code object.
+On 3.11, zero configured backoff rounds retires at the first exhausted deopt budget. Positive limits
+are capped at 15 ordinary rounds, followed by at most one guard-only generic retry.
+The 3.11 observer owns rewarm counting across scheduling and attachment doors.
+A subsequent exhausted round freezes the code. Exception deopts cannot create an
+unbounded retry loop; forced/instrumentation deopts keep their budget exemption.
+
+The Python and native regressions are `test_scheduling_policy_311.py` and
+`scheduling_policy_311_test.cpp`. Python cases run in Release and Py_DEBUG gates.
+The old `SPIKE_DESPEC`, `SPIKE_GRACEMS`, `SPIKE_FORKGRACE`, `SPIKE_NOFDC`, and
+`SPIKE_ROIGATE` names no longer control these settings.
 
 ## Dependency Cache And Pip Offline Mode
 

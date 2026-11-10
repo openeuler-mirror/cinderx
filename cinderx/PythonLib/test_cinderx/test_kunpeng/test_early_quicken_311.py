@@ -83,6 +83,7 @@ class EarlyQuicken311Test(unittest.TestCase):
             CINDERX_JIT_MODE=mode,
             PYTHONJITAUTO="2",
             PYTHONJITLIGHTWEIGHTFRAME="0",
+            CINDERX_JIT_STARTUP_GRACE_MS="0",
         )
         source = f"MODE = {mode!r}\n" + PROBE
         proc = subprocess.run(
@@ -112,6 +113,7 @@ class EarlyQuicken311Test(unittest.TestCase):
             PYTHONJITAUTO="2",
             PYTHONJITIMMORTALIZECOMPILEDFUNCTIONS="1",
             PYTHONJITLIGHTWEIGHTFRAME="0",
+            CINDERX_JIT_STARTUP_GRACE_MS="0",
         )
         proc = subprocess.run(
             [sys.executable, "-c", FAILED_INIT_PROBE],

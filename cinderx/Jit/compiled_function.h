@@ -98,6 +98,9 @@ struct CompiledFunctionData {
   vectorcallfunc vectorcall_entry{nullptr};
 #if PY_VERSION_HEX < 0x030C0000
   vectorcallfunc artifact_guarded_entry{nullptr};
+  // Call-site entry-cache jump target (AArch64 only); null when the
+  // compilation did not emit a direct entry.
+  void* direct_call_entry{nullptr};
 #endif
   int stack_size{0};
   int spill_stack_size{0};
@@ -170,6 +173,20 @@ class CompiledFunction {
 #if PY_VERSION_HEX < 0x030C0000
   vectorcallfunc artifactGuardedEntry311() const {
     return data_.artifact_guarded_entry;
+  }
+
+  // True when `vc` is one of this artifact's installed entry points: the
+  // artifact-specific guarded stub, or the generated entry itself when the
+  // entry guard is inlined (direct entry).
+  bool isInstalledEntry311(vectorcallfunc vc) const {
+    return vc != nullptr &&
+        (vc == data_.artifact_guarded_entry || vc == data_.vectorcall_entry);
+  }
+
+  // The direct entry a call-site entry cache may branch to; null when the
+  // compilation did not emit one.
+  void* directCallEntry311() const {
+    return data_.direct_call_entry;
   }
 #endif
 
@@ -265,6 +282,14 @@ class CompiledFunction {
   void clear(
       bool context_finalizing = false,
       bool release_runtime_references = true);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Link of the deferred-release chain (Ci_JitShell311_DeferArtifactRelease):
+  // an artifact whose last reference was dropped while a counted machine-code
+  // frame was live is resurrected and chained here until the sweep.  Kept in
+  // the object so that parking allocates nothing (tp_dealloc cannot fail).
+  PyObject* graveyard_next_311{nullptr};
+#endif
 
  private:
 #if PY_VERSION_HEX < 0x030C0000

@@ -506,4 +506,120 @@ BB %15
 #endif
 }
 
+TEST_F(LinearScanAllocatorTest, CoversHintMatchesPlainBinarySearch) {
+  // covers() resumes its search from the range examined by the previous
+  // call.  Query one interval in a scrambled order (forward hits, gaps,
+  // end boundaries, then backward jumps that leave the hint ahead of the
+  // query) and require every answer to match a fresh interval queried once.
+  const std::vector<LiveRange> ranges{{10, 20}, {40, 50}, {80, 90}, {200, 210}};
+  const std::vector<LIRLocation> queries{
+      5,
+      10,
+      19,
+      20,
+      45,
+      60,
+      85,
+      90,
+      150,
+      205,
+      210,
+      215,
+      // Backward queries: the hint now sits on the last range, ahead of the
+      // query, so covers() must fall back to the binary search.
+      45,
+      41,
+      205,
+      12,
+      5,
+      85,
+      42,
+      49,
+      50,
+      200,
+      209,
+      11};
+
+  Operand operand;
+  LiveInterval hinted{&operand};
+  for (const auto& range : ranges) {
+    hinted.addRange(range);
+  }
+
+  for (LIRLocation loc : queries) {
+    LiveInterval plain{&operand};
+    for (const auto& range : ranges) {
+      plain.addRange(range);
+    }
+    EXPECT_EQ(hinted.covers(loc), plain.covers(loc)) << fmt::format(
+        "covers({}) diverged from the binary-search answer", loc);
+  }
+
+  // The exact expected answers, so a shared bug in both paths cannot hide.
+  const std::vector<bool> expected{false, true,  true,  false, true,  false,
+                                   true,  false, false, true,  false, false,
+                                   true,  true,  true,  true,  false, true,
+                                   true,  true,  false, true,  true,  true};
+  for (size_t i = 0; i < queries.size(); i++) {
+    EXPECT_EQ(hinted.covers(queries[i]), expected[i])
+        << fmt::format("covers({}) gave the wrong answer", queries[i]);
+  }
+}
+
+TEST_F(LinearScanAllocatorTest, FixedIntervalsAreSortedAndMerged) {
+  // Fixed physical-register intervals collect their ranges with plain
+  // emplace_back during live-interval construction and are finalized by a
+  // sort-and-merge pass at the end of calculateLiveIntervals.  Two calls
+  // make the argument registers' ranges non-adjacent, so the merge must
+  // leave every fixed interval sorted, pairwise separated, and seeded at
+  // the very beginning of the function.
+  const char* lir_source = R"(Function:
+BB %0 - succs: %2
+  %1 = Move 0(0x0)
+  Branch BB%2
+BB %2 - succs: %8 %10
+  %3 = Call 1024(0x400), %1
+  %4 = Add %3, 1
+  %5 = Call 1024(0x400), %4
+  CondBranch %5, BB%8, BB%10
+BB %8
+  Return %5
+BB %10
+  Return %4
+
+)";
+
+  Parser parser;
+  auto lir_func = parser.parse(lir_source);
+
+  // Only live-interval construction is of interest here (the sort-and-merge
+  // runs at its end); like RegAllocationNoSpill, skip the scan and rewrite.
+  LinearScanAllocator allocator(lir_func.get());
+  lir_func->sortBasicBlocks();
+  allocator.calculateLiveIntervals();
+
+  bool saw_fixed = false;
+  for (auto& entry : allocator.intervalMap()) {
+    const LiveInterval& interval = entry.second;
+    if (!interval.isFixed()) {
+      continue;
+    }
+    saw_fixed = true;
+    ASSERT_FALSE(interval.ranges.empty())
+        << fmt::format("fixed interval has no ranges: {}", interval);
+    EXPECT_EQ(interval.ranges.front().start, -1) << fmt::format(
+        "fixed interval lost its function-entry seed range: {}", interval);
+    for (size_t i = 0; i + 1 < interval.ranges.size(); i++) {
+      // Sorted, and genuinely separate: neither overlapping nor adjacent
+      // (adjacent ranges must have been merged away).
+      EXPECT_LT(interval.ranges[i].end, interval.ranges[i + 1].start)
+          << fmt::format(
+                 "fixed interval has unsorted or unmerged ranges: {}",
+                 interval);
+    }
+  }
+
+  ASSERT_TRUE(saw_fixed) << "the LIR should have reserved physical registers";
+}
+
 } // namespace jit::lir

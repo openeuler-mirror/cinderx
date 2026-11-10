@@ -1524,6 +1524,20 @@ dummy_func(
         }
 
 
+    // Keep the 3.14 SET_ADD safety check when regenerating against older sources.
+    override inst(SET_ADD, (set, unused[oparg-1], v -- set, unused[oparg-1])) {
+        PyObject *set_o = PyStackRef_AsPyObjectBorrow(set);
+        if (!PySet_CheckExact(set_o)) {
+            _PyErr_Format(tstate, PyExc_TypeError,
+                          "'%T' object is not a set", set_o);
+            PyStackRef_CLOSE(v);
+            ERROR_IF(true);
+        }
+        int err = _PySet_AddTakeRef((PySetObject *)set_o,
+                                   PyStackRef_AsPyObjectSteal(v));
+        ERROR_IF(err);
+    }
+
 // END BYTECODES //
 
     }

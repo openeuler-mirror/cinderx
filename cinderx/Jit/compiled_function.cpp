@@ -55,8 +55,21 @@ PyObject *kCompiledFunctionKey, *kNestedCompiledFunctionsKey = nullptr;
 
 namespace {
 
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" int Ci_JitShell311_DeferArtifactRelease(PyObject* artifact);
+extern "C" int Ci_JitShell311_ArtifactClearDeferred(void);
+#endif
+
 void compiledfunc_dealloc(PyObject* self) {
   CompiledFunction* cf = reinterpret_cast<CompiledFunction*>(self);
+#if PY_VERSION_HEX < 0x030C0000
+  // A machine-code frame may still be live (this artifact's own, or one
+  // that returns through this one's deopt stub); the gate decides and, when
+  // it defers, keeps the object alive and tracked until the sweep.
+  if (Ci_JitShell311_DeferArtifactRelease(self)) {
+    return;
+  }
+#endif
   PyObject_GC_UnTrack(self);
 
   // Call destructor for C++ members.
@@ -72,6 +85,17 @@ int compiledfunc_traverse(PyObject* self, visitproc visit, void* arg) {
 
 int compiledfunc_clear(PyObject* self) {
   CompiledFunction* cf = reinterpret_cast<CompiledFunction*>(self);
+#if PY_VERSION_HEX < 0x030C0000
+  // The cycle collector clears an unreachable artifact before releasing it.
+  // With a counted machine-code frame live the artifact's runtime may still
+  // be in use (the shell's per-call pin used to keep the artifact reachable
+  // from the C stack; the direct entry has no such reference), so the
+  // artifact is left intact: the cycle survives this collection and is
+  // collected by a later one once no counted frame is live.
+  if (Ci_JitShell311_ArtifactClearDeferred()) {
+    return 0;
+  }
+#endif
   cf->clear();
   return 0;
 }
@@ -459,7 +483,7 @@ void CompiledFunction::clear(
   // still name this stub: a successor may already own the function.
   if (owner_ == nullptr) {
     for (PyFunctionObject* func : functions_) {
-      if (func->vectorcall == artifactGuardedEntry311()) {
+      if (isInstalledEntry311(func->vectorcall)) {
         func->vectorcall = getInterpretedVectorcall(func);
       }
     }

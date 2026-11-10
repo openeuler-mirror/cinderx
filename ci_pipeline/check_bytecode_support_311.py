@@ -21,6 +21,8 @@ product:
   * front-end reachability -- translated rows (and normalization targets) are
     admitted by isSupportedOpcode() and have a buildHIRImpl translation case,
     while refusal rows are admitted by neither.
+  * execute surface -- the audited capability manifest matches the 3.11
+    machine-code whitelist, including additions and removals.
 
 Ground truth is the running interpreter's opcode module plus the vendored
 pristine opcode_targets.h; the gate runs this under the anchored 3.11.6.
@@ -43,6 +45,7 @@ SUPPORT_LIST = "cinderx/Interpreter/3.11/bytecode_support.toml"
 OPCODE_TARGETS = "cinderx/Interpreter/3.11/upstream/opcode_targets.h"
 HIR_BUILDER = "cinderx/Jit/hir/builder.cpp"
 BYTECODE_DECODER = "cinderx/Jit/bytecode.cpp"
+EXECUTE_CAPABILITIES = "ci_pipeline/jit311/data/semantic_conformance_capabilities.toml"
 
 # BytecodeInstructionBlock folds EXTENDED_ARG into the following instruction,
 # so it is intentionally accepted by the support predicate but can never have
@@ -504,6 +507,24 @@ def validate(
     return errors
 
 
+def validate_execute_surface(expected: list[str], builder_source: str) -> list[str]:
+    if not isinstance(expected, list) or not all(isinstance(x, str) for x in expected):
+        return ["execute surface: supported_opcodes must be a list of names"]
+    if len(expected) != len(set(expected)):
+        return ["execute surface: duplicate opcode names in capability manifest"]
+    try:
+        actual = _opcode_switch_cases(
+            _function_body(builder_source, "bool isExecuteOpcodeSupported311(int opcode)")
+        )
+    except ValueError as exc:
+        return [f"execute surface: {exc}"]
+    missing = sorted(set(expected) - actual)
+    added = sorted(actual - set(expected))
+    if missing or added:
+        return [f"execute surface drift: missing={missing}, added={added}"]
+    return []
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", type=Path, default=REPO_ROOT)
@@ -512,12 +533,20 @@ def main(argv: list[str] | None = None) -> int:
     support_list = args.repo / SUPPORT_LIST
     rows = load_rows(support_list)
     registry = load_reason_registry(support_list)
+    builder_source = (args.repo / HIR_BUILDER).read_text()
     errors = validate(rows, ground_truth(args.repo), registry)
     errors.extend(
         validate_frontend(
             rows,
-            (args.repo / HIR_BUILDER).read_text(),
+            builder_source,
             (args.repo / BYTECODE_DECODER).read_text(),
+        )
+    )
+    capabilities = load_document(args.repo / EXECUTE_CAPABILITIES)
+    errors.extend(
+        validate_execute_surface(
+            capabilities.get("execute_surface", {}).get("supported_opcodes"),
+            builder_source,
         )
     )
     if errors:

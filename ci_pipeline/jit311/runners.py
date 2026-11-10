@@ -130,6 +130,7 @@ class RunnerSpec:
     expect_stderr_contains: str | None = None
     timeout: int = 300
     target_modules_attempted: int = 0
+    deopt_manifest: Path | None = None
 
 
 def _env_assertions(asserted_env: dict[str, str]) -> str:
@@ -158,7 +159,23 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
         env.update(spec.env)
         env["JIT311_REPORT_PATH"] = report_path
         env["JIT311_REPO_ROOT"] = str(REPO_ROOT)
-        source = CHILD_PREAMBLE + _env_assertions(spec.asserted_env)
+        env.pop("JIT311_DEOPT_PATH", None)
+        deopt_path = Path(tmp) / "deopts.json"
+        if spec.deopt_manifest is not None:
+            env["JIT311_DEOPT_PATH"] = str(deopt_path)
+        preamble = CHILD_PREAMBLE
+        if spec.deopt_manifest is not None:
+            # Construct this in the parent: extra os.environ lookups after
+            # native initialization would themselves change the import canary.
+            preamble = preamble.replace(
+                "import _cinderx\n", "import _cinderx\nimport cinderjit\n"
+                "cinderjit._jit311_reset_transition_ledger()\n", 1)
+            preamble = preamble.replace(
+                '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:',
+                '    with open(os.environ["JIT311_DEOPT_PATH"], "w") as fp:\n'
+                '        json.dump(_cinderjit_module._jit311_transition_ledger(), fp)\n'
+                '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:', 1)
+        source = preamble + _env_assertions(spec.asserted_env)
         source += spec.payload
         try:
             proc = subprocess.run(
@@ -204,6 +221,14 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
             f"report schema: {error}"
             for error in _validate_report_schema(snap)
         )
+        if spec.deopt_manifest is not None:
+            from ci_pipeline.jit311.deopt_fingerprint import check
+            try:
+                ledger = json.loads(deopt_path.read_text())
+                manifest = json.loads(spec.deopt_manifest.read_text())
+                errors.extend(check(ledger, manifest, snap.get("organic_deopt_hits")))
+            except (OSError, ValueError, TypeError) as exc:
+                errors.append(f"deopt fingerprint unavailable: {exc}")
         for judge in spec.judges:
             errors.extend(judge(snap))
         return RunResult(spec.name, not errors, errors, snap, returncode)
@@ -576,19 +601,54 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # one more when MR-08 opened the exception family, 333 once MR-09's
     # pull-validated attribute caches guard attribute sites across 72
     # importing modules (import-time class mutation retires
-    # receiver-version guards by design), and 333 in the current shared-3.11
-    # gate after the CPython test support path is added.  The base build and this
-    # branch measure alike in that invocation context.  The count is
-    # sensitive to sys.path; the gate runs with its system-3.11 venv plus
-    # the matching CPython 3.11.6 test support paths.  Verified deterministic
-    # across base and candidate reruns; the exact pin keeps the fail-closed
-    # drift guard.
-    default = execute_holds(expected_organic_deopts=333) + [
+    # receiver-version guards by design), 333 in the shared-3.11 gate after
+    # the CPython test support path is added, and 30 once LOAD_GLOBAL goes
+    # through the per-site cell: import-time module-dict growth no longer
+    # deopts the loads that read those modules' globals, it re-pins them.
+    # The count is sensitive to sys.path; the gate runs with its
+    # system-3.11 venv plus the matching CPython 3.11.6 test support paths.
+    # 36 once compiled except handlers land together with the and/or value
+    # jumps on the execute whitelist: typing._BaseGenericAlias.__getattr__
+    # now compiles and its `raise AttributeError` deopts twelve times across
+    # the imports (a raise statement keeps the deopt exit), while the
+    # os.path.exists and _GeneratorContextManager.__exit__ try blocks stop
+    # deopting after their eighth raise, when the site's exception edge is
+    # granted (three fewer).  Attributed with the transition ledger.
+    # MR7 broad subscript admission adds 153 deopts in 11 newly compiled
+    # functions: 64 GuardFailure, 65 UnhandledException and 24 Raise.
+    # MR8's bounded generic retry adds 64 UnhandledException deopts at
+    # SubPattern.__getitem__ (cause 61, resume 124). Disabling that retry
+    # restores all earlier events with the exact original fingerprint.
+    # The CPython 3.11 float speculation adds 34 GuardFailure deopts: 32 at
+    # re/_parser.py Tokenizer.match (cause 8, resume 16), and in
+    # enum._is_single_bit the typed in-place operation now fails at its first
+    # site (3 deopts at cause 3) instead of the later one (1 at cause 19).
+    # Every one of them is a per-site numeric speculation guard, so each site
+    # stops at its fuse; the retry opt-out total becomes 223.
+    # The compact-int and bitwise speculation adds 2 GuardFailure deopts at
+    # enum _simple_enum convert_class, bounded by its fuse, and re/_parser.py
+    # SubPattern.getwidth's three sites move from 3/2/27 to 5/8/19 (same
+    # total).  Bitwise operators on two ints of unknown origin stay generic,
+    # so ipaddress's 128-bit masks do not deopt.  The retry opt-out total
+    # becomes 225.
+    # Formatting/slice/accumulator admission adds 69 events at seven new
+    # sites: io.__getattr__ (Raise, 5), zipimporter.__init__ (Raise, 15),
+    # enum._proto_member.__set_name__ (UnhandledException, 8; GuardFailure,
+    # 24), inspect._signature_from_callable (UnhandledException, 14),
+    # re._compiler._optimize_charset (UnhandledException, 2+1). Three
+    # baseline/head rounds and F/S/I ablations in the gate's isolated
+    # CPython 3.11.6 venv preserve every old site.
+    # Disabling generic retry still removes only its 64-event site, leaving
+    # 294 events, including all 69 admission events.
+    # Preserve the exact total AND the independently attributed site/reason
+    # fingerprint; equal totals must not hide a different failure path.
+    default = execute_holds(expected_organic_deopts=358) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
     return RunnerSpec(
         name="canary_stdlib_72",
+        deopt_manifest=REPO_ROOT / "ci_pipeline/jit311/data/stdlib_canary_deopts.json",
         payload=payload,
         env={
             "CINDERX_JIT_MODE": "canary",
@@ -597,8 +657,14 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
             # See above: this sweep is about import-time breadth.
             "CINDERX_AUTOJIT_IMPORT_PROVIDER": "off",
             "CINDERX_AUTOJIT_SETUP_PROVIDER": "off",
+            # MR8's product startup grace must not suppress this compiler
+            # coverage sweep or make its exact fingerprint depend on timing.
+            "CINDERX_JIT_STARTUP_GRACE_MS": "0",
         },
-        asserted_env={"CINDERX_JIT_MODE": "canary"},
+        asserted_env={
+            "CINDERX_JIT_MODE": "canary",
+            "CINDERX_JIT_STARTUP_GRACE_MS": "0",
+        },
         judges=judges if judges is not None else default,
         target_modules_attempted=len(STDLIB_SHADOW_MODULES),
         timeout=1800,
@@ -793,13 +859,18 @@ def canary_force_warm_runner(*, judges: list[Judge] | None = None) -> RunnerSpec
     )
 
 
+# These drivers verify steady-state automatic scheduling. Keep MR8's
+# 100 ms startup grace enabled and let it expire before exercising the target.
+_AUTO_SCHEDULING_READY = "import time\ntime.sleep(0.2)\n"
+
+
 def canary_execute_runner(
     *, threshold: int = 8, judges: list[Judge] | None = None
 ) -> RunnerSpec:
     """Organic canary dispatch: crossing the observe threshold compiles
     and installs without force_compile; the ledger records the request
     with the "installed" result."""
-    payload = CANARY_DEF + CANARY_ATTEST + (
+    payload = CANARY_DEF + CANARY_ATTEST + _AUTO_SCHEDULING_READY + (
         "for i in range(40):\n"
         "    hot(i, 5, 1)\n"
         "assert cinderjit.is_jit_compiled(hot), 'threshold must install'\n"
@@ -849,7 +920,7 @@ def execute_auto_runner(
     compilation.  The fresh-attach CONTRACT (budget, flags, event ledger)
     is owned by test_execute_311.py; re-proving it here would track that
     suite, not the product."""
-    payload = EXECUTE_FRESH_DEF + CANARY_ATTEST + (
+    payload = EXECUTE_FRESH_DEF + CANARY_ATTEST + _AUTO_SCHEDULING_READY + (
         "_stats = _cinderx._get_observe_stats()\n"
         "assert _stats['mode'] == 'execute', _stats\n"
         "assert _stats['requested_mode'] == 'execute', _stats\n"
@@ -962,11 +1033,15 @@ def exception_semantics_runner(*, judges: list[Judge] | None = None) -> RunnerSp
         "    assert cinderjit.is_jit_compiled(target), (\n"
         "        'a handled exception must not uninstall the artifact')\n"
     )
-    # Eight organic deopts: the corpus raises through compiled code by
-    # design, and each raising form deopts exactly once (kUnhandledException
+    # Six organic deopts: the corpus raises through compiled code by
+    # design, once per raising checkpoint (k = 1..N; the N+1 and 0 sweeps
+    # never raise), and each raise deopts exactly once (kUnhandledException
     # delegation).  The exact pin replaces the old ">0" judge so a deopt
-    # storm cannot wash green.
-    default = execute_holds(expected_organic_deopts=8)
+    # storm cannot wash green.  (The two non-raising sweeps used to deopt
+    # as well, at LOAD_GLOBAL, because the sweep loop's own module-level
+    # bindings changed the globals keys version after the compile; the
+    # per-site global-load cell re-pins instead of deoptimizing.)
+    default = execute_holds(expected_organic_deopts=6)
     return RunnerSpec(
         name="exception_semantics",
         payload=payload,

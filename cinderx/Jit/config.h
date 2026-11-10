@@ -49,6 +49,7 @@ struct HIROptimizations {
   bool tree_iter_state_machine{true};
   bool primitive_box_remat{true};
   bool primitive_unbox_cse{true};
+  bool hir_cse{true};
   bool float_comparison_simplification{true};
   bool simplify{true};
 };
@@ -151,6 +152,7 @@ struct Config {
   // calls.  This includes the code object, and the globals and builtins
   // dictionaries (but not their contents).
   bool stable_frame{true};
+
   // Use inline caches for attribute accesses.
   bool attr_caches{
 #ifdef Py_GIL_DISABLED
@@ -230,6 +232,14 @@ struct Config {
   size_t preload_dependent_limit{99};
   // Memory threshold after which we stop jitting.
   size_t max_code_size{0};
+  // Maximum number of HIR blocks we can support for a single function.
+  size_t max_hir_blocks{4000};
+  // Maximum number of HIR instructions we can support for a single function.
+  size_t max_hir_instrs{40000};
+  // Maximum number of LIR blocks we can support for a single function.
+  size_t max_lir_blocks{10000};
+  // Maximum number of LIR instructions we can support for a single function.
+  size_t max_lir_instrs{80000};
   // Size (in number of entries) of the LoadAttrCached and StoreAttrCached
   // inline caches used by the JIT.
   uint32_t attr_cache_size{4};
@@ -237,6 +247,10 @@ struct Config {
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
   // numeric PYTHONJITAUTO and Python APIs keep this disabled.
   bool auto_classify{false};
+  // Bounded interpreter feedback sampling before ordinary automatic admission.
+  // Numeric thresholds, explicit compilation, OSR and free-threaded builds
+  // retain their existing paths. Disable with CINDERX_AUTOJIT_IC_STABILITY=0.
+  bool auto_jit_ic_stability{true};
   // Provider-before v1 keeps startup/import deferral disabled. This is only
   // for a later import-depth provider-backed slice.
   bool enable_startup_init_policy{false};
@@ -244,6 +258,16 @@ struct Config {
   // repeatedly deopts. Enabled by default; disable with
   // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
   bool roi_backoff_enabled{true};
+  // CPython 3.11 automatic compilation waits for startup to settle. Explicit
+  // compilation is unaffected; zero makes threshold-based tests deterministic.
+  size_t auto_jit_startup_grace_ms{100};
+  bool auto_jit_fork_grace{true};
+  // Permit one generic retry for an exhausted round of guard failures.
+  bool auto_jit_despecialize{true};
+  // Keep the existing diagnostic API usable unless explicitly disabled.
+  bool emit_force_deopt_checks{true};
+  // Size-scaled thresholds remain opt-in until their ROI is established.
+  bool auto_jit_size_scaling{false};
   // Canonicalize exec-generated namespace-free content-twin code objects
   // (factory helpers recreated per instantiation) onto the first-seen
   // identity at compile time, so twins attach to the existing compiled
@@ -261,6 +285,8 @@ struct Config {
   // with CINDERX_AUTOJIT_LOWROI_WARM_CALLS.
   size_t auto_classify_low_roi_warm_calls{4096};
   size_t roi_deopt_budget_base{32};
+  // Ordinary backoff rounds, clamped to the control word's capacity. On
+  // 3.11 an eligible guard-only code can get at most one extra generic retry.
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
   // Halve unfrozen deopt history once per elapsed interval. Zero disables

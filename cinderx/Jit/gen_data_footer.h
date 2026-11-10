@@ -4,6 +4,9 @@
 
 #include "cinderx/python.h"
 
+#include "internal/pycore_frame.h" // _PyInterpreterFrame layout for kGenObjectSize
+#include "internal/pycore_genobject.h" // PyGenObject layout for kGenObjectSize
+
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/frame_header.h"
@@ -12,6 +15,18 @@
 namespace jit {
 
 class CompiledFunction;
+
+// Size of the fixed part of a generator object: the JIT generator types use
+// it as their basicsize, and the frame slots plus the footer pointer follow.
+constexpr size_t kGenObjectSize =
+#if PY_VERSION_HEX >= 0x030E0000
+    sizeof(PyGenObject)
+#else
+    // For 3.12 and 3.13 generator objects are variable-sized, so we use
+    // offsetof(). This is inherited from genobject.c.
+    offsetof(PyGenObject, gi_iframe) + offsetof(_PyInterpreterFrame, localsplus)
+#endif
+    ;
 
 // In a regular JIT function spill-data is stored at negative offsets from the
 // frame pointer and the frame pointer points into the system stack. In JIT
@@ -34,6 +49,8 @@ class CompiledFunction;
 //
 // TASK(T209500214): In 3.12 we should roll this data directly into memory
 // allocated for a generator rather than having it in a separate heap object.
+struct JitGenObject;
+
 struct GenDataFooter {
   // Tools which examine/walk the stack expect the following two values to be
   // ahead of the frame pointer.
@@ -69,6 +86,25 @@ struct GenDataFooter {
   // State machine state for the TreeIter optimisation.  Null for non-TreeIter
   // generators and before the first resume of an optimised generator.
   TreeIterState* tree_iter_state{nullptr};
+#if PY_VERSION_HEX < 0x030C0000
+  // the resume entry stores its finish_yield_from argument
+  // here (0 = plain resume, 1 = the sub-iterator returned the sent value,
+  // 2 = the sub-iterator raised); JITRT_GenSend consumes and clears it so a
+  // delegation finished by the C++ shortcut resumes the delegating generator
+  // with the sub-iterator's outcome instead of re-sending into it.
+  uint64_t resume_finish_flag{0};
+  // 1 while the generator can be resumed by a direct call
+  // from JIT code: just created, or suspended at a plain yield.  The resume
+  // entry clears it; the plain-yield exit sets it; a yield-from suspend, a
+  // return, a raise and a deopt leave it clear.
+  uint8_t direct_ok{0};
+  // direct_ok == 2 marks a yield-from suspension; yf_sub is
+  // the sub-iterator (borrowed, valid while suspended there) and delegator
+  // the generator currently delegating to this one (set while a chain walk
+  // runs, cleared when it unwinds).
+  PyObject* yf_sub{nullptr};
+  JitGenObject* delegator{nullptr};
+#endif
 
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES)
   // Frame header used for tracking the current frame.

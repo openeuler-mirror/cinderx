@@ -111,6 +111,24 @@ JIT_COLD void logImplV(
 }
 
 void printPythonException() {
+  // Diagnostics can run on a compiler thread with no attached thread state.
+  // Python error APIs require an attached state; skip them when it is absent.
+#if PY_VERSION_HEX >= 0x030E0000
+  auto* tstate = PyThreadState_GetUnchecked();
+#else
+  auto* tstate = _PyThreadState_UncheckedGet();
+#endif
+  if (tstate == nullptr) {
+    return;
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11's unchecked getter reads the global GIL owner's state, not TLS.
+  // Do not report another thread's exception. PyGILState_Check alone is not
+  // sufficient because creating a subinterpreter disables that check.
+  if (tstate->thread_id != PyThread_get_thread_ident()) {
+    return;
+  }
+#endif
   if (PyErr_Occurred()) {
 #if PY_VERSION_HEX < 0x030C0000
     PyObject *type, *value, *traceback;

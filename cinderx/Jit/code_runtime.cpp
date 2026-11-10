@@ -3,11 +3,17 @@
 #include "cinderx/Jit/code_runtime.h"
 
 #include "cinderx/Common/util.h"
+#include "cinderx/Jit/jit_rt.h"
 
 namespace jit {
 
-GenYieldPoint::GenYieldPoint(std::size_t deopt_idx, ptrdiff_t yield_from_offset)
-    : deopt_idx_{deopt_idx}, yield_from_offset_{yield_from_offset} {}
+GenYieldPoint::GenYieldPoint(
+    std::size_t deopt_idx,
+    ptrdiff_t yield_from_offset,
+    bool handler_free)
+    : deopt_idx_{deopt_idx},
+      yield_from_offset_{yield_from_offset},
+      handler_free_{handler_free} {}
 
 void GenYieldPoint::setResumeTarget(uintptr_t resume_target) {
   resume_target_ = resume_target;
@@ -63,6 +69,19 @@ CodeRuntime::CodeRuntime(
   addReference(globals);
 }
 
+CodeRuntime::~CodeRuntime() = default;
+
+#if PY_VERSION_HEX < 0x030C0000
+JITRT_SubscrSiteCache311* CodeRuntime::allocateSubscrCache311() {
+  // Only the compiler building this runtime mutates this collection. Other
+  // workers have distinct runtimes, and runtime cache access holds the GIL.
+  auto cache = std::make_unique<JITRT_SubscrSiteCache311>();
+  auto* result = cache.get();
+  subscr_caches_311_.push_back(std::move(cache));
+  return result;
+}
+#endif
+
 void CodeRuntime::addReference(BorrowedRef<> obj) {
   // Serialize as we modify the ref-count to obj which may be widely accessible.
   ThreadedCompileSerialize guard;
@@ -74,12 +93,22 @@ void CodeRuntime::releaseReferences() {
   // the objects could cause our CompiledFunction to be freed as well so first
   // we grab the references and then clear them.
   std::unordered_set<ThreadedRef<>> refs;
+#if PY_VERSION_HEX < 0x030C0000
+  std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> caches;
+  std::vector<std::shared_ptr<void>> predicate_caches;
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   ThreadedRef<> tmp;
 #endif
   {
     ThreadedCompileSerialize guard;
     refs = std::move(references_);
+#if PY_VERSION_HEX < 0x030C0000
+    // Release the cells and backing storage even when this cleared runtime
+    // remains as an arena husk. Do this before dropping Python references.
+    caches.swap(subscr_caches_311_);
+    predicate_caches.swap(predicate_caches_311_);
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     tmp = std::move(reifier_);
 #endif
@@ -93,10 +122,12 @@ GenYieldPoint* CodeRuntime::addGenYieldPoint(GenYieldPoint&& gen_yield_point) {
 }
 
 std::size_t CodeRuntime::addDeoptMetadata(DeoptMetadata&& deopt_meta) {
-  if (!deopt_meta.frame_meta.empty()) {
+  if (deopt_meta.forced_site_row >= 0) {
+    deopt_meta.site_id = deopt_metadatas_[deopt_meta.forced_site_row].site_id;
+  } else if (!deopt_meta.frame_meta.empty()) {
     uint32_t seq = 0;
     for (const DeoptMetadata& existing : deopt_metadatas_) {
-      if (existing.frame_meta.empty()) {
+      if (existing.frame_meta.empty() || existing.forced_site_row >= 0) {
         continue;
       }
       if (existing.code() == deopt_meta.code() &&
@@ -157,18 +188,22 @@ bool CodeRuntime::consumeForcedDeopt(std::size_t deopt_id) {
   if (deopt_id >= deopt_metadatas_.size()) {
     return false;
   }
+  // The slow-path guard deopts through its own row; the arming state is on
+  // the site row.
   DeoptMetadata& meta = deopt_metadatas_[deopt_id];
-  if (meta.force_mode == 0) {
+  DeoptMetadata& site =
+      meta.forced_site_row >= 0 ? deopt_metadatas_[meta.forced_site_row] : meta;
+  if (site.force_mode == 0) {
     return false;
   }
-  if (meta.force_countdown > 0) {
-    --meta.force_countdown;
+  if (site.force_countdown > 0) {
+    --site.force_countdown;
   }
-  if (meta.force_countdown > 0) {
+  if (site.force_countdown > 0) {
     return false;
   }
-  if (meta.force_mode == 1) {
-    meta.force_mode = 0;
+  if (site.force_mode == 1) {
+    site.force_mode = 0;
     forced_deopt_armed_ = 0;
     for (const DeoptMetadata& other : deopt_metadatas_) {
       if (other.force_mode != 0) {

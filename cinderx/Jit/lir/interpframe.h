@@ -109,7 +109,10 @@ constexpr auto kFuncObjKind = FrameFieldKind::kFrameReifier;
 constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
 #endif
 
-consteval FrameInitTable buildFrameInitTable() {
+// lightweight=true 生成轻量帧表（惰性物化，字段最小集 + FrameHeader）；
+// lightweight=false 生成普通（物化）帧的完整解释器字段集——供 3.11
+// kNormal 模式的行内建帧使用，语义镜像 _PyFrame_InitializeSpecials。
+consteval FrameInitTable buildFrameInitTable(bool lightweight) {
   FrameInitTable t;
 
   auto add = [&](int32_t offset, FrameFieldKind kind, DataType dt) {
@@ -121,15 +124,19 @@ consteval FrameInitTable buildFrameInitTable() {
 
   constexpr int32_t fh = -static_cast<int32_t>(sizeof(jit::FrameHeader));
 
-  add(fh + static_cast<int32_t>(offsetof(jit::FrameHeader, frame_status)),
-      FrameFieldKind::kFrameHeaderFunc,
+  if (lightweight) {
+    add(fh + static_cast<int32_t>(offsetof(jit::FrameHeader, frame_status)),
+        FrameFieldKind::kFrameHeaderFunc,
+        DataType::kObject);
+  }
+  add(FRAME_EXECUTABLE_OFFSET,
+      lightweight ? kExecutableKind : FrameFieldKind::kExecutable,
       DataType::kObject);
-  add(FRAME_EXECUTABLE_OFFSET, kExecutableKind, DataType::kObject);
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous)),
       FrameFieldKind::kPrevFrame,
       DataType::kObject);
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_funcobj)),
-      kFuncObjKind,
+      lightweight ? kFuncObjKind : FrameFieldKind::kFuncObj,
       DataType::kObject);
   add(FRAME_INSTR_OFFSET, FrameFieldKind::kInstrPtr, DataType::kObject);
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_locals)),
@@ -152,62 +159,61 @@ consteval FrameInitTable buildFrameInitTable() {
       FrameFieldKind::kOwnerThread,
       DataType::k8bit);
 
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX < 0x030C0000
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
-      FrameFieldKind::kGlobals,
-      DataType::kObject);
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
-      FrameFieldKind::kBuiltins,
-      DataType::kObject);
-  // CPython 3.11's lightweight frame lives in uninitialized native stack
-  // storage. The fast unlink path reads frame_obj, and deopt/inspection paths
-  // consume is_entry and stacktop, so none of them may inherit stale bytes.
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
-      FrameFieldKind::kZero,
-      DataType::kObject);
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
-      FrameFieldKind::kZero,
-      DataType::k8bit);
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
-      FrameFieldKind::kStackPointer,
-      DataType::k32bit);
+  if (lightweight) {
+#if PY_VERSION_HEX < 0x030C0000
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
+        FrameFieldKind::kGlobals,
+        DataType::kObject);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
+        FrameFieldKind::kBuiltins,
+        DataType::kObject);
+    // CPython 3.11's lightweight frame lives in uninitialized native stack
+    // storage. The fast unlink path reads frame_obj, and deopt/inspection
+    // paths consume is_entry and stacktop, so none of them may inherit stale
+    // bytes.
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
+        FrameFieldKind::kZero,
+        DataType::kObject);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
+        FrameFieldKind::kZero,
+        DataType::k8bit);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
+        FrameFieldKind::kStackPointer,
+        DataType::k32bit);
 #endif
-
-#ifndef ENABLE_LIGHTWEIGHT_FRAMES
-  // Without ENABLE_LIGHTWEIGHT_FRAMES there is no lazy reification so
-  // we must initialize every field the interpreter expects.
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
-      FrameFieldKind::kGlobals,
-      DataType::kObject);
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
-      FrameFieldKind::kBuiltins,
-      DataType::kObject);
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
-      FrameFieldKind::kZero,
-      DataType::kObject);
+  } else {
+    // 无惰性物化：解释器可见的每个字段都必须初始化。
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
+        FrameFieldKind::kGlobals,
+        DataType::kObject);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
+        FrameFieldKind::kBuiltins,
+        DataType::kObject);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
+        FrameFieldKind::kZero,
+        DataType::kObject);
 
 #if PY_VERSION_HEX >= 0x030C0000
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, return_offset)),
-      FrameFieldKind::kZero,
-      DataType::k16bit);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, return_offset)),
+        FrameFieldKind::kZero,
+        DataType::k16bit);
 #else
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
-      FrameFieldKind::kZero,
-      DataType::k8bit);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, is_entry)),
+        FrameFieldKind::kZero,
+        DataType::k8bit);
 #endif
 #if PY_VERSION_HEX >= 0x030E0000
-  // ugly, visited is a bitfield on debug builds and we can't use offset of on
-  // it.
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, owner) + 1),
-      FrameFieldKind::kZero,
-      DataType::k8bit);
+    // ugly, visited is a bitfield on debug builds and we can't use offset of
+    // on it.
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, owner) + 1),
+        FrameFieldKind::kZero,
+        DataType::k8bit);
 #else
-  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
-      FrameFieldKind::kStackPointer,
-      DataType::k32bit);
+    add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
+        FrameFieldKind::kStackPointer,
+        DataType::k32bit);
 #endif
-
-#endif
+  }
 
   // Sort by offset (insertion sort for consteval compatibility).
   for (size_t i = 1; i < t.num_fields; i++) {
@@ -244,6 +250,15 @@ consteval FrameInitTable buildFrameInitTable() {
   return t;
 }
 
-constexpr FrameInitTable kFrameInitTable = buildFrameInitTable();
+constexpr FrameInitTable kFrameInitTable = buildFrameInitTable(
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+    true
+#else
+    false
+#endif
+);
+
+// 3.11 kNormal 模式行内建帧用的完整字段表（与编译旗标无关）。
+constexpr FrameInitTable kNormalFrameInitTable = buildFrameInitTable(false);
 
 } // namespace jit::lir

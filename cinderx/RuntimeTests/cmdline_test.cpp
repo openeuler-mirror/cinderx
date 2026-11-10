@@ -806,7 +806,13 @@ TEST_F(CmdLineTest, LightweightFrameFlagRequiresCompileSupport) {
   resetFrameModeAndOSRConfig();
   lightweight_env.set("1");
   int init_status = jit::initialize();
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 runs normal frames only: the flag is logged and ignored,
+  // initialization succeeds with normal frames.
+  ASSERT_EQ(init_status, 0);
+  EXPECT_EQ(getConfig().frame_mode, FrameMode::kNormal);
+  jit::finalize();
+#elif defined(ENABLE_LIGHTWEIGHT_FRAMES)
   ASSERT_EQ(init_status, 0);
   EXPECT_EQ(getConfig().frame_mode, FrameMode::kLightweight);
   jit::finalize();
@@ -841,9 +847,17 @@ TEST_F(CmdLineTest, LightweightFrameRejectsOSRConflict) {
   osr_env.set("1");
 
   int init_status = jit::initialize();
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 ignores the lightweight-frame flag (normal frames only),
+  // so there is no conflict with OSR: initialization succeeds.
+  ASSERT_EQ(init_status, 0);
+  EXPECT_EQ(getConfig().frame_mode, FrameMode::kNormal);
+  jit::finalize();
+#else
   ASSERT_EQ(init_status, -1);
   ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
   PyErr_Clear();
+#endif
 
   jit::shutdown_jit_genobject_type();
 }

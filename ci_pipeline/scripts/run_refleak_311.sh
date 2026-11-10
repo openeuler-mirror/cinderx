@@ -31,7 +31,8 @@ THRESHOLD=${PYTHONJITAUTO:-20}
 # -R <warmups>:<repetitions>.  regrtest reports a leak only when the
 # totals move in every repetition, so the repetitions are the judge.  Ten
 # warmups let threshold-triggered compilation settle before those measured
-# repetitions; otherwise compilation itself lands inside the measurement.
+# repetitions. Disable startup grace in the -R workers so delayed compilation
+# cannot first become eligible during the measured repetitions.
 ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}
 BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
 case "$BUILD_JOBS" in
@@ -103,6 +104,28 @@ rm -rf "$WORK/venv"
 "$WORK/venv/bin/pip" install -q "$WHEEL"
 VENV_PY="$WORK/venv/bin/python"
 
+# Exercise finalization with Py_DEBUG assertions enabled as well as the
+# release gate: the in-place JIT finalizer enters deallocation before it
+# restores the stock generator type.
+PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
+  test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
+  test_cinderx.test_kunpeng.test_subscript_cache_lifetime_311 \
+  test_cinderx.test_kunpeng.test_quickened_count_311 \
+  test_cinderx.test_kunpeng.test_exception_handler_semantics_311 \
+  test_cinderx.test_kunpeng.test_execute_surface_coverage_311 \
+  test_cinderx.test_kunpeng.test_scheduling_policy_311 \
+  test_cinderx.test_kunpeng.test_speculation_feedback_311 \
+  test_cinderx.test_kunpeng.test_range_lowering_311 \
+  test_cinderx.test_kunpeng.test_loop_phi_identity_311 \
+  > "$WORK/generator-close.log" 2>&1
+
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 \
+PYTHONJITAUTO=1000000 AUTO_JIT=1000000 \
+PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
+  test_cinderx.test_kunpeng.test_admission_semantics_311 \
+  > "$WORK/admission-semantics.log" 2>&1
+
 # Build sanity only: this shows the debug build CAN run the JIT.  The
 # trigger proof comes from the -R processes themselves, below.
 CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
@@ -125,17 +148,17 @@ MODULE_LOG_DIR="$WORK/regrtest-modules"
 rm -rf "$MODULE_LOG_DIR"
 mkdir -p "$MODULE_LOG_DIR"
 : > "$WORK/regrtest.log"
-RC=0
-FAILED_MODULES=()
 for MODULE in "${MODULES[@]}"; do
   MODULE_LOG="$MODULE_LOG_DIR/$MODULE.log"
   set +e
   env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+      CINDERX_JIT_STARTUP_GRACE_MS=0 \
       CINDERX_REFLEAK_LEDGER="$LEDGER" \
       PYTHONPATH="$START" \
     "$VENV_PY" -m test -R "$ROUNDS" "$MODULE" > "$MODULE_LOG" 2>&1
   MODULE_RC=$?
+  printf '%s\n' "$MODULE_RC" > "$MODULE_LOG_DIR/$MODULE.exitcode"
   set -e
   if [ "$MODULE_RC" != 0 ] && [ "$MODULE_RC" != 2 ]; then
     echo "refleak: $MODULE exited abnormally ($MODULE_RC)"
@@ -157,69 +180,16 @@ for MODULE in "${MODULES[@]}"; do
       tail -30 "$MODULE_LOG"
       exit 1
     }
-  else
-    RC=2
-    FAILED_MODULES+=("$MODULE")
   fi
 done
 tail -20 "$WORK/regrtest.log"
 
-# Reference leaks are the acceptance item's subject and are never excused.
-REF_LINES=$(grep -E "leaked \[[-0-9, ]+\] references" "$WORK/regrtest.log" || true)
-if [ -n "$REF_LINES" ]; then
-  echo "refleak: regrtest -R reported reference leaks"
-  echo "$REF_LINES"
+# Quickening and code destruction now update CPython's same native counter.
+# Require each ORIGINAL -R process to pass. No memory-block finding, including
+# the former [1, 1, 1] test_binop figure, is reclassified or excused.
+if ! "$VENV_PY" -m ci_pipeline.jit311.refleak_verdict \
+    --logs "$MODULE_LOG_DIR" "${MODULES[@]}"; then
   exit 1
-fi
-if grep -qE "file descriptors leaked" "$WORK/regrtest.log"; then
-  echo "refleak: regrtest -R reported file-descriptor leaks"
-  grep -E "file descriptors leaked" "$WORK/regrtest.log"
-  exit 1
-fi
-
-# Block lines need verifying rather than believing.  regrtest computes
-# its block figure as getallocatedblocks() - _getquickenedcount(), and
-# that subtraction is unsound here: _Py_QuickenedCount is a file-local
-# symbol in the interpreter, so the vendored evaluator must define its
-# own copy.  Quickening then increments CinderX's counter while
-# code_dealloc decrements the interpreter's -- the one sys reports -- so
-# it only ever falls, and subtracting a negative inflates the figure.
-# quickened_artifact.py re-runs each flagged module recording both terms
-# and clears the line only when the raw block count is flat over a
-# settled tail AND the counter drift accounts for the reported figure.
-BLK_MODULES=$(grep -E "leaked \[[-0-9, ]+\] memory blocks" "$WORK/regrtest.log" \
-  | awk '{print $1}' | sort -u || true)
-if [ -n "$BLK_MODULES" ]; then
-  echo "refleak: verifying block lines for: $(echo "$BLK_MODULES" | tr '\n' ' ')"
-  # shellcheck disable=SC2086
-  if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
-       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
-       PYTHONPATH="$START" \
-       "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
-       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8 \
-       --original-log-dir "$MODULE_LOG_DIR"; then
-    echo "refleak: a reported block figure is not the quickened-counter"
-    echo "artifact -- treating it as a real leak"
-    exit 1
-  fi
-elif [ "$RC" != 0 ]; then
-  echo "refleak: regrtest -R reported failures (exit $RC) with no leak lines"
-  exit 1
-fi
-# A non-zero module is acceptable only when that same module's block figure
-# was verified above.  Looking for any global SUCCESS epilogue would let a
-# later successful module hide an earlier real failure.
-if ((${#FAILED_MODULES[@]})); then
-  FAILED=$(printf '%s\n' "${FAILED_MODULES[@]}" | sort -u)
-  UNEXPLAINED=$(comm -3 <(printf '%s\n' "$FAILED") \
-    <(printf '%s\n' "$BLK_MODULES" | sort -u) || true)
-  if [ -n "$UNEXPLAINED" ]; then
-    echo "refleak: regrtest failed on tests beyond the verified block"
-    echo "artifact: $(echo "$UNEXPLAINED" | tr '\n' ' ')"
-    exit 1
-  fi
-  echo "refleak: the only failures were block figures verified as the"
-  echo "quickened-counter artifact"
 fi
 
 # The proof, from the -R run itself.

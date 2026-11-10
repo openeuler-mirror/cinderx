@@ -38,7 +38,8 @@ std::vector<uint64_t> siteIdsOf(BorrowedRef<PyFunctionObject> func) {
     return ids;
   }
   for (const jit::DeoptMetadata& meta : compiled->runtime()->deoptMetadatas()) {
-    if (!meta.frame_meta.empty()) {
+    // Forced-check slow-path rows reuse their site's id; they are not sites.
+    if (!meta.frame_meta.empty() && meta.forced_site_row < 0) {
       ids.push_back(meta.site_id);
     }
   }
@@ -232,8 +233,13 @@ def unpack(seq):
 TEST_F(DeoptSite311Test, LoadGlobalReexecDoesNotDoublePushNull) {
   SKIP_311_EXECUTABLE_COMPILE();
 
+  // A positional call with fewer arguments than parameters pins the
+  // function-valued global by identity (the simplifier completes the
+  // default at compile time); that pin is the GuardFailure site left at
+  // LOAD_GLOBAL now that keys-version misses re-pin the site's cell
+  // instead of deoptimizing.
   const char* src = R"(
-def _g():
+def _g(a=1):
     return 7
 
 G = _g
@@ -273,5 +279,72 @@ def read():
   auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(PyLong_AsLong(result), 7);
+}
+
+TEST_F(DeoptSite311Test, ForcedDeoptRightAfterGeneratorResume) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The type guards of `i + b` are the first guards after the resume.  At
+  // that point b is still in its spill slot, while the ordinary guard reads
+  // it from the register it is reloaded into.  The forced check's slow path
+  // used to deopt through the ordinary guard's metadata and so read b from
+  // that not-yet-loaded register.
+  const char* src = R"(
+def gen(a, b):
+    i = a - a
+    yield i
+    c = i + b
+    yield c
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "gen"));
+  ASSERT_NE(func, nullptr);
+  auto three = Ref<>::steal(PyLong_FromLong(3));
+  auto five = Ref<>::steal(PyLong_FromLong(5));
+  auto args = Ref<>::steal(PyTuple_Pack(2, three.get(), five.get()));
+  auto run = [&]() -> Ref<> {
+    auto gen_obj = Ref<>::steal(PyObject_Call(func, args, nullptr));
+    if (gen_obj == nullptr) {
+      return Ref<>{};
+    }
+    return Ref<>::steal(PySequence_List(gen_obj));
+  };
+  for (int i = 0; i < 64; ++i) {
+    ASSERT_NE(run(), nullptr);
+  }
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  ASSERT_NE(compiled, nullptr);
+  std::vector<uint64_t> sites;
+  for (const jit::DeoptMetadata& meta : compiled->runtime()->deoptMetadatas()) {
+    if (meta.forceable && !meta.frame_meta.empty() &&
+        meta.innermostFrame().cause_instr_idx.asOffset().value() > 0) {
+      sites.push_back(meta.site_id);
+    }
+  }
+  std::sort(sites.begin(), sites.end());
+  sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+  ASSERT_FALSE(sites.empty()) << "generator compiled with no forceable site";
+
+  for (uint64_t site : sites) {
+    if (Ci_JitShell311_InstalledArtifact(func) == nullptr) {
+      ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+    }
+    compiled = reinterpret_cast<jit::CompiledFunction*>(
+        Ci_JitShell311_InstalledArtifact(func));
+    ASSERT_NE(compiled, nullptr);
+    jit::TriggerStats before = jit::triggerStatsSnapshot();
+    ASSERT_TRUE(compiled->runtime()->armForcedDeopt(site, 1, false));
+    auto result = run();
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(PyList_GET_SIZE(result.get()), 2);
+    EXPECT_EQ(PyLong_AsLong(PyList_GET_ITEM(result.get(), 0)), 0);
+    EXPECT_EQ(PyLong_AsLong(PyList_GET_ITEM(result.get(), 1)), 5);
+    EXPECT_EQ(
+        jit::triggerStatsSnapshot().forced_deopt_hits,
+        before.forced_deopt_hits + 1)
+        << "site " << site << " was armed but not forced";
+  }
 }
 #endif

@@ -19,6 +19,105 @@
 
 namespace jit {
 
+class CodeRuntime;
+
+#if PY_VERSION_HEX < 0x030C0000
+// Per-call-site entry cache for the CPython 3.11 generated call sequence.
+// The codegen probe compares the callee against (code, vectorcall); a hit
+// branches to fast_target, which is either the callee's direct entry (the
+// compiled body past its own prologue) or a neutral fill of the callee's
+// vectorcall at fill time.  A direct fill is admitted only for a bare
+// compiled entry with no varargs / keyword-only parameters, a site argument
+// count equal to co_argcount and a non-static prototype, so the prologue's
+// argument-count and __code__ checks are proven once by the fill.  The
+// vectorcall entry sits at a body-independent offset inside the artifact,
+// so a (code, vectorcall) match also pins the direct entry.
+//
+// code is a borrowed pointer used for identity comparison only; address
+// reuse after its death is covered by the vectorcall identity guard.
+// helper_budget bounds the miss helper's refills so a polymorphic site
+// settles on the generic arm.  The first four fields are read by the
+// codegen probe at hardcoded offsets (see the static_assert below).
+struct CallSiteEntryCache {
+  PyObject* code{nullptr};
+  void* vectorcall{nullptr};
+  void* fast_target{nullptr};
+  uint8_t helper_budget{64};
+  // Constructor arm: a heap class whose instances object_new allocates and
+  // a Python __init__ initialises.  The __init__ resolution is pinned by the
+  // class version tag, its entry by the function's vectorcall identity.
+  // Read by the runtime helper only.
+  PyTypeObject* ctor_type{nullptr};
+  uint32_t ctor_version{0};
+  uint8_t ctor_budget{16};
+  PyObject* ctor_init{nullptr};
+  void* ctor_init_vectorcall{nullptr};
+  void* ctor_target{nullptr};
+  PyObject* ctor_init_code{nullptr}; // identity only
+  // The caller's code runtime: every code object an entry names is added
+  // to its references, so an address compared above cannot be reused.
+  CodeRuntime* runtime{nullptr};
+};
+
+static_assert(
+    offsetof(CallSiteEntryCache, code) == 0 &&
+        offsetof(CallSiteEntryCache, vectorcall) == 8 &&
+        offsetof(CallSiteEntryCache, fast_target) == 16 &&
+        offsetof(CallSiteEntryCache, helper_budget) == 24,
+    "codegen probe hardcodes CallSiteEntryCache layout");
+
+// Per-site cache for the builtin super() lookup.  The descriptor super()
+// finds for (instance type, start class, name) is a function of the
+// instance type's MRO and of the dicts along it, all covered by the
+// instance type's version tag (a change to any base invalidates every
+// subclass), so one entry keyed by (instance type, version tag, start class)
+// replays the lookup.  descr is borrowed from the type dict that the tag
+// keeps unchanged.
+// Per-site state of a 3.11 LOAD_GLOBAL (HIRBuilder::tryEmitLoadGlobal311).
+// The slot is the address of the pinned entry's value inside the dict keys
+// that were live when the pin was taken, and it is read only while both
+// recorded keys versions still match the live ones: versions are allocated
+// monotonically and never reused, so a match proves the keys objects (and
+// with them the slot) are the pinned ones.  A same-key rebinding does not
+// change dk_version, so the value is read live.  A version match also
+// proves the entry still holds a value: 3.11 zeroes dk_version on every key
+// insertion and deletion (insertdict, delitem_common, popitem) and a resize
+// or clear installs another keys object, so the fast arm reads the slot
+// without a NULL test.  An unpinned cell records kGlobalLoadCellUnpinned311
+// in both version fields, a value the vendored keys-version allocator
+// (Ci_GetDictKeysVersion_311) never issues, so it matches no live dict.
+inline constexpr uint32_t kGlobalLoadCellUnpinned311 = UINT32_MAX;
+// The slow arm answers through a pointer to stable storage so that both
+// arms hand the site a borrowed reference (an owned slow-arm result merged
+// with the borrowed fast-arm load would make the merge owned and put an
+// incref/decref pair on the fast arm): the pinned entry slot when the cell
+// could be pinned, the cell's own `held` reference otherwise, and this
+// NULL storage when the lookup raised.
+inline PyObject* kGlobalLoadNoValue311 = nullptr;
+
+struct GlobalLoadCell311 {
+  uint32_t globals_keys_version{kGlobalLoadCellUnpinned311};
+  uint32_t builtins_keys_version{kGlobalLoadCellUnpinned311};
+  PyObject** slot{nullptr};
+  // Owned: the last value the slow arm answered with when the cell could
+  // not be pinned, kept until the next such answer replaces it (the cell
+  // itself lives as long as the JIT context).
+  PyObject* held{nullptr};
+  // Fixed at compile time from where the name resolved then.  A name found
+  // in the module dict cannot be shadowed by builtins, so its site checks
+  // the globals keys version only and the pin refuses a builtins entry; a
+  // name resolved in builtins checks both versions.
+  bool globals_only{false};
+};
+
+struct SuperSiteCache311 {
+  PyTypeObject* obj_type{nullptr};
+  uint32_t version{0};
+  PyTypeObject* start_type{nullptr};
+  PyObject* descr{nullptr};
+};
+#endif
+
 // Mutator for an instance attribute that is stored in a split dictionary
 struct SplitMutator {
   PyObject* getAttr(PyObject* obj, PyObject* name);
@@ -59,6 +158,11 @@ struct DictMutator {
 
   BorrowedRef<> getattr_method;
 #if PY_VERSION_HEX < 0x030C0000
+  // me_key-self-validating entry indexes, refreshed on
+  // every slow-path hit.  dict_hint indexes the receiver dict keys
+  // (materialized instances); values_hint indexes the type's cached
+  // shared keys (values-form instances).  A wrong hint just falls back,
+  // so per-instance keys divergence costs a refresh, not correctness.
   Py_ssize_t dict_hint{-1};
   Py_ssize_t values_hint{-1};
 #endif
@@ -109,20 +213,6 @@ struct GetAttrMutator {
   uint32_t keys_version;
 };
 
-#if PY_VERSION_HEX < 0x030C0000
-struct TypeRecvMutator {
-  enum class Form : uint8_t { kValue, kMetaDescr, kStaticMethod };
-
-  PyObject* payload{nullptr};
-  uint32_t meta_version{0};
-  uint32_t payload_type_version{0};
-  Form form{Form::kValue};
-};
-static_assert(
-    sizeof(TypeRecvMutator) <= sizeof(DictMutator),
-    "type receiver entries must not grow AttributeMutator");
-#endif
-
 // An instance of AttributeMutator is specialized to more efficiently perform a
 // get/set of a particular kind of attribute.
 class AttributeMutator {
@@ -132,11 +222,6 @@ class AttributeMutator {
   enum class Kind : uint8_t {
     kSplit,
     kSplitInline,
-#if PY_VERSION_HEX < 0x030C0000
-    // CPython 3.11 has no inline-values dictionaries, so the tagged value
-    // otherwise used by kSplitInline is available for type receivers.
-    kTypeRecv = kSplitInline,
-#endif
     kCombined,
     kDataDescr,
     kMemberDescr,
@@ -175,26 +260,6 @@ class AttributeMutator {
       PyTypeObject* type,
       PyObject* getattr_method,
       uint32_t keys_version);
-#if PY_VERSION_HEX < 0x030C0000
-  void set_type_recv_value(
-      PyTypeObject* receiver,
-      uint32_t meta_version,
-      PyObject* payload,
-      uint32_t payload_type_version);
-  void set_type_recv_meta_descr(
-      PyTypeObject* metatype,
-      PyObject* payload,
-      uint32_t payload_type_version);
-  void set_type_recv_static_method(
-      PyTypeObject* receiver,
-      uint32_t meta_version,
-      PyObject* wrapper,
-      uint32_t wrapper_type_version);
-  bool isTypeRecv() const {
-    return !isEmpty() && get_kind() == Kind::kTypeRecv;
-  }
-  PyObject* getTypeRecvAttr(PyObject* obj, PyObject* name);
-#endif
   BorrowedRef<PyTypeObject> watchedDescrType() const;
 
   PyObject* getAttr(PyObject* obj, PyObject* name);
@@ -202,8 +267,13 @@ class AttributeMutator {
 
   static void changeKindFromSplitInline(SplitMutator* split, Kind new_kind);
 #if PY_VERSION_HEX < 0x030C0000
+  // re-kind a kSplit entry whose receivers have
+  // materialized and re-keyed their dicts to kDict, so subsequent hits
+  // take the hint-indexed read (asm kdict arm / DictMutator) instead of
+  // a full hash probe per access, and answer the demoting access.
   static PyObject*
   demoteSplitToDict(SplitMutator* split, PyObject* obj, PyObject* name);
+  // Store-side twin: same demotion, answering the demoting store.
   static int demoteSplitToDictStore(
       SplitMutator* split,
       PyObject* obj,
@@ -226,8 +296,17 @@ class AttributeMutator {
         offsetof(SplitMutator, val_offset);
   }
 #if PY_VERSION_HEX < 0x030C0000
+  // the 3.11 stubs pull-validate against the captured
+  // receiver type version, exactly like doInvoke.
   static constexpr size_t typeVersionOffset() {
     return offsetof(AttributeMutator, type_version_);
+  }
+  static constexpr size_t memberDescrMemberdefOffset() {
+    return offsetof(AttributeMutator, member_descr_) +
+        offsetof(MemberDescrMutator, memberdef);
+  }
+  static constexpr uintptr_t memberDescrKind() {
+    return static_cast<uintptr_t>(Kind::kMemberDescr);
   }
   static constexpr size_t splitKeysOffset() {
     return offsetof(AttributeMutator, split_) + offsetof(SplitMutator, keys);
@@ -238,12 +317,33 @@ class AttributeMutator {
   static constexpr uintptr_t dictKind() {
     return static_cast<uintptr_t>(Kind::kDict);
   }
-  static constexpr size_t memberDescrMemberdefOffset() {
-    return offsetof(AttributeMutator, member_descr_) +
-        offsetof(MemberDescrMutator, memberdef);
+  static constexpr uintptr_t descrOrClassVarKind() {
+    return static_cast<uintptr_t>(Kind::kDescrOrClassVar);
   }
-  static constexpr uintptr_t memberDescrKind() {
-    return static_cast<uintptr_t>(Kind::kMemberDescr);
+  static constexpr size_t descrOrClassVarDescrOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, descr);
+  }
+  static constexpr size_t descrOrClassVarKeysVersionOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, keys_version);
+  }
+  // kDataDescr entry fields for the inline stub's direct
+  // descriptor call.
+  static constexpr uintptr_t dataDescrKind() {
+    return static_cast<uintptr_t>(Kind::kDataDescr);
+  }
+  static constexpr size_t dataDescrDescrOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr);
+  }
+  static constexpr size_t dataDescrTypeOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr_type);
+  }
+  static constexpr size_t dataDescrTypeVersionOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr_type_version);
   }
 #endif
   template <typename T>
@@ -311,9 +411,6 @@ class AttributeMutator {
     MemberDescrMutator member_descr_;
     DescrOrClassVarMutator descr_or_cvar_;
     GetAttrMutator getattr_;
-#if PY_VERSION_HEX < 0x030C0000
-    TypeRecvMutator type_recv_;
-#endif
   };
 };
 
@@ -329,8 +426,55 @@ class AttributeCache {
   }
 
 #if PY_VERSION_HEX < 0x030C0000
+  // Type-receiver entries.  The
+  // general fill refuses class receivers (metatype getattro), so class
+  // constant reads (deltablue Strength.FORWARD: 12.9M futile fill calls
+  // per run) re-ran the full lookup every time.  Two forms: kValue keys
+  // on the receiver type (identity-stable class vars / functions /
+  // wrapper+method descriptors, staticmethod unwrap), kMetaDescr keys on
+  // the metatype (data descriptors like type.__name__, shared by every
+  // class of that metatype).  Both pull-validate tp_version_tag before
+  // the borrowed payload is touched; entries round-robin to absorb
+  // polymorphic receivers; lazily allocated so non-type sites pay
+  // nothing.
+  struct TypeRecvEntry {
+    PyTypeObject* recv{nullptr}; // pointer compare only; version-gated
+    uint32_t recv_version{0};
+    uint32_t meta_version{0};
+    // kDescrGet: a descriptor found on the receiver class whose class-level
+    // access is a fresh object each time (classmethod, classmethod_descriptor,
+    // custom __get__): the hit runs type_getattro's own step,
+    // tp_descr_get(descr, NULL, receiver), with the descriptor pinned by the
+    // receiver version and the metatype version proving no data descriptor
+    // shadows it.
+    enum class Form : uint8_t {
+      kNone,
+      kValue,
+      kMetaDescr,
+      kDescrGet
+    } form{Form::kNone};
+    PyObject* payload{nullptr}; // borrowed
+    // The payload's own type version: a value whose type later grows
+    // __get__ becomes a descriptor, a descriptor whose type loses __get__
+    // stops being one; neither touches the receiver or metatype version.
+    uint32_t payload_version{0};
+  };
+  struct TypeRecvEntries {
+    static constexpr size_t kNumEntries = 8;
+    TypeRecvEntry entries[kNumEntries];
+    size_t rr{0};
+  };
+
   PyObject* typeRecvGetAttr(PyObject* obj, PyObject* name);
   void typeRecvTryFill(PyObject* obj, PyObject* name, PyObject* result);
+
+  std::unique_ptr<TypeRecvEntries> type_recv_;
+  // bound-method receivers.  method_getattro delegates any
+  // name the method type itself lacks to im_func; that verdict is fixed
+  // for the static method type, so it is taken once per site and the
+  // function is then served by the ordinary entries.  0 unknown, 1
+  // delegates, 2 the method type has the name.
+  uint8_t method_delegate_{0};
 #endif
 
  protected:
@@ -493,6 +637,8 @@ struct CacheStats {
   std::unordered_map<std::string, CacheMiss> misses;
 };
 
+class LoadTypeMethodCache;
+
 class LoadMethodCache {
  public:
   struct Entry {
@@ -502,18 +648,34 @@ class LoadMethodCache {
 #if PY_VERSION_HEX < 0x030C0000
     // Pull-based validity (see AttributeMutator::typeVersionMatches).
     uint32_t type_version{0};
+    // the shared-keys version could not prove the instance
+    // dict never shadows this name (dk_version == 0 after late-attr
+    // growth); a hit must peek the instance storage instead.
     bool peek_shadow{false};
+    // memo for the values-form peek.  peek_keys is
+    // compared against the LIVE type's cached keys (never dereferenced
+    // stale); while identical and dk_nentries == peek_nentries the name
+    // membership answer is pinned: peek_hint >= 0 gives the entry index
+    // (me_key-validated at hit), kPeekAbsent pins non-membership, and a
+    // shadow answer still takes the slow path.
     static constexpr Py_ssize_t kPeekAbsent = -2;
-    // Borrowed shape data for inline values only.
     PyDictKeysObject* peek_keys{nullptr};
     Py_ssize_t peek_nentries{0};
     Py_ssize_t peek_hint{-1};
+    // For a materialized combined-keys receiver (anchor) the
+    // keys table is owned by the dict alone: dict.clear() frees it and the
+    // next insert can allocate a new table at the same address with the
+    // same dk_nentries, so the pointer-and-count memo would pin a stale
+    // absence.  The anchor therefore also records the table's keys
+    // version, which a fresh table does not have (dk_version == 0) and
+    // which every key-set change resets.  Value replacement keeps it.
+    uint32_t peek_keys_version{0};
+    // the name is an INSTANCE attribute callable (bound
+    // method stored in __init__, the _Unpickler.read pattern) -- the
+    // class side has no such attribute at all (pinned by type_version),
+    // so the hit caches the lookup SHAPE, not the per-instance value:
+    // slot non-null -> {Py_None, slot}.  value stays null for this form.
     bool inst_attr{false};
-    // A nonzero version records verified absence in that globally unique
-    // dict content state.  No combined keys pointer is retained.
-    uint64_t peek_dict_version{0};
-
-    void setInlinePeekKeys(PyDictKeysObject* keys);
     void clearPeekKeys();
 #endif
 
@@ -531,6 +693,29 @@ class LoadMethodCache {
   void clearCacheStats();
   const CacheStats* cacheStats();
 
+ private:
+  LoadMethodResult lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
+  void
+  fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, BorrowedRef<> name);
+
+  std::array<Entry, 4> entries_;
+  std::unique_ptr<CacheStats> cache_stats_;
+#if PY_VERSION_HEX < 0x030C0000
+  // a class receiver (Cls.method / cls.method inside a
+  // classmethod) can never match the per-metatype entries above, so every
+  // such load fell through to PyObject_GetAttr and a fresh bound method.
+  // Lazily hold the pull-validated type-receiver cache for it instead.
+  std::unique_ptr<LoadTypeMethodCache> type_recv_311_;
+  void absorbTypeRecvStats311();
+  // Misses since the last hit; a site whose class receivers keep changing
+  // (many classes through one call site) would only thrash the single
+  // entry, so it falls back to the generic path once this trips.
+  uint16_t type_recv_misses_311_{0};
+  bool type_recv_off_311_{false};
+#endif
+
+ public:
+  // layout accessors for the 3.11 aarch64 inline stub.
   static constexpr size_t numEntries() {
     return 4;
   }
@@ -556,15 +741,22 @@ class LoadMethodCache {
   static constexpr size_t entryPeekShadowOffset() {
     return offsetof(Entry, peek_shadow);
   }
+  static constexpr size_t entryPeekKeysOffset() {
+    return offsetof(Entry, peek_keys);
+  }
+  static constexpr size_t entryPeekNentriesOffset() {
+    return offsetof(Entry, peek_nentries);
+  }
+  static constexpr size_t entryPeekKeysVersionOffset() {
+    return offsetof(Entry, peek_keys_version);
+  }
+  static constexpr size_t entryPeekHintOffset() {
+    return offsetof(Entry, peek_hint);
+  }
+  static constexpr size_t entryInstAttrOffset() {
+    return offsetof(Entry, inst_attr);
+  }
 #endif
-
- private:
-  LoadMethodResult lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
-  void
-  fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, BorrowedRef<> name);
-
-  std::array<Entry, 4> entries_;
-  std::unique_ptr<CacheStats> cache_stats_;
 };
 
 // A cache for LoadMethodCached instructions where we expect the receiver to be
@@ -589,6 +781,15 @@ class LoadTypeMethodCache {
   static LoadMethodResult getValueHelper(
       LoadTypeMethodCache* cache,
       PyObject* obj);
+#if PY_VERSION_HEX < 0x030C0000
+  // Validated hit when the receiver is the cached type, full lookup (and
+  // fill) otherwise.  Exceptions propagate as {NULL, NULL}; the caller is
+  // a deopt-checked instruction.
+  static LoadMethodResult lookupOrHitHelper311(
+      LoadTypeMethodCache* cache,
+      PyTypeObject* obj,
+      PyObject* name);
+#endif
 
   LoadMethodResult lookup(BorrowedRef<PyTypeObject> obj, BorrowedRef<> name);
 
@@ -605,8 +806,17 @@ class LoadTypeMethodCache {
   const CacheStats* cacheStats();
 
  private:
+#if PY_VERSION_HEX < 0x030C0000
+  enum class WrapperForm : uint8_t { kPlain, kClassMethod, kStaticMethod };
+  void fill(
+      BorrowedRef<PyTypeObject> type,
+      BorrowedRef<> value,
+      bool is_bound_meth,
+      WrapperForm form = WrapperForm::kPlain);
+#else
   void
   fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value, bool is_bound_meth);
+#endif
 
   // Borrowed, but uses a raw pointer as typeAddr() will return the address of
   // this field for codegen purposes.
@@ -631,6 +841,13 @@ class LoadTypeMethodCache {
   BorrowedRef<> name_;
   PyTypeObject* metatype_{nullptr};
   uint32_t metatype_version_{0};
+  // What value_ is on 3.11: the method itself, or the classmethod /
+  // staticmethod object found in the class dict (pinned there by the
+  // receiver version).  The wrapper's callable is read on every hit:
+  // classmethod.__init__ / staticmethod.__init__ replace it in place
+  // without any version moving, so a cached inner callable would go stale
+  // or dangle.
+  WrapperForm wrapper_form_{WrapperForm::kPlain};
 #endif
 };
 
@@ -716,7 +933,17 @@ struct AttrCacheStats311 {
 };
 
 AttrCacheStats311& attrCacheStats311();
-void resetDictValueTransition311();
+
+// Replace an existing value of a materialized instance dict in place: the
+// new value is owned before the old one is released (storing the same object
+// back is safe) and the dict's PEP 509 version advances exactly as stock's
+// STORE_ATTR_WITH_HINT / insertdict do.  The method cache's negative anchors
+// are keyed on the keys table version, which a value replacement leaves
+// untouched.
+void replaceMaterializedDictValue311(
+    PyDictObject* dict,
+    PyObject** slot,
+    PyObject* value);
 #endif
 
 } // namespace jit

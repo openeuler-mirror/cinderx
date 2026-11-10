@@ -22,6 +22,8 @@ def hot(a, b):
     return total
 
 
+# Build sanity is independent of the automatic scheduler's startup grace.
+assert cinderjit.force_compile(hot), "debug build could not compile the probe"
 for i in range(200):
     hot(i, 2)
 assert cinderjit.is_jit_compiled(hot), "nothing compiled in the refleak arm"

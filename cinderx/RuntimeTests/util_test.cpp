@@ -27,6 +27,21 @@ TEST(UtilTestNoFixture, Worklist) {
   EXPECT_TRUE(wl.empty());
 }
 
+TEST(UtilTestNoFixture, RoundUpRejectsOverflow) {
+  EXPECT_EQ(jit::roundUp(size_t{13}, size_t{8}), size_t{16});
+  EXPECT_EQ(jit::roundUp(size_t{16}, size_t{8}), size_t{16});
+  EXPECT_EQ(jit::roundUp(size_t{0}, size_t{8}), size_t{0});
+  EXPECT_EQ(jit::roundUp(size_t{13}, size_t{1}), size_t{13});
+  EXPECT_EQ(jit::roundUp(size_t{13}, size_t{0}), size_t{0});
+  EXPECT_DEATH(
+      jit::roundUp(std::numeric_limits<size_t>::max(), size_t{2}),
+      "roundUp overflow");
+  EXPECT_DEATH(
+      jit::roundUp(std::numeric_limits<int>::max(), size_t{2}),
+      "roundUp overflow");
+  EXPECT_DEATH(jit::roundUp(uint8_t{1}, size_t{512}), "roundUp overflow");
+}
+
 TEST(UtilTest, CombineHash) {
   EXPECT_EQ(jit::combineHash(123, 456), 0x9e379a24);
   EXPECT_EQ(jit::combineHash(123, 456, 789), 0x28cd9c7673);

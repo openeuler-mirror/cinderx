@@ -15,16 +15,19 @@
 #include "cinderx/Common/import.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/type.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/codegen/tls.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
@@ -36,6 +39,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/inline_cache.h"
@@ -55,6 +59,7 @@
 #endif
 #include <fmt/std.h>
 
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -67,10 +72,12 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -78,11 +85,36 @@
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
 #include "cinderx/Interpreter/3.11/eval_hook.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_RefreshDirectEntryGate(void);
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+#if defined(CINDER_AARCH64)
+extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void);
+#endif
+#endif
 #include "cinderx/Interpreter/3.11/observe.h"
 extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
 #endif
 
+// Every JIT state transition goes through here so that, on CPython 3.11, the
+// direct-entry gate the generated entry guards read stays in step with
+// isJitUsable().  Other versions only set the state.
+static inline void ciSetJitState(jit::State state) {
+  jit::getMutableConfig().state = state;
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_RefreshDirectEntryGate();
+#endif
+}
+
 using namespace jit;
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace jit {
+// Code objects carrying numeric speculation fuse state (defined below).
+size_t numericSpecCodeCount311();
+} // namespace jit
+#endif
 
 namespace {
 
@@ -104,6 +136,13 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_frozen{0};
   std::atomic<uint64_t> roi_aging_events{0};
   std::atomic<uint64_t> roi_aging_count_reduced{0};
+  std::atomic<uint64_t> ic_stability_sample{0};
+  std::atomic<uint64_t> ic_stability_change{0};
+  std::atomic<uint64_t> ic_stability_defer{0};
+  std::atomic<uint64_t> ic_stability_stable{0};
+  std::atomic<uint64_t> ic_stability_cap{0};
+  std::atomic<uint64_t> ic_stability_unknown{0};
+  std::atomic<uint64_t> ic_stability_bypass{0};
 };
 
 struct AutoJitGateState {
@@ -180,6 +219,38 @@ void recordAutoJitAgingStats(uint32_t count_reduced) {
   }
 }
 
+void recordICStabilityStats(
+    const ICStabilityDecision& decision,
+    bool admission = true) {
+  if (decision.sampled) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_sample);
+  }
+  if (decision.changed) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_change);
+  }
+  if (decision.unknown) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_unknown);
+  }
+  // Warmup only collects feedback; stability is not permission to compile
+  // before the existing threshold has also been reached.
+  if (!admission) {
+    return;
+  }
+  if (decision.defer) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_defer);
+  } else if (!decision.terminal_reuse) {
+    if (decision.reason == ICStabilityReason::Stable) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_stable);
+    } else if (decision.reason == ICStabilityReason::Cap) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_cap);
+    } else if (
+        decision.reason != ICStabilityReason::Disabled &&
+        decision.reason != ICStabilityReason::NonAuto) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.ic_stability_bypass);
+    }
+  }
+}
+
 void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.jit_vectorcall.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.global_threshold_return.store(
@@ -200,6 +271,14 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_aging_events.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_aging_count_reduced.store(
       0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_sample.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_change.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_defer.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_stable.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_cap.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_unknown.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.ic_stability_bypass.store(0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -331,7 +410,8 @@ void writeAutoJitCompileEvent(
     const AutoJitGateState& state,
     const std::optional<StructureKey>& key,
     const ThresholdDecision& decision,
-    uint32_t effective_limit) {
+    uint32_t effective_limit,
+    const ICStabilityDecision& stability) {
   const char* path = std::getenv("CINDERX_AUTOJIT_COMPILE_EVENTS_FILE");
   if (path == nullptr || path[0] == '\0') {
     return;
@@ -361,7 +441,16 @@ void writeAutoJitCompileEvent(
       << ",\"import_phase\":" << (state.context.import_phase ? "true" : "false")
       << ",\"setup_phase\":" << (state.context.setup_phase ? "true" : "false")
       << ",\"branch_reason\":\"" << branchReasonName(decision.branch_reason)
-      << "\"";
+      << "\""
+      << ",\"ic_stability_reason\":\""
+      << icStabilityReasonName(stability.reason) << "\""
+      << ",\"ic_stability_samples\":" << stability.samples
+      << ",\"ic_stability_first_calls\":" << stability.first_calls
+      << ",\"ic_stability_admission_calls\":" << stability.admission_calls
+      << ",\"ic_stability_sites\":" << stability.sites
+      << ",\"ic_stability_known_sites\":" << stability.ready_sites
+      << ",\"ic_stability_ready_sites\":" << stability.ready_sites
+      << ",\"ic_stability_skipped_sites\":" << stability.skipped_sites;
   if (key.has_value()) {
     out << ",\"shape\":{"
         << "\"family\":\"" << familyName(key->family) << "\""
@@ -441,6 +530,60 @@ void recordAutoJitInterpretedCall(const AutoJitGateState& state) {
   }
 }
 
+ICStabilityReason icStabilityBypassReason(
+    BorrowedRef<PyCodeObject> code,
+    const AutoJitGateState& state) {
+  if (!getConfig().auto_jit_ic_stability) {
+    return ICStabilityReason::Disabled;
+  }
+  if (!getConfig().auto_classify) {
+    return ICStabilityReason::NonAuto;
+  }
+  auto module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    return ICStabilityReason::Unsupported;
+  }
+  if ((code->co_flags &
+       (CI_CO_STATICALLY_COMPILED | CO_GENERATOR | CO_COROUTINE |
+        CO_ASYNC_GENERATOR)) != 0 ||
+      module_state->jit_list != nullptr) {
+    return ICStabilityReason::Explicit;
+  }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+  // Read history before roiBackoffStateAllowsCompile() consumes its recompile
+  // floor. Warmup observation and admission share this same bypass decision.
+  if (state.extra != nullptr &&
+      (state.extra->roi_ctl != 0 || state.extra->roi_deopt_count != 0 ||
+       state.extra->roi_recompile_floor != 0 ||
+       state.extra->roi_aging_epoch_ms != 0)) {
+    return ICStabilityReason::ROI;
+  }
+#endif
+  return ICStabilityReason::None;
+}
+
+void observeAutoJitICWarmup(
+    BorrowedRef<PyCodeObject> code,
+    const AutoJitGateState& state,
+    uint32_t threshold,
+    ICStabilityReason bypass_reason) {
+  if (bypass_reason != ICStabilityReason::None || state.calls == 0) {
+    return;
+  }
+  // Reuse the known threshold without running classification again. Collect
+  // near it to avoid full IC scans throughout a long interpreted warmup.
+  constexpr uint64_t warmup_span =
+      kICStabilitySampleInterval * (kICStabilityRequiredSamples - 1);
+  uint64_t first_sample = threshold > warmup_span ? threshold - warmup_span : 1;
+  if (state.calls < first_sample ||
+      (state.extra != nullptr &&
+       (Ci_code_extra_load_skey_acquire(state.extra) & kSkeyDecidedColdBit))) {
+    return;
+  }
+  recordICStabilityStats(observeICStabilityWarmup(code, state.calls), false);
+}
+
 bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code);
 
 uint32_t roiBackoffRound(uint32_t ctl) {
@@ -507,7 +650,9 @@ bool roiBackoffCtlPending(uint32_t ctl) {
   return (ctl & CI_CODE_EXTRA_ROI_PENDING_BIT) != 0;
 }
 
-bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
+bool roiBackoffStateAllowsCompile(
+    CodeExtra* extra,
+    std::optional<uint64_t> observed_calls = std::nullopt) {
   if (!getConfig().roi_backoff_enabled || extra == nullptr) {
     return true;
   }
@@ -522,7 +667,7 @@ bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
     return true;
   }
 
-  uint64_t calls = Ci_code_extra_get_calls(extra);
+  uint64_t calls = observed_calls.value_or(Ci_code_extra_get_calls(extra));
   if (calls < floor) {
     return false;
   }
@@ -676,9 +821,11 @@ PyObject* jitVectorcall(
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     AutoJitGateState state = readAutoJitGateState(code);
+    ICStabilityReason stability_bypass = icStabilityBypassReason(code, state);
     if (state.calls < *limit) {
       incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
       auto entry = getInterpretedVectorcall(func);
+      observeAutoJitICWarmup(code, state, *limit, stability_bypass);
       recordAutoJitInterpretedCall(state);
       return entry(func_obj, stack, nargsf, kwnames);
     }
@@ -728,12 +875,29 @@ PyObject* jitVectorcall(
         setVectorcall(func, entry);
       } else {
         incAutoJitGateStat(g_auto_jit_gate_stats.classified_warmup_return);
+        observeAutoJitICWarmup(code, state, effective_limit, stability_bypass);
         recordAutoJitInterpretedCall(state);
       }
       return entry(func_obj, stack, nargsf, kwnames);
     }
 
-    writeAutoJitCompileEvent(func, state, key, decision, effective_limit);
+    stability_bypass = icStabilityAdmissionBypassReason(stability_bypass, key);
+    ICStabilityDecision stability;
+    stability.first_calls = state.calls;
+    stability.admission_calls = state.calls;
+    if (stability_bypass != ICStabilityReason::None) {
+      stability.reason = stability_bypass;
+    } else {
+      stability = checkICStabilityAdmission(code, state.calls);
+    }
+    recordICStabilityStats(stability);
+    if (stability.defer) {
+      auto entry = getInterpretedVectorcall(func);
+      recordAutoJitInterpretedCall(state);
+      return entry(func_obj, stack, nargsf, kwnames);
+    }
+    writeAutoJitCompileEvent(
+        func, state, key, decision, effective_limit, stability);
   }
 
   incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile);
@@ -775,13 +939,13 @@ size_t parse_sized_argument(const std::string& val) {
   // " 1024 k" should parse OK - so remove the space.
   std::remove_copy_if(
       val.begin(), val.end(), std::back_inserter(parsed), ::isspace);
-  JIT_CHECK(!parsed.empty(), "Input string is empty");
+  JIT_THROW_IF(parsed.empty(), "Input string is empty");
   static_assert(
       sizeof(decltype(std::stoull(parsed))) == sizeof(size_t),
       "stoull parses to size_t size");
   size_t scale = 1;
   // "1024k" and "1024K" are the same - so upper case.
-  char lastChar = std::toupper(parsed.back());
+  char lastChar = std::toupper(static_cast<unsigned char>(parsed.back()));
   switch (lastChar) {
     case 'K':
       scale = 1024;
@@ -796,18 +960,20 @@ size_t parse_sized_argument(const std::string& val) {
       parsed.pop_back();
       break;
     default:
-      JIT_CHECK(
-          std::isdigit(lastChar), "Invalid character in input string: {}", val);
+      JIT_THROW_IF(
+          !std::isdigit(static_cast<unsigned char>(lastChar)),
+          "Invalid character in input string: {}",
+          val);
   }
   size_t ret_value{0};
   auto p_last = parsed.data() + parsed.size();
   auto int_ok = std::from_chars(parsed.data(), p_last, ret_value);
-  JIT_CHECK(
-      int_ok.ec == std::errc() && int_ok.ptr == p_last,
+  JIT_THROW_IF(
+      int_ok.ec != std::errc() || int_ok.ptr != p_last,
       "Invalid unsigned integer in input string: '{}'",
       val);
-  JIT_CHECK(
-      ret_value <= (std::numeric_limits<size_t>::max() / scale),
+  JIT_THROW_IF(
+      ret_value > (std::numeric_limits<size_t>::max() / scale),
       "Unsigned Integer overflow in input string: '{}'",
       val);
   return ret_value * scale;
@@ -869,6 +1035,7 @@ bool parseAutoJitOption(const std::string& value) {
 }
 
 bool g_auto_jit_option_valid = true;
+bool g_startup_grace_option_valid = true;
 
 FlagProcessor initFlagProcessor() {
   FlagProcessor flag_processor;
@@ -898,12 +1065,47 @@ FlagProcessor initFlagProcessor() {
       "threshold");
 
 #if PY_VERSION_HEX < 0x030C0000
+  flag_processor
+      .addOption(
+          "jit-startup-grace-ms",
+          "CINDERX_JIT_STARTUP_GRACE_MS",
+          [](const std::string& value) {
+            uint32_t ms;
+            g_startup_grace_option_valid = parse_uint32_arg(value, &ms);
+            if (g_startup_grace_option_valid) {
+              getMutableConfig().auto_jit_startup_grace_ms = ms;
+            }
+          },
+          "Delay CPython 3.11 automatic compilation during startup "
+          "(default 100 milliseconds; 0 disables the delay)")
+      .withFlagParamName("MS");
+  flag_processor.addOption(
+      "jit-fork-grace",
+      "CINDERX_JIT_FORK_GRACE",
+      getMutableConfig().auto_jit_fork_grace,
+      "Restart the CPython 3.11 startup grace period after fork");
+  flag_processor.addOption(
+      "jit-despecialize",
+      "CINDERX_JIT_DESPECIALIZE",
+      getMutableConfig().auto_jit_despecialize,
+      "Allow one generic retry after a CPython 3.11 guard-failure round");
+  flag_processor.addOption(
+      "jit-force-deopt-checks",
+      "CINDERX_JIT_FORCE_DEOPT_CHECKS",
+      getMutableConfig().emit_force_deopt_checks,
+      "Emit CPython 3.11 forced-deoptimization checks (enabled by default)");
+  flag_processor.addOption(
+      "jit-auto-size-scaling",
+      "CINDERX_JIT_AUTO_SIZE_SCALING",
+      getMutableConfig().auto_jit_size_scaling,
+      "Scale automatic compile thresholds for large straight-line "
+      "CPython 3.11 code (disabled by default)");
   flag_processor.addOption(
       "jit-generator",
       "PYTHONJITGENERATOR",
       getMutableConfig().sync_generator_jit,
-      "Enable explicit CPython 3.11 synchronous-generator JIT execution; "
-      "automatic generator compilation remains disabled");
+      "Enable CPython 3.11 synchronous-generator JIT execution (explicit "
+      "and automatic compilation alike)");
 #endif
 
   flag_processor.addOption(
@@ -928,6 +1130,13 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().roi_backoff_enabled,
       "Enable or disable AutoJIT dynamic negative-ROI backoff after "
       "repeated deopts");
+
+  flag_processor.addOption(
+      "jit-auto-ic-stability",
+      "CINDERX_AUTOJIT_IC_STABILITY",
+      getMutableConfig().auto_jit_ic_stability,
+      "Use bounded mature, stable interpreter feedback before classified "
+      "automatic compilation (CPython 3.14 with the GIL)");
 
   flag_processor.addOption(
       "jit-auto-roi-backoff-budget",
@@ -1261,6 +1470,8 @@ FlagProcessor initFlagProcessor() {
       "jit-primitive-unbox-cse",
       "PYTHONJITPRIMITIVEUNBOXCSE");
   HIR_OPTIMIZATION_OPTION(
+      "HIR pure-instruction CSE", hir_cse, "jit-hir-cse", "PYTHONJITHIRCSE");
+  HIR_OPTIMIZATION_OPTION(
       "simplify", simplify, "jit-simplify", "PYTHONJITSIMPLIFY");
 
   flag_processor.addOption(
@@ -1412,6 +1623,38 @@ FlagProcessor initFlagProcessor() {
       "Set the maximum code size for JIT in bytes (no suffix). For kilobytes "
       "use k or K as a suffix. "
       "Megabytes is m or M and gigabytes is g or G. 0 implies no limit.");
+
+  flag_processor.addOption(
+      "jit-max-hir-blocks",
+      "PYTHONJITMAXHIRBLOCKS",
+      getMutableConfig().max_hir_blocks,
+      "Set the maximum number of HIR basic blocks in a function when it "
+      "starts to be compiled. Larger functions are not compiled. Unlike "
+      "jit-max-code-size, 0 is not special: it rejects every function.");
+
+  flag_processor.addOption(
+      "jit-max-hir-instrs",
+      "PYTHONJITMAXHIRINSTRS",
+      getMutableConfig().max_hir_instrs,
+      "Set the maximum number of HIR instructions in a function when it "
+      "starts to be compiled. Larger functions are not compiled. Unlike "
+      "jit-max-code-size, 0 is not special: it rejects every function.");
+
+  flag_processor.addOption(
+      "jit-max-lir-blocks",
+      "PYTHONJITMAXLIRBLOCKS",
+      getMutableConfig().max_lir_blocks,
+      "Set the maximum number of LIR basic blocks in a compiled function. "
+      "Larger functions are not compiled. Unlike jit-max-code-size, 0 is not "
+      "special: it rejects every function.");
+
+  flag_processor.addOption(
+      "jit-max-lir-instrs",
+      "PYTHONJITMAXLIRINSTRS",
+      getMutableConfig().max_lir_instrs,
+      "Set the maximum number of LIR instructions in a compiled function. "
+      "Larger functions are not compiled. Unlike jit-max-code-size, 0 is not "
+      "special: it rejects every function.");
 
   flag_processor.addOption(
       "jit-emit-type-annotation-guards",
@@ -2143,6 +2386,14 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
 void uncompileImpl(BorrowedRef<PyFunctionObject> func) {
   deoptFuncImpl(func);
   jitCtx()->forgetCode(func);
+#if PY_VERSION_HEX < 0x030C0000
+  // This path is reachable from prepareForDeopt with the retiring artifact's
+  // machine code still live on the C stack (ROI-backoff despecialization
+  // runs at deopt time); the artifact's dealloc has deferred itself onto the
+  // graveyard in that case, and the sweep is a no-op until the stack
+  // unwinds.
+  Ci_JitShell311_SweepGraveyard();
+#endif
 }
 
 void uncompile(BorrowedRef<PyFunctionObject> func) {
@@ -2198,7 +2449,7 @@ void disable_jit_impl(bool deopt_all) {
   }
 
   if (isJitUsable()) {
-    getMutableConfig().state = State::kPaused;
+    ciSetJitState(State::kPaused);
     getMutableConfig().osr_capable = false;
     setInterpreterJitFlag(false);
     syncOSRFlags();
@@ -2349,7 +2600,7 @@ bool enable_jit_impl() {
   // only here; other versions keep the order they had.
   const State state_before_flip = getConfig().state;
   setInterpreterJitFlag(true);
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
   if (!reattachParkedFuncs()) {
     // enable() either completes or leaves the world as it found it.  The
@@ -2364,7 +2615,7 @@ bool enable_jit_impl() {
     // walk's anchor drain -- is not overwritten either.
     if (isJitUsable()) {
       setInterpreterJitFlag(false);
-      getMutableConfig().state = state_before_flip;
+      ciSetJitState(state_before_flip);
       syncOSRFlags();
     }
     return false;
@@ -2387,7 +2638,7 @@ bool enable_jit_impl() {
 #endif
 
   setInterpreterJitFlag(true);
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
 
   JIT_DLOG("Re-enabled the JIT");
@@ -2961,6 +3212,12 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
       jit_state, "code_runtimes_allocated", census.code_runtimes_allocated);
   rc |= lifecycleSetSize(
       jit_state, "code_runtimes_live", census.code_runtimes_live);
+  rc |=
+      lifecycleSetSize(jit_state, "subscript_caches", census.subscript_caches);
+  rc |=
+      lifecycleSetSize(jit_state, "predicate_caches", census.predicate_caches);
+  rc |= lifecycleSetSize(
+      jit_state, "numeric_spec_codes", jit::numericSpecCodeCount311());
   rc |= lifecycleSetSize(
       module,
       "registered_compilation_units",
@@ -3234,6 +3491,13 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // force_compile() reports through its return value and exceptions, never
+  // through the refusal slot: consume whatever this request recorded, on every
+  // exit, so it cannot be read as the reason of a later, unrelated compile.
+  SCOPE_EXIT(Ci_JitShell311_TakeExecuteRefusal());
+#endif
+
   // Compile the function.
   Result result;
   try {
@@ -3445,6 +3709,10 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
     claimed.reset();
     detained_anchors.clear();
     jitCtx()->drainDeferredAnchorReleases();
+    // An artifact whose machine code is still on the stack (this call made
+    // from inside the function being retired) has deferred its destruction;
+    // reclaim what can be reclaimed now.
+    Ci_JitShell311_SweepGraveyard();
     // Verdict AFTER the releases: a __del__ there can reenter
     // force_compile(), and a rebuilt compilation state is a newer decision
     // this operation must not report over (symmetric to force_compile's
@@ -3493,7 +3761,7 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
   for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
-    if (meta.frame_meta.empty()) {
+    if (meta.frame_meta.empty() || meta.forced_site_row >= 0) {
       continue;
     }
     auto site = Ref<>::steal(Py_BuildValue(
@@ -3544,6 +3812,13 @@ PyObject* force_deopt(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
   }
   if (n < 1) {
     PyErr_SetString(PyExc_ValueError, "force_deopt n must be >= 1");
+    return nullptr;
+  }
+  if (!jit::getConfig().emit_force_deopt_checks) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "force_deopt unavailable: forced-deopt checks are not emitted "
+        "(CINDERX_JIT_FORCE_DEOPT_CHECKS=0)");
     return nullptr;
   }
   Ref<jit::CompiledFunction> compiled = compiledArtifactFor311(func);
@@ -4400,7 +4675,34 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats,
           "roi_aging_count_reduced",
-          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0) {
+          g_auto_jit_gate_stats.roi_aging_count_reduced) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_sample",
+          g_auto_jit_gate_stats.ic_stability_sample) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_change",
+          g_auto_jit_gate_stats.ic_stability_change) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_defer",
+          g_auto_jit_gate_stats.ic_stability_defer) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_stable",
+          g_auto_jit_gate_stats.ic_stability_stable) != 0 ||
+      setAutoJitGateStat(
+          stats, "ic_stability_cap", g_auto_jit_gate_stats.ic_stability_cap) !=
+          0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_unknown",
+          g_auto_jit_gate_stats.ic_stability_unknown) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "ic_stability_bypass",
+          g_auto_jit_gate_stats.ic_stability_bypass) != 0) {
     return nullptr;
   }
 
@@ -4652,6 +4954,11 @@ int deopt_gen_visitor(PyObject* obj, void*) {
 PyObject* after_fork_child(PyObject*, PyObject*) {
 #ifndef WIN32
   perf::afterForkChild();
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  if (jit::getConfig().auto_jit_fork_grace) {
+    Ci_JitShell311_ResetStartupGrace();
+  }
 #endif
   Py_RETURN_NONE;
 }
@@ -5142,6 +5449,18 @@ PyModuleDef_Slot jit_slots[] = {
 // caller picked.  Canary therefore publishes only what its own evidence
 // needs, and each later milestone adds back what its acceptance covers.
 PyMethodDef jit_methods_311_canary[] = {
+    {"after_fork_child",
+     after_fork_child,
+     METH_NOARGS,
+     PyDoc_STR("Reset child-process JIT state after fork().")},
+    {"_autojit_gate_stats",
+     autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Return scheduling and ROI backoff counters.")},
+    {"_clear_autojit_gate_stats",
+     clear_autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Clear scheduling and ROI backoff counters.")},
     {"is_enabled",
      is_enabled,
      METH_NOARGS,
@@ -5266,6 +5585,18 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_NOARGS,
      PyDoc_STR("Per-class fill/hit/miss/invalidation tallies of the "
                "pull-validated attribute caches.")},
+    {"get_and_clear_inline_cache_stats",
+     get_and_clear_inline_cache_stats,
+     METH_NOARGS,
+     PyDoc_STR(
+         "Returns and clears information about the runtime inline cache stats "
+         "behavior of JIT-compiled code. Stats will only be collected with X "
+         "flag jit-enable-inline-cache-stats-collection.")},
+    {"is_inline_cache_stats_collection_enabled",
+     is_inline_cache_stats_collection_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True if jit-enable-inline-cache-stats-collection is on "
+               "and False otherwise.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -5643,6 +5974,18 @@ bool isLightweightFramesCompiledIn() {
 }
 
 int validateFrameModeConfig() {
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 runs the materialized frame only: the inline frame
+  // protocol below assumes it, and lightweight frames have no 3.11 delivery.
+  // The opt-in is refused rather than erroring so a shared environment
+  // keeps working; the frame-mode queries report normal frames.
+  if (getConfig().frame_mode == FrameMode::kLightweight) {
+    JIT_LOG(
+        "PYTHONJITLIGHTWEIGHTFRAME is not supported on CPython 3.11; "
+        "using normal frames");
+    getMutableConfig().frame_mode = FrameMode::kNormal;
+  }
+#endif
   if (getConfig().frame_mode == FrameMode::kLightweight &&
       !isLightweightFramesCompiledIn()) {
     PyErr_SetString(
@@ -5735,6 +6078,18 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 extern "C" int Ci_QuickenWarmupStep_311;
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+// Keep the retry decision with the code object so destruction/reuse cannot
+// transfer a stale mark, and parallel compilation can read it safely.
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code) {
+  if (code == nullptr) {
+    return 0;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  return extra != nullptr && Ci_code_extra_jit311_despecialized(extra);
+}
+#endif
+
 namespace jit {
 
 #if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
@@ -5783,6 +6138,40 @@ bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
   return roiBackoffStateAllowsCompile(extra);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+bool roiBackoffAllowsCompile311(
+    BorrowedRef<PyCodeObject> code,
+    uint64_t interpreted_calls) {
+  if (!getConfig().roi_backoff_enabled) {
+    return true;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra == nullptr) {
+    return true;
+  }
+  uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+  if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+    return false;
+  }
+  return interpreted_calls >=
+      Ci_code_extra_load_roi_recompile_floor_relaxed(extra);
+}
+
+void roiBackoffDidPublish311(BorrowedRef<PyCodeObject> code) {
+  if (!getConfig().roi_backoff_enabled) {
+    return;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr &&
+      Ci_code_extra_load_roi_recompile_floor_relaxed(extra) != 0) {
+    // Queries do not spend a retry. Only a successful automatic publication
+    // releases the floor, including reuse of an explicitly rebuilt artifact.
+    Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
+    incAutoJitGateStat(g_auto_jit_gate_stats.roi_recompile);
+  }
+}
+#endif
+
 namespace {
 
 class PreservePythonError {
@@ -5803,6 +6192,46 @@ class PreservePythonError {
   PyObject* value_{nullptr};
   PyObject* traceback_{nullptr};
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+// The artifact a code object runs through when no function object is
+// attached to it.  A comprehension body or a per-call closure is a fresh
+// function object every time (dispatched by code through the code-extra
+// cache, see Ci_JitShell311_CodeArtifactVectorcall); the artifact is kept
+// resident by the outer function's nested list, and compiledFuncs() never
+// names it once the few fresh-attached members have died.  Without this
+// arm the backoff returned early on that empty member set, which left such
+// a code deopting for the life of the process and rescanned every compiled
+// function on every further deopt.  Only an artifact with no members at all
+// qualifies; a member whose __code__ moved elsewhere keeps the function
+// path.
+CompiledFunction* roiByCodeArtifact311(
+    BorrowedRef<PyCodeObject> code,
+    CodeExtra* extra) {
+  auto* compiled = reinterpret_cast<CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr || compiled->runtime() == nullptr ||
+      compiled->runtime()->code() != code || !compiled->functions().empty()) {
+    return nullptr;
+  }
+  return compiled;
+}
+
+// Retire the by-code artifact: drop the outer function's anchor and the
+// code-extra cache entry so the by-code dispatch stops.  Its machine code
+// may be on the C stack right now (the backoff runs at deopt time); the
+// artifact's dealloc then defers itself onto the graveyard, which the sweep
+// drains once the stack has unwound.  The observer's slot is reopened by
+// the caller, which makes the next interpreted frames re-earn the threshold
+// and re-dispatch a compile.
+void retireByCodeArtifact311(BorrowedRef<CompiledFunction> compiled) {
+  {
+    Ref<CompiledFunction> pin = Ref<CompiledFunction>::create(compiled);
+    jitCtx()->forgetCodeForArtifact(nullptr, compiled);
+  }
+  Ci_JitShell311_SweepGraveyard();
+}
+#endif
 
 void triggerRoiBackoff(
     BorrowedRef<PyCodeObject> code,
@@ -5827,21 +6256,50 @@ void triggerRoiBackoff(
     }
   }
 
-  if (funcs.empty()) {
+  BorrowedRef<CompiledFunction> by_code;
+#if PY_VERSION_HEX < 0x030C0000
+  if (funcs.empty() && jitCtx() != nullptr) {
+    by_code = roiByCodeArtifact311(code, extra);
+  }
+#endif
+  if (funcs.empty() && by_code == nullptr) {
     Ci_code_extra_store_roi_ctl_release(extra, ctl);
     return;
   }
 
   uint32_t round = roiBackoffRound(ctl);
   uint32_t next_round = round + 1;
-  bool frozen = getConfig().roi_backoff_max_rounds == 0 ||
-      next_round >= getConfig().roi_backoff_max_rounds;
+  size_t max_rounds = getConfig().roi_backoff_max_rounds;
+#if PY_VERSION_HEX < 0x030C0000
+  constexpr uint32_t kMaxRound =
+      CI_CODE_EXTRA_ROI_ROUND_MASK >> CI_CODE_EXTRA_ROI_ROUND_SHIFT;
+  max_rounds = std::min<size_t>(max_rounds, kMaxRound);
+#endif
+  bool frozen = max_rounds == 0 || next_round >= max_rounds;
+#if PY_VERSION_HEX < 0x030C0000
+  // A guard-only round may earn one generic retry. Exception/mixed rounds
+  // and a second exhausted round retain the final retirement protection.
+  if (frozen && getConfig().auto_jit_despecialize &&
+      getConfig().roi_backoff_max_rounds != 0 &&
+      !Ci_code_extra_jit311_has_non_guard_deopt(extra) &&
+      Ci_code_extra_jit311_try_despecialize(extra)) {
+    frozen = false;
+  }
+#endif
 
   for (auto& func : funcs) {
     ::uncompileImpl(func);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (by_code != nullptr) {
+    retireByCodeArtifact311(by_code);
+  }
+#endif
 
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_code_extra_jit311_clear_non_guard_deopt(extra);
+#endif
   extra->roi_aging_epoch_ms = 0;
   if (frozen) {
     Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
@@ -5853,18 +6311,193 @@ void triggerRoiBackoff(
     return;
   }
 
+  // 3.11 counts the retry's interpreted calls in its observer slot. The
+  // legacy vectorcall scheduler uses a different counter and must not be
+  // installed as a competing scheduling door on this version.
+#if PY_VERSION_HEX < 0x030C0000
+  uint64_t calls = 0;
+#else
   uint64_t calls = Ci_code_extra_get_calls(extra);
+#endif
   Ci_code_extra_store_roi_recompile_floor_release(
       extra, roiBackoffRecompileFloor(calls, round));
   Ci_code_extra_store_roi_ctl_release(extra, roiBackoffCtlForRound(next_round));
   incAutoJitGateStat(g_auto_jit_gate_stats.roi_uncompile);
 
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_Observe311_ReopenSlotForCode(code.get());
+#else
   for (auto& func : funcs) {
     scheduleJitCompile(func);
   }
+#endif
 }
 
 } // namespace
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Per-site exception edges are earned, not eager.  An eager edge at every
+// raising site puts a CondBranch and a stub behind every call, binary op and
+// store, and the value copy it introduces breaks the box look-through of the
+// numeric lowerings (spectral_norm 2.8x, scimark_fft 2.5x, chaos +25% in the
+// eager form).  So a site's exception deopts are counted here; at the eighth
+// the site is granted its edge and the code recompiles in place -- the new
+// artifact is compiled and installed before the deopt hook returns, so the
+// function never reads as uncompiled and no call misses machine code.  Only
+// the sites the builder hooks (CALL, BINARY_OP, BINARY_SUBSCR, STORE_SUBSCR)
+// are eligible.  The state is keyed by code object and dropped with it
+// (every compiled code carries a CodeExtra, whose free function delivers the
+// code-death notification), so a reused address never inherits grants.
+struct ExcEdgeCodeState311 {
+  // Bytecode offsets (the instruction's base offset) whose exit is granted.
+  std::unordered_set<int64_t> granted;
+  // Stop counting rejected sites without enabling frame write-through.
+  std::unordered_set<int64_t> ineligible;
+  // Exception deopts counted per eligible site that is not yet granted.
+  std::unordered_map<int64_t, uint32_t> counts;
+};
+std::unordered_map<PyCodeObject*, ExcEdgeCodeState311> s_exc_edge_311;
+constexpr uint32_t kExcEdgeGrantAfter311 = 8;
+bool s_exc_edge_recompiling_311 = false;
+
+void excEdgeCodeDestroyed311(PyCodeObject* code) {
+  s_exc_edge_311.erase(code);
+}
+
+// Per-site numeric speculation fuses: the *_FLOAT binary-op guards, the
+// compact-long guards, the array.array typecode guards of subscript sites and
+// the evidence-free float diamonds of
+// SPIKE_FLOATSPEC=all.  Same lifetime as the exception-edge state above:
+// keyed by code object and dropped with it, so a reused address never
+// inherits a fuse.  Unlike that state, the builder and Simplify write here
+// (site registration, hit counters), and a batch compile runs them on several
+// worker threads at once, so every access holds s_numeric_spec_mutex_311.
+// The mutex is never held across a recompile, which re-enters the builder.
+struct NumericSpecSiteFuse311 {
+  // Sites whose speculation guard some artifact of the code has emitted.
+  std::unordered_set<int64_t> registered;
+  // Guard failures per registered site that is not yet taken down.
+  std::unordered_map<int64_t, uint64_t> fails;
+  // Sites a recompile must leave unspeculated.
+  std::unordered_set<int64_t> taken_down;
+};
+struct NumericSpecCodeState311 {
+  NumericSpecSiteFuse311 float_guard;
+  NumericSpecSiteFuse311 long_guard;
+  NumericSpecSiteFuse311 array_typecode;
+  // {hits, misses} per float diamond site (SPIKE_FLOATSPEC=all).  Compiled
+  // code bumps hits through the cell's address: map nodes do not move on
+  // rehash, and the cells die only with the code object, after its last
+  // artifact.
+  std::unordered_map<int64_t, std::array<uint64_t, 2>> float_spec_counters;
+  std::unordered_set<int64_t> float_spec_taken_down;
+};
+std::mutex s_numeric_spec_mutex_311;
+std::unordered_map<PyCodeObject*, NumericSpecCodeState311> s_numeric_spec_311;
+bool s_numeric_spec_recompiling_311 = false;
+
+void numericSpecCodeDestroyed311(PyCodeObject* code) {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  s_numeric_spec_311.erase(code);
+}
+
+void numericSpecClear311() {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  s_numeric_spec_311.clear();
+}
+
+// Recompile every artifact of `code` with the granted sites: uncompile and
+// compile again synchronously.  Reached from prepareForDeopt with the
+// retiring artifact's machine code still live on the C stack (the artifact
+// then defers itself onto the graveyard, as the ROI backoff relies on).  A
+// by-code artifact (no function object to compile through) is retired and
+// re-earned through the observer's slot instead.
+void recompileCodeForExcEdge311(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyFunctionObject> deopting_func) {
+  FreeThreadedJITEntrypointGuard guard;
+  if (jitCtx() == nullptr) {
+    return;
+  }
+  CodeExtra* extra = codeExtra(code);
+  if (extra != nullptr) {
+    uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+    if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+      // Being withdrawn by the ROI backoff; nothing to recompile.
+      return;
+    }
+  }
+  std::vector<Ref<PyFunctionObject>> funcs;
+  for (auto& entry : jitCtx()->compiledFuncs()) {
+    BorrowedRef<PyFunctionObject> func = entry.first;
+    if (reinterpret_cast<PyCodeObject*>(func->func_code) == code.get()) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+    }
+  }
+  BorrowedRef<CompiledFunction> by_code;
+  if (funcs.empty() && extra != nullptr) {
+    by_code = roiByCodeArtifact311(code, extra);
+  }
+  JIT_DLOG(
+      "exception-edge grant for {}: {} member function(s), by-code artifact "
+      "{}, deopting function {}",
+      codeQualname(code),
+      funcs.size(),
+      by_code != nullptr,
+      deopting_func != nullptr);
+  if (funcs.empty() && by_code == nullptr) {
+    return;
+  }
+  // The hook runs with the raising exception set; compiling must neither
+  // see it nor replace it.
+  PreservePythonError preserve_error;
+  for (auto& func : funcs) {
+    ::uncompileImpl(func);
+  }
+  if (by_code != nullptr) {
+    retireByCodeArtifact311(by_code);
+    // The by-code artifact had no registered member; the deopting
+    // activation's own function object is compiled through instead, and
+    // the publication re-arms the by-code dispatch for the fresh function
+    // objects that follow.  Without one the observer's slot is reopened
+    // for the code to re-earn its compile.
+    if (deopting_func != nullptr &&
+        reinterpret_cast<PyCodeObject*>(deopting_func->func_code) ==
+            code.get()) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(deopting_func.get()));
+    } else {
+      Ci_Observe311_ReopenSlotForCode(code.get());
+    }
+  }
+  for (auto& func : funcs) {
+    // A refusal here leaves the function interpreted until the scheduler
+    // compiles it again; the common outcome is the new artifact installed.
+    // This runs inside prepareForDeopt, below machine code on the C stack:
+    // no C++ exception may leave it.
+    try {
+      Result result = compileFunction(func);
+      JIT_DLOG(
+          "exception-edge recompile of {}: result {}",
+          funcFullname(func),
+          static_cast<int>(result));
+    } catch (const std::exception& exn) {
+      JIT_DLOG(
+          "exception-edge recompile of {} failed: {}",
+          funcFullname(func),
+          exn.what());
+    } catch (...) {
+      JIT_DLOG("exception-edge recompile of {} failed", funcFullname(func));
+    }
+  }
+}
+} // namespace
+
+size_t numericSpecCodeCount311() {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  return s_numeric_spec_311.size();
+}
+#endif
 
 void recordDeoptForRoiBackoff(
     CodeRuntime* code_runtime,
@@ -5917,6 +6550,11 @@ void recordDeoptForRoiBackoff(
     recordAutoJitAgingStats(update.count_reduced);
     count = update.count;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (reason != DeoptReason::kGuardFailure) {
+    Ci_code_extra_jit311_note_non_guard_deopt(extra);
+  }
+#endif
   if (count < budget) {
     return;
   }
@@ -5939,7 +6577,6 @@ int initialize() {
   auto use_stable_pointers = getConfig().use_stable_pointers;
 
 #if PY_VERSION_HEX < 0x030C0000
-  resetDictValueTransition311();
   // CPython 3.11 only initializes the compiler for the explicit shadow and
   // execute modes (or RuntimeTests' force-init hook). Observe and off stay
   // capability-gated before a compiler context or code allocator is
@@ -5967,6 +6604,7 @@ int initialize() {
   getMutableConfig().use_stable_pointers = use_stable_pointers;
 
   g_auto_jit_option_valid = true;
+  g_startup_grace_option_valid = true;
   FlagProcessor flag_processor = initFlagProcessor();
   if (flag_processor.hasHandled("jit-help")) {
     std::cout << flag_processor.jitXOptionHelpMessage() << '\n';
@@ -5974,6 +6612,15 @@ int initialize() {
     return -2;
   }
 #if PY_VERSION_HEX < 0x030C0000
+  if (!g_startup_grace_option_valid) {
+    Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "invalid CINDERX_JIT_STARTUP_GRACE_MS/-X jit-startup-grace-ms: "
+        "expected an integer from 0 to 4294967295");
+    return -1;
+  }
+  Ci_JitShell311_ResetStartupGrace();
   if (!g_auto_jit_option_valid) {
     Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
     PyErr_Format(
@@ -6021,6 +6668,8 @@ int initialize() {
   setCodeDestroyedHook([](PyCodeObject* code) {
     try {
       codeDestroyed(code);
+      excEdgeCodeDestroyed311(code);
+      numericSpecCodeDestroyed311(code);
       // The bookkeeping above is no-throw by construction; the injection
       // models a fault at the boundary's edge, after cleanup has run.
       throwIfJitPublishStepArmedForTest(11);
@@ -6052,9 +6701,15 @@ int initialize() {
     std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
     auto jit_context = std::make_unique<CompilerContext<Compiler>>();
     jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
     shadow_mod_state->code_allocator = std::move(code_allocator);
     shadow_mod_state->jit_context = std::move(jit_context);
-    getMutableConfig().state = State::kShadow;
+    ciSetJitState(State::kShadow);
     return 0;
   }
 
@@ -6071,12 +6726,16 @@ int initialize() {
   // 3.11 frames still leave machine code through the existing per-bytecode
   // instrumentation polls; the stack-IP patcher is a no-op for this frame
   // mode/architecture.
-  getMutableConfig().support_instrumentation = true;
-  // The 3.12+ behaviour classifier (PYTHONJITAUTO=auto[:N]) is not part of
-  // this port: the 3.11 scheduler takes a plain threshold, and the
-  // classifier's per-code state machine has no 3.11 opcode tables.  The
-  // observe parser already refuses the environment spelling; the -X
-  // option reaches only this flag, so refuse it here too.
+  // The per-bytecode instrumentation poll keeps the config default (off):
+  // a 3-opcode function body would pick up 13 CheckInstrumentation
+  // instructions from it.  sys.settrace/sys.setprofile pause the JIT and
+  // deoptimize the frames on the stack instead;
+  // PYTHONJITSUPPORTINSTRUMENTATION=1 restores the polls. The 3.12+ behaviour
+  // classifier (PYTHONJITAUTO=auto[:N]) is not part of this port: the 3.11
+  // scheduler takes a plain threshold, and the classifier's per-code state
+  // machine has no 3.11 opcode tables.  The observe parser already refuses the
+  // environment spelling; the -X option reaches only this flag, so refuse it
+  // here too.
   if (getConfig().auto_classify) {
     PyErr_SetString(
         PyExc_RuntimeError,
@@ -6130,6 +6789,12 @@ int initialize() {
     std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
     auto jit_context = std::make_unique<CompilerContext<Compiler>>();
     jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
     canary_mod_state->code_allocator = std::move(code_allocator);
     canary_mod_state->jit_context = std::move(jit_context);
   }
@@ -6140,6 +6805,9 @@ int initialize() {
       return -1;
     }
     jitCtx()->setCinderJitModule(Ref<>::steal(canary_mod));
+    if (register_fork_callback(canary_mod) < 0) {
+      return -1;
+    }
     patchSysSetProfileAndSetTrace(canary_mod);
   }
   // Sync generators now compile to machine code; copy stock gen/coro
@@ -6175,12 +6843,21 @@ int initialize() {
         "point; another component holds it");
     return -1;
   }
+  // SPIKE(ARRTC): the interpreter's subscript record reads an array's
+  // descriptor only for the validated array.array type object, and it runs
+  // inside the specializer, where resolving the type would re-enter the
+  // interpreter.  Resolve it here, before any site records; a failure leaves
+  // it unresolved and the record off.
+  static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+  if (spike_arrtc) {
+    jit::hir::getStdlibArrayType();
+  }
   // Publish process-global quickening policy only after execute-mode
   // initialization can no longer fail. CPython starts co_warmup at -8;
   // advancing by eight quickens on the first interpreted entry, before the
   // required PYTHONJITAUTO=2 compilation gate.
   Ci_QuickenWarmupStep_311 = 8;
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   return 0;
 #endif
 
@@ -6213,6 +6890,9 @@ int initialize() {
   // directly from the thread-local segment register instead of calling
   // _PyThreadState_GetCurrent().
   jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
 
   // Initialize the main compiler object and its context.  This will throw if
   // asmjit cannot initialize.
@@ -6236,7 +6916,7 @@ int initialize() {
 
   setInterpreterJitFlag(true);
   getMutableConfig().osr_capable = true;
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
 
   mod_state->jit_list = std::move(jit_list);
@@ -6269,9 +6949,12 @@ void finalize() {
   if (!isJitInitialized()) {
     return;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_SweepGraveyard();
+#endif
 
   if (isJitShadow()) {
-    getMutableConfig().state = State::kFinalizing;
+    ciSetJitState(State::kFinalizing);
     jit::executionEntryLedgerDisable();
     jit::runtimeTransitionLedgerDisable();
 
@@ -6296,15 +6979,17 @@ void finalize() {
     mod_state->code_allocator.reset();
     setCodeDestroyedHook(nullptr);
 #if PY_VERSION_HEX < 0x030C0000
+    s_exc_edge_311.clear();
+    numericSpecClear311();
     Ci_QuickenWarmupStep_311 = 1;
 #endif
-    getMutableConfig().state = State::kNotInitialized;
+    ciSetJitState(State::kNotInitialized);
     return;
   }
 
   // Disable the JIT first so nothing we do in here ends up attempting to
   // invoke the JIT while we're finalizing our data structures.
-  getMutableConfig().state = State::kFinalizing;
+  ciSetJitState(State::kFinalizing);
   setInterpreterJitFlag(false);
   syncOSRFlags();
   jit::executionEntryLedgerDisable();
@@ -6390,9 +7075,11 @@ void finalize() {
   setCodeDestroyedHook(nullptr);
 
 #if PY_VERSION_HEX < 0x030C0000
+  s_exc_edge_311.clear();
+  numericSpecClear311();
   Ci_QuickenWarmupStep_311 = 1;
 #endif
-  getMutableConfig().state = State::kNotInitialized;
+  ciSetJitState(State::kNotInitialized);
   getMutableConfig().osr_capable = false;
   syncOSRFlags();
 }
@@ -6589,6 +7276,13 @@ Result compileFunction(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<PyCodeObject> expected_code) {
   FreeThreadedJITEntrypointGuard guard;
+#if PY_VERSION_HEX < 0x030C0000
+  // A refusal reason belongs to the request that recorded it.  Drop any reason
+  // an earlier request left behind, so that whoever reads the reason after
+  // this call -- even on an early return below -- only ever sees one this
+  // request produced.
+  Ci_JitShell311_TakeExecuteRefusal();
+#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }
@@ -6955,9 +7649,15 @@ Result compilePreloaderImpl(
       }
       return Result::OK;
     } else if (jit_ctx->hasCompletedCompile(key)) {
-      // We're in the multi-threaded scenario we've created the
-      // CompiledFunctionData and will create the CompiledFunction at the end
-      return Result::OK;
+      // Multi-threaded compile: a worker already produced the
+      // CompiledFunctionData for this key, and finalizeMultiThreadedCompile()
+      // turns it into a CompiledFunction after the workers have joined.  That
+      // step only attaches the function the data was recorded with, so a
+      // further function sharing the same code must be attached afterwards.
+      // Reporting it as scheduled puts it on the serial retry list, where
+      // lookupCode() finds the published artifact and finalizeFunc() attaches
+      // it.  A bare code object (nested function) has nothing to attach.
+      return func != nullptr ? Result::ALREADY_SCHEDULED : Result::OK;
     } else if (!jit_ctx->addActiveCompile(key)) {
       // The compilation is in-flight on another thread
       return Result::ALREADY_SCHEDULED;
@@ -6965,8 +7665,13 @@ Result compilePreloaderImpl(
   }
 
   std::optional<CompiledFunctionData> compiled_func;
+  [[maybe_unused]] bool over_budget = false;
   try {
     compiled_func = jit_ctx->compiler().Compile(preloader);
+  } catch (const CompileBudgetExceeded& exn) {
+    // The function is too large to be worth compiling; it stays interpreted.
+    JIT_DLOG("{}", exn.what());
+    over_budget = true;
   } catch (const std::exception& exn) {
     JIT_DLOG("{}", exn.what());
   }
@@ -6974,6 +7679,14 @@ Result compilePreloaderImpl(
   ThreadedCompileSerialize guard;
   jit_ctx->removeActiveCompile(key);
   if (!compiled_func.has_value()) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (over_budget) {
+      // The refusal reason was recorded where the budget was checked; report
+      // it as a refusal (not as a compiler failure) so that
+      // _jit311_compile_diagnostic() and the scheduling gate name it.
+      return Result::CANNOT_SPECIALIZE;
+    }
+#endif
     return Result::UNKNOWN_ERROR;
   }
 
@@ -7000,9 +7713,15 @@ Result compilePreloaderImpl(
   // Re-verify after the drain, so OK still means what the control plane
   // defines it to mean: this function's calls execute machine code as
   // this returns.
-  jit_ctx->drainDeferredAnchorReleases();
-  if (func != nullptr && !isJitCompiled(func)) {
-    return Result::CANNOT_SPECIALIZE;
+  // During a multi-threaded batch the publication was only parked: the
+  // CompiledFunction is created and the function attached by
+  // finalizeMultiThreadedCompile() on the main thread, so the verdict cannot
+  // be taken here and nothing was displaced yet.
+  if (!getThreadedCompileContext().compileRunning()) {
+    jit_ctx->drainDeferredAnchorReleases();
+    if (func != nullptr && !isJitCompiled(func)) {
+      return Result::CANNOT_SPECIALIZE;
+    }
   }
 #else
   jit_ctx->codeCompiled(func, key, std::move(*compiled_func));
@@ -7012,3 +7731,337 @@ Result compilePreloaderImpl(
 }
 
 } // namespace jit
+
+#if PY_VERSION_HEX < 0x030C0000
+int Ci_ExcEdgeCodeHasGrant311(PyCodeObject* code) {
+  if (jit::s_exc_edge_311.empty()) {
+    return 0;
+  }
+  auto it = jit::s_exc_edge_311.find(code);
+  return it != jit::s_exc_edge_311.end() && !it->second.granted.empty();
+}
+
+int Ci_ExcEdgeSiteGranted311(PyCodeObject* code, int64_t bc_offset) {
+  if (jit::s_exc_edge_311.empty()) {
+    return 0;
+  }
+  auto it = jit::s_exc_edge_311.find(code);
+  return it != jit::s_exc_edge_311.end() &&
+      it->second.granted.count(bc_offset) != 0;
+}
+
+void Ci_ExcEdgeDeopt311(
+    PyCodeObject* code,
+    int64_t bc_offset,
+    int guard_failure,
+    PyObject* func) {
+  if (code == nullptr || bc_offset < 0 ||
+      (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
+          0) {
+    return;
+  }
+  jit::BytecodeInstruction instr{code, BCOffset{bc_offset}};
+  switch (instr.opcode()) {
+    case BINARY_SUBSCR:
+      // Both exits count here: the inline bounds check of a list/tuple/str
+      // subscript is a guard (the interpreter re-executes the subscript and
+      // raises), the generic form an exception exit.
+      break;
+    case CALL:
+    case BINARY_OP:
+    case STORE_SUBSCR:
+      // Guard failures at these sites belong to the type speculation.
+      if (guard_failure) {
+        return;
+      }
+      break;
+    default:
+      return;
+  }
+  jit::ExcEdgeCodeState311& state = jit::s_exc_edge_311[code];
+  if (state.granted.count(bc_offset) != 0 ||
+      state.ineligible.count(bc_offset) != 0) {
+    // Already classified. A granted site can still deopt if
+    // instrumentation declined its edge.
+    return;
+  }
+  uint32_t fails = ++state.counts[bc_offset];
+  if (fails < jit::kExcEdgeGrantAfter311 || jit::s_exc_edge_recompiling_311) {
+    return;
+  }
+  state.counts.erase(bc_offset);
+  if (!jit::hir::excEdgeCapable311(code, bc_offset)) {
+    state.ineligible.insert(bc_offset);
+    JIT_DLOG(
+        "exception-edge site {}+{} is not edge-capable",
+        codeQualname(code),
+        bc_offset);
+    // Under a row the builder does not compile (with, finally, a handler's
+    // own body) or under no row at all: stop counting without a grant.
+    // The deopt exit stays and spends the ROI budget as before.
+    return;
+  }
+  state.granted.insert(bc_offset);
+  jit::s_exc_edge_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_exc_edge_recompiling_311 = false);
+  jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});
+}
+
+// SPIKE(FLOATSPEC, LONGSPEC, BINTYPED, ARRTC): the per-site numeric
+// speculation fuses declared in jit_rt.h; the state lives in
+// jit::s_numeric_spec_311.
+namespace {
+// A guard that has failed this often at one site is recompiled away there.
+constexpr uint64_t kNumericGuardFailMax311 = 8;
+// An evidence-free float diamond (SPIKE_FLOATSPEC=all) is taken down only
+// when it is (nearly) never float: at least this many misses, and at least
+// kFloatSpecMissPerHit311 misses per hit.  An absolute count alone took
+// raytrace down (int coordinates on every site, but only a few percent of
+// executions); at a 60% miss rate the diamond still beat the generic op.
+constexpr uint64_t kFloatSpecMissMin311 = 256;
+constexpr uint64_t kFloatSpecMissPerHit311 = 4;
+
+using NumericSpecFuseOf311 =
+    jit::NumericSpecSiteFuse311 jit::NumericSpecCodeState311::*;
+
+// True when `compiled` inlined `code`, so its machine code also holds that
+// code's guard sites.
+bool artifactInlines311(
+    BorrowedRef<CompiledFunction> compiled,
+    PyCodeObject* code) {
+  CodeRuntime* runtime = compiled->runtime();
+  if (runtime == nullptr) {
+    return false;
+  }
+  for (const DeoptMetadata& meta : runtime->deoptMetadatas()) {
+    for (size_t i = 1; i < meta.frame_meta.size(); ++i) {
+      if (meta.frame_meta[i].code == code) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Uncompile every artifact holding a site of `code` and compile it again; the
+// recompile consults the taken-down sites.  That is every function of `code`,
+// every function whose artifact inlined `code`, and a by-code artifact of
+// `code` (fresh function objects dispatched by code, no member to recompile
+// through), which is retired and re-earned through the observer's slot as the
+// exception-edge grant does.  Reached from a deopt or a diamond's generic arm
+// with the retiring artifact still on the C stack, which then defers itself
+// onto the graveyard.
+void recompileCodeForNumericSpec311(
+    PyCodeObject* code,
+    const char* fuse,
+    int64_t bc_offset,
+    uint64_t count) {
+  if (jitCtx() == nullptr) {
+    return;
+  }
+  FreeThreadedJITEntrypointGuard guard;
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr) {
+    uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+    if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+      // Being withdrawn by the ROI backoff; nothing to recompile.
+      return;
+    }
+  }
+  std::vector<Ref<PyFunctionObject>> funcs;
+  for (auto& entry : jitCtx()->compiledFuncs()) {
+    BorrowedRef<PyFunctionObject> func = entry.first;
+    if (reinterpret_cast<PyCodeObject*>(func->func_code) == code ||
+        artifactInlines311(entry.second, code)) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+    }
+  }
+  BorrowedRef<CompiledFunction> by_code;
+  if (extra != nullptr) {
+    by_code = jit::roiByCodeArtifact311(code, extra);
+  }
+  JIT_DLOG(
+      "numeric speculation fuse {} blew at {}+{} after {}; recompiling {} "
+      "function(s), by-code artifact {}",
+      fuse,
+      codeQualname(code),
+      bc_offset,
+      count,
+      funcs.size(),
+      by_code != nullptr);
+  for (auto& func : funcs) {
+    ::uncompileImpl(func);
+  }
+  if (by_code != nullptr) {
+    jit::retireByCodeArtifact311(by_code);
+  }
+  Ci_Observe311_ReopenSlotForCode(code);
+  for (auto& func : funcs) {
+    scheduleJitCompile(func);
+  }
+}
+
+void registerGuardSite311(
+    NumericSpecFuseOf311 fuse_of,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  (jit::s_numeric_spec_311[code].*fuse_of).registered.insert(bc_offset);
+}
+
+bool guardSiteTakenDown311(
+    NumericSpecFuseOf311 fuse_of,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  auto it = jit::s_numeric_spec_311.find(code);
+  return it != jit::s_numeric_spec_311.end() &&
+      (it->second.*fuse_of).taken_down.count(bc_offset) != 0;
+}
+
+void guardFailed311(
+    NumericSpecFuseOf311 fuse_of,
+    const char* fuse_name,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  if (jit::s_numeric_spec_recompiling_311) {
+    return;
+  }
+  uint64_t fails = 0;
+  {
+    std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+    auto it = jit::s_numeric_spec_311.find(code);
+    if (it == jit::s_numeric_spec_311.end()) {
+      return;
+    }
+    jit::NumericSpecSiteFuse311& fuse = it->second.*fuse_of;
+    if (fuse.registered.count(bc_offset) == 0 ||
+        fuse.taken_down.count(bc_offset) != 0) {
+      return;
+    }
+    fails = ++fuse.fails[bc_offset];
+    if (fails < kNumericGuardFailMax311) {
+      return;
+    }
+    fuse.fails.erase(bc_offset);
+    fuse.taken_down.insert(bc_offset);
+  }
+  jit::s_numeric_spec_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_numeric_spec_recompiling_311 = false);
+  recompileCodeForNumericSpec311(code, fuse_name, bc_offset, fails);
+}
+} // namespace
+
+extern "C" uint64_t* Ci_SpikeFloatSpecSiteCounters311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  return jit::s_numeric_spec_311[code].float_spec_counters[bc_offset].data();
+}
+
+extern "C" int Ci_SpikeNoFloatSpec311(PyCodeObject* code, int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  auto it = jit::s_numeric_spec_311.find(code);
+  return it != jit::s_numeric_spec_311.end() &&
+      it->second.float_spec_taken_down.count(bc_offset) != 0;
+}
+
+extern "C" void Ci_SpikeFloatSpecMiss311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  uint64_t misses = 0;
+  {
+    std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+    jit::NumericSpecCodeState311& state = jit::s_numeric_spec_311[code];
+    std::array<uint64_t, 2>& cell = state.float_spec_counters[bc_offset];
+    uint64_t hits = cell[0];
+    misses = ++cell[1];
+    if (misses < kFloatSpecMissMin311 ||
+        misses < hits * kFloatSpecMissPerHit311 ||
+        jit::s_numeric_spec_recompiling_311 ||
+        !state.float_spec_taken_down.insert(bc_offset).second) {
+      return;
+    }
+  }
+  jit::s_numeric_spec_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_numeric_spec_recompiling_311 = false);
+  recompileCodeForNumericSpec311(code, "float-spec-miss", bc_offset, misses);
+}
+
+// SPIKE(LONGSPEC): a compact-long guard that keeps failing at one site
+// (pyflate's `(1 << n) - 1`: the shift result is never compact) is recompiled
+// without the speculation at that site only.  The per-code despec fuse would
+// instead drop every specialisation in the function and land below the
+// unspeculated baseline.
+extern "C" void Ci_SpikeLongSpecRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::long_guard, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoLongSpec311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::long_guard, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeLongSpecGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::long_guard, "long-guard", code, bc_offset);
+}
+
+// SPIKE(BINTYPED): a per-site fuse for the *_FLOAT binary-op guards.  A
+// blanket diamond at every float site doubled nbody (the Phi at the join
+// blocks the unbox/box folding that keeps float expression chains in
+// registers), so the diamond is applied only where a guard has actually kept
+// failing (spectral_norm's `eval_A(i, j) * u_j` with an int-seeded `u`,
+// raytrace's mixed leaf arithmetic).
+extern "C" void Ci_SpikeFloatGuardRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::float_guard, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoFloatGuard311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::float_guard, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeFloatGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::float_guard,
+      "float-guard",
+      code,
+      bc_offset);
+}
+
+// SPIKE(ARRTC): the same fuse for the array.array typecode speculation of
+// subscript sites.  Kept apart from the LONGSPEC fuse so that a site's index
+// arithmetic and its container speculation do not share a failure count.
+extern "C" void Ci_SpikeArrTcRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::array_typecode, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoArrTc311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::array_typecode, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeArrTcGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::array_typecode,
+      "array-typecode",
+      code,
+      bc_offset);
+}
+#endif

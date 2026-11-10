@@ -1,0 +1,20 @@
+{
+  "golden_additions": {
+    "hir_cse_test.txt": "156c4ab4477a9835b9ae67d7e934e5b7ae8a4b989d42164b8238b7fa7b1cf29d"
+  },
+  "test_additions": {
+    "CodeLayoutTest.AppendingKnownSuccessorDoesNotDuplicateItsEdge": "pass",
+    "CodeLayoutTest.ColdSinkPreservesStableOrderAndControlFlow": "pass",
+    "CodeLayoutTest.NearDeoptPlacementHonorsSizeAndSectionBoundaries": "skip",
+    "CodeLayoutTest.PostAllocationAddsBranchesForDisplacedSuccessors": "pass",
+    "CodeLayoutTest.PostAllocationBranchesAcrossAdjacentCodeSections": "pass",
+    "CodeLayoutTest.PostAllocationKeepsAdjacentSameSectionFallthrough": "pass",
+    "HirCSENonceTest.MemoryReadsAndObjectBoxesStayDistinct": "pass",
+    "HirCSENonceTest.PreservesExplicitlyIdentifiedDeoptimizationSites": "pass",
+    "HirCSENonceTest.PrimitiveKeysPreserveTypesOperatorsAndOperandOrder": "pass",
+    "HirCSENonceTest.SiblingExpressionsAndGuardsDoNotEscapeTheirScope": "pass",
+    "HirCSETest.MergesRepeatedCompactLongChecksAndUnboxesAndDropsDominatedGuard": "pass",
+    "HirCSETest.ReusesAcrossDominatedBlocksButNotAcrossSiblings": "pass"
+  },
+  "skip_reason": "CodeLayoutTest.NearDeoptPlacementHonorsSizeAndSectionBoundaries: CP314 default SPIKE_DEOPTSINK is disabled; CP311 AArch64 executes the boundary test."
+}

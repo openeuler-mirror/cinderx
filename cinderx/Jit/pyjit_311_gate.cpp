@@ -24,13 +24,16 @@
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
+#include "cinderx/Interpreter/3.11/cinder_opcode.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/direct_entry_gate_311.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/pyjit.h"
@@ -38,11 +41,14 @@
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -236,7 +242,13 @@ constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
 constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
 #endif
 
-thread_local std::uintptr_t t_c_stack_soft_limit = 0;
+// The generated entry guard reads this at a constant offset from the thread
+// pointer, so it must live in the static TLS block of every thread.  The
+// initial-exec model pins it there (a dlopen'd module takes the slot from
+// glibc's static-TLS surplus); the dynamic model would place it in a
+// per-thread DTV block at a thread-dependent offset.
+thread_local std::uintptr_t t_c_stack_soft_limit
+    __attribute__((tls_model("initial-exec"))) = 0;
 thread_local std::uintptr_t t_c_stack_hard_limit = 0;
 thread_local jit::CompiledFunction* t_invocation_artifact = nullptr;
 
@@ -322,6 +334,60 @@ bool cStackSoftLimitReached311() {
 }
 
 } // namespace
+
+#if defined(CINDER_AARCH64)
+// Direct entry re-proves the C-stack soft limit in the generated entry guard
+// instead of the shell.  The limit is thread-local; the guard reads it at a
+// constant offset from the thread pointer.  The variable is declared with the
+// initial-exec TLS model, so that offset is fixed by the static TLS layout
+// and identical in every thread; it is taken once from the calling thread.
+// No helper thread is created for this: glibc clears __libc_single_threaded
+// for good on the first pthread_create, after which every mutex in the
+// process (the GIL, SQLite, malloc arenas) pays the atomic path.
+namespace {
+int32_t g_cstack_soft_limit_tls_offset311 = -1;
+}
+
+extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void) {
+  std::uintptr_t tp = 0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  const std::intptr_t here =
+      reinterpret_cast<std::intptr_t>(&t_c_stack_soft_limit) -
+      static_cast<std::intptr_t>(tp);
+  if (here >= INT32_MIN && here <= INT32_MAX) {
+    g_cstack_soft_limit_tls_offset311 = static_cast<int32_t>(here);
+  } else {
+    g_cstack_soft_limit_tls_offset311 = -1;
+  }
+}
+
+extern "C" int32_t Ci_JitShell311_CStackSoftLimitTlsOffset(void) {
+  return g_cstack_soft_limit_tls_offset311;
+}
+
+// First compiled call on a thread: establish its limits.  The guard stub
+// preserves the vectorcall registers around this call and then diverts the
+// call to the interpreter, so the limit is in place from the next call on.
+extern "C" void Ci_JitShell311_InitCStackLimits(void) {
+  initCStackLimits311();
+}
+
+// Fallback for the guard when the TLS offset is unknown: the full C check.
+extern "C" int Ci_JitShell311_CStackSoftLimitReached(void) {
+  return cStackSoftLimitReached311() ? 1 : 0;
+}
+
+// vectorcall-shaped: the guard tail-branches here when the stack pointer is
+// below the soft limit, mirroring the shell's RecursionError.
+extern "C" PyObject* Ci_JitShell311_CStackOverflow(
+    PyObject* /* func */,
+    PyObject* const* /* args */,
+    size_t /* nargsf */,
+    PyObject* /* kwnames */) {
+  PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+  return nullptr;
+}
+#endif
 
 // The strict MR-04 execute surface: everything the shadow eligibility
 // rejects, plus the argument shape, the artifact ownership rule and the
@@ -438,7 +504,7 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
   if (compiled == nullptr ||
       (func->vectorcall !=
            reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry) &&
-       func->vectorcall != compiled->artifactGuardedEntry311()) ||
+       !compiled->isInstalledEntry311(func->vectorcall)) ||
       extra->jit_globals != func->func_globals ||
       extra->jit_builtins != func->func_builtins ||
       // The artifact must be this function's own.
@@ -450,6 +516,95 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
 
 extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
   return t_invocation_artifact;
+}
+
+// Direct entry has no per-call C shell to fail closed when the frame
+// evaluator is gone or the JIT is paused/disabled, so the generated entry
+// guard reads this byte instead: 1 while the evaluator is installed and the
+// JIT is usable.  Refreshed on every state transition of either input.
+// The guard reads two things through one materialized address: the usable
+// byte (JIT state, refreshed on every transition) and the evaluator our
+// frames expect in the interpreter's PEP 523 slot (compared live on every
+// entry, so a third party replacing the slot is noticed without a refresh).
+extern "C" PyObject*
+Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag);
+extern "C" Ci_JitDirectEntryGate311Layout Ci_JitDirectEntryGate311 = {
+    nullptr,
+    0};
+extern "C" void Ci_JitShell311_RefreshDirectEntryGate(void) {
+  Ci_JitDirectEntryGate311.eval_frame = reinterpret_cast<void*>(&Ci_EvalFrame);
+  Ci_JitDirectEntryGate311.usable =
+      Ci_EvalHook311_IsInstalled() && jit::isJitUsable() ? 1 : 0;
+}
+
+// Artifact lifetime under direct entry.  The guarded C shell pinned the
+// artifact for the duration of every call; the generated entry does not.
+// Instead every compilation that links its frame inline counts itself in
+// and out of Ci_JitActiveFrames311 (entry at the inline frame link and at an
+// OSR entry, exit at the hard-exit epilogue that normal returns, exceptions
+// and deopt exits all pass through), and an artifact whose last reference
+// is dropped while any such frame is live is not destroyed: its dealloc
+// resurrects it onto the graveyard, and the graveyard is swept -- the
+// deferred destruction runs -- at the next safe point with no machine-code
+// frame on any stack (compile, uncompile, finalize, or the next evaluator
+// frame).  This covers every release path -- force_uncompile, clearing the
+// function's __dict__, GC, artifact replacement, ROI backoff from a deopt --
+// in one place, and the graveyard drains as soon as the stack unwinds.
+extern "C" uint8_t Ci_JitGraveyardPending311 = 0;
+
+namespace {
+// Intrusive singly linked chain through CompiledFunction::graveyard_next_311;
+// parking an artifact allocates nothing, so a failed allocation can never
+// escape tp_dealloc or leave a resurrected object untracked.
+PyObject* g_artifact_graveyard_head = nullptr;
+size_t g_artifact_graveyard_size = 0;
+
+jit::CompiledFunction* asArtifact(PyObject* artifact) {
+  return reinterpret_cast<jit::CompiledFunction*>(artifact);
+}
+} // namespace
+
+extern "C" int Ci_JitShell311_ArtifactClearDeferred(void) {
+  return *jit::triggerStatsActiveFramesAddress() != 0;
+}
+
+extern "C" int Ci_JitShell311_DeferArtifactRelease(PyObject* artifact) {
+  if (*jit::triggerStatsActiveFramesAddress() == 0) {
+    return 0;
+  }
+  // Resurrect: the refcount reached zero inside tp_dealloc; make it look as
+  // if the original release never happened (refcount accounting, tracing)
+  // and hold the only reference from the chain.
+  _Py_NewReference(artifact);
+  asArtifact(artifact)->graveyard_next_311 = g_artifact_graveyard_head;
+  g_artifact_graveyard_head = artifact;
+  g_artifact_graveyard_size++;
+  Ci_JitGraveyardPending311 = 1;
+  return 1;
+}
+
+extern "C" void Ci_JitShell311_SweepGraveyard(void) {
+  if (*jit::triggerStatsActiveFramesAddress() != 0 ||
+      g_artifact_graveyard_head == nullptr) {
+    return;
+  }
+  // Detach the whole chain first: a destructor can run Python that compiles
+  // or retires other functions; those arrive on the fresh chain and are
+  // swept by the next call.
+  PyObject* dead = g_artifact_graveyard_head;
+  g_artifact_graveyard_head = nullptr;
+  g_artifact_graveyard_size = 0;
+  Ci_JitGraveyardPending311 = 0;
+  while (dead != nullptr) {
+    PyObject* next = asArtifact(dead)->graveyard_next_311;
+    asArtifact(dead)->graveyard_next_311 = nullptr;
+    Py_DECREF(dead);
+    dead = next;
+  }
+}
+
+extern "C" size_t Ci_JitShell311_GraveyardSize(void) {
+  return g_artifact_graveyard_size;
 }
 
 // RuntimeTests uses this to enter synthetic artifacts which are not installed
@@ -483,6 +638,24 @@ extern "C" PyObject* Ci_JitShell311_InvokeArtifact(
   // call onto a different artifact or the interpreter's vectorcall layout.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
   InvocationArtifactScope invocation(compiled);
+  // A synthetic artifact is entered on request: the generated entry guard
+  // must find the direct-entry gate open for this call even when no frame
+  // evaluator is installed and the JIT is not usable (the RuntimeTests
+  // fixtures), exactly as the guarded shell entered the body without
+  // consulting the gate.  The gate is restored once machine code returns.
+  struct DirectEntryGateOverride311 {
+    Ci_JitDirectEntryGate311Layout saved;
+    explicit DirectEntryGateOverride311(PyThreadState* tstate)
+        : saved(Ci_JitDirectEntryGate311) {
+      Ci_JitDirectEntryGate311.eval_frame =
+          reinterpret_cast<void*>(tstate->interp->eval_frame);
+      Ci_JitDirectEntryGate311.usable = 1;
+    }
+    ~DirectEntryGateOverride311() {
+      Ci_JitDirectEntryGate311 = saved;
+    }
+  };
+  DirectEntryGateOverride311 gate_override{PyThreadState_GET()};
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }
 
@@ -584,12 +757,15 @@ bool isCodeScopedRefusal311(const char* reason) {
       "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
       "REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP",
       "REFUSE_SHAPE_NON_FUNCTION_SCOPE",
-      "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED",
       "REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED",
       "REFUSE_SHAPE_INVALID_UTF8_NAME",
       // The compiler could not produce an artifact for this code.
       "REFUSE_SHAPE_CODEGEN_SPAN",
       "REFUSE_SHAPE_SPECULATIVE_GUARD",
+      // The code is over the per-function size budget; compiling it again
+      // would only repeat the work that found that out.
+      jit::kRefuseHirSizeLimit,
+      jit::kRefuseLirSizeLimit,
       "SUPPORTED_OPCODE_FAILURE",
   };
   for (const char* known : kCodeScoped) {
@@ -622,14 +798,12 @@ int attachFreshImpl311(PyFunctionObject* raw_func);
 const char* requestExecute311(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<PyCodeObject> code) {
+  if (Ci_JitShell311_CodeBackoffHold(code, Ci_Observe311_CallCount(code)) !=
+      0) {
+    return CI_JIT_RESULT_311_DEFERRED;
+  }
   if (codeAutoJitDisabled311(code)) {
     return "REFUSE_SHAPE_AUTO_JIT_DISABLED";
-  }
-  if ((code->co_flags & CO_GENERATOR) != 0) {
-    // Generators compile on request only: the measured verdict is that
-    // compiling them automatically loses to both compiling them all and
-    // interpreting them all, so the auto default stays off (MR-11).
-    return "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED";
   }
   if (const char* execute_reason = Ci_JitShell311_ExecuteRefusal(func)) {
     return execute_reason;
@@ -661,6 +835,7 @@ const char* requestExecute311(
     // as CODE_MOVED rather than as a refusal about this code object.
     jit::Result result = jit::compileFunction(func, code);
     if (result == jit::Result::OK) {
+      jit::roiBackoffDidPublish311(code);
       return CI_JIT_RESULT_311_INSTALLED;
     }
     PyErr_Clear();
@@ -772,6 +947,15 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     jit::triggerStatsOnShadowCompile(
         result->code_size, result->specialized_opcodes);
     return "compiled";
+  } catch (const jit::CompileBudgetExceeded& exc) {
+    // Not a compiler failure: the function is over the size budget.  The
+    // reason was recorded where the budget was checked; consume it here so
+    // it cannot be attributed to a later, unrelated compile.
+    PyErr_Clear();
+    JIT_LOG(
+        "shadow compile skipped for {}: {}", functionName(func), exc.what());
+    Ci_JitShell311_TakeExecuteRefusal();
+    return exc.reason();
   } catch (const std::exception& exc) {
     // Shadow compilation is observational: failures are reported through the
     // stable event reason and must never perturb the interpreted call.
@@ -801,18 +985,86 @@ extern "C" int Ci_JitShell311_CodeAutoJitDisabled(PyCodeObject* code) {
   return code != nullptr && codeAutoJitDisabled311(code);
 }
 
+extern "C" int Ci_JitShell311_CodeBackoffHold(
+    PyCodeObject* code,
+    uint64_t calls) {
+  if (!jit::getConfig().roi_backoff_enabled || code == nullptr) {
+    return 0;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr &&
+      (Ci_code_extra_load_roi_ctl_relaxed(extra) &
+       CI_CODE_EXTRA_ROI_FROZEN_BIT)) {
+    return -1;
+  }
+  return jit::roiBackoffAllowsCompile311(code, calls) ? 0 : 1;
+}
+
 // The transient conditions shared by every scheduling door: under a trace
 // or profile function a publication would immediately fall back and be
 // reported as a failed attempt, and inside an import/setup scope nothing
 // says the code is hot.  Neither says anything about the code object, so
 // neither may spend an attempt or a budget.
+// Startup grace is a transient scheduling condition, never a failed
+// compilation attempt. Explicit compilation remains available during it.
+static std::chrono::steady_clock::time_point s_startup_grace_start;
+static bool s_startup_grace_expired = false;
+
+extern "C" void Ci_JitShell311_ResetStartupGrace(void) {
+  s_startup_grace_start = std::chrono::steady_clock::now();
+  s_startup_grace_expired = false;
+}
+
+static bool autoJitStartupGraceHold311(void) {
+  const size_t grace_ms = jit::getConfig().auto_jit_startup_grace_ms;
+  if (grace_ms == 0 || s_startup_grace_expired) {
+    return false;
+  }
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - s_startup_grace_start)
+          .count();
+  if (elapsed >= 0 && static_cast<uint64_t>(elapsed) >= grace_ms) {
+    s_startup_grace_expired = true;
+    return false;
+  }
+  return true;
+}
+
 static bool autoJitTransientHold311(void) {
   PyThreadState* tstate = PyThreadState_Get();
   if (tstate == nullptr || tstate->c_tracefunc != nullptr ||
       tstate->c_profilefunc != nullptr) {
     return true;
   }
+  if (autoJitStartupGraceHold311()) {
+    return true;
+  }
   return jit::autoJitImportDepth() > 0 || jit::autoJitSetupDepth() > 0;
+}
+
+// Optional size scaling for straight-line code. Iterate instructions, not
+// inline-cache words, and saturate rather than wrapping a large threshold.
+extern "C" uint64_t Ci_JitShell311_RoiGateNeed(
+    PyCodeObject* raw_code,
+    uint64_t threshold) {
+  const uint64_t base = threshold == 0 ? 1 : threshold;
+  if (!jit::getConfig().auto_jit_size_scaling || raw_code == nullptr) {
+    return base;
+  }
+  const Py_ssize_t units = Py_SIZE(raw_code);
+  if (units < 200) {
+    return base;
+  }
+  for (const auto& instr : jit::BytecodeInstructionBlock{raw_code}) {
+    if (instr.opcode() == JUMP_BACKWARD ||
+        instr.opcode() == JUMP_BACKWARD_NO_INTERRUPT) {
+      return base;
+    }
+  }
+  const uint64_t factor = units >= 1000 ? 16 : 4;
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  return base > limit / factor ? limit : base * factor;
 }
 
 extern "C" int Ci_JitShell311_DispatchDeferred(void) {
@@ -1107,6 +1359,11 @@ int attachFreshImpl311(PyFunctionObject* raw_func) {
   if (Ci_code_extra_jit311_auto_disabled(extra)) {
     return -1;
   }
+  int backoff =
+      Ci_JitShell311_CodeBackoffHold(code, Ci_Observe311_CallCount(code));
+  if (backoff != 0) {
+    return backoff < 0 ? -1 : 0;
+  }
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
   if (compiled == nullptr) {
@@ -1192,10 +1449,157 @@ int attachFreshImpl311(PyFunctionObject* raw_func) {
     return 0;
   }
   Ci_code_extra_jit311_note_attach(extra);
+  jit::roiBackoffDidPublish311(code);
   return 1;
 }
 
 } // namespace
+
+// The compiled artifact of a code object, reachable for a function object
+// that was never attached to it.  A comprehension body or a closure created
+// per call is a fresh function object every time; the fresh-attach path
+// publishes at most fresh_attach_budget of them per code and refuses the
+// rest, which would then run interpreted (each attach costs far more than
+// one interpreted run, so raising the budget is no answer).  Sharing needs
+// only what attachment needs: the same globals and builtins dicts the
+// artifact was compiled against, and the code not disabled.  The generated
+// entry reads defaults, closure cells and globals from the function object
+// it is called with, and the frame it links records that object, so nothing
+// is registered per function.
+namespace {
+
+// Layout of PyCodeObject::co_extra on 3.11 (Objects/codeobject.c); the
+// header keeps it private, and this file is 3.11-only.
+struct CiCodeObjectExtra311 {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+};
+
+jit::CompiledFunction* codeArtifactFor311(
+    PyFunctionObject* func,
+    CodeExtra** extra_out = nullptr) {
+  // Only a function still on the interpreted entry qualifies: an attached
+  // function already carries the installed entry.
+  if (func == nullptr || func->vectorcall != Ci_PyFunction_Vectorcall) {
+    return nullptr;
+  }
+  // This runs on every interpreted call of a function on the stock entry,
+  // and nearly all of those have no artifact (cold code, code refused by
+  // policy, generator-family code).  Answer that case from the code object
+  // alone -- three dependent loads, no calls -- and leave the per-call
+  // environment predicates to the rare hit.
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  auto* ex = static_cast<CiCodeObjectExtra311*>(code->co_extra);
+  if (ex == nullptr) {
+    return nullptr;
+  }
+  auto* state = cinderx::getModuleState();
+  if (state == nullptr) {
+    return nullptr;
+  }
+  Py_ssize_t index = state->code_extra_index;
+  if (index < 0 || index >= ex->ce_size) {
+    return nullptr;
+  }
+  auto* extra = static_cast<CodeExtra*>(ex->ce_extras[index]);
+  if (extra == nullptr) {
+    return nullptr;
+  }
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr) {
+    return nullptr;
+  }
+  // An artifact exists: the attachment conditions, then the installed
+  // entry's fail-closed predicates (execute mode, our evaluator installed,
+  // the JIT usable, no legacy tracing on this thread).
+  if (Ci_code_extra_jit311_auto_disabled(extra) ||
+      extra->jit_globals != func->func_globals ||
+      extra->jit_builtins != func->func_builtins) {
+    return nullptr;
+  }
+  if (jit::getConfig().roi_backoff_enabled &&
+      ((Ci_code_extra_load_roi_ctl_relaxed(extra) &
+        (CI_CODE_EXTRA_ROI_FROZEN_BIT | CI_CODE_EXTRA_ROI_PENDING_BIT)) != 0 ||
+       Ci_code_extra_load_roi_recompile_floor_relaxed(extra) != 0)) {
+    return nullptr;
+  }
+  if ((code->co_flags & CO_GENERATOR) != 0 &&
+      !jit::getConfig().sync_generator_jit) {
+    return nullptr;
+  }
+  if (!executeMode() || !Ci_EvalHook311_IsInstalled() || !jit::isJitUsable()) {
+    return nullptr;
+  }
+  PyThreadState* tstate = PyThreadState_GET();
+  if (tstate->c_tracefunc != nullptr || tstate->c_profilefunc != nullptr) {
+    return nullptr;
+  }
+  if (extra_out != nullptr) {
+    *extra_out = extra;
+  }
+  return compiled;
+}
+
+} // namespace
+
+// Vectorcall-shaped entry for such a function object.  It re-validates on
+// every call and otherwise takes the function's own entry, so a call-site
+// cache may hold it as the fast target for the (code, interpreted entry)
+// pair -- every function object matching that pair is served correctly.
+extern "C" PyObject* Ci_JitShell311_CodeArtifactVectorcall(
+    PyObject* func_obj,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  auto* func = reinterpret_cast<PyFunctionObject*>(func_obj);
+  CodeExtra* extra = nullptr;
+  jit::CompiledFunction* compiled = codeArtifactFor311(func, &extra);
+  if (compiled == nullptr) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  // The installed entry's protocol, which the bare generated entry does not
+  // supply: pin the artifact for the duration of the call (from here on --
+  // the attachment offer below runs Python, and a collection reached from
+  // it can retire the artifact and drop its last anchor), and publish it as
+  // the invocation artifact further down.  The argument-binding helpers
+  // (JITRT_CallWithIncorrectArgcount, the keyword path) and generator
+  // creation re-enter machine code through the invocation artifact, falling
+  // back to the function's installed artifact -- which an unattached
+  // function does not have.
+  Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  // The fresh-attach door first: within the per-code budget the function
+  // object takes the installed entry (anchoring on its outer function and
+  // the observe statistics included) and every later call is direct.  The
+  // by-code dispatch below serves the objects the budget refuses; the
+  // budget is read here so that those pay no observer probe per call.
+  if (Ci_code_extra_jit311_attach_count(extra) <
+          jit::getConfig().fresh_attach_budget &&
+      Ci_Observe311_OfferFreshAttach(func) &&
+      func->vectorcall != Ci_PyFunction_Vectorcall) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  // The offer ran Python: the artifact may have been retired (the pin keeps
+  // it allocated, nothing more) and the function's code may have moved.
+  // Resolve again and leave through the function's own entry when the
+  // answer is no longer this artifact.
+  if (codeArtifactFor311(func, &extra) != compiled) {
+    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  }
+  if (cStackSoftLimitReached311()) {
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+    return nullptr;
+  }
+  InvocationArtifactScope invocation(compiled);
+  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+}
+
+extern "C" vectorcallfunc Ci_JitShell311_CodeArtifactEntry(
+    PyFunctionObject* func) {
+  return codeArtifactFor311(func) != nullptr
+      ? Ci_JitShell311_CodeArtifactVectorcall
+      : nullptr;
+}
 
 extern "C" int Ci_JitShell311_AttachFresh(PyFunctionObject* raw_func) {
   try {

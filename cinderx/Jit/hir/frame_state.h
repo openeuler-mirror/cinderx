@@ -103,6 +103,11 @@ struct FrameState {
         return false;
       }
     }
+    for (auto& reg : local_bound) {
+      if (reg != nullptr && !func(reg)) {
+        return false;
+      }
+    }
     if (parent != nullptr) {
       return parent->visitUses(func);
     }
@@ -117,6 +122,13 @@ struct FrameState {
   // free variables are at the end, but note locals can be cells so there is no
   // guarantee cells are all in the middle.
   std::vector<Register*> localsplus;
+
+  // SPIKE(PHIUNBOX): either empty, or parallel to `localsplus`.  A non-null
+  // entry names a CInt64 register holding 0 or 1 that says whether the local
+  // in the same slot is bound; the slot itself then holds the local's value
+  // as a raw primitive (meaningless while unbound). A null entry, or an empty
+  // vector, means the slot needs no such flag.
+  std::vector<Register*> local_bound;
 
   // Number of local variables. Stored as a field directly because in tests
   // there's no code object for us to inspect.

@@ -395,8 +395,11 @@ def compiles_self_contained_eafp_predicates() -> None:
     logger.propagate = False
 
     cinderjit._clear_autojit_gate_stats()
-    for _ in range(16):
+    # The default IC gate may defer compilation for 256 calls after auto:2.
+    for _ in range(512):
         assert not logger.isEnabledFor(logging.DEBUG)
+        if jit.is_jit_compiled(logging.Logger.isEnabledFor):
+            break
 
     stats = cinderjit._autojit_gate_stats()
     assert jit.is_jit_compiled(logging.Logger.isEnabledFor), (

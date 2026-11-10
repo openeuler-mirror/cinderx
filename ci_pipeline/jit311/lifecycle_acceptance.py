@@ -863,6 +863,8 @@ class LifecycleAcceptanceRunner:
                 "--env",
                 "CINDERX_JIT_MODE=canary",
                 "--env",
+                "CINDERX_JIT_STARTUP_GRACE_MS=0",
+                "--env",
                 "PYTHONJITGENERATOR=1",
                 "--env",
                 "PYTHONJITAUTO=50",

@@ -120,7 +120,8 @@ class TestLog:
         self.pid = pid
         self.test_order: List[str] = []
         if path is None:
-            self.path = tempfile.NamedTemporaryFile(delete=False).name
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                self.path = tf.name
         else:
             self.path = path
             self._deserialize()
@@ -136,7 +137,7 @@ class TestLog:
         }
         with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
             json.dump(data, tf)
-            shutil.move(tf.name, self.path)
+        shutil.move(tf.name, self.path)
 
     def _deserialize(self) -> None:
         with open(self.path) as f:

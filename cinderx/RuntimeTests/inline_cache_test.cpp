@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/func.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -130,14 +131,33 @@ regular_meth = RequestContext.regular_meth
 
   auto py_class_meth = Ref<>::steal(PyUnicode_FromString("class_meth"));
   jit::LoadTypeMethodCache cache;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 fills only for a class whose version tag was valid on entry, and
+  // assigns tags inside _PyType_Lookup itself: the fresh class is tagged by
+  // one lookup before the asserted one.
+  {
+    auto warm = cache.lookup(klass, py_class_meth);
+    Py_XDECREF(warm.callable);
+    Py_XDECREF(warm.self_or_null);
+  }
+#endif
   auto res = cache.lookup(klass, py_class_meth);
   ASSERT_EQ(res.self_or_null, klass)
       << "Expected instance to be equal to class from cache look up";
   PyObject* class_meth = PyDict_GetItemString(locals, "class_meth");
   ASSERT_EQ(PyObject_RichCompareBool(res.callable, class_meth, Py_EQ), 1)
       << "Expected method " << class_meth << " to be equal from cache lookup";
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 caches the classmethod object itself and reads its callable on
+  // every hit (classmethod.__init__ may re-bind it in place).
+  ASSERT_TRUE(PyObject_TypeCheck(cache.value(), &PyClassMethod_Type))
+      << "Expected the classmethod object to be cached";
+  ASSERT_EQ(Ci_PyClassMethod_GetFunc(cache.value()), res.callable)
+      << "Expected method " << py_class_meth << " to be cached";
+#else
   ASSERT_EQ(cache.value(), res.callable)
       << "Expected method " << py_class_meth << " to be cached";
+#endif
 
   for (auto& meth : {"static_meth", "regular_meth"}) {
     auto name = Ref<>::steal(PyUnicode_FromString(meth));
@@ -149,8 +169,21 @@ regular_meth = RequestContext.regular_meth
         << "Expected first part of cache result to be Py_None";
     ASSERT_EQ(PyObject_RichCompareBool(methRes.self_or_null, py_meth, Py_EQ), 1)
         << "Expected method " << meth << " to be equal from cache lookup";
+#if PY_VERSION_HEX < 0x030C0000
+    // A staticmethod is cached as the wrapper object (see above); a plain
+    // function is cached as itself.
+    if (PyObject_TypeCheck(methCache.value(), &PyStaticMethod_Type)) {
+      ASSERT_EQ(
+          Ci_PyStaticMethod_GetFunc(methCache.value()), methRes.self_or_null)
+          << "Expected method " << meth << " to be cached";
+    } else {
+      ASSERT_EQ(methCache.value(), methRes.self_or_null)
+          << "Expected method " << meth << " to be cached";
+    }
+#else
     ASSERT_EQ(methCache.value(), methRes.self_or_null)
         << "Expected method " << meth << " to be cached";
+#endif
 #else
     ASSERT_EQ(methRes.self_or_null, nullptr)
         << "Expected first part of cache result to be nullptr";

@@ -1,5 +1,6 @@
 """Another PEP 523 client takes the slot; the JIT degrades safely."""
 import ctypes
+import functools
 
 import _cinderx
 
@@ -21,6 +22,12 @@ entered_ours = entries() - before
 # The stock evaluator stands in for the other client: nothing runs
 # compiled, nothing crashes, and we do not write our pointer back.
 api._PyInterpreterState_SetEvalFrameFunc(interp, stock)
+# Enter the installed function from C (map, partial) before anything of
+# ours has looked at the slot: the generated entry must notice the foreign
+# evaluator on its own, not through a status query refreshing a cache.
+before = entries()
+direct_values = list(map(hot, range(4), [3] * 4)) + [functools.partial(hot, 2)(3)]
+entered_foreign_direct = entries() - before
 installed_foreign = _cinderx.is_frame_evaluator_installed()
 compiled_foreign = cinderjit.is_jit_compiled(hot)
 before = entries()
@@ -39,6 +46,8 @@ before = entries()
 assert hot(2, 3) == 6
 emit(
     entered_ours=entered_ours,
+    direct_values_ok=direct_values == [i * 3 for i in range(4)] + [6],
+    entered_foreign_direct=entered_foreign_direct,
     installed_foreign=installed_foreign,
     compiled_foreign=compiled_foreign,
     values_ok=values == [i * 3 for i in range(T + 5)],

@@ -9,6 +9,26 @@ import textwrap
 import unittest
 
 
+_LWF_SUPPORTED = None
+
+
+def _lightweight_frames_supported() -> bool:
+    """The frame-state sink of the boxed temporary is a lightweight-frame
+    property; CPython 3.11 refuses the opt-in and runs normal frames."""
+    global _LWF_SUPPORTED
+    if _LWF_SUPPORTED is None:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("PYTHONJIT", "CINDERX_"))}
+        env.update(CINDERX_PLUGIN_ENABLE="1", CINDERX_EVAL_MODE="cinder",
+                   CINDERX_JIT_MODE="execute", PYTHONJITLIGHTWEIGHTFRAME="1")
+        probe = ("import _cinderx, cinderx; cinderx.init(); import cinderjit; "
+                 "print(cinderjit.jit_frame_mode())")
+        completed = subprocess.run([sys.executable, "-c", probe], env=env,
+                                   capture_output=True, text=True, timeout=120)
+        _LWF_SUPPORTED = completed.returncode == 0 and completed.stdout.strip() == "1"
+    return _LWF_SUPPORTED
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11)
     and platform.machine().lower() in {"aarch64", "arm64"},
@@ -85,6 +105,9 @@ class FloatBoxSink311Tests(unittest.TestCase):
             self.assertEqual(slow[0].count("= PrimitiveBox<CDouble>"), 1,
                              match.group(1))
 
+    @unittest.skipUnless(
+        _lightweight_frames_supported(),
+        "frame-state box sink needs lightweight frames")
     def test_temporary_sink_identity_and_forced_restore(self):
         probe = textwrap.dedent(r"""
             import dis

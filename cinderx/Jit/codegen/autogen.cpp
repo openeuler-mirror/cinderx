@@ -4,17 +4,20 @@
 
 #include "internal/pycore_long.h"
 #include "internal/pycore_pystate.h"
+#include "internal/pycore_runtime.h"
 
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_patcher.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/gen_asm_utils.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/instruction.h"
 #include "cinderx/Jit/lir/printer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_state.h"
 
 using namespace asmjit;
@@ -719,10 +722,20 @@ void emitStoreGenYieldPoint(
       live_regs_input - num_live_regs,
       live_regs_input);
 
+  // Input 0 is tstate; the yield-from sub-iterator is input 1.
   auto yield_from_offset =
-      is_yield_from ? calc_spill_offset(0) : kInvalidYieldFromOffset;
+      is_yield_from ? calc_spill_offset(1) : kInvalidYieldFromOffset;
+  // record whether the suspend point sits outside every
+  // exception-table range, so close() can skip the deopt when no handler or
+  // cleanup code would run.
+  bool handler_free = false;
+  if (yield->origin() != nullptr &&
+      yield->origin()->bytecodeOffset().value() >= 0) {
+    handler_free = !hir::isInExceptionProtectedRange(
+        env->code_rt->code(), yield->origin()->bytecodeOffset());
+  }
   GenYieldPoint* gen_yield_point = env->code_rt->addGenYieldPoint(
-      GenYieldPoint{deopt_idx, yield_from_offset});
+      GenYieldPoint{deopt_idx, yield_from_offset, handler_free});
 
   env->unresolved_gen_entry_labels.emplace(gen_yield_point, resume_label);
   if (yield->origin()) {
@@ -860,6 +873,17 @@ void translateLoadThreadState(Environ* env, const Instruction* instr) {
             dst,
             cinderx::getModuleState()->tstate_offset,
             arch::reg_scratch_0));
+#if PY_VERSION_HEX < 0x030C0000
+  } else {
+    // 3.11 keeps the current thread state in
+    // _PyRuntime.gilstate.tstate_current (an exported data symbol), not in
+    // TLS, so the TLS matcher never arms and every function entry would pay
+    // a call through the PLT.  Load the word directly instead.
+    as->mov(
+        dst, reinterpret_cast<uint64_t>(&_PyRuntime.gilstate.tstate_current));
+    as->ldr(dst, a64::ptr(dst));
+  }
+#else
   } else {
     // Fallback: call _PyThreadState_GetCurrent().
     as->bl(_PyThreadState_GetCurrent);
@@ -867,6 +891,7 @@ void translateLoadThreadState(Environ* env, const Instruction* instr) {
       as->mov(dst, a64::x0);
     }
   }
+#endif
 
   if (output->isStack()) {
     as->str(
@@ -929,10 +954,16 @@ void translateYieldInitial(Environ* env, const Instruction* instr) {
       a64::x0,
       arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
 
+#if PY_VERSION_HEX < 0x030C0000
+  // fp holds the footer here.
+  as->mov(a64::x1, arch::fp);
+  emitCall(*env, reinterpret_cast<uint64_t>(JITRT_UnlinkGenFrame311), instr);
+#else
   emitCall(
       *env,
       reinterpret_cast<uint64_t>(JITRT_UnlinkGenFrameAndReturnGenDataFooter),
       instr);
+#endif
   // This will return pointers to a generator in X0 and JIT data in X1.
 
   // Arbitrary scratch register for use in emitStoreGenYieldPoint(). Any
@@ -955,6 +986,48 @@ void translateYieldInitial(Environ* env, const Instruction* instr) {
   CINDER_UNSUPPORTED
 #endif
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// the exit half of the resume protocol for a plain or a
+// yield-from suspension.  Every allocatable register is spilled at a yield,
+// so x13/x14/x16/x30 are free scratch; fp still addresses the footer.
+void emitGenYieldExitProtocol(
+    a64::Builder* as,
+    const Instruction* yield,
+    bool is_yield_from) {
+  PhyLocation tstate = yield->getInput(0)->getStackSlot();
+  as->ldr(a64::x14, arch::ptr_resolve(as, arch::fp, tstate.loc, a64::x13));
+  as->ldr(a64::x16, a64::ptr(arch::fp, offsetof(GenDataFooter, gen)));
+  constexpr int prev_item_off = offsetof(PyGenObject, gi_exc_state) +
+      offsetof(_PyErr_StackItem, previous_item);
+  constexpr int frame_prev_off = offsetof(PyGenObject, gi_iframe) +
+      offsetof(_PyInterpreterFrame, previous);
+  // tstate->exc_info = gen->gi_exc_state.previous_item; previous_item = NULL
+  as->ldr(a64::x30, a64::ptr(a64::x16, prev_item_off));
+  as->str(a64::x30, a64::ptr(a64::x14, offsetof(PyThreadState, exc_info)));
+  as->str(a64::xzr, a64::ptr(a64::x16, prev_item_off));
+  // tstate->cframe->current_frame = frame->previous; frame->previous = NULL
+  as->ldr(a64::x30, a64::ptr(a64::x16, frame_prev_off));
+  as->ldr(a64::x13, a64::ptr(a64::x14, offsetof(PyThreadState, cframe)));
+  as->str(a64::x30, a64::ptr(a64::x13, offsetof(_PyCFrame, current_frame)));
+  as->str(a64::xzr, a64::ptr(a64::x16, frame_prev_off));
+  // gen->gi_frame_state = FRAME_SUSPENDED
+  as->mov(a64::w30, static_cast<uint8_t>(FRAME_SUSPENDED));
+  as->strb(a64::w30, a64::ptr(a64::x16, offsetof(PyGenObject, gi_frame_state)));
+  // footer->direct_ok = plain yield ? 1 : (walker ? 2 : 0)
+  if (is_yield_from) {
+    // record the sub-iterator (input 1) for the walker.
+    PhyLocation sub = yield->getInput(1)->getStackSlot();
+    as->ldr(a64::x30, arch::ptr_resolve(as, arch::fp, sub.loc, a64::x13));
+    as->str(a64::x30, a64::ptr(arch::fp, offsetof(GenDataFooter, yf_sub)));
+    as->mov(a64::w30, 2);
+    as->strb(a64::w30, a64::ptr(arch::fp, offsetof(GenDataFooter, direct_ok)));
+  } else {
+    as->mov(a64::w30, 1);
+    as->strb(a64::w30, a64::ptr(arch::fp, offsetof(GenDataFooter, direct_ok)));
+  }
+}
+#endif
 
 void translateStoreGenYieldPoint(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
@@ -981,6 +1054,9 @@ void translateStoreGenYieldPoint(Environ* env, const Instruction* instr) {
       arch::fp,
       scratch_r,
       false);
+#if PY_VERSION_HEX < 0x030C0000
+  emitGenYieldExitProtocol(as, instr, false);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -1011,6 +1087,9 @@ void translateStoreGenYieldFromPoint(Environ* env, const Instruction* instr) {
       arch::fp,
       scratch_r,
       true);
+#if PY_VERSION_HEX < 0x030C0000
+  emitGenYieldExitProtocol(as, instr, true);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -1162,6 +1241,30 @@ void translateEpilogueEnd(Environ* env, const Instruction* instr) {
   }
 
   as->bind(env->hard_exit_label);
+#if PY_VERSION_HEX < 0x030C0000
+  // Count the live frame out (see triggerStatsActiveFramesAddress).  Every
+  // exit of a
+  // counted compilation passes here: the normal return, the exception
+  // return and the deopt exit (the trampoline lands on this label after the
+  // interpreter has finished the frame).  The prologue-exit, static
+  // typecheck and wrapper stubs tear down their own frame before the inline
+  // link ran, so they are balanced by never having counted in.  x9/x10 are
+  // scratch here; the return value sits in x0/x1 or d0/d1.
+  if (env->code_rt->activeFrameCounted()) {
+    // The counter's address comes from the function's constant pool (one
+    // PC-relative load) rather than a movz/movk chain.
+    const uint64_t counter =
+        reinterpret_cast<uint64_t>(triggerStatsActiveFramesAddress());
+    auto it = env->const_pool_labels.find(counter);
+    if (it == env->const_pool_labels.end()) {
+      it = env->const_pool_labels.emplace(counter, as->newLabel()).first;
+    }
+    as->ldr(a64::x9, a64::ptr(it->second));
+    as->ldr(a64::x10, a64::ptr(a64::x9));
+    as->sub(a64::x10, a64::x10, 1);
+    as->str(a64::x10, a64::ptr(a64::x9));
+  }
+#endif
   auto saved_regs = env->changed_regs & CALLEE_SAVE_REGS;
   if (!saved_regs.Empty()) {
     JIT_CHECK(
@@ -1467,7 +1570,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   auto base_location = instr->getInput(1)->getPhyRegister();
   auto base = base_location == SP ? a64::sp : a64::x(base_location.loc);
   // stp signed offset range is -512..504. Fall back to two str instructions
-  // when the offset is out of range.
+  // when the offset is out of range. The str immediate form only reaches
+  // 32760, so frames with thousands of slots (a namedtuple constructor with
+  // more than 4095 fields zeroes its localsplus inline) resolve the address
+  // through the scratch register instead of aborting on an unencodable
+  // displacement.
   if (Support::isInt7(offset >> 3)) {
     as->stp(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
@@ -1476,10 +1583,11 @@ void translateStorePair(Environ* env, const Instruction* instr) {
   } else {
     as->str(
         a64::x(instr->getInput(2)->getPhyRegister().loc),
-        a64::ptr(base, offset));
+        arch::ptr_resolve(as, base, offset, arch::reg_scratch_0));
     as->str(
         a64::x(instr->getInput(3)->getPhyRegister().loc),
-        a64::ptr(base, offset + kPointerSize));
+        arch::ptr_resolve(
+            as, base, offset + kPointerSize, arch::reg_scratch_0));
   }
 #else
   CINDER_UNSUPPORTED
@@ -2337,6 +2445,145 @@ void translateStoreAttrCachedFastPath(Environ* env, const Instruction* instr) {
   }
 #else
   translateCall(env, instr);
+#endif
+}
+
+// Call-site entry-cache probe (CPython 3.11, AArch64).  postalloc has
+// already placed x0=callable / x1=args / x2=nargsf / x3=0 per the
+// vectorcall convention (the instruction is only emitted for kwnames-free
+// sites); the call-shape semantics guarantee x9-x15 hold no live values.
+// Guards: (1) exact function type -- anything else takes the generic arm
+// (which also excludes out-of-bounds field reads on non-function objects);
+// (2) func_code identity -- carries the callee entry's __code__ check;
+// (3) vectorcall identity -- deopt, recompile and reattachment invalidate.
+// A hit blr's fast_target (the callee's direct entry, or a neutral fill with
+// the per-call-slot-load semantics of the plain arm).  A function-shaped
+// miss within budget passes the cache in x3 (kwnames is NULL here by
+// construction; the helper knows) to the miss helper; an exhausted budget
+// short-circuits inline through x13 (func->vectorcall is already loaded).
+// All paths converge on a single blr; return-value and debug-location
+// handling match translateCall.  Cache field offsets are locked by the
+// static_assert in inline_cache.h.
+void translateCallSiteVectorCall(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  auto as = env->as;
+  auto output = instr->output();
+  uint64_t cache_addr =
+      static_cast<uint64_t>(instr->getInput(0)->getConstant());
+  // Method-call form (CallSiteCallMethod): a NULL/None callable (LOAD_METHOD
+  // fallback form, real callable in args[0]) and an empty receiver slot
+  // (the second of JITRT_Call's double-NULL protocol) take the generic arm,
+  // whose stub applies JITRT_Call's slot protocol.
+  const bool method_form = instr->opcode() == Instruction::kCallSiteCallMethod;
+
+  asmjit::Label miss_func = as->newLabel();
+  asmjit::Label generic = as->newLabel();
+  asmjit::Label generic_func = as->newLabel();
+  asmjit::Label do_call = as->newLabel();
+  asmjit::Label post_call = as->newLabel();
+  asmjit::Label done = as->newLabel();
+
+  if (method_form) {
+    as->cbz(a64::x0, generic);
+    as->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+    as->cmp(a64::x0, a64::x11);
+    as->b_eq(generic);
+    as->ldr(a64::x14, a64::ptr(a64::x1)); // receiver slot args[0]
+    as->cbz(a64::x14, generic);
+  }
+
+  as->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyObject, ob_type))));
+  as->mov(a64::x11, reinterpret_cast<uint64_t>(&PyFunction_Type));
+  as->cmp(a64::x10, a64::x11);
+  as->b_ne(generic);
+  as->mov(a64::x9, cache_addr);
+  as->ldp(a64::x10, a64::x11, a64::ptr(a64::x9));
+  as->ldr(
+      a64::x12,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+  as->ldr(
+      a64::x13,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall))));
+  as->cmp(a64::x10, a64::x12);
+  as->b_ne(miss_func);
+  as->cmp(a64::x11, a64::x13);
+  as->b_ne(miss_func);
+  as->ldr(
+      arch::reg_scratch_br,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(
+              offsetof(jit::CallSiteEntryCache, fast_target))));
+
+  as->bind(do_call);
+  as->blr(arch::reg_scratch_br);
+  as->bind(post_call);
+
+  if (instr->origin()) {
+    asmjit::Label label = as->newLabel();
+    as->bind(label);
+    env->pending_debug_locs.emplace_back(label, instr->origin());
+  }
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+  as->b(done);
+
+  as->bind(miss_func);
+  as->ldrb(
+      a64::w10,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(
+              offsetof(jit::CallSiteEntryCache, helper_budget)),
+          arch::AccessSize::k8));
+  as->cbz(a64::w10, generic_func);
+  as->mov(a64::x3, a64::x9);
+  as->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(JITRT_CallSiteEntryMiss311));
+  as->b(do_call);
+
+  // Generic arm: the per-function dispatch stub (emitted at the end of the
+  // function, see emitAarch64VcDirectStub311).  x15 tells the stub whether
+  // JITRT_Call's slot protocol applies (1, method form); the plain form
+  // hands it the site cache (an 8-byte-aligned address, never 1) so that
+  // the stub's class-callable test can take the constructor arm.
+  as->bind(generic);
+  if (!env->vcdirect_stub.isValid()) {
+    env->vcdirect_stub = as->newLabel();
+  }
+  if (method_form) {
+    as->mov(a64::x15, 1);
+  } else {
+    as->mov(a64::x15, cache_addr);
+  }
+  as->adr(arch::reg_scratch_br, env->vcdirect_stub);
+  as->b(do_call);
+
+  as->bind(generic_func);
+  as->mov(arch::reg_scratch_br, a64::x13);
+  as->b(do_call);
+
+  as->bind(done);
+#else
+  (void)env;
+  (void)instr;
+  JIT_ABORT("CallSiteVectorCall is AArch64 CPython 3.11 only");
 #endif
 }
 
@@ -4105,6 +4352,10 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kStoreAttrCachedFastPath:
       translateStoreAttrCachedFastPath(env, instr);
+      return;
+    case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
+      translateCallSiteVectorCall(env, instr);
       return;
     case Instruction::kBinaryOpExactLongAddSubFastPath:
       translateBinaryOpExactLongAddSubFastPath(env, instr);

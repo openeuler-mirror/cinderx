@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import functools
 import os
 import re
 import subprocess
@@ -8,8 +9,34 @@ import textwrap
 import unittest
 
 
+def _child_env(**overrides):
+    """Run the test with these variables in the process environment, which the
+    probes it spawns inherit.  CPython 3.11 keeps the per-bytecode
+    instrumentation polls off by default; the probes that expect a mid-frame
+    instrumentation transition opt back in explicitly."""
+
+    def decorate(test):
+        @functools.wraps(test)
+        def wrapped(*args, **kwargs):
+            saved = {k: os.environ.get(k) for k in overrides}
+            os.environ.update(overrides)
+            try:
+                return test(*args, **kwargs)
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+        return wrapped
+
+    return decorate
+
+
 @unittest.skipUnless(sys.version_info[:2] == (3, 11), "CP311 inplace guards")
 class ExactFloatInPlace311Tests(unittest.TestCase):
+    @_child_env(PYTHONJITSUPPORTINSTRUMENTATION="1")
     def test_lowering_and_deopt_preserve_inplace_effects(self):
         probe = textwrap.dedent(r"""
             import dis

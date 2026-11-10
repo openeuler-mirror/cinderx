@@ -1,0 +1,121 @@
+--- Test Suite Name ---
+HirCSETest
+--- Passes ---
+HirCSE
+--- Test Name ---
+MergesRepeatedCompactLongChecksAndUnboxesAndDropsDominatedGuard
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = RefineType<LongExact> v0
+    v2 = IsCompactLong v1
+    Guard v2
+    v3 = CompactLongUnbox v1
+    v4 = IsCompactLong v1
+    Guard v4
+    v5 = CompactLongUnbox v1
+    v6 = IntBinaryOp<Add> v3 v5
+    Return<CInt64> v6
+  }
+}
+--- Expected 3.11 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:LongExact = RefineType<LongExact> v0
+    v2:CBool = IsCompactLong v1
+    Guard v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:CInt64 = CompactLongUnbox v1
+    v6:CInt64 = IntBinaryOp<Add> v3 v3
+    Return<CInt64> v6
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:LongExact = RefineType<LongExact> v0
+    v2:CBool = IsCompactLong v1
+    Guard v2 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:CInt64 = CompactLongUnbox v1
+    v6:CInt64 = IntBinaryOp<Add> v3 v3
+    Return<CInt64> v6
+  }
+}
+--- Test Name ---
+ReusesAcrossDominatedBlocksButNotAcrossSiblings
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<LongExact> v0
+    v3 = IsCompactLong v2
+    CondBranch<1, 2> v3
+  }
+  bb 1 (preds 0) {
+    v4 = IsCompactLong v2
+    v5 = CompactLongUnbox v2
+    Return<CInt64> v5
+  }
+  bb 2 (preds 0) {
+    v6 = CompactLongUnbox v2
+    v7 = CompactLongUnbox v2
+    v8 = IntBinaryOp<Add> v6 v7
+    Return<CInt64> v8
+  }
+}
+--- Expected 3.11 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:LongExact = RefineType<LongExact> v0
+    v3:CBool = IsCompactLong v2
+    CondBranch<1, 2> v3
+  }
+
+  bb 1 (preds 0) {
+    v5:CInt64 = CompactLongUnbox v2
+    Return<CInt64> v5
+  }
+
+  bb 2 (preds 0) {
+    v6:CInt64 = CompactLongUnbox v2
+    v8:CInt64 = IntBinaryOp<Add> v6 v6
+    Return<CInt64> v8
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:LongExact = RefineType<LongExact> v0
+    v3:CBool = IsCompactLong v2
+    CondBranch<1, 2> v3
+  }
+
+  bb 1 (preds 0) {
+    v5:CInt64 = CompactLongUnbox v2
+    Return<CInt64> v5
+  }
+
+  bb 2 (preds 0) {
+    v6:CInt64 = CompactLongUnbox v2
+    v8:CInt64 = IntBinaryOp<Add> v6 v6
+    Return<CInt64> v8
+  }
+}
+--- End ---

@@ -29,6 +29,14 @@ struct OSRMetadata;
 
 namespace jit::codegen {
 
+// Emit the final LIR block order and its near-deopt stubs. Optional code
+// section metadata is used by JIT functions and omitted by trampolines.
+void emitLIRBlocks(
+    Environ* env,
+    lir::Function* lir_func,
+    const asmjit::CodeHolder* code = nullptr,
+    CodeHolderMetadata* metadata = nullptr);
+
 class NativeGeneratorFactory;
 class NativeGenerator {
  public:
@@ -60,6 +68,12 @@ class NativeGenerator {
   // entry, or null when unsupported.
   void* getArtifactGuardedEntry311() const {
     return artifact_guarded_entry_311_;
+  }
+
+  // Direct call entry (the call-site entry-cache jump target), or null when
+  // unsupported.
+  void* getDirectCallEntry311() const {
+    return direct_call_entry_311_;
   }
 #endif
 
@@ -95,6 +109,7 @@ class NativeGenerator {
   void* vectorcall_entry_{nullptr};
 #if PY_VERSION_HEX < 0x030C0000
   void* artifact_guarded_entry_311_{nullptr};
+  void* direct_call_entry_311_{nullptr};
 #endif
   arch::Builder* as_{nullptr};
   CodeHolderMetadata metadata_{CodeSection::kHot};
@@ -151,9 +166,10 @@ class NativeGenerator {
   int maxInlineStackSize();
   void generateDeoptExits(const asmjit::CodeHolder& code);
   void emitAarch64LoadAttrInvokeStub(const asmjit::CodeHolder& code);
-  void emitAarch64LoadAttrNewShapeStub311(const asmjit::CodeHolder& code);
-  void emitAarch64LoadMethodStub311(const asmjit::CodeHolder& code);
-  void emitAarch64StoreAttrStub311(const asmjit::CodeHolder& code);
+  void emitAarch64LoadAttrInvokeStub311(const asmjit::CodeHolder& code);
+  void emitAarch64LoadMethodInvokeStub311(const asmjit::CodeHolder& code);
+  void emitAarch64StoreAttrInvokeStub311(const asmjit::CodeHolder& code);
+  void emitAarch64VcDirectStub311(const asmjit::CodeHolder& code);
   void emitAarch64ExactLongAddSubStubs(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   Py_ssize_t giJITDataOffset();
@@ -184,12 +200,19 @@ class NativeGeneratorFactory {
 
   void* deoptTrampoline();
   void* deoptTrampolineGenerators();
+  // The yield-from delegation walker (AArch64, CPython 3.11): generated once
+  // per factory, on the first non-shadow compile, exactly like the deopt
+  // trampolines, so it shares their residency baseline and the observe and
+  // shadow states allocate no executable memory.  Returns nullptr where it
+  // is unavailable (the LIR then calls the C++ walker).
+  void* genDelegateWalker();
   void* failedDeferredCompileTrampoline();
 
  private:
   void* deopt_trampoline_{nullptr};
   void* deopt_trampoline_generators_{nullptr};
   void* failed_deferred_compile_trampoline_{nullptr};
+  void* gen_delegate_walker_{nullptr};
 };
 
 } // namespace jit::codegen

@@ -253,6 +253,14 @@ size_t Function::getNumBasicBlocks() const {
   return basic_blocks_.size();
 }
 
+size_t Function::getNumInstrs() const {
+  size_t n = 0;
+  for (const BasicBlock* block : basic_blocks_) {
+    n += block->getNumInstrs();
+  }
+  return n;
+}
+
 void Function::sortBasicBlocks() {
   // Remove resume_entry_block from the block list before sorting.
   // It is a placeholder with no instructions during regalloc — populated
@@ -273,6 +281,13 @@ void Function::sortBasicBlocks() {
   BasicBlock* exit = exit_block_ ? exit_block_ : basic_blocks_.back();
   BasicBlockSorter sorter(basic_blocks_, exit);
   basic_blocks_ = sorter.getSortedBlocks();
+}
+
+void Function::sinkColdBlocks() {
+  std::stable_partition(
+      basic_blocks_.begin(), basic_blocks_.end(), [](BasicBlock* block) {
+        return block->section() == codegen::CodeSection::kHot;
+      });
 }
 
 const hir::Function* Function::hirFunc() const {

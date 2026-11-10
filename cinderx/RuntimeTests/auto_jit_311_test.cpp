@@ -201,7 +201,7 @@ TEST_F(AutoJit311Test, FreshInstanceAttachesToThePublishedArtifact) {
   ASSERT_TRUE(isJitCompiled(first));
   jit::CompiledFunction* artifact = installedArtifact(first);
   ASSERT_NE(artifact, nullptr);
-  EXPECT_EQ(first->vectorcall, artifact->artifactGuardedEntry311())
+  EXPECT_TRUE(artifact->isInstalledEntry311(first->vectorcall))
       << "the installed function bypasses its artifact guard";
   uint64_t made = jit::triggerStatsSnapshot().compiled_function_creations;
 
@@ -212,7 +212,7 @@ TEST_F(AutoJit311Test, FreshInstanceAttachesToThePublishedArtifact) {
   EXPECT_TRUE(isJitCompiled(second));
   EXPECT_EQ(installedArtifact(second), artifact)
       << "the fresh instance did not attach to the code's own artifact";
-  EXPECT_EQ(second->vectorcall, artifact->artifactGuardedEntry311())
+  EXPECT_TRUE(artifact->isInstalledEntry311(second->vectorcall))
       << "the attached function bypasses its artifact guard";
   EXPECT_EQ(jit::triggerStatsSnapshot().compiled_function_creations, made)
       << "attachment compiled the code again";
@@ -540,6 +540,63 @@ TEST_F(AutoJit311Test, AFailedCodeExtraAllocationLeavesTheGaugeBalanced) {
   // And the successful call that follows still accounts for itself.
   ASSERT_NE(codeExtra(code), nullptr);
   EXPECT_EQ(liveCodeExtraBlocks(), before + 1);
+}
+
+extern "C" void Ci_JitShell311_SetExecuteRefusal(const char* reason);
+extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
+
+TEST_F(AutoJit311Test, SizeRefusalIsNotInheritedByLaterRequests) {
+  // A size refusal belongs to the request that hit the budget.  The
+  // scheduling gate reads the refusal slot after every failed compile, so a
+  // reason left behind would relabel a later, unrelated compiler failure as
+  // an allowed size refusal and record that verdict on another code object.
+  SKIP_311_EXECUTABLE_COMPILE();
+  struct Restore {
+    size_t lir_instrs{jit::getConfig().max_lir_instrs};
+    jit::State state{jit::getConfig().state};
+    ~Restore() {
+      jit::getMutableConfig().max_lir_instrs = lir_instrs;
+      jit::getMutableConfig().state = state;
+      Ci_JitShell311_TakeExecuteRefusal();
+    }
+  } restore;
+  runCode(kFactorySource);
+
+  // A: force_compile() of an over-budget function reports the refusal
+  // through its own result and must not leave it in the slot.
+  jit::getMutableConfig().max_lir_instrs = 1;
+  runCode(R"(
+import cinderjit
+try:
+    cinderjit.force_compile(factory(1))
+except RuntimeError:
+    pass
+)");
+  EXPECT_EQ(Ci_JitShell311_TakeExecuteRefusal(), nullptr)
+      << "force_compile() left its size refusal behind";
+  jit::getMutableConfig().max_lir_instrs = restore.lir_instrs;
+
+  // B succeeds, then C fails before reaching the compiler without recording
+  // a reason of its own: neither may report a reason left by an earlier
+  // request (here planted directly, as any producer could leave one).
+  // (Separate code objects: the over-budget verdict is recorded on A's.)
+  Ref<PyFunctionObject> b(
+      compileAndGet("def refusal_b(x):\n    return x + 1", "refusal_b"));
+  ASSERT_NE(b, nullptr);
+  ASSERT_EQ(jit::compileFunction(b), jit::Result::OK);
+  EXPECT_EQ(Ci_JitShell311_TakeExecuteRefusal(), nullptr);
+
+  Ci_JitShell311_SetExecuteRefusal("REFUSE_SHAPE_LIR_SIZE_LIMIT");
+  Ref<PyFunctionObject> c(
+      compileAndGet("def refusal_c(x):\n    return x + 2", "refusal_c"));
+  ASSERT_NE(c, nullptr);
+  // A paused JIT turns the request away before the compiler runs.
+  jit::getMutableConfig().state = jit::State::kPaused;
+  EXPECT_NE(jit::compileFunction(c), jit::Result::OK);
+  jit::getMutableConfig().state = restore.state;
+  EXPECT_EQ(Ci_JitShell311_TakeExecuteRefusal(), nullptr)
+      << "a failed request reported a refusal it did not produce";
+  EXPECT_FALSE(isJitCompiled(c));
 }
 
 #endif

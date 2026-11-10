@@ -288,6 +288,8 @@ class RuntimeTransitionAcceptanceRunner:
                 "--env",
                 "CINDERX_JIT_MODE=canary",
                 "--env",
+                "CINDERX_JIT_STARTUP_GRACE_MS=0",
+                "--env",
                 "PYTHONJITGENERATOR=1",
             ]
             command += (
@@ -302,6 +304,7 @@ class RuntimeTransitionAcceptanceRunner:
         env = self.base._stage_env()
         env.update(
             CINDERX_JIT_MODE="canary",
+            CINDERX_JIT_STARTUP_GRACE_MS="0",
             PYTHONJITALL="1",
             PYTHONJITGENERATOR="1",
         )

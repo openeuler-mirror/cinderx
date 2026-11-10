@@ -140,6 +140,8 @@ struct LifecycleSnapshot311 {
   size_t context_references{0};
   size_t code_runtimes_allocated{0};
   size_t code_runtimes_live{0};
+  size_t subscript_caches{0};
+  size_t predicate_caches{0};
 };
 
 } // namespace jit
@@ -544,6 +546,11 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   LoadModuleMethodCache* allocateLoadModuleMethodCache();
   LoadTypeMethodCache* allocateLoadTypeMethodCache();
   StoreAttrCache* allocateStoreAttrCache();
+#if PY_VERSION_HEX < 0x030C0000
+  CallSiteEntryCache* allocateCallSiteEntryCache();
+  SuperSiteCache311* allocateSuperSiteCache311();
+  GlobalLoadCell311* allocateGlobalLoadCell311();
+#endif
 
   const Builtins& builtins();
 
@@ -591,6 +598,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
       BorrowedRef<PyFunctionObject> func,
       BorrowedRef<CompiledFunction> compiled);
 
+  // Defers the release of a CodeRuntime whose compilation was abandoned by
+  // a worker thread (e.g. an over-budget function).  Dropping the runtime's
+  // references decrements refcounts of objects shared between workers, so a
+  // worker must not do it itself; finalizeMultiThreadedCompile performs the
+  // release on the main thread, which holds the GIL.
+  void deferCodeRuntimeRelease(CodeRuntime* runtime);
+
   void finalizeMultiThreadedCompile();
 
   // Notifies that a compilation is complete. If we're not in multi-threaded
@@ -637,6 +651,11 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   SlabArena<LoadModuleMethodCache> load_module_method_caches_;
   SlabArena<LoadTypeMethodCache> load_type_method_caches_;
   SlabArena<StoreAttrCache, AttributeCacheSizeTrait> store_attr_caches_;
+#if PY_VERSION_HEX < 0x030C0000
+  SlabArena<CallSiteEntryCache> call_site_entry_caches_;
+  SlabArena<SuperSiteCache311> super_site_caches_;
+  SlabArena<GlobalLoadCell311> global_load_cells_311_;
+#endif
   SlabArena<void*> pointer_caches_;
 
   FunctionEntryCacheMap function_entry_caches_;
@@ -790,6 +809,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   std::vector<
       std::pair<ThreadedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>>
       deferred_finalizations_;
+
+  /*
+   * CodeRuntimes abandoned by compile workers (over-budget functions).
+   * Their references are released on the main thread by
+   * finalizeMultiThreadedCompile, after the workers have joined.
+   */
+  std::vector<CodeRuntime*> deferred_release_runtimes_;
 
   /*
    * Code which is being kept alive in case it was in use when

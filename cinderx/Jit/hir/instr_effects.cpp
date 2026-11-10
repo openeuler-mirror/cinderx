@@ -586,6 +586,16 @@ bool hasArbitraryExecution(const Instr& inst) {
           return false;
         case CallCFunc::Func::kJitGen_yf:
           return false;
+        // Handler entry normalizes the exception (its class may run Python)
+        // and creates the frame object; POP_EXCEPT releases the previously
+        // handled exception (a destructor may run); the no-handler exit adds
+        // the traceback entry (frame object creation).
+        case CallCFunc::Func::kJITRT_EnterExceptHandler311:
+        case CallCFunc::Func::kJITRT_PopExcInfo311:
+          return true;
+        case CallCFunc::Func::kJITRT_PushExcInfo311:
+        case CallCFunc::Func::kJITRT_ExcMatch311:
+          return false;
       }
       JIT_ABORT(
           "Bad CallCFunc function {}",

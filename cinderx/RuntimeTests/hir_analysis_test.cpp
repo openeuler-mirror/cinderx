@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Jit/compile_budget.h"
+#include "cinderx/Jit/compiler.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
@@ -633,4 +636,89 @@ fun type_hints {
   EXPECT_EQ(seen.dominatingTypeHint(v2, bb7), nullptr);
 
   EXPECT_EQ(seen.dominatingTypeHint(v1, bb4), nullptr);
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
+#endif
+
+class HIRSizeBudgetTest : public RuntimeTest {
+ protected:
+  // Two blocks, three instructions:
+  //
+  // fun sized {
+  //   bb 0 {
+  //     v0 = LoadArg<0>
+  //     Branch<1>
+  //   }
+  //
+  //   bb 1 {
+  //     Return v0
+  //   }
+  // }
+  static void buildTwoBlockFunction(Function& func) {
+    auto entry = func.cfg.AllocateBlock();
+    func.cfg.entry_block = entry;
+    auto v0 = func.env.AllocateRegister();
+    entry->append<LoadArg>(v0, 0);
+    auto exit = func.cfg.AllocateBlock();
+    entry->append<Branch>(exit);
+    exit->append<Return>(v0);
+  }
+};
+
+TEST_F(HIRSizeBudgetTest, CountsBlocksAndInstrs) {
+  Function func;
+  EXPECT_EQ(func.numBlocks(), 0);
+  EXPECT_EQ(func.numInstrs(), 0);
+
+  buildTwoBlockFunction(func);
+  EXPECT_EQ(func.cfg.numBlocks(), 2);
+  EXPECT_EQ(func.cfg.numInstrs(), 3);
+  EXPECT_EQ(func.numBlocks(), 2);
+  EXPECT_EQ(func.numInstrs(), 3);
+}
+
+TEST_F(HIRSizeBudgetTest, RunPassesRefusesAnOversizedFunction) {
+  struct RestoreConfig {
+    size_t blocks{jit::getConfig().max_hir_blocks};
+    size_t instrs{jit::getConfig().max_hir_instrs};
+    ~RestoreConfig() {
+      jit::getMutableConfig().max_hir_blocks = blocks;
+      jit::getMutableConfig().max_hir_instrs = instrs;
+    }
+  } restore;
+
+  auto expect_refused = [](Function& func, const char* what) {
+    try {
+      jit::Compiler::runPasses(func, jit::PassConfig::kMinimal);
+      ADD_FAILURE() << "runPasses accepted a function over the " << what
+                    << " budget";
+    } catch (const jit::CompileBudgetExceeded& exn) {
+      EXPECT_STREQ(exn.reason(), "REFUSE_SHAPE_HIR_SIZE_LIMIT");
+      EXPECT_NE(std::string{exn.what()}.find(what), std::string::npos)
+          << exn.what();
+    }
+#if PY_VERSION_HEX < 0x030C0000
+    // CPython 3.11 also records the refusal for the scheduling gate; consume
+    // it so it cannot leak into a later test.
+    const char* recorded = Ci_JitShell311_TakeExecuteRefusal();
+    ASSERT_NE(recorded, nullptr);
+    EXPECT_STREQ(recorded, "REFUSE_SHAPE_HIR_SIZE_LIMIT");
+#endif
+  };
+
+  {
+    Function func;
+    buildTwoBlockFunction(func);
+    jit::getMutableConfig().max_hir_blocks = 1;
+    expect_refused(func, "basic blocks");
+  }
+  {
+    Function func;
+    buildTwoBlockFunction(func);
+    jit::getMutableConfig().max_hir_blocks = restore.blocks;
+    jit::getMutableConfig().max_hir_instrs = 2;
+    expect_refused(func, "instructions");
+  }
 }

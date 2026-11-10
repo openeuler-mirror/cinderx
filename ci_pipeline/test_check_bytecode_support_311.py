@@ -45,6 +45,54 @@ def decoder_source():
     return (checker.REPO_ROOT / checker.BYTECODE_DECODER).read_text()
 
 
+def test_execute_surface_manifest_matches_builder(builder_source):
+    manifest = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    assert checker.validate_execute_surface(
+        manifest["execute_surface"]["supported_opcodes"], builder_source
+    ) == []
+
+
+@pytest.mark.parametrize("opcode", ["BUILD_SLICE", "BUILD_STRING", "FORMAT_VALUE"])
+def test_execute_surface_missing_admission_is_rejected(builder_source, opcode):
+    manifest = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    names = list(manifest["execute_surface"]["supported_opcodes"])
+    names.remove(opcode)
+    errors = checker.validate_execute_surface(names, builder_source)
+    assert errors and "added=" in errors[0] and opcode in errors[0]
+
+
+def test_execute_surface_manifest_cannot_admit_extra_opcode(builder_source):
+    manifest = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    names = [*manifest["execute_surface"]["supported_opcodes"], "IMPORT_STAR"]
+    errors = checker.validate_execute_surface(names, builder_source)
+    assert errors and "missing=" in errors[0] and "IMPORT_STAR" in errors[0]
+
+
+def test_execute_surface_rejects_duplicate_names(builder_source):
+    manifest = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    names = [*manifest["execute_surface"]["supported_opcodes"], "LOAD_FAST"]
+    assert "duplicate" in checker.validate_execute_surface(names, builder_source)[0]
+
+
+def test_execute_surface_cpp_removal_is_rejected(builder_source):
+    manifest = checker.load_document(checker.REPO_ROOT / checker.EXECUTE_CAPABILITIES)
+    source = mutate_function(
+        builder_source,
+        "bool isExecuteOpcodeSupported311(int opcode)",
+        "    case BUILD_SLICE:\n",
+        "",
+    )
+    errors = checker.validate_execute_surface(
+        manifest["execute_surface"]["supported_opcodes"], source
+    )
+    assert errors and "missing=" in errors[0] and "BUILD_SLICE" in errors[0]
+
+
+@pytest.mark.parametrize("names", [None, "LOAD_FAST", [1]])
+def test_execute_surface_rejects_invalid_manifest(names, builder_source):
+    assert "list of names" in checker.validate_execute_surface(names, builder_source)[0]
+
+
 def mutate(rows):
     return {name: dict(row) for name, row in rows.items()}
 

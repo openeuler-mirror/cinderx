@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/environ.h"
@@ -11,6 +12,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/parser.h"
+#include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
@@ -113,6 +115,122 @@ class LIRGeneratorTest : public RuntimeTest {
   }
 };
 
+// Construct guards without any preloader, constant, or Environment owner for
+// their targets. This isolates the ownership added by LIR lowering.
+TEST_F(LIRGeneratorTest, GuardIsPinsTargetUntilRuntimeRelease) {
+  runCode("class Target: pass\n");
+  auto target = Ref<>::steal(PyObject_CallNoArgs(getGlobal("Target")));
+  ASSERT_NE(target, nullptr);
+  auto weak = Ref<>::steal(PyWeakref_NewRef(target, nullptr));
+  ASSERT_NE(weak, nullptr);
+  auto func = hir::HIRParser{}.ParseHIR(R"(
+fun guard_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    Snapshot { CurInstrOffset 0 Locals<1> v0 }
+    v1 = GuardIs<Py_None> v0
+    v2 = GuardIs<Py_None> v1
+    Return v2
+  }
+}
+)");
+  ASSERT_NE(func, nullptr);
+  runCode("def guard_runtime(value): return value\n");
+  BorrowedRef<PyFunctionObject> owner{getGlobal("guard_runtime")};
+  func->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+  func->builtins.reset(owner->func_builtins);
+  func->globals.reset(owner->func_globals);
+  for (auto& block : func->cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      auto& instr = *it++;
+      if (!instr.IsGuardIs()) {
+        continue;
+      }
+      auto replacement =
+          hir::GuardIs::create(instr.output(), target, instr.GetOperand(0));
+      replacement->setFrameState(hir::FrameState{});
+      instr.ReplaceWith(*replacement);
+      delete &instr;
+    }
+  }
+  Compiler::runPasses(*func, static_cast<PassConfig>(0));
+  CodeRuntime runtime{func->code, func->builtins, func->globals};
+  codegen::Environ env;
+  env.ctx = getContext();
+  env.code_rt = &runtime;
+  auto before = Py_REFCNT(target.get());
+  LIRGenerator generator(func.get(), &env);
+  auto lir = generator.TranslateFunction();
+  ASSERT_NE(lir, nullptr);
+  EXPECT_EQ(Py_REFCNT(target.get()), before + 1);
+  lir.reset();
+  func.reset();
+  target.reset();
+  PyGC_Collect();
+  EXPECT_NE(PyWeakref_GetObject(weak), Py_None);
+  runtime.releaseReferences();
+  PyGC_Collect();
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
+}
+
+TEST_F(LIRGeneratorTest, GuardTypePinsHeapTypeUntilRuntimeRelease) {
+  auto target = Ref<>::steal(PyObject_CallFunction(
+      reinterpret_cast<PyObject*>(&PyType_Type), "s(){}", "GuardTarget"));
+  ASSERT_NE(target, nullptr);
+  auto weak = Ref<>::steal(PyWeakref_NewRef(target, nullptr));
+  ASSERT_NE(weak, nullptr);
+  auto func = hir::HIRParser{}.ParseHIR(R"(
+fun type_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    Snapshot { CurInstrOffset 0 Locals<1> v0 }
+    v1 = GuardType<Object> v0
+    Return v1
+  }
+}
+)");
+  ASSERT_NE(func, nullptr);
+  runCode("def guard_runtime(value): return value\n");
+  BorrowedRef<PyFunctionObject> owner{getGlobal("guard_runtime")};
+  func->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+  func->builtins.reset(owner->func_builtins);
+  func->globals.reset(owner->func_globals);
+  for (auto& block : func->cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      auto& instr = *it++;
+      if (!instr.IsGuardType()) {
+        continue;
+      }
+      auto replacement = hir::GuardType::create(
+          instr.output(),
+          hir::Type::fromTypeExact(
+              reinterpret_cast<PyTypeObject*>(target.get())),
+          instr.GetOperand(0),
+          hir::FrameState{});
+      instr.ReplaceWith(*replacement);
+      delete &instr;
+    }
+  }
+  Compiler::runPasses(*func, static_cast<PassConfig>(0));
+  CodeRuntime runtime{func->code, func->builtins, func->globals};
+  codegen::Environ env;
+  env.ctx = getContext();
+  env.code_rt = &runtime;
+  auto before = Py_REFCNT(target.get());
+  LIRGenerator generator(func.get(), &env);
+  auto lir = generator.TranslateFunction();
+  ASSERT_NE(lir, nullptr);
+  EXPECT_EQ(Py_REFCNT(target.get()), before + 1);
+  lir.reset();
+  func.reset();
+  target.reset();
+  PyGC_Collect();
+  EXPECT_NE(PyWeakref_GetObject(weak), Py_None);
+  runtime.releaseReferences();
+  PyGC_Collect();
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
+}
+
 #if PY_VERSION_HEX < 0x030C0000
 struct Translated311HIR {
   std::unique_ptr<hir::Function> hir;
@@ -178,6 +296,164 @@ static size_t countOpcode(
   return count;
 }
 
+class LoopBoxing311Test : public LIRGeneratorTest {};
+
+TEST_F(LoopBoxing311Test, DirectIntegerBoxingKeepsCacheAndAllocationGuards) {
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def boxing_owner(left, right): return left\n", "boxing_owner"));
+  ASSERT_NE(owner, nullptr);
+  const char* primitive = R"(fun boxing_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = RefineType<LongExact> v0
+    v3 = PrimitiveUnbox<CInt64> v2
+    v4 = PrimitiveBox<CInt64> v3 {
+      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }
+    }
+    Return v4
+  }
+}
+)";
+  for (const std::string operation : {"PrimitiveBox", "Add", "Subtract"}) {
+    SCOPED_TRACE(operation);
+    std::string source = primitive;
+    if (operation != "PrimitiveBox") {
+      source =
+          "fun boxing_owner {\n  bb 0 {\n"
+          "    v0 = LoadArg<0>\n    v1 = LoadArg<1>\n"
+          "    v2 = RefineType<LongExact> v0\n"
+          "    v3 = RefineType<LongExact> v1\n"
+          "    v4 = LongInPlaceOp<" +
+          operation +
+          "> v2 v3 {\n"
+          "      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }\n"
+          "    }\n    Return v4\n  }\n}\n";
+    }
+    auto irfunc = hir::HIRParser{}.ParseHIR(source.c_str());
+    ASSERT_NE(irfunc, nullptr);
+    irfunc->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    irfunc->builtins.reset(owner->func_builtins);
+    irfunc->globals.reset(owner->func_globals);
+    // Keep these HIR operations intact while resolving their deopt metadata.
+    Compiler::runPasses(*irfunc, static_cast<PassConfig>(0));
+    CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    codegen::Environ env;
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator generator(irfunc.get(), &env);
+    auto lir = generator.TranslateFunction();
+    ASSERT_NE(lir, nullptr);
+    EXPECT_TRUE(hasImmediate(*lir, reinterpret_cast<uint64_t>(PyLong_FromLong)))
+        << *lir;
+    EXPECT_FALSE(hasImmediate(*lir, reinterpret_cast<uint64_t>(JITRT_BoxI64)))
+        << *lir;
+    EXPECT_GE(countOpcode(*lir, Instruction::kLessThanUnsigned), 1u) << *lir;
+    bool allocation_guard = false;
+    for (const auto* block : lir->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        if (instr->opcode() != Instruction::kGuard ||
+            static_cast<InstrGuardKind>(instr->getInput(0)->getConstant()) !=
+                InstrGuardKind::kNotZero ||
+            !instr->getInput(2)->isLinked()) {
+          continue;
+        }
+        const auto* boxed =
+            static_cast<const LinkedOperand*>(instr->getInput(2))
+                ->getLinkedInstr();
+        if (boxed->isCall() && boxed->getNumInputs() > 0 &&
+            boxed->getInput(0)->isImm() &&
+            boxed->getInput(0)->getConstant() ==
+                reinterpret_cast<uint64_t>(PyLong_FromLong)) {
+          allocation_guard = true;
+        }
+      }
+    }
+    EXPECT_TRUE(allocation_guard) << *lir;
+  }
+}
+
+TEST_F(LIRGeneratorTest, Python311ForcedDeoptOptOutKeepsOrganicChecks) {
+  const auto saved = getConfig();
+  SCOPE_EXIT(getMutableConfig() = saved);
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def policy_lowering(value, result): return value\n", "policy_lowering"));
+  ASSERT_NE(owner, nullptr);
+  const char* source = R"(fun policy_lowering {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    Snapshot { CurInstrOffset 0 Locals<2> v0 v1 }
+    v2 = GuardType<LongExact> v0
+    v3 = CheckExc v1 {
+      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }
+    }
+    Return v2
+  }
+}
+)";
+
+  for (bool emit_checks : {true, false}) {
+    SCOPED_TRACE(emit_checks);
+    getMutableConfig().emit_force_deopt_checks = emit_checks;
+    auto irfunc = hir::HIRParser{}.ParseHIR(source);
+    ASSERT_NE(irfunc, nullptr);
+    irfunc->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    irfunc->builtins.reset(owner->func_builtins);
+    irfunc->globals.reset(owner->func_globals);
+    // Resolve snapshots and reference state without folding away the two
+    // independent organic checks whose lowering this test protects.
+    Compiler::runPasses(*irfunc, static_cast<PassConfig>(0));
+    CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    codegen::Environ env;
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator generator(irfunc.get(), &env);
+    auto lir = generator.TranslateFunction();
+    ASSERT_NE(lir, nullptr);
+
+    size_t polls = 0;
+    size_t type_guards = 0;
+    size_t exception_guards = 0;
+    for (const auto* block : lir->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        if (instr->isCall() && instr->getNumInputs() > 0 &&
+            instr->getInput(0)->isImm() &&
+            instr->getInput(0)->getConstant() ==
+                reinterpret_cast<uint64_t>(JITRT_ConsumeForcedDeopt)) {
+          ++polls;
+        }
+        if (instr->opcode() != Instruction::kGuard) {
+          continue;
+        }
+        const auto kind =
+            static_cast<InstrGuardKind>(instr->getInput(0)->getConstant());
+        const auto deopt_id = instr->getInput(1)->getConstant();
+        ASSERT_LT(deopt_id, runtime.deoptMetadatas().size());
+        const auto& meta = runtime.deoptMetadatas()[deopt_id];
+        if (kind == InstrGuardKind::kHasType) {
+          ++type_guards;
+          EXPECT_EQ(meta.reason, DeoptReason::kGuardFailure);
+          EXPECT_TRUE(meta.forceable);
+          EXPECT_FALSE(meta.frame_meta.empty());
+        } else if (kind == InstrGuardKind::kNotZero) {
+          ++exception_guards;
+          EXPECT_EQ(meta.reason, DeoptReason::kUnhandledException);
+          EXPECT_FALSE(meta.forceable);
+          EXPECT_FALSE(meta.frame_meta.empty());
+        }
+      }
+    }
+    // GuardType is forceable; CheckExc must retain its natural exception
+    // guard without becoming a diagnostic forced-deopt site in either arm.
+    EXPECT_EQ(polls, emit_checks ? 1u : 0u) << *lir;
+    EXPECT_EQ(type_guards, 1u) << *lir;
+    EXPECT_EQ(exception_guards, 1u) << *lir;
+    EXPECT_EQ(countOpcode(*lir, Instruction::kGuard), emit_checks ? 3u : 2u)
+        << *lir;
+  }
+}
+
 TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
   const char* exact_source = R"(fun exact_call {
   bb 0 {
@@ -191,16 +467,27 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
 )";
   auto exact = translate311HIR(exact_source, getContext());
   ASSERT_NE(exact.lir, nullptr);
-  const Instruction* exact_call =
-      findOpcode(*exact.lir, Instruction::kVectorCall);
-  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   EXPECT_FALSE(hasImmediate(
       *exact.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
       << *exact.lir;
+#if defined(CINDER_AARCH64)
+  // A callee known to be a function takes the call-site entry cache as well:
+  // a fresh function object (one this code just made) still carries the
+  // interpreter's vectorcall, and only the cache's miss arm dispatches it by
+  // code into its artifact; the raw vectorcall-slot call would interpret it.
+  EXPECT_NE(findOpcode(*exact.lir, Instruction::kCallSiteVectorCall), nullptr)
+      << *exact.lir;
+  EXPECT_EQ(findOpcode(*exact.lir, Instruction::kVectorCall), nullptr)
+      << *exact.lir;
+#else
+  const Instruction* exact_call =
+      findOpcode(*exact.lir, Instruction::kVectorCall);
+  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   ASSERT_GT(exact_call->getNumInputs(), 0u);
   EXPECT_TRUE(exact_call->getInput(exact_call->getNumInputs() - 1)->isImm());
   EXPECT_EQ(
       exact_call->getInput(exact_call->getNumInputs() - 1)->getConstant(), 0);
+#endif
 
   const char* generic_source = R"(fun generic_call {
   bb 0 {
@@ -213,11 +500,42 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
 )";
   auto generic = translate311HIR(generic_source, getContext());
   ASSERT_NE(generic.lir, nullptr);
-  EXPECT_TRUE(hasImmediate(
+#if defined(CINDER_AARCH64)
+  // A kwnames-free site with an unknown callable takes the call-site entry
+  // cache: the probe sequence replaces the select chain and the slow slot
+  // lives in the per-function dispatch stub.
+  EXPECT_NE(findOpcode(*generic.lir, Instruction::kCallSiteVectorCall), nullptr)
+      << *generic.lir;
+  EXPECT_EQ(findOpcode(*generic.lir, Instruction::kVectorCall), nullptr)
+      << *generic.lir;
+  EXPECT_FALSE(hasImmediate(
       *generic.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
       << *generic.lir;
-  EXPECT_GE(countOpcode(*generic.lir, Instruction::kSelect), 1u)
+  EXPECT_EQ(countOpcode(*generic.lir, Instruction::kSelect), 0u)
       << *generic.lir;
+
+  // A keyword site keeps the branchless select between the callee's own
+  // vectorcall slot and the slow slot.
+  const char* generic_keyword_source = R"(fun generic_keyword_call {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = VectorCall<1, kwnames> v0 v1
+    Return v2
+  }
+}
+)";
+  auto generic_keyword = translate311HIR(generic_keyword_source, getContext());
+  ASSERT_NE(generic_keyword.lir, nullptr);
+  EXPECT_NE(findOpcode(*generic_keyword.lir, Instruction::kVectorCall), nullptr)
+      << *generic_keyword.lir;
+  EXPECT_TRUE(hasImmediate(
+      *generic_keyword.lir,
+      reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
+      << *generic_keyword.lir;
+  EXPECT_GE(countOpcode(*generic_keyword.lir, Instruction::kSelect), 1u)
+      << *generic_keyword.lir;
+#endif
 
   const char* keyword_source = R"(fun keyword_call {
   bb 0 {
@@ -240,7 +558,8 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
       << *keyword.lir;
 }
 
-TEST_F(LIRGeneratorTest, Python311CallMethodKeepsNullReceiverSlowArm) {
+TEST_F(LIRGeneratorTest, Python311CallMethodTakesTheEntryCacheForm) {
+#if defined(CINDER_AARCH64)
   const char* source = R"(fun method_call {
   bb 0 {
     v0 = LoadArg<0>
@@ -253,15 +572,24 @@ TEST_F(LIRGeneratorTest, Python311CallMethodKeepsNullReceiverSlowArm) {
 )";
   auto function = translate311HIR(source, getContext());
   ASSERT_NE(function.lir, nullptr);
-  EXPECT_NE(findOpcode(*function.lir, Instruction::kVectorCall), nullptr)
+  // The method-call entry cache carries the NULL/None callable and
+  // empty-receiver prechecks itself; its slow arm (the JITRT_Call slot,
+  // shift protocol included) lives in the per-function dispatch stub, so
+  // no select chain remains in the LIR.
+  EXPECT_NE(
+      findOpcode(*function.lir, Instruction::kCallSiteCallMethod), nullptr)
       << *function.lir;
-  EXPECT_TRUE(hasImmediate(
+  EXPECT_EQ(findOpcode(*function.lir, Instruction::kVectorCall), nullptr)
+      << *function.lir;
+  EXPECT_FALSE(hasImmediate(
       *function.lir, reinterpret_cast<uint64_t>(&g_JITRT_Call311_slot)))
       << *function.lir;
-  // The final Select is the receiver-null override of the earlier type-based
-  // fast/slow selection. The preceding Selects make callable loads safe.
-  EXPECT_GE(countOpcode(*function.lir, Instruction::kSelect), 4u)
+  EXPECT_EQ(countOpcode(*function.lir, Instruction::kSelect), 0u)
       << *function.lir;
+
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.11 call-site entry cache";
+#endif
 }
 
 TEST_F(LIRGeneratorTest, Python311FrameLocalWriteEliminatesHelperCall) {
@@ -425,6 +753,94 @@ def test(value):
       << errors.str() << *lir_func;
 }
 #endif
+
+TEST_F(LIRGeneratorTest, GILRefcountGuardsFollowImmortalizationCapability) {
+  if constexpr (kFreeThreadedBuild) {
+    GTEST_SKIP() << "GIL refcount lowering contract";
+  }
+  for (std::string_view type :
+       {"MortalListExact", "Object", "OptObject", "ImmortalObject"}) {
+    SCOPED_TRACE(type);
+    bool nullable = type == "OptObject";
+    bool immortal = type == "ImmortalObject";
+    // CPython 3.11 has no immortal heap objects: every refcount operation
+    // is emitted in the 64-bit mortal form without a capability guard.
+    bool runtime_check = !immortal && PY_VERSION_HEX >= 0x030C0000;
+    auto source = fmt::format(
+        R"(fun test {{
+  bb 0 {{
+    v0 = LoadArg<0>
+    v1 = RefineType<{}> v0
+    Incref v1
+    {}Decref v1
+    Return v0
+  }}
+}}
+)",
+        type,
+        nullable ? "X" : "");
+    auto irfunc = hir::HIRParser{}.ParseHIR(source.c_str());
+    ASSERT_NE(irfunc, nullptr);
+    hir::reflowTypes(*irfunc);
+    if (nullable) {
+      // The HIR parser does not support XIncref; construct that instruction.
+      hir::Instr* incref = nullptr;
+      for (auto& instr : *irfunc->cfg.entry_block) {
+        if (instr.IsIncref()) {
+          incref = &instr;
+          break;
+        }
+      }
+      ASSERT_NE(incref, nullptr);
+      incref->ReplaceWith(*hir::XIncref::create(incref->GetOperand(0)));
+      delete incref;
+    }
+    jit::codegen::Environ env;
+    jit::CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator lir_gen(irfunc.get(), &env);
+    auto function = lir_gen.TranslateFunction();
+
+    size_t increfs = 0;
+    size_t decrefs = 0;
+    size_t incref_guards = 0;
+    size_t decref_guards = 0;
+    size_t null_checks = 0;
+    for (const auto* block : function->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        const auto* origin = instr->origin();
+        if (origin == nullptr) {
+          continue;
+        }
+        bool inc = origin->IsIncref() || origin->IsXIncref();
+        bool dec = origin->IsDecref() || origin->IsXDecref();
+        if (!inc && !dec) {
+          continue;
+        }
+        if (inc && instr->opcode() == Instruction::kInc) {
+          ++increfs;
+          EXPECT_EQ(
+              instr->getInput(0)->dataType(),
+              runtime_check ? DataType::k32bit : DataType::k64bit);
+        }
+        decrefs += dec && instr->opcode() == Instruction::kDec;
+#if PY_VERSION_HEX >= 0x030E0000
+        incref_guards += inc && instr->opcode() == Instruction::kBranchS;
+#else
+        incref_guards += inc && instr->opcode() == Instruction::kBranchE;
+#endif
+        decref_guards += dec && instr->opcode() == Instruction::kBranchBitSet;
+        null_checks += instr->opcode() == Instruction::kCondBranch;
+      }
+    }
+    EXPECT_EQ(increfs, immortal ? 0u : 1u) << *function;
+    EXPECT_EQ(decrefs, immortal ? 0u : 1u) << *function;
+    EXPECT_EQ(incref_guards, runtime_check ? 1u : 0u) << *function;
+    EXPECT_EQ(decref_guards, runtime_check ? 1u : 0u) << *function;
+    EXPECT_EQ(null_checks, nullable ? 2u : 0u) << *function;
+  }
+}
 
 TEST_F(LIRGeneratorTest, BroadPythonTranslationCoverage) {
   const char* snippets[] = {
@@ -1045,6 +1461,25 @@ BB %10 - preds: %0 %7 - section: hot
       parsed_func->basicblocks()[1]->section(), codegen::CodeSection::kCold);
   ASSERT_EQ(
       parsed_func->basicblocks()[2]->section(), codegen::CodeSection::kHot);
+}
+
+TEST(LIRParserTest, FunctionSizeCounts) {
+  // The size budget counts blocks and instructions across the whole function.
+  const std::string source =
+      "Function:\nBB %0\n"
+      "    %1:64bit = Move 1(0x1):64bit\n"
+      "    CondBranch %1:64bit, BB%2, BB%3\n"
+      "\n"
+      "BB %2 - preds: %0 - succs: %3\n"
+      "    Return %1:64bit\n"
+      "\n"
+      "BB %3 - preds: %0 %2\n"
+      "    Return %1:64bit\n";
+  Parser parser;
+  auto function = parser.parse(source);
+  ASSERT_NE(function, nullptr);
+  EXPECT_EQ(function->getNumBasicBlocks(), 3);
+  EXPECT_EQ(function->getNumInstrs(), 4);
 }
 
 template <typename... Args>

@@ -247,6 +247,74 @@ TEST_F(AArch64PeepholeTest, PairsAdjacentPointerWidthLoads) {
   EXPECT_TRUE(verifyPostRegAllocInvariants(&function, std::cout));
 }
 
+TEST_F(AArch64PeepholeTest, PairsDescendingPointerWidthLoads) {
+  for (int32_t lower_offset : {-512, 0, 64, 504}) {
+    SCOPED_TRACE(lower_offset);
+    Function function;
+    auto* block = function.allocateBasicBlock();
+    appendPhysicalIndirectLoad(
+        block,
+        Instruction::kMove,
+        X1,
+        lower_offset + kPointerSize,
+        DataType::kObject,
+        X8,
+        DataType::kObject);
+    auto* lower_load = appendPhysicalIndirectLoad(
+        block,
+        Instruction::kMove,
+        X1,
+        lower_offset,
+        DataType::k64bit,
+        X9,
+        DataType::k64bit);
+    const auto* origin = lower_load->origin();
+    runPostAllocRewrites(function);
+    ASSERT_EQ(block->getNumInstrs(), 1);
+    ASSERT_EQ(lower_load->opcode(), Instruction::kLoadPair);
+    EXPECT_EQ(lower_load->origin(), origin);
+    EXPECT_EQ(
+        lower_load->getInput(0)->getConstant(),
+        static_cast<uint64_t>(static_cast<int64_t>(lower_offset)));
+    EXPECT_EQ(lower_load->getInput(2)->getPhyRegister(), X9);
+    EXPECT_EQ(lower_load->getInput(2)->dataType(), DataType::k64bit);
+    EXPECT_EQ(lower_load->getInput(3)->getPhyRegister(), X8);
+    EXPECT_EQ(lower_load->getInput(3)->dataType(), DataType::kObject);
+    block->allocateInstr(Instruction::kReturn, nullptr);
+    EXPECT_TRUE(verifyPostRegAllocInvariants(&function, std::cout));
+  }
+}
+
+TEST_F(AArch64PeepholeTest, RejectsDescendingLoadRegisterHazards) {
+  const PhyLocation destinations[][2] = {{X1, X9}, {X8, X1}, {X8, X8}};
+  for (const auto& regs : destinations) {
+    Function function;
+    auto* block = function.allocateBasicBlock();
+    appendPhysicalIndirectLoad(
+        block,
+        Instruction::kMove,
+        X1,
+        8,
+        DataType::kObject,
+        regs[0],
+        DataType::kObject);
+    appendPhysicalIndirectLoad(
+        block,
+        Instruction::kMove,
+        X1,
+        0,
+        DataType::kObject,
+        regs[1],
+        DataType::kObject);
+    runPostAllocRewrites(function);
+    for (const auto& instr : block->instructions()) {
+      EXPECT_NE(instr->opcode(), Instruction::kLoadPair);
+    }
+    block->allocateInstr(Instruction::kReturn, nullptr);
+    EXPECT_TRUE(verifyPostRegAllocInvariants(&function, std::cout));
+  }
+}
+
 TEST_F(AArch64PeepholeTest, PairsLoadOffsetsAtEncodingBoundaries) {
   struct Case {
     int32_t lower_offset;
@@ -362,17 +430,7 @@ TEST_F(AArch64PeepholeTest, KeepsIneligibleAdjacentLoadsUnchanged) {
        DataType::kObject,
        DataType::kObject,
        DataType::kObject},
-      // Preserve load order and require consecutive, aligned addresses.
-      {8,
-       0,
-       X1,
-       X1,
-       X8,
-       X9,
-       DataType::kObject,
-       DataType::kObject,
-       DataType::kObject,
-       DataType::kObject},
+      // Require consecutive, aligned addresses.
       {0,
        16,
        X1,

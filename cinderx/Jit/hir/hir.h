@@ -320,6 +320,18 @@ class DeoptBase : public Instr {
   // Get or set the human-readable description of why this instruction might
   // deopt.
   const std::string& descr() const;
+
+  // When set, the exception exit of this instruction is a CFG edge -- the
+  // CondBranch that follows tests its NULL output and branches to the
+  // compiled handler's entry stub -- and the LIR lowering omits the
+  // exception guard.  The deopt metadata stays for the other exits (a nested
+  // guard, the forced-deopt poll).
+  bool excEdge() const {
+    return exc_edge_;
+  }
+  void setExcEdge(bool exc_edge) {
+    exc_edge_ = exc_edge;
+  }
   void setDescr(std::string r);
 
   // Get or set the optional value that is responsible for this deopt
@@ -336,6 +348,7 @@ class DeoptBase : public Instr {
   int nonce_{-1};
   // A human-readable description of why this instruction might deopt.
   std::string descr_;
+  bool exc_edge_{false};
 };
 
 // This pile of template metaprogramming provides a convenient way to define
@@ -568,10 +581,12 @@ class INSTR_CLASS(
       Register* left,
       Register* right,
       const FrameState& frame,
-      bool array_subscr_slow_path = false)
+      bool array_subscr_slow_path = false,
+      bool subscr_adaptive_stuck = false)
       : InstrT(dst, left, right, frame),
         op_(op),
-        array_subscr_slow_path_(array_subscr_slow_path) {}
+        array_subscr_slow_path_(array_subscr_slow_path),
+        subscr_adaptive_stuck_(subscr_adaptive_stuck) {}
 
   BinaryOpKind op() const {
     return op_;
@@ -589,9 +604,48 @@ class INSTR_CLASS(
     return array_subscr_slow_path_;
   }
 
+  // Subscript site whose interpreter specialization was attempted and
+  // failed (see BytecodeInstruction::isSubscrAdaptiveStuck).  Used as
+  // emission evidence for the speculative array.array fast path.
+  bool isSubscrAdaptiveStuck() const {
+    return subscr_adaptive_stuck_;
+  }
+
+  // SPIKE(ARRTC): the only array.array typecode the site's interpreter
+  // record has seen (BytecodeInstruction::subscrArrayTypecode), or 0.
+  char subscrArrayTypecode() const {
+    return subscr_array_typecode_;
+  }
+  void setSubscrArrayTypecode(char tc) {
+    subscr_array_typecode_ = tc;
+  }
+
+  // SPIKE(FLOATSPEC): arithmetic site whose interpreter specialisation was
+  // attempted and failed; Simplify may speculate float operands behind a
+  // type-check diamond.
+  bool speculateFloat() const {
+    return speculate_float_;
+  }
+  void setSpeculateFloat(bool v) {
+    speculate_float_ = v;
+  }
+  // The generic arm of a speculation diamond: never speculate on it again
+  // (the one-known-float rule would otherwise re-fire on every simplifier
+  // iteration and nest diamonds until the block limit).
+  bool noSpeculation() const {
+    return no_speculation_;
+  }
+  void setNoSpeculation(bool v) {
+    no_speculation_ = v;
+  }
+
  private:
   BinaryOpKind op_;
   bool array_subscr_slow_path_;
+  bool subscr_adaptive_stuck_;
+  char subscr_array_typecode_{0};
+  bool speculate_float_{false};
+  bool no_speculation_{false};
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \
@@ -704,9 +758,37 @@ class INSTR_CLASS(
     float_fast_path_ = enabled;
   }
 
+  // SPIKE(IPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TFloatExact / TLongExact), or TBottom when the
+  // site carries no such evidence.  Consumed by simplifyInPlaceOp.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
+  // SPIKE(FLOATSPEC): see BinaryOp::speculateFloat / noSpeculation.
+  bool speculateFloat() const {
+    return speculate_float_;
+  }
+  void setSpeculateFloat(bool v) {
+    speculate_float_ = v;
+  }
+  bool noSpeculation() const {
+    return no_speculation_;
+  }
+  void setNoSpeculation(bool v) {
+    no_speculation_ = v;
+  }
+
  private:
   InPlaceOpKind op_;
   bool float_fast_path_;
+  Type specialized_exact_{TBottom};
+  bool speculate_float_{false};
+  bool no_speculation_{false};
 };
 
 // Builds a slice object, with 2 or 3 operands from the stack
@@ -942,7 +1024,11 @@ class INSTR_CLASS(CallCFunc, (TOptObject | TCUInt64), HasOutput, Operands<>) {
 #define CallCFunc_FUNCS(X)         \
   X(Cix_PyAsyncGenValueWrapperNew) \
   X(JitCoro_GetAwaitableIter)      \
-  X(JitGen_yf)
+  X(JitGen_yf)                     \
+  X(JITRT_EnterExceptHandler311)   \
+  X(JITRT_PushExcInfo311)          \
+  X(JITRT_PopExcInfo311)           \
+  X(JITRT_ExcMatch311)
 
   enum class Func {
 #define ENUM_FUNC(name, ...) k##name,
@@ -1739,8 +1825,20 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  // SPIKE(CMPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TLongExact), or TBottom when the builder emitted
+  // guards or has no such evidence.  Consumed by Simplify.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
  private:
   CompareOp op_;
+  Type specialized_exact_{TBottom};
 };
 
 // Perform the comparison indicated by op between two floats
@@ -2066,8 +2164,34 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  // SPIKE(CMPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TLongExact), or TBottom when the builder emitted
+  // guards or has no such evidence.  Consumed by Simplify.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(STRLITEQ): set on the helper-form fallback that the inline literal
+  // compare emits, so Simplify does not expand that instruction again.
+  bool inlineLiteralDone() const {
+    return inline_literal_done_;
+  }
+  void setInlineLiteralDone() {
+    inline_literal_done_ = true;
+  }
+#endif
+
  private:
   CompareOp op_;
+  Type specialized_exact_{TBottom};
+#if PY_VERSION_HEX < 0x030C0000
+  bool inline_literal_done_{false};
+#endif
 };
 
 class INSTR_CLASS(PrimitiveConvert, (TPrimitive), HasOutput, Operands<1>) {

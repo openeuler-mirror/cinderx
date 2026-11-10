@@ -3,6 +3,7 @@
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
@@ -15,13 +16,18 @@
 #include "cinderx/module_state.h"
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface predicates the lifecycle cases assert on.
+#include "internal/pycore_pystate.h"
+
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 
+#include <chrono>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #if defined(__linux__)
@@ -61,6 +67,64 @@ class JITContextTest : public RuntimeTest {
 
   std::unique_ptr<jit::CompilerContext<jit::Compiler>> jit_ctx_;
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, SuppressedTraceEventsDoNotEnterArgumentBinder311) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  for (const char* source :
+       {"def func(value, *, strict=False):\n"
+        "    return -value if strict else value\n",
+        "def func(value, *args, **kwargs):\n"
+        "    return value + len(args) + len(kwargs)\n"}) {
+    Ref<PyFunctionObject> func(compileAndGet(source, "func"));
+    ASSERT_NE(func, nullptr);
+    auto preloader =
+        jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
+    ASSERT_NE(preloader, nullptr);
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+        jit::Result::OK);
+    ASSERT_TRUE(jit_ctx_->didCompile(func));
+    auto argument = Ref<>::steal(PyLong_FromLong(7));
+    PyObject* args[] = {argument.get()};
+    const auto entry_before = jit::triggerStatsSnapshot().machine_code_entries;
+    Ref<> ordinary_result = Ref<>::steal(func->vectorcall(
+        reinterpret_cast<PyObject*>(func.get()), args, 1, nullptr));
+    ASSERT_NE(ordinary_result, nullptr);
+    EXPECT_EQ(PyLong_AsLong(ordinary_result), 7);
+    EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
+    for (bool profile : {false, true}) {
+      auto callback =
+          +[](PyObject*, PyFrameObject*, int, PyObject*) { return 0; };
+      PyThreadState* tstate = PyThreadState_Get();
+      ASSERT_EQ(tstate->c_tracefunc, nullptr);
+      ASSERT_EQ(tstate->c_profilefunc, nullptr);
+      if (profile) {
+        PyEval_SetProfile(callback, Py_None);
+      } else {
+        PyEval_SetTrace(callback, Py_None);
+      }
+      // Model execution inside the registered C callback: recursive events
+      // are suppressed, but the callback is still installed. Bound slots
+      // must never be passed to an interpreted raw-vectorcall entry.
+      PyThreadState_EnterTracing(tstate);
+      const auto before = jit::triggerStatsSnapshot().machine_code_entries;
+      Ref<> result = Ref<>::steal(func->vectorcall(
+          reinterpret_cast<PyObject*>(func.get()), args, 1, nullptr));
+      const auto after = jit::triggerStatsSnapshot().machine_code_entries;
+      PyThreadState_LeaveTracing(tstate);
+      if (profile) {
+        PyEval_SetProfile(nullptr, nullptr);
+      } else {
+        PyEval_SetTrace(nullptr, nullptr);
+      }
+      ASSERT_NE(result, nullptr) << PyErr_Occurred();
+      EXPECT_EQ(PyLong_AsLong(result), 7);
+      EXPECT_EQ(after, before);
+    }
+  }
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
@@ -137,12 +201,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
   // install.  Its answer is what lets the compile entry stop reporting OK
-  // for a function that was never installed.  BINARY_SUBSCR is on the
-  // execute whitelist but outside the numeric-kernel admission policy, so
-  // obj[0] is still refused before the compiler runs.  An empty data block
-  // exercises the same early-return paths an allocation failure would take.
+  // for a function that was never installed. Async code remains outside
+  // execution admission. An empty data block proves rejection happens before
+  // artifact construction; slices are now admitted and cannot be this control.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(obj): return obj[0]", "func"));
+      compileAndGet("async def func(obj): return obj", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;
@@ -274,6 +337,13 @@ TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
       "    return 42",
       "func"));
   ASSERT_NE(func, nullptr);
+  // The per-bytecode instrumentation polls are opt-in
+  // (PYTHONJITSUPPORTINSTRUMENTATION=1); this contract is about their
+  // placement relative to Decrefs, so turn them on for this compile.
+  auto saved_instrumentation = jit::getConfig().support_instrumentation;
+  SCOPE_EXIT(
+      jit::getMutableConfig().support_instrumentation = saved_instrumentation);
+  jit::getMutableConfig().support_instrumentation = true;
 
   std::unique_ptr<jit::hir::Function> irfunc =
       jit::compileToFinalHIRForTest(func);
@@ -489,23 +559,54 @@ def replacement(a, b):
   EXPECT_FALSE(prior_art->functions().contains(func.get()))
       << "the settled takeover left the prior claim standing";
 #if PY_VERSION_HEX < 0x030C0000
-  if (new_art->artifactGuardedEntry311() != nullptr) {
-    EXPECT_EQ(func->vectorcall, new_art->artifactGuardedEntry311())
-        << "takeover left the function on the prior stub";
-    if (prior_art->artifactGuardedEntry311() != nullptr) {
-      EXPECT_NE(func->vectorcall, prior_art->artifactGuardedEntry311());
-    }
-  } else {
-    EXPECT_EQ(
-        func->vectorcall,
-        reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry));
-  }
+  // The installed entry is the successor's: its guarded stub, or the
+  // generated entry itself under direct entry (AArch64).
+  EXPECT_TRUE(new_art->isInstalledEntry311(func->vectorcall))
+      << "takeover left the function on the prior stub";
+  EXPECT_FALSE(prior_art->isInstalledEntry311(func->vectorcall));
+#else
+  EXPECT_EQ(func->vectorcall, new_art->vectorcallEntry());
 #endif
   EXPECT_EQ(
       PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
       reinterpret_cast<PyObject*>(new_art));
   PyErr_Clear();
 }
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+extern "C" size_t Ci_JitShell311_GraveyardSize(void);
+extern "C" uint8_t Ci_JitGraveyardPending311;
+
+TEST_F(JITContextTest, DeferredArtifactReleaseChainsWithoutAllocation) {
+  // An artifact whose last reference is dropped while a counted machine-code
+  // frame is live is parked on an intrusive chain: no allocation happens in
+  // tp_dealloc, every parked artifact is accounted for, the sweep refuses
+  // while the frame is live and drains the whole chain once it is gone.
+  // The fixture does not initialize the artifact type (no cinderjit module);
+  // PyType_Ready is idempotent.
+  ASSERT_EQ(PyType_Ready(jit::getCompiledFunctionType()), 0);
+  uint64_t* live_frames = jit::triggerStatsActiveFramesAddress();
+  ASSERT_EQ(*live_frames, 0u);
+  ASSERT_EQ(Ci_JitShell311_GraveyardSize(), 0u);
+  *live_frames = 1;
+  constexpr size_t kArtifacts = 4096;
+  for (size_t i = 0; i < kArtifacts; i++) {
+    Ref<jit::CompiledFunction> artifact = jit::CompiledFunction::create(
+        jit::CompiledFunctionData{}, /*immortal=*/false);
+    ASSERT_NE(artifact, nullptr);
+  }
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), kArtifacts);
+  EXPECT_EQ(Ci_JitGraveyardPending311, 1);
+  Ci_JitShell311_SweepGraveyard();
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), kArtifacts)
+      << "swept while a counted frame was live";
+  *live_frames = 0;
+  Ci_JitShell311_SweepGraveyard();
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), 0u);
+  EXPECT_EQ(Ci_JitGraveyardPending311, 0);
+}
+#endif
+
 TEST_F(JITContextTest, TeardownReleasesCannotOutliveTheDeathWatch) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -999,6 +1100,202 @@ def other(a, b):
 
 #endif
 
+namespace {
+
+class CountingTypeDeoptPatcher : public jit::TypeDeoptPatcher {
+ public:
+  CountingTypeDeoptPatcher() : TypeDeoptPatcher(&PyLong_Type) {}
+
+  bool maybePatch(BorrowedRef<PyTypeObject>) override {
+    ++notifications;
+    return false;
+  }
+
+  int notifications{0};
+};
+
+} // namespace
+
+TEST_F(JITContextTest, UnwatchRemovesOnlyTheRequestedPatcher) {
+  CountingTypeDeoptPatcher removed;
+  CountingTypeDeoptPatcher retained;
+  jit_ctx_->watchType(&PyLong_Type, &removed);
+  jit_ctx_->watchType(&PyLong_Type, &retained);
+  jit_ctx_->unwatch(&removed);
+  jit_ctx_->unwatch(&removed);
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(removed.notifications, 0);
+  EXPECT_EQ(retained.notifications, 1);
+  jit_ctx_->unwatch(&retained);
+}
+
+TEST_F(JITContextTest, UnwatchSupportsRecursiveCompileLock) {
+  CountingTypeDeoptPatcher patcher;
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  {
+    jit::ThreadedCompileSerialize guard;
+    jit_ctx_->watchType(&PyLong_Type, &patcher);
+    jit_ctx_->unwatch(&patcher);
+    EXPECT_TRUE(threaded.canAccessSharedData());
+  }
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(patcher.notifications, 0);
+}
+
+TEST_F(
+    JITContextTest,
+    UnwatchOnArtifactDestructionSupportsRecursiveCompileLock) {
+  // Shadow-mode 3.11 fixtures do not initialize the executable artifact type.
+  ASSERT_EQ(PyType_Ready(jit::getCompiledFunctionType()), 0);
+  auto compiled = jit::CompiledFunction::create({}, false);
+  ASSERT_NE(compiled, nullptr);
+  compiled->setOwner(jit_ctx_.get());
+  auto patcher = std::make_unique<CountingTypeDeoptPatcher>();
+  auto* owned_patcher = patcher.get();
+  CountingTypeDeoptPatcher retained;
+  std::vector<std::unique_ptr<jit::CodePatcher>> patchers;
+  patchers.push_back(std::move(patcher));
+  compiled->setCodePatchers(std::move(patchers));
+
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  {
+    jit::ThreadedCompileSerialize guard;
+    // Destroy through the real clear path while the compile lock is held.
+    jit_ctx_->watchType(&PyLong_Type, owned_patcher);
+    jit_ctx_->watchType(&PyLong_Type, &retained);
+    compiled.reset();
+    EXPECT_TRUE(threaded.canAccessSharedData());
+  }
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(retained.notifications, 1);
+  jit_ctx_->unwatch(&retained);
+}
+
+TEST_F(JITContextTest, UnwatchWaitsForCompileLock) {
+  CountingTypeDeoptPatcher patcher;
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  std::promise<void> started;
+  std::promise<void> completed;
+  auto started_future = started.get_future();
+  auto completed_future = completed.get_future();
+  std::thread worker;
+  {
+    jit::ThreadedCompileSerialize guard;
+    jit_ctx_->watchType(&PyLong_Type, &patcher);
+    worker = std::thread([&] {
+      started.set_value();
+      jit_ctx_->unwatch(&patcher);
+      completed.set_value();
+    });
+    started_future.wait();
+    // No other thread accesses the registry while the worker tries to unwatch.
+    EXPECT_EQ(
+        completed_future.wait_for(std::chrono::milliseconds(200)),
+        std::future_status::timeout);
+  }
+  worker.join();
+  EXPECT_EQ(
+      completed_future.wait_for(std::chrono::seconds(0)),
+      std::future_status::ready);
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(patcher.notifications, 0);
+}
+
+TEST_F(JITContextTest, LateSharedCodeFunctionIsAttachedAfterBatchFinalization) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Two functions share one code object and therefore one CompilationKey.
+  // During a batch compile a worker may take up the second function only
+  // after the first one's compile has completed but before the main thread
+  // has turned the parked CompiledFunctionData into a CompiledFunction.  The
+  // second function must still be attached once the batch is finalized.
+  const char* py_src = R"(
+def make():
+    def unit(x):
+        return x * 2
+    return unit
+
+first = make()
+second = make()
+)";
+  Ref<PyFunctionObject> first(compileAndGet(py_src, "first"));
+  ASSERT_NE(first, nullptr);
+  Ref<PyFunctionObject> second(getGlobal("second"));
+  ASSERT_NE(second, nullptr);
+  ASSERT_EQ(first->func_code, second->func_code);
+
+  std::unique_ptr<jit::hir::Preloader> first_preloader(
+      jit::hir::Preloader::make(
+          first, jit::makeFrameReifier(first->func_code)));
+  ASSERT_NE(first_preloader, nullptr);
+  std::unique_ptr<jit::hir::Preloader> second_preloader(
+      jit::hir::Preloader::make(
+          second, jit::makeFrameReifier(second->func_code)));
+  ASSERT_NE(second_preloader, nullptr);
+
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  // An assertion failure below must not leave the process in the batch
+  // state: every later test in this binary would observe compileRunning().
+  bool batch_closed = false;
+  SCOPE_EXIT({
+    if (!batch_closed) {
+      threaded.endCompile();
+      jit_ctx_->finalizeMultiThreadedCompile();
+    }
+  });
+  // A worker compiles the first function; its data is parked until the batch
+  // is finalized, so no CompiledFunction exists yet.
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *first_preloader, first),
+      jit::Result::OK);
+  ASSERT_EQ(
+      jit_ctx_->lookupCode(
+          first->func_code, first->func_builtins, first->func_globals),
+      nullptr);
+  // The second function reaches the worker inside that window.
+  jit::Result late =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *second_preloader, second);
+  threaded.endCompile();
+  jit_ctx_->finalizeMultiThreadedCompile();
+  batch_closed = true;
+
+  if (late == jit::Result::OK) {
+    EXPECT_TRUE(jit_ctx_->didCompile(second))
+        << "Result::OK was reported for a function the batch never attached";
+  } else {
+    // Scheduled for the serial retry that compile_all() runs after
+    // finalization; the retry finds the published artifact and attaches it.
+    EXPECT_EQ(late, jit::Result::ALREADY_SCHEDULED);
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *second_preloader, second),
+        jit::Result::OK);
+  }
+
+  auto compiled = jit_ctx_->lookupCode(
+      second->func_code, second->func_builtins, second->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  EXPECT_EQ(compiled->functions().count(first), 1u);
+  EXPECT_EQ(compiled->functions().count(second), 1u);
+  EXPECT_TRUE(jit_ctx_->didCompile(first));
+  EXPECT_TRUE(jit_ctx_->didCompile(second));
+
+  compiled.reset();
+  second_preloader.reset();
+  first_preloader.reset();
+  second.reset();
+  first.reset();
+}
+
 TEST_F(JITContextTest, UnwatchableBuiltins) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -1025,24 +1322,25 @@ foo = "hello"
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
-#if PY_VERSION_HEX < 0x030C0000
-  // The body reads globals, loads an attribute and makes calls -- opcodes
-  // the canary execute surface has not opened (MR-06 and later), so
-  // publication refuses this compile.  While the publication verdict was
-  // swallowed this case reported OK, ran the call through the interpreter,
-  // and was green without asserting anything; the honest verdict is what
-  // it can assert until the surface opens, at which point the OK branch
-  // below takes over and the builtins-watchability contract it was
-  // written for becomes checkable again.
-  ASSERT_EQ(comp_result, jit::Result::CANNOT_SPECIALIZE);
-  ASSERT_FALSE(jit_ctx_->didCompile(func));
-#else
   ASSERT_EQ(comp_result, jit::Result::OK);
+  ASSERT_TRUE(jit_ctx_->didCompile(func));
+#if PY_VERSION_HEX < 0x030C0000
+  auto entries_before = jit::triggerStatsSnapshot().machine_code_entries;
 #endif
 
   auto empty_tuple = Ref<>::steal(PyTuple_New(0));
   auto result = Ref<>::steal(PyObject_Call(func, empty_tuple, nullptr));
   ASSERT_EQ(result, Py_None);
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entries_before);
+#endif
+  EXPECT_EQ(PyDict_GetItemString(func->func_globals, "foo"), nullptr);
+  auto key = Ref<>::steal(PyLong_FromLong(42));
+  ASSERT_NE(key, nullptr);
+  BorrowedRef<> stored = PyDict_GetItem(func->func_builtins, key);
+  ASSERT_NE(stored, nullptr);
+  EXPECT_EQ(PyLong_AsLong(stored), 42);
+  EXPECT_FALSE(PyErr_Occurred());
 }
 
 class JITConfigTest : public RuntimeTest {};

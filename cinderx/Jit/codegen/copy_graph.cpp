@@ -92,6 +92,18 @@ std::vector<CopyGraph::Op> CopyGraph::process() {
   //     leaf node.
   // 14. Repeat steps 1-4 until no leaf nodes are left. Goto 6.
 
+  // Canonicalize independent copies before consuming the graph. The edge
+  // insertion order may come from pointer-keyed register-allocation maps.
+  for (auto& [loc, node] : nodes_) {
+    if (node.leaf_node.isLinked()) {
+      node.leaf_node.Unlink();
+    }
+  }
+  for (auto& [loc, node] : nodes_) {
+    if (node.children.IsEmpty()) {
+      leaf_nodes_.PushBack(node);
+    }
+  }
   std::vector<Op> ops;
   processLeafNodes(ops);
 

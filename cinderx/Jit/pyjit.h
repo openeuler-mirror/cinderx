@@ -75,6 +75,12 @@ void recordDeoptForRoiBackoff(
     bool is_instrumentation_deopt);
 
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
+#if PY_VERSION_HEX < 0x030C0000
+bool roiBackoffAllowsCompile311(
+    BorrowedRef<PyCodeObject> code,
+    uint64_t interpreted_calls);
+void roiBackoffDidPublish311(BorrowedRef<PyCodeObject> code);
+#endif
 
 /*
  * JIT compile func and patch its entry point.

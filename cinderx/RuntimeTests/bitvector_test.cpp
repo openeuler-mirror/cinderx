@@ -116,6 +116,90 @@ TEST(BitVectorTest, SetBitChunk) {
   EXPECT_DEATH(l.SetBitChunk(2, 0x4), "invalid bit chunk");
 }
 
+TEST(BitVectorTest, ShrinkToChunkMultiplePreservesLastChunk) {
+  // Shrinking to an exact multiple of the chunk width must keep the fully-used
+  // last chunk intact rather than masking it to zero.
+
+  // Long vector: bit 127 lives in the last chunk after shrinking to 128 bits.
+  BitVector longvec(129);
+  longvec.SetBit(127);
+  longvec.SetBit(5);
+  longvec.SetBitWidth(128);
+  EXPECT_EQ(longvec.GetPopCount(), 2);
+  EXPECT_TRUE(longvec.GetBit(127));
+  EXPECT_TRUE(longvec.GetBit(5));
+
+  // Long to short: shrinking to 64 bits keeps bit 63 in the only chunk.
+  BitVector shortvec(65);
+  shortvec.SetBit(63);
+  shortvec.SetBit(0);
+  shortvec.SetBitWidth(64);
+  EXPECT_EQ(shortvec.GetPopCount(), 2);
+  EXPECT_TRUE(shortvec.GetBit(63));
+  EXPECT_TRUE(shortvec.GetBit(0));
+}
+
+TEST(BitVectorTest, GrowToChunkMultiplePreservesBits) {
+  // Growing to an exact multiple of the chunk width must keep existing bits.
+
+  // Short to short: 63 -> 64 bits.
+  BitVector shortvec(63);
+  shortvec.SetBit(0);
+  shortvec.SetBit(62);
+  shortvec.AddBits(1);
+  EXPECT_EQ(shortvec.GetNumBits(), 64);
+  EXPECT_EQ(shortvec.GetPopCount(), 2);
+  EXPECT_TRUE(shortvec.GetBit(0));
+  EXPECT_TRUE(shortvec.GetBit(62));
+
+  // Long to long: 127 -> 128 bits keeps the bits of the last chunk.
+  BitVector longvec(127);
+  longvec.SetBit(64);
+  longvec.SetBit(126);
+  longvec.SetBitWidth(128);
+  EXPECT_EQ(longvec.GetPopCount(), 2);
+  EXPECT_TRUE(longvec.GetBit(64));
+  EXPECT_TRUE(longvec.GetBit(126));
+}
+
+TEST(BitVectorTest, ShrinkClearsBitsPastNewWidth) {
+  // Bits beyond a non-multiple width are dropped, so growing back yields
+  // zeros there.
+  BitVector shortvec(10);
+  shortvec.SetBit(9);
+  shortvec.SetBitWidth(8);
+  shortvec.SetBitWidth(10);
+  EXPECT_FALSE(shortvec.GetBit(9));
+  EXPECT_TRUE(shortvec.IsEmpty());
+
+  BitVector longvec(70);
+  longvec.SetBit(69);
+  longvec.SetBit(65);
+  longvec.SetBitWidth(66);
+  longvec.SetBitWidth(70);
+  EXPECT_TRUE(longvec.GetBit(65));
+  EXPECT_FALSE(longvec.GetBit(69));
+  EXPECT_EQ(longvec.GetPopCount(), 1);
+}
+
+TEST(BitVectorTest, ShrinkToZeroClearsBits) {
+  // A zero-width vector holds no bits, so growing it again must start empty.
+  BitVector shortvec(5);
+  shortvec.SetBit(2);
+  shortvec.SetBitWidth(0);
+  EXPECT_EQ(shortvec, BitVector(0));
+  shortvec.SetBitWidth(5);
+  EXPECT_TRUE(shortvec.IsEmpty());
+
+  BitVector longvec(130);
+  longvec.SetBit(3);
+  longvec.SetBit(129);
+  longvec.SetBitWidth(0);
+  EXPECT_EQ(longvec, BitVector(0));
+  longvec.SetBitWidth(130);
+  EXPECT_TRUE(longvec.IsEmpty());
+}
+
 TEST(BitVectorTest, IsEmpty) {
   BitVector shortvec(8);
   EXPECT_TRUE(shortvec.IsEmpty());

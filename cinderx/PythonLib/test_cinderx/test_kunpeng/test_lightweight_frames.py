@@ -1,5 +1,6 @@
 import os
 import platform
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -39,6 +40,46 @@ def _clean_env() -> dict[str, str]:
         env.pop(key, None)
     return env
 
+
+
+_LWF_SUPPORTED = None
+
+
+def _lightweight_frames_supported() -> bool:
+    """True when a child started with PYTHONJITLIGHTWEIGHTFRAME=1 actually runs
+    lightweight frames.  CPython 3.11 refuses the opt-in and keeps normal
+    frames, so the lightweight-only cases below have nothing to test there."""
+    global _LWF_SUPPORTED
+    if _LWF_SUPPORTED is None:
+        env = _clean_env()
+        env.update(
+            {
+                "CINDERX_EVAL_MODE": "cinder",
+                "CINDERX_JIT_MODE": "execute",
+                "CINDERX_PLUGIN_ENABLE": "1",
+                "PYTHONJITLIGHTWEIGHTFRAME": "1",
+            }
+        )
+        probe = (
+            "import _cinderx, cinderx; cinderx.init(); import cinderjit; "
+            "print(cinderjit.jit_frame_mode())"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        _LWF_SUPPORTED = completed.returncode == 0 and completed.stdout.strip() == "1"
+    return _LWF_SUPPORTED
+
+
+def _requires_lightweight_frames(test):
+    return unittest.skipUnless(
+        _lightweight_frames_supported(),
+        "lightweight frames are not supported on this interpreter",
+    )(test)
 
 def _run_tls_case(case: str) -> str:
     env = _clean_env()
@@ -208,7 +249,7 @@ class LightweightFramesTests(unittest.TestCase):
     @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 delivery contract")
     def test_python311_jit_recursion_balances_frame_modes(self) -> None:
         frame_modes = ["rollback"]
-        if cinderx.is_lightweight_frames_enabled():
+        if _lightweight_frames_supported():
             frame_modes.insert(0, "lightweight")
         for frame_mode in frame_modes:
             with self.subTest(frame_mode=frame_mode):
@@ -259,6 +300,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderjit is not None and hasattr(cinderjit, "disassemble"),
         "JIT disassembler unavailable",
     )
+    @_requires_lightweight_frames
     def test_s6_real_jit_dump_uses_inline_tls_access(self) -> None:
         output = _run_tls_case("inline")
         self.assertIn("tpidr_el0", output)
@@ -269,6 +311,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_s7_inline_tls_minimal_jit_function_executes(self) -> None:
         output = _run_tls_case("execute")
         self.assertIn("CASE_RESULT minimal_jit_target OK 42", output)
@@ -278,6 +321,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_python311_lightweight_frame_clears_argument_local(self) -> None:
         output = _run_tls_case("localsplus_reuse")
         self.assertIn("CASE_RESULT localsplus_reuse OK 100", output)
@@ -288,6 +332,7 @@ class LightweightFramesTests(unittest.TestCase):
         and hasattr(cinderjit, "_test_parse_thread_state_prologue"),
         "TLS parser test hook unavailable",
     )
+    @_requires_lightweight_frames
     def test_s8_unrecognized_tls_shape_falls_back_conservatively(self) -> None:
         code = [
             0xD2800000,  # mov x0, #0
@@ -313,6 +358,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_getframe_inside_jit_function_materializes_frame(self) -> None:
         output = _run_lightweight_case("materialize_getframe")
         self.assertIn("CASE_RESULT materialize_getframe OK mode=1", output)
@@ -321,6 +367,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_traceback_from_jit_function_materializes_frame(self) -> None:
         output = _run_lightweight_case("materialize_traceback")
         self.assertIn("CASE_RESULT materialize_traceback OK mode=1", output)
@@ -329,6 +376,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_generator_return_cleanup_marks_generator_done(self) -> None:
         output = _run_lightweight_case(
             "generator_return_cleanup", enable_generators=True
@@ -339,6 +387,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_generator_argument_survives_initial_yield(self) -> None:
         output = _run_lightweight_case(
             "generator_argument_lifetime", enable_generators=True
@@ -349,6 +398,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_generator_close_releases_owned_argument_once(self) -> None:
         output = _run_lightweight_case(
             "generator_close_gc", enable_generators=True
@@ -359,6 +409,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 canary control plane")
     def test_forced_deopt_rebuilds_locals_and_value_stack(self) -> None:
         output = _run_lightweight_case(
@@ -370,6 +421,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_normal_and_exceptional_exits_release_owned_argument_once(self) -> None:
         output = _run_lightweight_case("exit_ownership", jit_mode="canary")
         self.assertIn("CASE_RESULT exit_ownership OK mode=1", output)
@@ -378,6 +430,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_deopt_preserves_materialized_frame_identity(self) -> None:
         output = _run_lightweight_case("deopt_materialized_frame")
         self.assertIn("CASE_RESULT deopt_materialized_frame OK mode=1", output)
@@ -386,6 +439,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     @unittest.skipUnless(IS_CPYTHON_311, "CPython 3.11 delivery contract")
     def test_generator_frame_traversal_and_escape_lifecycle(self) -> None:
         output = _run_lightweight_case(
@@ -397,6 +451,7 @@ class LightweightFramesTests(unittest.TestCase):
         cinderx.is_lightweight_frames_enabled(),
         "LWF not compiled in",
     )
+    @_requires_lightweight_frames
     def test_f_locals_dictionary_releases_owned_argument(self) -> None:
         output = _run_lightweight_case("f_locals_ownership")
         self.assertIn("CASE_RESULT f_locals_ownership OK mode=1", output)

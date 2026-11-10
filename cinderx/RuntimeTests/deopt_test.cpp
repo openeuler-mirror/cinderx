@@ -434,6 +434,15 @@ class DeoptStressTest : public RuntimeTest {
         ThreadedRef<>::create(makeFrameReifier(funcobj->func_code).get());
     auto guards = insertDeopts(*irfunc);
     jit::Compiler::runPasses(*irfunc, PassConfig::kAllExceptInliner);
+    size_t remaining_stress_guards = 0;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (instr.IsGuard() && instr.asDeoptBase()->nonce() >= 0) {
+          ++remaining_stress_guards;
+        }
+      }
+    }
+    ASSERT_EQ(remaining_stress_guards, guards.size());
     auto delete_one_deopt = [&](const DeoptMetadata& deopt_meta) {
       auto it = guards.find(deopt_meta.nonce);
       JIT_CHECK(it != guards.end(), "No guard for nonce {}", deopt_meta.nonce);
@@ -608,6 +617,12 @@ expected = (True, 6.0, 1)
   auto saved_state = jit::getConfig().state;
   SCOPE_EXIT(jit::getMutableConfig().state = saved_state);
   jit::getMutableConfig().state = jit::State::kRunning;
+  // The per-bytecode instrumentation polls are opt-in
+  // (PYTHONJITSUPPORTINSTRUMENTATION=1); this test keys on one of them.
+  auto saved_instrumentation = jit::getConfig().support_instrumentation;
+  SCOPE_EXIT(
+      jit::getMutableConfig().support_instrumentation = saved_instrumentation);
+  jit::getMutableConfig().support_instrumentation = true;
   auto irfunc = jit::compileToFinalHIRForTest(func);
   ASSERT_NE(irfunc, nullptr);
 

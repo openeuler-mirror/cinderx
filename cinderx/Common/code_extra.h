@@ -28,10 +28,14 @@
 //   bit 31: automatic compilation is disabled for this code object -- its
 //           one scheduling attempt failed or was refused, and the scheduler
 //           must never ask again (explicit force_compile is unaffected).
+//   bit 30: one despecialized retry has been granted for this code object.
+//   bit 29: the current ROI round includes a non-guard deopt.
 //   bits 0-15: fresh function objects that were attached to the code's
 //              published artifact, counted against the per-code budget.
 // Unused on 3.12+, where function watchers deliver the same information.
 #define CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT 0x80000000u
+#define CI_CODE_EXTRA_JIT311_DESPECIALIZED_BIT 0x40000000u
+#define CI_CODE_EXTRA_JIT311_NON_GUARD_DEOPT_BIT 0x20000000u
 #define CI_CODE_EXTRA_JIT311_ATTACH_MASK 0x0000FFFFu
 
 #ifdef __cplusplus
@@ -243,30 +247,83 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
 
 #endif
 
-// The 3.11 scheduler runs under the GIL and never on a free-threaded
-// build, so plain accesses are the whole story here.
+#if PY_VERSION_HEX < 0x030C0000
+// The scheduler writes under the GIL, while compile workers can read the
+// despecialization bit. All accesses share the same atomic control word.
 static inline int Ci_code_extra_jit311_auto_disabled(const CodeExtra* extra) {
-  return (extra->jit311_ctl & CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT) != 0;
+  return (__atomic_load_n(&extra->jit311_ctl, __ATOMIC_ACQUIRE) &
+          CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT) != 0;
 }
 
 static inline void Ci_code_extra_jit311_disable_auto(CodeExtra* extra) {
-  extra->jit311_ctl |= CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT;
+  __atomic_fetch_or(
+      &extra->jit311_ctl,
+      CI_CODE_EXTRA_JIT311_AUTO_DISABLED_BIT,
+      __ATOMIC_RELEASE);
 }
 
 static inline uint32_t Ci_code_extra_jit311_attach_count(
     const CodeExtra* extra) {
-  return extra->jit311_ctl & CI_CODE_EXTRA_JIT311_ATTACH_MASK;
+  return __atomic_load_n(&extra->jit311_ctl, __ATOMIC_RELAXED) &
+      CI_CODE_EXTRA_JIT311_ATTACH_MASK;
 }
 
 // Saturating: the budget is far below the field's range, and a saturated
 // count still reads as "exhausted".
 static inline void Ci_code_extra_jit311_note_attach(CodeExtra* extra) {
-  uint32_t count = extra->jit311_ctl & CI_CODE_EXTRA_JIT311_ATTACH_MASK;
-  if (count < CI_CODE_EXTRA_JIT311_ATTACH_MASK) {
-    extra->jit311_ctl =
-        (extra->jit311_ctl & ~CI_CODE_EXTRA_JIT311_ATTACH_MASK) | (count + 1);
+  uint32_t current = __atomic_load_n(&extra->jit311_ctl, __ATOMIC_RELAXED);
+  for (;;) {
+    uint32_t count = current & CI_CODE_EXTRA_JIT311_ATTACH_MASK;
+    if (count == CI_CODE_EXTRA_JIT311_ATTACH_MASK) {
+      return;
+    }
+    uint32_t next = (current & ~CI_CODE_EXTRA_JIT311_ATTACH_MASK) | (count + 1);
+    if (__atomic_compare_exchange_n(
+            &extra->jit311_ctl,
+            &current,
+            next,
+            0,
+            __ATOMIC_RELAXED,
+            __ATOMIC_RELAXED)) {
+      return;
+    }
   }
 }
+
+static inline int Ci_code_extra_jit311_despecialized(const CodeExtra* extra) {
+  return (__atomic_load_n(&extra->jit311_ctl, __ATOMIC_ACQUIRE) &
+          CI_CODE_EXTRA_JIT311_DESPECIALIZED_BIT) != 0;
+}
+
+static inline int Ci_code_extra_jit311_try_despecialize(CodeExtra* extra) {
+  uint32_t old = __atomic_fetch_or(
+      &extra->jit311_ctl,
+      CI_CODE_EXTRA_JIT311_DESPECIALIZED_BIT,
+      __ATOMIC_RELEASE);
+  return (old & CI_CODE_EXTRA_JIT311_DESPECIALIZED_BIT) == 0;
+}
+
+static inline int Ci_code_extra_jit311_has_non_guard_deopt(
+    const CodeExtra* extra) {
+  return (__atomic_load_n(&extra->jit311_ctl, __ATOMIC_RELAXED) &
+          CI_CODE_EXTRA_JIT311_NON_GUARD_DEOPT_BIT) != 0;
+}
+
+static inline void Ci_code_extra_jit311_note_non_guard_deopt(CodeExtra* extra) {
+  __atomic_fetch_or(
+      &extra->jit311_ctl,
+      CI_CODE_EXTRA_JIT311_NON_GUARD_DEOPT_BIT,
+      __ATOMIC_RELAXED);
+}
+
+static inline void Ci_code_extra_jit311_clear_non_guard_deopt(
+    CodeExtra* extra) {
+  __atomic_fetch_and(
+      &extra->jit311_ctl,
+      ~CI_CODE_EXTRA_JIT311_NON_GUARD_DEOPT_BIT,
+      __ATOMIC_RELAXED);
+}
+#endif
 
 #ifdef __cplusplus
 }

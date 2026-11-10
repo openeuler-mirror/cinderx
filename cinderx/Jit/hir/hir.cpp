@@ -20,7 +20,8 @@ DeoptBase::DeoptBase(const DeoptBase& other)
       live_regs_{other.live_regs()},
       guilty_reg_{other.guiltyReg()},
       nonce_{other.nonce()},
-      descr_{other.descr()} {
+      descr_{other.descr()},
+      exc_edge_{other.excEdge()} {
   if (FrameState* copy_fs = other.frameState()) {
     setFrameState(std::make_unique<FrameState>(*copy_fs));
   }
@@ -72,7 +73,7 @@ void DeoptBase::sortLiveRegs() {
         return a.reg->id() < b.reg->id();
       });
 
-  if (kPyDebug) {
+  if constexpr (kDebug) {
     // Check for uniqueness after sorting rather than inside the predicate
     // passed to std::sort(), in case sort() performs extra comparisons to
     // sanity-check our predicate.
@@ -80,7 +81,7 @@ void DeoptBase::sortLiveRegs() {
         live_regs_.begin(),
         live_regs_.end(),
         [](const RegState& a, const RegState& b) { return a.reg == b.reg; });
-    JIT_DCHECK(it == live_regs_.end(), "Register {} is live twice", *it->reg);
+    JIT_CHECK(it == live_regs_.end(), "Register {} is live twice", *it->reg);
   }
 }
 
@@ -683,6 +684,12 @@ bool isLoadMethodBase(const Instr& instr) {
 
 bool isAnyLoadMethod(const Instr& instr) {
   if (isLoadMethodBase(instr)) {
+    return true;
+  }
+  // The 3.11 type-method load is the fill instruction on its own (no
+  // entry-value arm); its output is a LoadMethod result pair like the Phi
+  // form below, and a deopt between it and the call must reify it as one.
+  if (instr.IsFillTypeMethodCache()) {
     return true;
   }
   if (!instr.IsPhi() || instr.NumOperands() != 2) {

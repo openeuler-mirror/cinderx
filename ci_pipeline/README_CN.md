@@ -5,6 +5,47 @@
 这里维护 ARM64 Linux CPython 3.11 和 3.14 CinderX JIT 的本地门禁流程。入口脚本是
 `ci_pipeline/run_gate.py`，suite 配置位于 `ci_pipeline/suites/*.toml`。
 
+## CPython 3.14 参考线的测试增量合同
+
+`ref314` 使用 `rt314_differential.sh` 分别构建并完整运行 baseline/head。
+`jit311/data/rt314_test_additions.json` 只声明经过检视的新增 golden SHA256、
+精确测试身份及预期状态；`ref314_contract.py` 校验实际增量与声明一致。
+已有 golden 的内容和路径、已有注册身份继续受到严格保护；新增测试必须实际
+运行一次并得到声明结果，不能通过缺失、过滤、禁用或意外 skip 放行。
+声明已进入 baseline 时不再计为增量，支持后续基线前进。
+
+每侧仍须运行完整 enabled 集合。仅在旧测试比较视图中移除声明新增项的日志标记，
+随后继续比较旧测试失败集合、skip 集合和规范化诊断；环境失败 allowlist 的
+约束保持不变。CP314 默认关闭 near-deopt sinking，相关边界测试的唯一预期 skip
+及原因在合同中显式记录；CP311 AArch64 的同一测试实际执行。
+新增、删除、哈希漂移、注册替换、执行状态及日志拼接的回归通过公共
+`runner_selftests` 在两个 Python 版本下运行。
+
+CP311 tuple 生命周期的验证分两层：`TupleLayout311Test` 检查 LIR 快/慢路径形态，
+`TupleRuntime311Test` 对实际 Python 目标的最终 HIR/LIR、freelist 地址/数量、
+定向 OBJ 分配失败、析构重入、tracemalloc 和强制 deopt 后的引用与对象身份作断言。
+执行用例必须使用 canary 模式。CP311 仅支持 normal frames；请求 LWF 时须
+验证回退到 normal，不能记为 LWF 执行覆盖。CP314 的公共 CSE/layout 检查另行
+覆盖两种受支持的帧模式。
+Release/ASAN 验证启用内联的快路径；Py_DEBUG/引用跟踪/统计构建验证标准 API 回退，
+不能用后者的成功替代前者。测试直接使用现有解释器状态和 allocator 包装，
+不新增产品测试 hook。
+
+## CPython 3.11 的严格 quickening 检查
+
+CinderX 快速化现在记入 CPython 原生 quickened 计数，由原生代码对象析构配对扣减。
+缓存的 `sys._getquickenedcount` 引用也看到同一计数。正式回归覆盖两种 evaluator、
+循环引用和保留 code、生成器、JIT 退役、tracing、递归及分配失败。
+
+Daily 要求每个模块原始 Py_DEBUG `-R 10:3` 直接成功。任何 reference、memory-block
+或 FD 泄漏报告都失败，不再有计数伪差豁免或成功复跑替代原始失败。
+标准库导入 canary 同时核对 358 次自然去优化及完整站点/原因指纹。
+该导入覆盖测试关闭启动宽限期，保留默认的有界泛化重试；关闭重试的对照回归要求
+精确移除同一站点的 64 次重试事件，保留 294 次事件及其指纹。产品调度测试仍验证正常启动宽限期。
+编译执行及生命周期探针同样关闭宽限期，以验证目标路径立即执行；refleak 的构建
+自检显式编译探针，原始 `-R` worker 继续提供独立的实际执行证明。
+`-R` worker 关闭宽限期，使编译从十轮预热开始即可收敛；采样轮数和泄漏判定不变。
+
 ## 软件依赖
 
 运行 `run_gate.py` 前，需要先准备目标 Python、编译工具链、CMake 和测试工具。`pr
@@ -207,6 +248,33 @@ native `RuntimeTests` 默认从目标 `CINDERX_TEST_PYTHON` 的 `sysconfig` 读�
 `CC/CXX`。这样链接器会和目标 Python 的静态 `libpython` 保持兼容，包括带 GCC LTO
 bytecode 的 Python 构建。如果手动覆盖 `CC` 或 `CXX`，调用方必须保证该编译器能链接目标
 Python 库。
+
+## CPython 3.11 调度策略
+
+这些配置在编译器初始化时读取，`-X` 选项优先于环境变量。它们不改变 3.14 的默认行为。
+
+| 环境变量 | 对应 `-X` 选项 | 默认值与语义 |
+|---|---|---|
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`；自动编译的启动宽限期，毫秒，允许 `0..4294967294`，`0` 禁用延迟，非法值使初始化失败 |
+| `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`；fork 子进程重新开始宽限期，已继承的编译产物继续可用 |
+| `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`；守卫失败耗尽普通退避轮次后，最多允许一次去特化重试；异常或混合失败轮次仍会退役 |
+| `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`；保留 `force_deopt` 诊断能力，显式置 `0` 后不发出轮询，API 会明确拒绝触发请求 |
+| `CINDERX_JIT_AUTO_SIZE_SCALING` | `jit-auto-size-scaling` | `0`；显式启用后提高大段直线代码的自动编译阈值，循环保持原阈值，乘法饱和而不溢出 |
+
+宽限期只延后自动调度，不消耗一次性编译机会或预算，`force_compile` 在宽限期内仍可用。
+初始化和 fork 分别重置计时。精确测试调用阈值的旧回归显式使用宽限期 `0`，生产默认
+`100ms`、fork 和显式编译行为由独立策略回归验证。引用计数矩阵的自动调度臂和
+生命周期 census 也显式选择零宽限，保留其编译数量、机器码进入和回收断言。
+
+去特化状态存放在代码对象的 `CodeExtra`，随对象回收，不保留进程级裸指针集合。
+`CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS=0` 会在首次耗尽去优化预算时退役；其他值在 3.11 按控制字段容量
+限制到最多 15 个普通轮次，随后至多再有一次守卫专用的泛化重试。3.11 的重新预热由同一个 observer 计数并检查，冻结后不会从其他自动调度入口绕过。
+再次耗尽预算仍会冻结，
+异常 deopt 不会借此无限重编译。强制/插桩 deopt 保持原有的预算豁免语义。
+
+策略回归位于 `test_scheduling_policy_311.py` 和 `scheduling_policy_311_test.cpp`，
+Python 回归同时接入 Release/Py_DEBUG 门禁。原型中的 `SPIKE_DESPEC`、`SPIKE_GRACEMS`、
+`SPIKE_FORKGRACE`、`SPIKE_NOFDC`、`SPIKE_ROIGATE` 不再控制这组正式配置。
 
 ## 依赖缓存与 pip 离线模式
 

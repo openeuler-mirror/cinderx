@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <tuple>
 #include <utility>
 
 using namespace jit::codegen;
@@ -80,6 +81,31 @@ bool isTreeIterHelperCall(Instruction::Opcode opcode) {
     default:
       return false;
   }
+}
+
+// Sort an interval's ranges by start and merge overlapping or adjacent ones.
+// Used to finalize fixed physical-register intervals, whose ranges are appended
+// out of order during live-interval construction.
+void sortAndMergeRanges(std::vector<LiveRange>& ranges) {
+  if (ranges.size() < 2) {
+    return;
+  }
+  std::sort(
+      ranges.begin(), ranges.end(), [](const LiveRange& a, const LiveRange& b) {
+        return a.start < b.start;
+      });
+  size_t w = 0;
+  for (size_t r = 1; r < ranges.size(); ++r) {
+    // Half-open ranges merge when the next one starts at or before this one
+    // ends (overlap or adjacency).
+    if (ranges[r].start <= ranges[w].end) {
+      ranges[w].end = std::max(ranges[w].end, ranges[r].end);
+    } else {
+      ranges[++w] = ranges[r];
+    }
+  }
+  // LiveRange has no default constructor, so truncate with erase, not resize.
+  ranges.erase(ranges.begin() + (w + 1), ranges.end());
 }
 
 } // namespace
@@ -212,16 +238,31 @@ LIRLocation LiveInterval::endLocation() const {
 }
 
 bool LiveInterval::covers(LIRLocation loc) const {
-  auto iter =
-      std::upper_bound(ranges.begin(), ranges.end(), loc, LiveRangeCompare());
-
-  if (iter == ranges.begin()) {
+  const size_t n = ranges.size();
+  if (n == 0) {
     return false;
   }
 
-  --iter;
-
-  return iter->end > loc;
+  // Fast path: resume from the last examined range.  Valid only when it starts
+  // at or before loc; otherwise the hint is stale/ahead and we fall back to a
+  // binary search.  Either way we land on the last range whose start <= loc.
+  size_t i = range_hint_;
+  if (i < n && ranges[i].start <= loc) {
+    while (i + 1 < n && ranges[i + 1].start <= loc) {
+      ++i;
+    }
+  } else {
+    auto iter =
+        std::upper_bound(ranges.begin(), ranges.end(), loc, LiveRangeCompare());
+    if (iter == ranges.begin()) {
+      range_hint_ = 0;
+      return false;
+    }
+    i = static_cast<size_t>((iter - ranges.begin()) - 1);
+  }
+  range_hint_ =
+      i < std::numeric_limits<uint32_t>::max() ? static_cast<uint32_t>(i) : 0;
+  return ranges[i].end > loc;
 }
 
 bool LiveInterval::isEmpty() const {
@@ -268,7 +309,7 @@ LIRLocation LiveInterval::intersectWith(const LiveInterval& interval) const {
 }
 
 std::unique_ptr<LiveInterval> LiveInterval::splitAt(LIRLocation loc) {
-  JIT_CHECK(!fixed, "Trying to split fixed interval {} at {}", *this, loc);
+  JIT_CHECK(!isFixed(), "Trying to split fixed interval {} at {}", *this, loc);
 
   if (loc <= startLocation() || loc >= endLocation()) {
     return nullptr;
@@ -310,12 +351,21 @@ void LiveInterval::allocateTo(PhyLocation loc) {
   allocated_loc = loc;
 }
 
+void LiveInterval::fixTo(PhyLocation loc) {
+  allocateTo(loc);
+  fixed_ = true;
+}
+
 bool LiveInterval::isAllocated() const {
   return allocated_loc != PhyLocation::REG_INVALID;
 }
 
 bool LiveInterval::isRegisterAllocated() const {
   return isAllocated() && allocated_loc.is_register();
+}
+
+bool LiveInterval::isFixed() const {
+  return fixed_;
 }
 
 LinearScanAllocator::LinearScanAllocator(
@@ -466,7 +516,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
       // output
       auto output_opnd = instr->output();
       if (output_opnd->isVreg()) {
-        if (kPyDebug) {
+        if constexpr (kDebug) {
           auto inserted = seen_outputs.insert(output_opnd).second;
           JIT_CHECK(
               inserted,
@@ -648,6 +698,41 @@ void LinearScanAllocator::calculateLiveIntervals() {
 
     visited_blocks.insert(bb);
   }
+
+  // Fixed physical-register intervals had their ranges appended out of order
+  // (see reserveRegisters); sort and merge them now that construction is done.
+  for (auto& [operand, interval] : intervals_) {
+    if (interval.isFixed()) {
+      sortAndMergeRanges(interval.ranges);
+    }
+  }
+}
+
+namespace {
+// Virtual outputs have function-local instruction IDs. Reserved physical
+// operands have no instruction; use their architectural location instead.
+int64_t stableOperandKey(const Operand* operand) {
+  if (operand->isReg()) {
+    return operand->getPhyRegister().loc;
+  }
+  JIT_CHECK(operand->instr() != nullptr, "Missing virtual operand definition");
+  return int64_t{NUM_REGS} + operand->instr()->id();
+}
+
+bool stableIntervalLess(const LiveInterval* a, const LiveInterval* b) {
+  return std::tuple{
+             a->startLocation(),
+             stableOperandKey(a->operand),
+             a->endLocation()} <
+      std::tuple{
+          b->startLocation(), stableOperandKey(b->operand), b->endLocation()};
+}
+} // namespace
+
+bool LinearScanAllocator::LiveIntervalPtrGreater::operator()(
+    const LiveInterval* lhs,
+    const LiveInterval* rhs) const {
+  return stableIntervalLess(rhs, lhs);
 }
 
 bool LinearScanAllocator::intervalCoversLoopCall(
@@ -669,7 +754,7 @@ void LinearScanAllocator::assignLoopCallRegisterPreferences() {
 #if defined(CINDER_AARCH64)
   std::vector<LiveInterval*> candidates;
   for (auto& interval : allocated_) {
-    if (interval->fixed || interval->isRegisterAllocated() ||
+    if (interval->isFixed() || interval->isRegisterAllocated() ||
         !interval->operand->isVreg() ||
         interval->operand->dataType() == DataType::kObject ||
         !intervalCoversLoopCall(*interval)) {
@@ -685,7 +770,7 @@ void LinearScanAllocator::assignLoopCallRegisterPreferences() {
     if (lhs->endLocation() != rhs->endLocation()) {
       return lhs->endLocation() > rhs->endLocation();
     }
-    return lhs->operand < rhs->operand;
+    return stableOperandKey(lhs->operand) < stableOperandKey(rhs->operand);
   });
 
   bool assigned_gp = false;
@@ -758,16 +843,18 @@ void LinearScanAllocator::reserveRegisters(
     const Operand* vreg = &(vregs.at(reg));
     LiveInterval& interval = getInterval(vreg);
 
-    // add a range at the very beginning of the function so that the fixed
-    // intervals will be added to active/inactive interval set before any
-    // other intervals.
+    // Intervals will be sorted and merged at the end of
+    // calculateLiveIntervals().
+    //
+    // The first range sits at the very beginning of the function so that fixed
+    // intervals join the active/inactive sets before any other intervals.
     if (interval.ranges.empty()) {
-      interval.addRange({-1, 0});
+      interval.ranges.reserve(8);
+      interval.ranges.emplace_back(-1, 0);
     }
 
-    interval.addRange({instr_id, instr_id + 1});
-    interval.allocateTo(reg);
-    interval.fixed = true;
+    interval.ranges.emplace_back(instr_id, instr_id + 1);
+    interval.fixTo(reg);
 
     vreg_phy_uses_[vreg].emplace(instr_id);
   }
@@ -789,6 +876,10 @@ void LinearScanAllocator::linearScan() {
     TRACE("Queuing interval {} for allocation", *new_interval);
     allocated_.emplace_back(std::move(new_interval));
   }
+  std::sort(
+      allocated_.begin(), allocated_.end(), [](const auto& a, const auto& b) {
+        return stableIntervalLess(a.get(), b.get());
+      });
   assignLoopCallRegisterPreferences();
 
   UnorderedSet<LiveInterval*> active;
@@ -800,7 +891,7 @@ void LinearScanAllocator::linearScan() {
       const auto& rhs_end = rhs->endLocation();
 
       if (lhs_end == rhs_end) {
-        return lhs->operand < rhs->operand;
+        return stableOperandKey(lhs->operand) < stableOperandKey(rhs->operand);
       }
       return lhs_end < rhs_end;
     }
@@ -860,7 +951,12 @@ void LinearScanAllocator::linearScan() {
     }
 
     if (current->isRegisterAllocated()) {
-      changed_regs_.Set(current->allocated_loc);
+      // Reservations (call clobbers, yield spills) are fixed intervals that
+      // never write the register; counting them made every generator save and
+      // restore the whole callee-saved set on each resume.
+      if (!current->isFixed()) {
+        changed_regs_.Set(current->allocated_loc);
+      }
       active.insert(current);
     } else {
       stack_intervals.emplace(current);
@@ -880,7 +976,7 @@ bool LinearScanAllocator::tryAllocateFreeReg(
     UnorderedSet<LiveInterval*>& active,
     UnorderedSet<LiveInterval*>& inactive,
     UnhandledQueue& unhandled) {
-  if (current->fixed) {
+  if (current->isFixed()) {
     return true;
   }
 
@@ -1033,10 +1129,14 @@ void LinearScanAllocator::allocateBlockedReg(
 
     auto inact_iter = reg_inactive_intervals.find(reg);
     if (inact_iter != reg_inactive_intervals.end()) {
+      std::sort(
+          inact_iter->second.begin(),
+          inact_iter->second.end(),
+          stableIntervalLess);
       for (auto& inact_interval : inact_iter->second) {
         // do not split fixed intervals here. if current and the fixed interval
         // overlap, it will be handled later.
-        if (!inact_interval->fixed) {
+        if (!inact_interval->isFixed()) {
           // since by definition current_start is in the lifetime hole of
           // inactive intervals, splitting at current_start is effectively
           // splitting at the end of the lifetime hole.

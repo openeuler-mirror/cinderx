@@ -9,12 +9,15 @@ namespace jit::hir {
 namespace {
 
 Instr* replaceCompare(Compare* compare, IsTruthy* truthy) {
-  return CompareBool::create(
+  auto* result = CompareBool::create(
       truthy->output(),
       compare->op(),
       compare->GetOperand(0),
       compare->GetOperand(1),
       *get_frame_state(*truthy));
+  // SPIKE(CMPTYPED): carry the specialiser's type evidence across the fusion.
+  result->setSpecializedExact(compare->specializedExact());
+  return result;
 }
 
 } // namespace

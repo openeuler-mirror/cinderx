@@ -79,6 +79,9 @@ typedef struct {
   // opportunity, even if the artifact was retired in the meantime.
   int published;
   uint64_t post_publication_interpreted_frames;
+  // Cached size multiplier, not a threshold: live threshold changes must
+  // still take effect before the code's first automatic attempt.
+  uint64_t roi_scale;
   Py_ssize_t event_index; // -1 when the bounded event ledger dropped it
   // The keyed code object has been destroyed.  The key stays so probe
   // chains through this slot survive; the state does not.
@@ -372,6 +375,7 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
       // through this slot.  A keyed slot with no state is recycled in
       // place by the next tenant and swept when the table grows.
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -515,6 +519,7 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
         return NULL;
       }
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -531,6 +536,7 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       }
       slot->key = key;
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -646,12 +652,64 @@ static const char* observe_emit(
   return result;
 }
 
+// The live slot of this code object, or NULL: a lookup that neither
+// inserts nor grows the table, for callers that may run while another
+// frame holds a slot pointer (observe_slot_for can rehash and free the
+// table under it).
+static Ci_ObserveSlot* observe_slot_find(PyCodeObject* code) {
+  if (ci_observe_capacity == 0) {
+    return NULL;
+  }
+  uintptr_t key = (uintptr_t)code;
+  size_t probe = slot_index(key, ci_observe_capacity);
+  while (1) {
+    Ci_ObserveSlot* slot = &ci_observe_table[probe];
+    if (slot->key == key) {
+      return slot->dead ? NULL : slot;
+    }
+    if (slot->key == 0) {
+      return NULL;
+    }
+    probe = (probe + 1) & (ci_observe_capacity - 1);
+  }
+}
+
+// Reopen a code object's slot after its by-code artifact was retired by
+// the ROI backoff: the one-automatic-attempt latch would otherwise never
+// dispatch a recompile.  Counting restarts from zero, so the recompile
+// re-earns the threshold.  Reached from the retirement, which can run
+// inside an observer frame (a collection during a compile reaches the
+// control plane), so the slot is looked up without inserting or growing;
+// a code object without a live slot has nothing latched to reopen.
+void Ci_Observe311_ReopenSlotForCode(PyCodeObject* code) {
+  Ci_ObserveSlot* slot = observe_slot_find(code);
+  if (slot == NULL) {
+    return;
+  }
+  slot->dispatched = 0;
+  slot->published = 0;
+  slot->attachable = 0;
+  slot->count = 0;
+}
+
+uint64_t Ci_Observe311_CallCount(PyCodeObject* code) {
+  Ci_ObserveSlot* slot = observe_slot_find(code);
+  return slot == NULL ? 0 : slot->count;
+}
+
 void Ci_Observe311_OnFrame(
     PyFunctionObject* func,
     PyCodeObject* code,
     struct _PyInterpreterFrame* frame) {
   if (!Ci_Observe311_Enabled || func == NULL || code == NULL ||
       ci_observe_compiling) {
+    return;
+  }
+  // Coroutines and asynchronous generators are refused by the execute gate
+  // by shape, so the observer has nothing to decide for them, yet every
+  // resume re-enters this hook at full price (a nested yield-from chain once
+  // per level per item).  Synchronous generators are admitted and observed.
+  if (code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) {
     return;
   }
   // Observation stops where normal execution stops: nothing is counted
@@ -675,6 +733,41 @@ void Ci_Observe311_OnFrame(
   ci_observe_compiling = 1;
   observe_on_frame_locked(func, code, frame);
   ci_observe_compiling = 0;
+}
+
+// Offer a fresh function object over a dispatched code to the attach entry
+// point.  Returns 1 when it attached.  Attachment is scheduling, not
+// evaluation: nothing it raised may reach the frame that is about to run.
+static int observe_offer_attach(Ci_ObserveSlot* slot, PyFunctionObject* func) {
+  int attached = Ci_JitShell311_AttachFresh(func);
+  PyErr_Clear();
+  if (attached > 0) {
+    ci_observe_fresh_attachments++;
+  } else if (attached < 0) {
+    slot->attachable = 0;
+  }
+  return attached > 0;
+}
+
+// The same offer from the by-code artifact entry (pyjit_311_gate.cpp): a
+// fresh function object that would run its code's artifact without entering
+// the interpreter still takes its attachment within the per-code budget, so
+// the anchoring and the statistics are those the interpreter entry would
+// have produced.  Guarded exactly as Ci_Observe311_OnFrame is.
+int Ci_Observe311_OfferFreshAttach(PyFunctionObject* func) {
+  if (!Ci_Observe311_Enabled || func == NULL || ci_observe_compiling ||
+      _Py_IsFinalizing() || PyErr_Occurred() != NULL) {
+    return 0;
+  }
+  PyCodeObject* code = (PyCodeObject*)func->func_code;
+  int attached = 0;
+  ci_observe_compiling = 1;
+  Ci_ObserveSlot* slot = observe_slot_for(code);
+  if (slot != NULL && slot->dispatched && slot->attachable) {
+    attached = observe_offer_attach(slot, func);
+  }
+  ci_observe_compiling = 0;
+  return attached;
 }
 
 static void observe_on_frame_locked(
@@ -711,15 +804,7 @@ static void observe_on_frame_locked(
       }
     }
     if (slot->attachable) {
-      int attached = Ci_JitShell311_AttachFresh(func);
-      // Attachment is scheduling, not evaluation: nothing it raised may
-      // reach the frame that is about to run.
-      PyErr_Clear();
-      if (attached > 0) {
-        ci_observe_fresh_attachments++;
-      } else if (attached < 0) {
-        slot->attachable = 0;
-      }
+      observe_offer_attach(slot, func);
       // A published artifact that has since disappeared is deliberately
       // NOT grounds for another attempt: the commonest way for one to
       // disappear is force_uncompile(), and rescheduling there would undo
@@ -743,6 +828,25 @@ static void observe_on_frame_locked(
       // function that only ever runs under one (a workload living entirely
       // inside a coverage tracer) stays interpreted, as it should.
       if (Ci_JitShell311_DispatchDeferred()) {
+        return;
+      }
+      int backoff = Ci_JitShell311_CodeBackoffHold(code, slot->count);
+      if (backoff != 0) {
+        if (backoff < 0) {
+          // Final retirement is not another failed compilation attempt.
+          slot->dispatched = 1;
+          slot->attachable = 0;
+        }
+        return;
+      }
+      if (slot->roi_scale == 0) {
+        slot->roi_scale = Ci_JitShell311_RoiGateNeed(code, 1);
+      }
+      uint64_t base = ci_observe_threshold == 0 ? 1 : ci_observe_threshold;
+      uint64_t need = base > UINT64_MAX / slot->roi_scale
+          ? UINT64_MAX
+          : base * slot->roi_scale;
+      if (slot->count < need) {
         return;
       }
       // The scheduling entry point checks the disable bit too; this is

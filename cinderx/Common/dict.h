@@ -46,11 +46,31 @@ static inline Py_ssize_t getDictKeysIndex(
 #if PY_VERSION_HEX >= 0x030E0000
   return _PyDictKeys_StringLookupSplit(keys, name);
 #endif
+  // The keys of a unicode table are exact str objects hashed at insertion,
+  // and the probe is an attribute name with its hash cached; a hash
+  // mismatch settles inequality without the character compare, which
+  // otherwise ran once per key on every scan for an absent name.
+  Py_hash_t name_hash =
+      PyUnicode_CheckExact(name) ? ((PyASCIIObject*)name)->hash : -1;
   for (Py_ssize_t i = 0; i < keys->dk_nentries; i++) {
     PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[i];
-    // Combined unicode dictionaries retain deleted entries as tombstones.
-    // Their key is nullptr even though the slot remains below dk_nentries.
-    if (ep->me_key != NULL && PyUnicode_Compare(name, ep->me_key) == 0) {
+    // A deleted entry leaves me_key NULL below dk_nentries; comparing
+    // against it would dereference NULL.  Identity first: probes are
+    // interned attribute names, so the equal case is normally pointer
+    // equality.
+    if (ep->me_key == name) {
+      return i;
+    }
+    if (ep->me_key == NULL) {
+      continue;
+    }
+    if (name_hash != -1) {
+      Py_hash_t key_hash = ((PyASCIIObject*)ep->me_key)->hash;
+      if (key_hash != -1 && key_hash != name_hash) {
+        continue;
+      }
+    }
+    if (PyUnicode_Compare(name, ep->me_key) == 0) {
       return i;
     }
   }

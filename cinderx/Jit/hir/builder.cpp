@@ -4,21 +4,26 @@
 
 #include "ceval.h"
 
+#include "cinderx/Common/spike_env.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/python_runtime.h"
 
 #if PY_VERSION_HEX >= 0x030C0000
 extern "C" {
 #include "internal/pycore_intrinsics.h"
 #include "internal/pycore_long.h"
+#include "internal/pycore_object.h"
 #include "internal/pycore_runtime.h"
 }
 #endif
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/func.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Jit/auto_jit_ic_stability.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/annotation_index.h"
@@ -38,6 +43,7 @@ extern "C" {
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -45,6 +51,8 @@ extern "C" {
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code);
 
 // Variant of JIT_THROW() that will log the name of the code object and the
 // current offset.
@@ -125,6 +133,86 @@ bool attrSlotTypeDefinesGetattr(const BytecodeInstruction& bc_instr) {
   }
   return _PyType_Lookup(type, &_Py_ID(__getattr__)) != nullptr;
 }
+
+#if PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED)
+bool loadAttrInstanceValueCacheInfo(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index,
+    LoadAttrInstanceValueCacheInfo* info) {
+  if (code == nullptr || instruction.opcode() != LOAD_ATTR ||
+      instruction.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE ||
+      inlineCacheSize(code, instruction.opcodeIndex().value()) !=
+          INLINE_CACHE_ENTRIES_LOAD_ATTR) {
+    return false;
+  }
+
+  uint32_t type_version = instruction.attrCacheTypeVersion();
+  if (type_version == 0) {
+    return false;
+  }
+  PyInterpreterState* interp = _PyInterpreterState_GET();
+  PyTypeObject* type =
+      interp->types.type_version_cache[type_version % TYPE_VERSION_CACHE_SIZE];
+  if (type == nullptr || type->tp_version_tag != type_version ||
+      !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE) ||
+      !PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT) ||
+      !PyType_HasFeature(type, Py_TPFLAGS_INLINE_VALUES) ||
+      type->tp_dictoffset >= 0 ||
+      type->tp_basicsize < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      type->tp_basicsize % alignof(PyObject*) != 0) {
+    return false;
+  }
+
+  if (code->co_names == nullptr || !PyTuple_CheckExact(code->co_names) ||
+      name_index < 0 || name_index >= PyTuple_GET_SIZE(code->co_names)) {
+    return false;
+  }
+  BorrowedRef<> name = PyTuple_GET_ITEM(code->co_names, name_index);
+  if (!PyUnicode_CheckExact(name)) {
+    return false;
+  }
+
+  auto* heap_type = reinterpret_cast<PyHeapTypeObject*>(type);
+  PyDictKeysObject* keys = heap_type->ht_cached_keys;
+  if (keys == nullptr) {
+    return false;
+  }
+  Py_ssize_t attr_index = getDictKeysIndex(keys, name);
+  if (attr_index < 0 || attr_index >= keys->dk_nentries) {
+    return false;
+  }
+
+  constexpr Py_ssize_t values_offset = offsetof(PyDictValues, values);
+  constexpr Py_ssize_t valid_member_offset = offsetof(PyDictValues, valid);
+  constexpr Py_ssize_t pointer_size = sizeof(PyObject*);
+  if (type->tp_basicsize >
+      std::numeric_limits<uint16_t>::max() - values_offset) {
+    return false;
+  }
+  if (attr_index > (std::numeric_limits<uint16_t>::max() - type->tp_basicsize -
+                    values_offset) /
+          pointer_size) {
+    return false;
+  }
+  Py_ssize_t value_offset =
+      type->tp_basicsize + values_offset + attr_index * pointer_size;
+  Py_ssize_t valid_offset = type->tp_basicsize + valid_member_offset;
+  if (value_offset < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      value_offset > std::numeric_limits<uint16_t>::max() ||
+      valid_offset < static_cast<Py_ssize_t>(sizeof(PyObject)) ||
+      instruction.attrCacheIndex() != value_offset) {
+    return false;
+  }
+
+  if (info != nullptr) {
+    info->type_version = type_version;
+    info->value_offset = static_cast<uint16_t>(value_offset);
+    info->valid_offset = valid_offset;
+  }
+  return true;
+}
+#endif
 #elif PY_VERSION_HEX < 0x030C0000
 // The LOAD_ATTR_SLOT fast path reads interp->types.type_version_cache, which
 // does not exist on 3.11.  The path is gated off there (slot_fast_path_enabled
@@ -237,11 +325,15 @@ bool isSupportedOpcode(int opcode) {
     case GET_ITER:
     case GET_LEN:
     case GET_YIELD_FROM_ITER:
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+// One line: the bytecode-support checker's preprocessor filter does not
+// read continued #if expressions.
+// clang-format off
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+      // clang-format on
     case IMPORT_FROM:
       // LIR generation for IMPORT_FROM depends on access to _PyEval_ImportFrom
-      // (added in 3.14) or the_PyImport_ImportFrom function that's only added
-      // by Lazy Imports.
+      // (added in 3.14), the _PyImport_ImportFrom function that's only added
+      // by Lazy Imports, or the CPython 3.11 port JITRT_ImportFrom311.
 #endif
     case IMPORT_NAME:
     case INPLACE_ADD:
@@ -395,9 +487,14 @@ bool isSupportedOpcode(int opcode) {
   return false;
 }
 
-// Check that a symbol/name is one that the JIT has banned.
+// Check that a symbol/name is one that the JIT has banned.  These builtins
+// read the calling frame's fast locals through PyEval_GetLocals, which a
+// compiled frame does not keep current (3.11 inline-linked frames and 3.14
+// lightweight frames alike); vars() and dir() without an argument are
+// locals() by another name.
 bool isBannedName(std::string_view name) {
-  return name == "eval" || name == "exec" || name == "locals";
+  return name == "eval" || name == "exec" || name == "locals" ||
+      name == "vars" || name == "dir";
 }
 
 #if PY_VERSION_HEX < 0x030C0000
@@ -450,7 +547,18 @@ bool hasArraySubscrStoreFastPathEvidence(
     Register* container,
     Register* sub,
     Register* value,
-    Type array_type) {
+    Type array_type,
+    bool subscr_adaptive_stuck) {
+  // SPIKE(ARRAYSTUCK): a store site the 3.11 specializer tried and failed
+  // to specialize is evidence in itself -- list/dict receivers would have
+  // taken a *_LIST_INT/_DICT verdict, so a stuck site in array-using code
+  // is worth the guarded array fast path (scimark: 8 stores per FFT
+  // butterfly stayed on the generic helper over this).
+  static const bool spike_array_stuck =
+      Ci_SpikeGetenv("SPIKE_ARRAYSTUCK") != nullptr;
+  if (spike_array_stuck && subscr_adaptive_stuck) {
+    return true;
+  }
   return container->isA(array_type) ||
       (registerHasTypeEvidence(sub, TLongExact) &&
        registerHasTypeEvidence(value, TFloatExact));
@@ -672,8 +780,12 @@ BorrowedRef<PyTypeObject> resolveMethodOwnerType(
 // Pre-cached with runtime layout validation. The cached value is readable
 // by any thread once initialized; only the initialization path requires
 // the GIL (and is skipped on worker threads).
+namespace {
+PyTypeObject* g_stdlib_array_type = nullptr;
+} // namespace
+
 PyTypeObject* getStdlibArrayType() {
-  static PyTypeObject* cached_type = nullptr;
+  PyTypeObject*& cached_type = g_stdlib_array_type;
   if (cached_type != nullptr) {
     return cached_type;
   }
@@ -755,6 +867,19 @@ PyTypeObject* getStdlibArrayType() {
   cached_type = type;
   return cached_type;
 }
+
+} // namespace jit::hir
+
+// SPIKE(ARRTC): the validated array.array type object, or NULL while
+// getStdlibArrayType() has not resolved it.  Never initializes: the
+// interpreter's subscript record calls this from inside the specializer,
+// where importing the module or constructing a probe would re-enter the
+// interpreter.  Declared in Interpreter/3.11/interpreter_contract.h.
+extern "C" PyTypeObject* Ci_StdlibArrayTypeIfResolved(void) {
+  return jit::hir::g_stdlib_array_type;
+}
+
+namespace jit::hir {
 
 // Allocate a temp register that may be used for the stack. It should not be a
 // register that will be treated specially in the FrameState (e.g. tracked as
@@ -971,6 +1096,12 @@ HIRBuilder::BlockMap HIRBuilder::createBlocks(
 
   // Mark the beginning of each basic block in the bytecode
   std::set<BCIndex> block_starts = {BCIndex{0}};
+#if PY_VERSION_HEX < 0x030C0000
+  // A compiled handler is entered through its stub.
+  for (const ExcTable311::Entry& entry : exc_table_.entries) {
+    block_starts.insert(BCIndex{entry.target});
+  }
+#endif
   auto maybe_add_next_instr = [&](const BytecodeInstruction& bc_instr) {
     BCIndex next_instr_idx = bc_instr.nextInstrOffset();
     if (next_instr_idx < bc_block.size()) {
@@ -1059,7 +1190,7 @@ bool HIRBuilder::isSimpleLeafFunction(BorrowedRef<PyCodeObject> code) {
   return true;
 }
 
-bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
+static bool isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
   if (code->co_flags & kCoFlagsAnyGenerator) {
     return false;
   }
@@ -1114,69 +1245,31 @@ bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
   return numeric_binary_op_count > 1;
 }
 
-#if PY_VERSION_HEX < 0x030C0000
-static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+bool icStabilityIntGuardsUsable(PyCodeObject* code) {
+  return !getConfig().backedge_gated_int_guards || codeHasBackedge(code) ||
+      isSimpleNumericLeafFunction(code);
+}
 
-#if PY_VERSION_HEX >= 0x030B0000
-static bool hasIntConstLocalBinaryAccumulator311(
-    BorrowedRef<PyCodeObject> code) {
-  constexpr int kMaxCompactAccumulatorLocalsPlus = 8;
-  BytecodeInstructionBlock bc_instrs{code};
-  for (auto it = bc_instrs.begin(); it != bc_instrs.end(); ++it) {
-    BytecodeInstruction load = *it;
-    if (load.opcode() != LOAD_FAST) {
-      continue;
-    }
+bool icStabilitySlotCacheUsable(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index) {
+  return attrSlotMemberDef(code, instruction, name_index) != nullptr;
+}
 
-    auto const_it = it;
-    ++const_it;
-    if (const_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction load_const = *const_it;
-    if (load_const.opcode() != LOAD_CONST || load_const.oparg() < 0 ||
-        load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
-      continue;
-    }
-    BorrowedRef<> const_value =
-        PyTuple_GET_ITEM(code->co_consts, load_const.oparg());
-    if (!PyLong_CheckExact(const_value)) {
-      continue;
-    }
-
-    auto binary_it = const_it;
-    ++binary_it;
-    if (binary_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction binary = *binary_it;
-    if (binary.opcode() != BINARY_OP) {
-      continue;
-    }
-    auto inplace_op = getInPlaceOpKindFromOparg(binary.oparg());
-    if (!inplace_op.has_value()) {
-      continue;
-    }
-
-    auto store_it = binary_it;
-    ++store_it;
-    if (store_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction store = *store_it;
-    if (store.opcode() == STORE_FAST && store.oparg() == load.oparg()) {
-      if ((*inplace_op == InPlaceOpKind::kAdd ||
-           *inplace_op == InPlaceOpKind::kSubtract) &&
-          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus) {
-        continue;
-      }
-      return true;
-    }
-  }
-  return false;
+bool icStabilityInstanceValueCacheUsable(
+    PyCodeObject* code,
+    const BytecodeInstruction& instruction,
+    int name_index,
+    LoadAttrInstanceValueCacheInfo* info) {
+  return loadAttrInstanceValueCacheInfo(code, instruction, name_index, info);
 }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
 #endif
 
 const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
@@ -1188,9 +1281,6 @@ const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
   constexpr Py_ssize_t kMaxShadowBytecodeBytes311 = 65536;
   if (_PyCode_NBYTES(code) > kMaxShadowBytecodeBytes311) {
     return "REFUSE_SHAPE_CODEGEN_SPAN";
-  }
-  if (hasIntConstLocalBinaryAccumulator311(code)) {
-    return "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY";
   }
   PyObject* names = code->co_names;
   if (names == nullptr || !PyTuple_Check(names)) {
@@ -1227,8 +1317,6 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
       case MATCH_MAPPING:
       case MATCH_SEQUENCE:
         return "REFUSE_PATTERN_MATCHING_UNAUDITED";
-      case IMPORT_FROM:
-        return "REFUSE_HELPER_UNAVAILABLE_PRE314";
       case DELETE_DEREF:
       case DELETE_GLOBAL:
         return "REFUSE_UNPORTED";
@@ -1336,6 +1424,9 @@ bool collectNormalFlowReachable311(
 bool isExecuteOpcodeSupported311(int opcode) {
 #if PY_VERSION_HEX < 0x030C0000
   switch (opcode) {
+    case BUILD_SLICE:
+    case BUILD_STRING:
+    case FORMAT_VALUE:
     case BEFORE_WITH:
     case BINARY_OP:
     case BINARY_SUBSCR:
@@ -1351,6 +1442,7 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case CONTAINS_OP:
     case COPY:
     case COPY_FREE_VARS:
+    case DELETE_ATTR:
     case DELETE_FAST:
     case DICT_MERGE:
     case DICT_UPDATE:
@@ -1358,10 +1450,14 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case FOR_ITER:
     case GET_ITER:
     case GET_YIELD_FROM_ITER:
+    case IMPORT_FROM:
+    case IMPORT_NAME:
     case IS_OP:
     case JUMP_BACKWARD:
     case JUMP_BACKWARD_NO_INTERRUPT:
     case JUMP_FORWARD:
+    case JUMP_IF_FALSE_OR_POP:
+    case JUMP_IF_TRUE_OR_POP:
     case KW_NAMES:
     case LIST_APPEND:
     case LIST_EXTEND:
@@ -1399,7 +1495,9 @@ bool isExecuteOpcodeSupported311(int opcode) {
     case SEND:
     case SET_ADD:
     case STORE_ATTR:
+    case STORE_DEREF:
     case STORE_FAST:
+    case STORE_GLOBAL:
     case STORE_SUBSCR:
     case SWAP:
     case UNARY_INVERT:
@@ -1440,12 +1538,15 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // are checked: an opcode that occurs solely inside a handler region
   // executes in the interpreter after the deopt regardless of what it
   // is, so holding it to the machine-code whitelist would refuse
-  // functions this milestone fully supports.  Still out (on the
-  // reachable surface): DELETE_ATTR, STORE_DEREF, except*
-  // and pattern matching (the latter two refused earlier by the
-  // whole-code translate scan, keeping their audited refusals).  The
-  // decoder yields unspecialized opcodes, so quickened forms cannot
-  // slip past.
+  // functions this milestone fully supports.  DELETE_ATTR, STORE_DEREF,
+  // STORE_GLOBAL, the and/or short-circuit jumps and the in-function
+  // import opcodes (IMPORT_NAME; IMPORT_FROM through the 3.11 port
+  // JITRT_ImportFrom311) are on the surface: their translations were
+  // always present, only this list kept them interpreted.  Still out
+  // (on the reachable surface): except* and pattern matching (refused
+  // earlier by the whole-code translate scan, keeping their audited
+  // refusals).  The decoder yields unspecialized opcodes, so quickened
+  // forms cannot slip past.
   std::set<int> reachable;
   if (!collectNormalFlowReachable311(code, reachable)) {
     return {"REFUSE_SHAPE_EXECUTE_SURFACE", -1, -1};
@@ -1502,8 +1603,13 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
   // A timestamp calculation in an otherwise generic constructor is not a
   // numeric kernel. Scope the extension to repeated work or container updates.
   // All evidence comes from normal-flow-reachable instructions.
-  bool allow_subscripts = has_numeric_kernel_shape &&
-      (has_float_arithmetic || (has_float_constant && has_arithmetic));
+  // SIM(SUBSCR): the spike admitted every subscript-bearing function; dev's
+  // numeric-kernel heuristic below refuses the rest (deepcopy, chameleon,
+  // ...).  With the switch set the heuristic is bypassed for measurement.
+  static const bool sim_subscr_all = Ci_SpikeGetenv("SPIKE_SUBSCR") != nullptr;
+  bool allow_subscripts = sim_subscr_all ||
+      (has_numeric_kernel_shape &&
+       (has_float_arithmetic || (has_float_constant && has_arithmetic)));
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     if (!reachable.contains(bc_it->baseIndex().value())) {
       continue;
@@ -1538,6 +1644,286 @@ ExecuteRefusal311 unsupportedExecuteDetail311(BorrowedRef<PyCodeObject> code) {
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   return unsupportedExecuteDetail311(code).reason;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Decoder for co_exceptiontable (the same varint layout Objects/codeobject.c
+// writes; see also isInExceptionProtectedRange in function.cpp).
+bool excTableVarint311(
+    const unsigned char*& cursor,
+    const unsigned char* end,
+    bool is_entry_start,
+    int* result) {
+  if (cursor >= end || (((cursor[0] & 128) != 0) != is_entry_start)) {
+    return false;
+  }
+  unsigned int value = cursor[0] & 63;
+  while ((cursor[0] & 64) != 0) {
+    cursor++;
+    if (cursor >= end || (cursor[0] & 128) != 0) {
+      return false;
+    }
+    unsigned int chunk = cursor[0] & 63;
+    if (value > (std::numeric_limits<int>::max() - chunk) >> 6) {
+      return false;
+    }
+    value = (value << 6) | chunk;
+  }
+  *result = static_cast<int>(value);
+  cursor++;
+  return true;
+}
+} // namespace
+
+ExcTable311 analyzeExcTable311(BorrowedRef<PyCodeObject> code) {
+  ExcTable311 table;
+  if ((code->co_flags & kCoFlagsAnyGenerator) != 0) {
+    return table;
+  }
+  std::set<int> reachable;
+  if (!collectNormalFlowReachable311(code, reachable)) {
+    return table;
+  }
+  BytecodeInstructionBlock bc_instrs{code};
+  std::vector<BytecodeInstruction> instrs;
+  for (const auto& instr : bc_instrs) {
+    instrs.push_back(instr);
+  }
+  size_t n_units =
+      static_cast<size_t>(_PyCode_NBYTES(code)) / sizeof(_Py_CODEUNIT);
+  std::vector<int> slot_of_index(n_units, -1);
+  for (size_t i = 0; i < instrs.size(); ++i) {
+    int idx = instrs[i].baseIndex().value();
+    if (idx >= 0 && static_cast<size_t>(idx) < n_units) {
+      slot_of_index[idx] = static_cast<int>(i);
+    }
+  }
+  table.handler_region.assign(n_units, 0);
+
+  const auto* cursor = reinterpret_cast<const unsigned char*>(
+      PyBytes_AS_STRING(code->co_exceptiontable));
+  const auto* end = cursor + PyBytes_GET_SIZE(code->co_exceptiontable);
+  while (cursor < end) {
+    int start = 0;
+    int size = 0;
+    int target = 0;
+    int depth_lasti = 0;
+    if (!excTableVarint311(cursor, end, true, &start) ||
+        !excTableVarint311(cursor, end, false, &size) ||
+        !excTableVarint311(cursor, end, false, &target) ||
+        !excTableVarint311(cursor, end, false, &depth_lasti)) {
+      return ExcTable311{};
+    }
+    bool lasti = (depth_lasti & 1) != 0;
+    int depth = depth_lasti >> 1;
+    if (lasti || target < 0 || static_cast<size_t>(target) >= n_units ||
+        slot_of_index[target] < 0 || reachable.contains(target) ||
+        instrs[slot_of_index[target]].opcode() != PUSH_EXC_INFO) {
+      continue;
+    }
+    // The handler body: normal flow from the target until it rejoins code
+    // reachable from the entry.
+    std::vector<int> region;
+    std::vector<unsigned char> seen(n_units, 0);
+    std::vector<int> worklist{target};
+    bool ok = true;
+    while (ok && !worklist.empty()) {
+      int index = worklist.back();
+      worklist.pop_back();
+      if (index < 0 || static_cast<size_t>(index) >= n_units) {
+        ok = false;
+        break;
+      }
+      if (seen[index] || reachable.contains(index)) {
+        continue;
+      }
+      seen[index] = 1;
+      int slot = slot_of_index[index];
+      if (slot < 0) {
+        ok = false;
+        break;
+      }
+      const BytecodeInstruction& instr = instrs[slot];
+      int op = instr.opcode();
+      switch (op) {
+        case WITH_EXCEPT_START:
+        case CLEANUP_THROW:
+        case CHECK_EG_MATCH:
+        case PREP_RERAISE_STAR:
+        case YIELD_VALUE:
+        case SEND:
+        case RETURN_GENERATOR:
+          ok = false;
+          break;
+        case PUSH_EXC_INFO:
+          if (index != target) {
+            ok = false;
+          }
+          break;
+        default:
+          break;
+      }
+      if (!ok || !isExecuteOpcodeSupported311(op)) {
+        ok = false;
+        break;
+      }
+      region.push_back(index);
+      if (instr.isBranch()) {
+        worklist.push_back(instr.getJumpTarget().asIndex().value());
+      }
+      bool falls_through = !instr.isReturn() && op != RAISE_VARARGS &&
+          op != RERAISE && op != JUMP_FORWARD && op != JUMP_BACKWARD &&
+          op != JUMP_BACKWARD_NO_INTERRUPT && op != JUMP_ABSOLUTE;
+      if (falls_through) {
+        worklist.push_back(instr.nextInstrOffset().asIndex().value());
+      }
+    }
+    if (!ok) {
+      continue;
+    }
+    for (int index : region) {
+      table.handler_region[index] = 1;
+    }
+    table.entries.push_back(
+        ExcTable311::Entry{start, start + size, target, depth});
+  }
+  return table;
+}
+
+const ExcTable311::Entry* ExcTable311::entryFor(int index) const {
+  for (const Entry& entry : entries) {
+    if (index >= entry.start && index < entry.end) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+bool ExcTable311::inHandlerRegion(int index) const {
+  return index >= 0 && static_cast<size_t>(index) < handler_region.size() &&
+      handler_region[index] != 0;
+}
+
+bool excEdgeCapable311(BorrowedRef<PyCodeObject> code, int64_t base_offset) {
+  return analyzeExcTable311(code).edgeCapable(
+      BCOffset{base_offset}.asIndex().value());
+}
+
+const ExcTable311::Entry* HIRBuilder::excEntryFor311(BCOffset off) const {
+  return exc_table_.entryFor(off.asIndex().value());
+}
+
+// A granted site whose exception exit the builder can turn into an edge: it
+// lies in a compiled row.
+bool HIRBuilder::excEdgeSite311(
+    const jit::BytecodeInstruction& bc_instr) const {
+  BCOffset off = bc_instr.baseOffset();
+  if (!Ci_ExcEdgeSiteGranted311(code_, off.value())) {
+    return false;
+  }
+  return exc_table_.edgeCapable(off.asIndex().value());
+}
+
+bool HIRBuilder::inExcHandlerRegion311(BCOffset off) const {
+  return exc_table_.inHandlerRegion(off.asIndex().value());
+}
+
+// The exception exit of `raising` (its output `result` is NULL on that exit,
+// and is the top of the operand stack) becomes a CFG edge when the
+// instruction sits at a granted site inside a compiled row.  The stub replays
+// the evaluator's error path for a non-lasti row -- operand stack unwound to
+// the row's depth, traceback entry, normalized exception pushed -- and enters
+// the handler block; with a trace function installed it deopts instead,
+// exception untouched.  The fall-through refines the result to non-null.  A
+// raise with no handler in the function keeps the deopt exit: the evaluator
+// materializes the frame's locals before the traceback captures it, which
+// returning NULL from machine code would not.
+void HIRBuilder::emitExcEdge311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr,
+    DeoptBase* raising,
+    Register* result,
+    Register* cond,
+    bool ok_when_true) {
+  if (cfg_ == nullptr || !excEdgeSite311(bc_instr)) {
+    return;
+  }
+  const ExcTable311::Entry* entry = excEntryFor311(bc_instr.baseOffset());
+  JIT_CHECK(entry != nullptr, "exception edge site outside a compiled row");
+  if (result != nullptr) {
+    JIT_CHECK(
+        tc.frame.stack.top() == result,
+        "exception edge expects the raising result on top of the stack");
+  }
+  if (raising != nullptr) {
+    raising->setExcEdge(true);
+  }
+  Register* test = cond != nullptr ? cond : result;
+  JIT_CHECK(test != nullptr, "exception edge needs a condition");
+  CFG& cfg = *cfg_;
+  BasicBlock* ok_bb = cfg.AllocateBlock();
+  BasicBlock* exc_bb = cfg.AllocateBlock();
+  if (ok_when_true) {
+    tc.emit<CondBranch>(test, ok_bb, exc_bb);
+  } else {
+    tc.emit<CondBranch>(test, exc_bb, ok_bb);
+  }
+
+  TranslationContext stub{exc_bb, tc.frame};
+  if (result != nullptr) {
+    stub.frame.stack.pop();
+  }
+  // The position the evaluator publishes for the faulting instruction (its
+  // last cache unit for CALL, see InsertUpdatePrevInstr).
+  int64_t published_idx = bc_instr.opcode() == CALL
+      ? bc_instr.nextInstrOffset().asIndex().value() - 1
+      : bc_instr.opcodeIndex().value();
+  while (stub.frame.stack.size() > static_cast<size_t>(entry->depth)) {
+    stub.frame.stack.pop();
+  }
+  // No Snapshot in the stub: its frame state is an error continuation (the
+  // operation has failed and the exception is set), not a resumable
+  // bytecode boundary, so no instrumentation poll may be placed on it; the
+  // CheckExc below carries its own frame state.
+  Register* published = temps_.AllocateNonStack();
+  stub.emit<LoadConst>(
+      published,
+      Type::fromCUInt(static_cast<uint64_t>(published_idx), TCUInt64));
+  Register* exc = temps_.AllocateStack();
+  stub.emit<CallCFunc>(
+      1,
+      exc,
+      CallCFunc::Func::kJITRT_EnterExceptHandler311,
+      std::vector<Register*>{published});
+  BasicBlock* enter_bb = cfg.AllocateBlock();
+  BasicBlock* deopt_bb = cfg.AllocateBlock();
+  stub.emit<CondBranch>(exc, enter_bb, deopt_bb);
+
+  // Tracing installed: the helper declined and the exception is still set;
+  // the CheckExc on the NULL result deopts with the raising instruction's
+  // frame state, exactly the exit taken without a compiled handler.
+  TranslationContext deopt_tc{deopt_bb, stub.frame};
+  Register* dead = temps_.AllocateNonStack();
+  deopt_tc.emit<CheckExc>(dead, exc, deopt_tc.frame);
+  deopt_tc.emit<Unreachable>();
+
+  TranslationContext enter_tc{enter_bb, stub.frame};
+  enter_tc.frame.stack.push(exc);
+  BasicBlock* handler = getBlockAtOff(BCIndex{entry->target}.asOffset());
+  enter_tc.emit<Branch>(handler);
+  BlockCanonicalizer canon;
+  canon.Run(enter_bb, temps_, enter_tc.frame.stack);
+  pending_exc_handlers_.emplace_back(handler, enter_tc.frame);
+
+  tc.block = ok_bb;
+  if (result != nullptr) {
+    Register* refined = temps_.AllocateStack();
+    tc.emit<RefineType>(refined, TObject, result);
+    tc.frame.stack.pop();
+    tc.frame.stack.push(refined);
+  }
+}
+#endif
 
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
@@ -1665,6 +2051,37 @@ BasicBlock* HIRBuilder::buildHIRImpl(
     FrameState* frame_state) {
   temps_ = TempAllocator(&irfunc->env);
   env_ = &irfunc->env;
+#if PY_VERSION_HEX < 0x030C0000
+  cfg_ = &irfunc->cfg;
+  exc_table_ = ExcTable311{};
+  pending_exc_handlers_.clear();
+  exc_edge_frame_locals_ = false;
+  if (frame_state == nullptr) {
+    // Inlined bodies keep the deopt model: their handler would run in the
+    // caller's real frame, which the entry helper cannot tell apart.
+    exc_table_ = analyzeExcTable311(code_);
+    auto& capable = irfunc->exc_edge_capable_311;
+    capable.clear();
+    if (!exc_table_.entries.empty()) {
+      int units = static_cast<int>(exc_table_.handler_region.size());
+      capable.resize(units, false);
+      for (const auto& entry : exc_table_.entries) {
+        for (int index = std::max(entry.start, 0);
+             index < std::min(entry.end, units);
+             ++index) {
+          capable[index] = true;
+        }
+      }
+    }
+    // With an edge in this function the frame can be exposed by the
+    // traceback while machine code keeps running: keep its locals current
+    // (see frameLocalsWrittenThrough311), and tell the LIR exit to release
+    // them.
+    exc_edge_frame_locals_ = getConfig().state == State::kRunning &&
+        !exc_table_.entries.empty() && Ci_ExcEdgeCodeHasGrant311(code_);
+    irfunc->frame_locals_written_through_311 = exc_edge_frame_locals_;
+  }
+#endif
 
   BytecodeInstructionBlock bc_instrs{code_};
   block_map_ = createBlocks(*irfunc, bc_instrs);
@@ -1846,6 +2263,17 @@ void HIRBuilder::translate(
     for (auto bc_it = bc_block.begin(); bc_it != bc_block.end(); ++bc_it) {
       BytecodeInstruction bc_instr = *bc_it;
 
+#if PY_VERSION_HEX < 0x030C0000
+      // SPIKE(SLICEFAST): the subscript was emitted together with its
+      // BUILD_SLICE; nothing left to translate for it.
+      if (spike_skip_bc_offset_ >= 0 &&
+          bc_instr.baseOffset().value() == spike_skip_bc_offset_) {
+        spike_skip_bc_offset_ = -1;
+        prev_bc_instr = bc_instr;
+        continue;
+      }
+#endif
+
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
       bool emitted_entry_guards = false;
@@ -1859,12 +2287,11 @@ void HIRBuilder::translate(
             tc.frame.stack.isEmpty(),
             "entry guards inserted with non-empty operand stack");
         // Entry setup is done: arguments are bound and the cell slots
-        // hold their cells, so this is where the frame's observable
-        // localsplus gets its entry snapshot (executing mode, 3.11).
-        // This must precede the annotation guards: their Snapshot is the
-        // dominating FrameState for the instructions that follow, and the
-        // write-through calls are not replayable, so placing them after
-        // the guards would leave that stretch with no resume point.
+        // hold their cells, so this is where a generator frame's
+        // observable localsplus gets its entry snapshot (3.11).  This must
+        // precede the annotation guards: their Snapshot is the dominating
+        // FrameState for the instructions that follow, and the
+        // write-through calls are not replayable.
         emitLocalsplusWriteback311(tc);
         if (tc.frame.stack.isEmpty()) {
           emitted_entry_guards = emitTypeAnnotationGuards(tc);
@@ -2179,7 +2606,7 @@ void HIRBuilder::translate(
                   irfunc.cfg, tc, bc_it, bc_block)) {
             break;
           }
-          emitLoadGlobal(tc, bc_instr);
+          emitLoadGlobal(irfunc.cfg, tc, bc_instr);
           break;
         }
         case JUMP_ABSOLUTE:
@@ -2339,7 +2766,7 @@ void HIRBuilder::translate(
           break;
         }
         case STORE_ATTR: {
-          emitStoreAttr(tc, bc_instr);
+          emitStoreAttr(irfunc.cfg, tc, bc_instr);
           break;
         }
         case STORE_FAST: {
@@ -2447,7 +2874,7 @@ void HIRBuilder::translate(
           break;
         }
         case FOR_ITER: {
-          emitForIter(tc, bc_instr);
+          emitForIter(irfunc.cfg, tc, bc_instr);
           break;
         }
         case LOAD_FIELD: {
@@ -2471,7 +2898,11 @@ void HIRBuilder::translate(
           emitPopJumpIf(tc, bc_instr);
           break;
         }
-#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+// One line: the bytecode-support checker's preprocessor filter does not
+// read continued #if expressions.
+// clang-format off
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
+          // clang-format on
         case IMPORT_FROM: {
           emitImportFrom(tc, bc_instr);
           break;
@@ -2664,9 +3095,90 @@ void HIRBuilder::translate(
           emitStoreGlobal(tc, bc_instr);
           break;
         }
-#if PY_VERSION_HEX >= 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000
+        // The handler-body opcodes, translated only in a compiled handler
+        // region (see analyzeExcTable311).
+        case PUSH_EXC_INFO: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // [.., exc] -> [.., prev, exc]; exc becomes the handled exception.
+          Register* exc = tc.frame.stack.pop();
+          Register* prev = temps_.AllocateStack();
+          tc.emit<CallCFunc>(
+              1,
+              prev,
+              CallCFunc::Func::kJITRT_PushExcInfo311,
+              std::vector<Register*>{exc});
+          tc.frame.stack.push(prev);
+          tc.frame.stack.push(exc);
+          break;
+        }
+        case CHECK_EXC_MATCH: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // [.., exc, type] -> [.., exc, bool]; an invalid type raises
+          // TypeError, which the CheckNeg hands to the interpreter with the
+          // type already popped, as the evaluator does.
+          Register* type = tc.frame.stack.pop();
+          Register* exc = tc.frame.stack.top();
+          Register* res = temps_.AllocateNonStack();
+          tc.emit<CallCFunc>(
+              2,
+              res,
+              CallCFunc::Func::kJITRT_ExcMatch311,
+              std::vector<Register*>{exc, type});
+          Register* checked = temps_.AllocateNonStack();
+          tc.emit<CheckNeg>(checked, res, tc.frame);
+          Register* zero = temps_.AllocateNonStack();
+          tc.emit<LoadConst>(zero, Type::fromCInt(0, TCInt64));
+          Register* matched = temps_.AllocateNonStack();
+          tc.emit<PrimitiveCompare>(
+              matched, PrimitiveCompareOp::kNotEqual, checked, zero);
+          Register* boxed = temps_.AllocateStack();
+          tc.emit<PrimitiveBoxBool>(boxed, matched);
+          tc.frame.stack.push(boxed);
+          break;
+        }
+        case POP_EXCEPT: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          Register* prev = tc.frame.stack.pop();
+          Register* dead = temps_.AllocateNonStack();
+          tc.emit<CallCFunc>(
+              1,
+              dead,
+              CallCFunc::Func::kJITRT_PopExcInfo311,
+              std::vector<Register*>{prev});
+          break;
+        }
+        case RERAISE: {
+          if (!inExcHandlerRegion311(bc_instr.baseOffset())) {
+            BUILDER_THROW(
+                "{} appearing outside of exception handler",
+                opcodeName(opcode));
+          }
+          // Re-executed by the interpreter: it pops the exception, restores
+          // it and unwinds through the exception table from here (the
+          // cleanup rows are never compiled).
+          tc.emitSnapshot();
+          tc.emit<Deopt>();
+          break;
+        }
+        case CLEANUP_THROW:
+        case WITH_EXCEPT_START:
+          BUILDER_THROW(
+              "{} appearing outside of exception handler", opcodeName(opcode));
+#else
         case CHECK_EG_MATCH:
-#endif
         case CHECK_EXC_MATCH:
         case CLEANUP_THROW:
         case POP_EXCEPT:
@@ -2675,6 +3187,7 @@ void HIRBuilder::translate(
         case WITH_EXCEPT_START:
           BUILDER_THROW(
               "{} appearing outside of exception handler", opcodeName(opcode));
+#endif
         default: {
           BUILDER_THROW("Unhandled opcode {} ({})", opcodeName(opcode), opcode);
         }
@@ -2688,6 +3201,27 @@ void HIRBuilder::translate(
         }
       }
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (is_entry_bc_block && !entry_guards_emitted) {
+      // The entry block held entry-setup instructions only: a body that
+      // opens with `while True:` has RESUME and the loop's NOP ahead of the
+      // back-edge target, so no ordinary instruction reached the seeding
+      // above.  The block runs exactly once, so seed the observable
+      // localsplus here before leaving it (ahead of the branch a jumping
+      // block already emitted).
+      Instr* terminator = tc.block->GetTerminator();
+      bool reattach = terminator != nullptr && terminator->IsTerminator();
+      if (reattach) {
+        terminator->unlink();
+      }
+      emitLocalsplusWriteback311(tc);
+      if (reattach) {
+        tc.block->Append(terminator);
+      }
+      entry_guards_emitted = true;
+      in_entry_setup = false;
+    }
+#endif
     // Insert jumps for blocks that fall through.
     auto last_instr = tc.block->GetTerminator();
     if ((last_instr == nullptr) || !last_instr->IsTerminator()) {
@@ -2706,6 +3240,21 @@ void HIRBuilder::translate(
     // untouched along the other. Thus, they must be special cased.
     switch (prev_bc_instr.opcode()) {
       case FOR_ITER: {
+#if PY_VERSION_HEX < 0x030C0000
+        if (spike_range_body_ != nullptr) {
+          // SPIKE(RANGEITER): the range form ends in CondBranch(in range,
+          // value block, footer); the value block already pushed the loop
+          // value and branches to the body.  On exhaustion only the
+          // iterator is on the stack to pop.
+          auto* condbr = static_cast<CondBranch*>(last_instr);
+          auto exit_frame = tc.frame;
+          exit_frame.stack.discard(1);
+          queue.emplace_back(spike_range_body_, spike_range_body_frame_);
+          queue.emplace_back(condbr->false_bb(), exit_frame);
+          spike_range_body_ = nullptr;
+          break;
+        }
+#endif
         auto condbr = static_cast<CondBranchIterNotDone*>(last_instr);
         auto new_frame = tc.frame;
         if constexpr (PY_VERSION_HEX >= 0x030E0000) {
@@ -2739,6 +3288,24 @@ void HIRBuilder::translate(
         queue.emplace_back(condbr->false_bb(), new_frame);
         break;
       }
+#if PY_VERSION_HEX < 0x030C0000
+      case SEND: {
+        // 3.11's SEND replaces the receiver with the result when the
+        // sub-iterator finishes (there is no END_SEND to pop it later), so the
+        // finished edge leaves [.., result] while the resume edge keeps
+        // [.., receiver, result].  Leaving the receiver behind shifts every
+        // stack-relative operand below a `yield from`: the exit call of an
+        // enclosing `with` block was invoked on the sub-iterator.
+        auto condbr = static_cast<CondBranch*>(last_instr);
+        auto new_frame = tc.frame;
+        Register* result = new_frame.stack.pop();
+        new_frame.stack.pop();
+        new_frame.stack.push(result);
+        queue.emplace_back(condbr->true_bb(), new_frame);
+        queue.emplace_back(condbr->false_bb(), tc.frame);
+        break;
+      }
+#endif
       default: {
         if (prev_bc_instr.opcode() == YIELD_FROM &&
             is_in_async_for_header_block()) {
@@ -2764,6 +3331,13 @@ void HIRBuilder::translate(
         tc.block->GetTerminator() != nullptr &&
             !tc.block->GetTerminator()->IsSnapshot(),
         "opcodes should not end with a snapshot");
+#if PY_VERSION_HEX < 0x030C0000
+    // Handler blocks entered from this block's stubs.
+    for (auto& [handler, frame] : pending_exc_handlers_) {
+      queue.emplace_back(handler, frame);
+    }
+    pending_exc_handlers_.clear();
+#endif
   }
 
   JIT_CHECK(
@@ -3063,6 +3637,11 @@ void HIRBuilder::emitAnyCall(
     case CALL:
     case CALL_KW:
     case CALL_METHOD: {
+#if PY_VERSION_HEX < 0x030C0000
+      if (opcode == CALL && tryEmitRangeIter311(tc, bc_instr)) {
+        break;
+      }
+#endif
       auto num_operands = static_cast<std::size_t>(bc_instr.oparg()) + 2;
       auto num_stack_inputs = num_operands;
       bool is_call_kw = opcode == CALL_KW;
@@ -3093,6 +3672,9 @@ void HIRBuilder::emitAnyCall(
       call->setFrameState(tc.frame);
 
       tc.frame.stack.push(out);
+#if PY_VERSION_HEX < 0x030C0000
+      emitExcEdge311(tc, bc_instr, call, out);
+#endif
       break;
     }
     case INVOKE_FUNCTION: {
@@ -3178,6 +3760,57 @@ void HIRBuilder::emitKwNames(
       kwnames_, Type::fromObject(PyTuple_GET_ITEM(code_->co_consts, index)));
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(FLOATSPEC): may Simplify speculate float/float operands at this
+// arithmetic site when both are statically unknown?  SPIKE_FLOATSPEC=1: only
+// sites whose adaptive specialisation was attempted and failed (mixed types
+// seen).  SPIKE_FLOATSPEC=all: every site except those the specialiser has
+// already proven int or str -- the adaptive counter is still zero when a
+// function compiles at its 4th call, so the stuck evidence is rare, while an
+// *_INT / *_UNICODE form is positive evidence against floats (scimark_mc's
+// integer RNG paid +5% for the wasted float checks).
+static bool spikeFloatSpecSite311(
+    PyCodeObject* code,
+    const jit::BytecodeInstruction& bc_instr) {
+  static const int mode = [] {
+    const char* v = Ci_SpikeGetenv("SPIKE_FLOATSPEC");
+    return v == nullptr ? 0 : (strcmp(v, "all") == 0 ? 2 : 1);
+  }();
+  if (mode == 0 ||
+      Ci_SpikeNoFloatSpec311(code, bc_instr.baseOffset().value())) {
+    return false;
+  }
+  if (bc_instr.isBinaryOpAdaptiveStuck()) {
+    return true;
+  }
+  // SPIKE(MIXEDNUM): a site whose exact-float type guards blew their fuse
+  // keeps that evidence through a despecialised recompile, where
+  // specializedOpcode() reports the generic form and the BINTYPED path of
+  // the binary-op translation is not consulted.  The diamond carries no
+  // deopting type guard, so it cannot restart the churn the
+  // despecialisation was meant to stop.
+  static const bool spike_mixednum =
+      Ci_SpikeGetenv("SPIKE_MIXEDNUM") != nullptr;
+  if (spike_mixednum &&
+      Ci_SpikeNoFloatGuard311(code, bc_instr.baseOffset().value())) {
+    return true;
+  }
+  if (mode != 2) {
+    return false;
+  }
+  switch (bc_instr.specializedOpcode()) {
+    case BINARY_OP_ADD_INT:
+    case BINARY_OP_SUBTRACT_INT:
+    case BINARY_OP_MULTIPLY_INT:
+    case BINARY_OP_ADD_UNICODE:
+    case BINARY_OP_INPLACE_ADD_UNICODE:
+      return false;
+    default:
+      return true;
+  }
+}
+#endif
+
 void HIRBuilder::emitBinaryOp(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
@@ -3203,12 +3836,67 @@ void HIRBuilder::emitBinaryOp(
   // to deopt: a non-float input must retain the generic in-place operation.
   bool use_binary_op_type_guards =
       opcode != BINARY_OP || getBinaryOpKindFromOparg(oparg).has_value();
+  // SPIKE(IPTYPED): the in-place forms of the exact float / exact int
+  // specialisations have identical semantics to the binary forms (neither
+  // float nor int defines an nb_inplace_* slot, so PyNumber_InPlace* falls
+  // through to the binary slot).  The specialiser only quickens a site once
+  // both operands were observed as the exact type, so the evidence is worth
+  // carrying: the InPlaceOp is tagged with the exact type and Simplify turns
+  // it into a type-check diamond whose fast arm is the unboxed
+  // DoubleBinaryOp / compact-long lowering.  A diamond rather than a
+  // deopting guard because accumulators are routinely initialised with an
+  // int 0 and only become float after the first iteration; a guard would
+  // deopt the whole invocation once per call (spectral_norm +2.2%).
+  static const bool spike_iptyped = Ci_SpikeGetenv("SPIKE_IPTYPED") != nullptr;
+  Type inplace_specialized_exact = TBottom;
+  if (spike_iptyped && opcode == BINARY_OP && !use_binary_op_type_guards &&
+      getConfig().specialized_opcodes) {
+    auto inplace_kind = getInPlaceOpKindFromOparg(oparg);
+    switch (bc_instr.specializedOpcode()) {
+      case BINARY_OP_ADD_FLOAT:
+      case BINARY_OP_MULTIPLY_FLOAT:
+      case BINARY_OP_SUBTRACT_FLOAT:
+        if (inplace_kind == InPlaceOpKind::kAdd ||
+            inplace_kind == InPlaceOpKind::kSubtract ||
+            inplace_kind == InPlaceOpKind::kMultiply) {
+          inplace_specialized_exact = TFloatExact;
+        }
+        break;
+      case BINARY_OP_ADD_INT:
+      case BINARY_OP_SUBTRACT_INT: {
+        // Mirror the frame-size limit of the compact-long lowering in
+        // simplifyInPlaceOp; past it both arms would be generic.
+        size_t frame_size = tc.frame.localsplus.size() + tc.frame.stack.size();
+        if ((inplace_kind == InPlaceOpKind::kAdd ||
+             inplace_kind == InPlaceOpKind::kSubtract) &&
+            frame_size <= 8) {
+          inplace_specialized_exact = TLongExact;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
 #else
   constexpr bool use_binary_op_type_guards = true;
 #endif
 
   bool float_inplace_fast_path = false;
-  if (getConfig().specialized_opcodes) {
+#if PY_VERSION_HEX < 0x030C0000
+  // At a granted exception-edge site the operation keeps its generic form:
+  // a type guard in front of it would turn the raise into a guard failure
+  // (re-executed by the interpreter, past the compiled handler) instead of
+  // the NULL result the edge tests.
+  bool speculate_types =
+      getConfig().specialized_opcodes && !excEdgeSite311(bc_instr);
+#else
+  bool speculate_types = getConfig().specialized_opcodes;
+#endif
+  static const bool spike_bintyped_float =
+      Ci_SpikeGetenv("SPIKE_BINTYPED") != nullptr;
+  bool bintyped_float_site = false;
+  if (speculate_types) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
       case BINARY_OP_MULTIPLY_INT:
@@ -3234,8 +3922,20 @@ void HIRBuilder::emitBinaryOp(
               oparg == NB_INPLACE_SUBTRACT));
 #endif
         if (use_binary_op_type_guards) {
+#if PY_VERSION_HEX < 0x030C0000
+          int64_t site = bc_instr.baseOffset().value();
+          if (spike_bintyped_float && Ci_SpikeNoFloatGuard311(code_, site)) {
+            bintyped_float_site = true;
+            break;
+          }
+#endif
           tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
           tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
+#if PY_VERSION_HEX < 0x030C0000
+          if (spike_bintyped_float) {
+            Ci_SpikeFloatGuardRegister311(code_, site);
+          }
+#endif
         }
         break;
       }
@@ -3277,14 +3977,34 @@ void HIRBuilder::emitBinaryOp(
           "Unrecognized oparg for BINARY_OP: {}",
           oparg);
       InPlaceOpKind inplace_op_kind = *inplace_opt_op_kind;
-      tc.emit<InPlaceOp>(
+      auto* inplace = tc.emit<InPlaceOp>(
           result,
           inplace_op_kind,
           left,
           right,
           tc.frame,
           float_inplace_fast_path);
+#if PY_VERSION_HEX < 0x030C0000
+      inplace->setSpecializedExact(inplace_specialized_exact);
+      // SPIKE(FLOATSPEC): a stuck adaptive site saw operand types the
+      // specialiser could not handle (e.g. int mixed with float); let
+      // Simplify speculate float/float behind a type-check diamond.
+      if (spikeFloatSpecSite311(code_, bc_instr) &&
+          (inplace_op_kind == InPlaceOpKind::kAdd ||
+           inplace_op_kind == InPlaceOpKind::kSubtract ||
+           inplace_op_kind == InPlaceOpKind::kMultiply ||
+           inplace_op_kind == InPlaceOpKind::kTrueDivide)) {
+        inplace->setSpeculateFloat(true);
+      }
+#else
+      (void)inplace;
+#endif
       stack.push(result);
+#if PY_VERSION_HEX < 0x030C0000
+      emitExcEdge311(tc, bc_instr, inplace, result);
+#else
+      (void)inplace;
+#endif
       return;
     }
   } else {
@@ -3297,8 +4017,44 @@ void HIRBuilder::emitBinaryOp(
     op_kind = *opt_op_kind;
   }
 
-  tc.emit<BinaryOp>(result, op_kind, left, right, tc.frame);
+  // SPIKE(ARRAYSTUCK): carry the stuck-specialization evidence onto the
+  // HIR instruction for the simplify-stage array fast path.
+  bool subscr_stuck = op_kind == BinaryOpKind::kSubscript &&
+      getConfig().specialized_opcodes && bc_instr.isSubscrAdaptiveStuck();
+  auto* binop = tc.emit<BinaryOp>(
+      result,
+      op_kind,
+      left,
+      right,
+      tc.frame,
+      /* array_subscr_slow_path= */ false,
+      subscr_stuck);
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(ARRTC): and the interpreter's record of the one typecode it saw.
+  if (subscr_stuck) {
+    static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+    if (spike_arrtc) {
+      binop->setSubscrArrayTypecode(bc_instr.subscrArrayTypecode());
+    }
+  }
+  // SPIKE(FLOATSPEC): see the in-place counterpart above.  SPIKE(BINTYPED)
+  // feeds the *_FLOAT specialisation evidence into the same diamond.
+  if (bintyped_float_site ||
+      (opcode == BINARY_OP && spikeFloatSpecSite311(code_, bc_instr) &&
+       (op_kind == BinaryOpKind::kAdd || op_kind == BinaryOpKind::kSubtract ||
+        op_kind == BinaryOpKind::kMultiply ||
+        op_kind == BinaryOpKind::kTrueDivide))) {
+    binop->setSpeculateFloat(true);
+  }
+#else
+  (void)binop;
+#endif
   stack.push(result);
+#if PY_VERSION_HEX < 0x030C0000
+  emitExcEdge311(tc, bc_instr, binop, result);
+#else
+  (void)binop;
+#endif
 }
 
 void HIRBuilder::emitInPlaceOp(
@@ -3400,6 +4156,64 @@ void HIRBuilder::emitBuildSlice(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   std::size_t num_operands = static_cast<std::size_t>(bc_instr.oparg());
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(SLICEFAST): BUILD_SLICE immediately consumed by BINARY_SUBSCR /
+  // STORE_SUBSCR is translated as one helper call that never materialises
+  // the slice object (fannkuch: PySlice_New / Unpack / AdjustIndices plus the
+  // index conversions were ~20% of the profile).  The subscript bytecode is
+  // then skipped by the translation loop.  The helper raises exactly what
+  // the slice-object path would, so the deopt points are exception-only.
+  static const bool spike_slicefast =
+      Ci_SpikeGetenv("SPIKE_SLICEFAST") != nullptr;
+  if (spike_slicefast) {
+    BytecodeInstruction next = bc_instr.nextInstr();
+    int next_op = next.opcode();
+    if (next_op == BINARY_SUBSCR || next_op == STORE_SUBSCR) {
+      auto& stack = tc.frame.stack;
+      Register* step = nullptr;
+      if (num_operands == 3) {
+        step = stack.pop();
+      }
+      Register* stop = stack.pop();
+      Register* start = stack.pop();
+      if (step == nullptr) {
+        step = temps_.AllocateNonStack();
+        tc.emit<LoadConst>(step, Type::fromObject(Py_None));
+      }
+      Register* container = stack.pop();
+      tc.frame.cur_instr_offs = next.baseOffset();
+      if (next_op == BINARY_SUBSCR) {
+        Register* raw = temps_.AllocateNonStack();
+        auto call = tc.emit<CallStatic>(
+            4,
+            raw,
+            reinterpret_cast<void*>(JITRT_GetSlice311),
+            TObject | TNullptr);
+        call->SetOperand(0, container);
+        call->SetOperand(1, start);
+        call->SetOperand(2, stop);
+        call->SetOperand(3, step);
+        Register* result = temps_.AllocateStack();
+        tc.emit<CheckExc>(result, raw, tc.frame);
+        stack.push(result);
+      } else {
+        Register* value = stack.pop();
+        Register* status = temps_.AllocateNonStack();
+        auto call = tc.emit<CallStatic>(
+            5, status, reinterpret_cast<void*>(JITRT_SetSlice311), TCInt64);
+        call->SetOperand(0, container);
+        call->SetOperand(1, start);
+        call->SetOperand(2, stop);
+        call->SetOperand(3, step);
+        call->SetOperand(4, value);
+        Register* checked = temps_.AllocateNonStack();
+        tc.emit<IsNegativeAndErrOccurred>(checked, status, tc.frame);
+      }
+      spike_skip_bc_offset_ = next.baseOffset().value();
+      return;
+    }
+  }
+#endif
   tc.emitVariadic<BuildSlice>(temps_, num_operands);
 }
 
@@ -3827,8 +4641,35 @@ void HIRBuilder::emitCompareOp(
   CompareOp op = static_cast<CompareOp>(compare_op);
   bool specialize_int_guards = !getConfig().backedge_gated_int_guards ||
       code_has_backedge_ || code_is_simple_numeric_leaf_;
+  [[maybe_unused]] int compare_spec_for_tag = 0;
   if (getConfig().specialized_opcodes) {
-    switch (bc_instr.specializedOpcode()) {
+    int compare_spec = bc_instr.specializedOpcode();
+#if PY_VERSION_HEX < 0x030C0000
+    // SPIKE(CMPJUMP): 3.11 fuses the compare with the following POP_JUMP
+    // and names the specializations COMPARE_OP_{FLOAT,INT,STR}_JUMP; the
+    // type facts they carry are the same as the 3.12 unfused forms, so
+    // consume them under the same guards.  The jump itself is still built
+    // from the POP_JUMP bytecode that follows.
+    static const bool spike_cmpjump =
+        Ci_SpikeGetenv("SPIKE_CMPJUMP") != nullptr;
+    if (spike_cmpjump) {
+      switch (compare_spec) {
+        case COMPARE_OP_FLOAT_JUMP:
+          compare_spec = COMPARE_OP_FLOAT;
+          break;
+        case COMPARE_OP_INT_JUMP:
+          compare_spec = COMPARE_OP_INT;
+          break;
+        case COMPARE_OP_STR_JUMP:
+          compare_spec = COMPARE_OP_STR;
+          break;
+        default:
+          break;
+      }
+    }
+#endif
+    compare_spec_for_tag = compare_spec;
+    switch (compare_spec) {
       case COMPARE_OP_FLOAT:
         tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
         tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
@@ -3848,7 +4689,21 @@ void HIRBuilder::emitCompareOp(
     }
   }
 
-  tc.emit<Compare>(result, op, left, right, tc.frame);
+  auto* compare = tc.emit<Compare>(result, op, left, right, tc.frame);
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(CMPTYPED): when the int guards are withheld (no backedge, not a
+  // numeric leaf) the specialiser's COMPARE_OP_INT evidence is still worth
+  // carrying: Simplify pins the operands with a type-check diamond instead of
+  // a deopting guard, so mixed-type leaf helpers only pay a type test.
+  static const bool spike_cmptyped =
+      Ci_SpikeGetenv("SPIKE_CMPTYPED") != nullptr;
+  if (spike_cmptyped && getConfig().specialized_opcodes &&
+      !specialize_int_guards && compare_spec_for_tag == COMPARE_OP_INT) {
+    compare->setSpecializedExact(TLongExact);
+  }
+#else
+  (void)compare;
+#endif
   stack.push(result);
   if (PY_VERSION_HEX >= 0x030E0000 && bc_instr.oparg() & 0x10) {
     emitToBool(tc);
@@ -4033,9 +4888,13 @@ void HIRBuilder::emitLoadAttr(
   bool method_with_values_fast_path_enabled = false;
 #endif
 #if PY_VERSION_HEX < 0x030C0000
-  // The slot fast path needs the 3.14 type-version cache; it is out of scope
-  // on 3.11 and stays off (see the attrSlot* stubs above).
-  slot_fast_path_enabled = false;
+  // the 3.14 path resolves the PyMemberDef through the
+  // interpreter's type-version cache, which 3.11 lacks.  The 3.11
+  // specializer's OBJECT_SLOT contract (upstream/specialize.c) already
+  // pins everything the fast path needs into the inline cache: the slot is
+  // a T_OBJECT_EX member at cache->index on a type with generic getattro,
+  // valid while tp_version_tag equals cache->version.  Pull-validating
+  // that version at every access needs no watcher.
 #endif
 #ifdef Py_GIL_DISABLED
   slot_fast_path_enabled = false;
@@ -4049,11 +4908,6 @@ void HIRBuilder::emitLoadAttr(
 
   Register* receiver = tc.frame.stack.pop();
 
-#if PY_VERSION_HEX < 0x030C0000
-  if (tryEmitLoadAttrInstanceValue311(tc, bc_instr, receiver, name_idx)) {
-    return;
-  }
-#endif
 
   if (getConfig().specialized_opcodes) {
     switch (specialized_opcode) {
@@ -4068,6 +4922,14 @@ void HIRBuilder::emitLoadAttr(
         if (!slot_fast_path_enabled) {
           break;
         }
+        int slot_offset = 0;
+        bool slot_object_ex = true;
+        bool may_need_getattr_fallback = true;
+#if PY_VERSION_HEX < 0x030C0000
+        // offset straight from the inline cache; a NULL slot
+        // takes the generic LoadAttr so the AttributeError matches stock.
+        slot_offset = bc_instr.attrCacheIndex();
+#else
         PyMemberDef* member_def =
             attrSlotMemberDef(code_, bc_instr, name_idx);
         if (member_def == nullptr) {
@@ -4078,6 +4940,10 @@ void HIRBuilder::emitLoadAttr(
           }
           break;
         }
+        slot_offset = member_def->offset;
+        slot_object_ex = member_def->type == T_OBJECT_EX;
+        may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
+#endif
         BorrowedRef<PyUnicodeObject> name =
             PyTuple_GET_ITEM(code_->co_names, name_idx);
         const char* field_name = PyUnicode_AsUTF8(name);
@@ -4085,7 +4951,6 @@ void HIRBuilder::emitLoadAttr(
           PyErr_Clear();
           field_name = "<unknown>";
         }
-        bool may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
         Register* matches = emitSlotTypeVersionMatches(
             tc, receiver, bc_instr.attrCacheTypeVersion());
         BasicBlock* fast_path = cfg.AllocateBlock();
@@ -4097,12 +4962,8 @@ void HIRBuilder::emitLoadAttr(
         tc.block = fast_path;
         Register* field = temps_.AllocateStack();
         tc.emit<LoadField>(
-            field,
-            receiver,
-            field_name,
-            member_def->offset,
-            TOptObject);
-        if (member_def->type == T_OBJECT_EX) {
+            field, receiver, field_name, slot_offset, TOptObject);
+        if (slot_object_ex) {
           if (may_need_getattr_fallback) {
             BasicBlock* set_block = cfg.AllocateBlock();
             BasicBlock* fallback_block = cfg.AllocateBlock();
@@ -4146,12 +5007,18 @@ void HIRBuilder::emitLoadAttr(
         }
 
         tc.block = slow_path;
+#if PY_VERSION_HEX < 0x030C0000
+        // keep the polymorphic cache form for receivers that
+        // fail the version check (see the IVINLINE slow path).
+        tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
+#else
         tc.emit<LoadAttr>(
             result,
             receiver,
             name_idx,
             tc.frame,
             /* already_optimized= */ true);
+#endif
         tc.emit<Branch>(done);
 
         tc.block = done;
@@ -4161,6 +5028,13 @@ void HIRBuilder::emitLoadAttr(
         }
         return;
       }
+#endif
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+      case LOAD_ATTR_INSTANCE_VALUE:
+        // The IC stability observer may classify this cache while lowering
+        // remains generic.  Avoid adding a per-access guard chain here.
+        break;
 #endif
 #if PY_VERSION_HEX >= 0x030E0000
       case LOAD_ATTR_METHOD_WITH_VALUES: {
@@ -4203,6 +5077,73 @@ void HIRBuilder::emitLoadAttr(
 #endif
 #if PY_VERSION_HEX < 0x030C0000
       case LOAD_ATTR_INSTANCE_VALUE: {
+        // consume the 3.11 LOAD_ATTR_INSTANCE_VALUE cache
+        // the way the interpreter does (upstream/ceval.c): tp_version_tag
+        // pins the type (managed dict, generic getattro, name resolves to
+        // the split-keys slot cache->index), a live values array means the
+        // instance is still on the shared keys, and the slot itself is
+        // read directly.  Every other case -- version drift, materialized
+        // dict, unset slot -- takes the generic LoadAttr, so the observable
+        // behaviour (including the AttributeError text) is stock's.
+        uint32_t iv_version = bc_instr.attrCacheTypeVersion();
+        if (iv_version != 0) {
+          BorrowedRef<PyUnicodeObject> iv_name =
+              PyTuple_GET_ITEM(code_->co_names, name_idx);
+          const char* iv_field = PyUnicode_AsUTF8(iv_name);
+          if (iv_field == nullptr) {
+            PyErr_Clear();
+            iv_field = "<unknown>";
+          }
+          Register* matches =
+              emitSlotTypeVersionMatches(tc, receiver, iv_version);
+          BasicBlock* fast_path = cfg.AllocateBlock();
+          BasicBlock* have_values = cfg.AllocateBlock();
+          BasicBlock* set_block = cfg.AllocateBlock();
+          BasicBlock* slow_path = cfg.AllocateBlock();
+          BasicBlock* done = cfg.AllocateBlock();
+          Register* iv_result = temps_.AllocateStack();
+          tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+          tc.block = fast_path;
+          Register* values_raw = temps_.AllocateNonStack();
+          tc.emit<LoadField>(
+              values_raw,
+              receiver,
+              "__dict_values__",
+              -4 * sizeof(PyObject*),
+              TCUInt64);
+          tc.emit<CondBranch>(values_raw, have_values, slow_path);
+
+          tc.block = have_values;
+          Register* values_obj = temps_.AllocateNonStack();
+          tc.emit<BitCast>(values_obj, values_raw, TOptObject);
+          Register* iv_value = temps_.AllocateStack();
+          tc.emit<LoadField>(
+              iv_value,
+              values_obj,
+              iv_field,
+              static_cast<size_t>(bc_instr.attrCacheIndex()) *
+                  sizeof(PyObject*),
+              TOptObject);
+          tc.emit<CondBranch>(iv_value, set_block, slow_path);
+
+          tc.block = set_block;
+          Register* iv_checked = temps_.AllocateNonStack();
+          tc.emit<RefineType>(iv_checked, TObject, iv_value);
+          tc.emit<Assign>(iv_result, iv_checked);
+          tc.emit<Branch>(done);
+
+          tc.block = slow_path;
+          // Not "already optimized": a receiver that fails the version
+          // check (polymorphic site) must still reach the polymorphic
+          // LoadAttrCached form, not the fully generic getattr.
+          tc.emit<LoadAttr>(iv_result, receiver, name_idx, tc.frame);
+          tc.emit<Branch>(done);
+
+          tc.block = done;
+          tc.frame.stack.push(iv_result);
+          return;
+        }
         BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
         if (owner_type != nullptr) {
           auto guard = tc.emit<GuardType>(
@@ -4220,54 +5161,6 @@ void HIRBuilder::emitLoadAttr(
   Register* result = temps_.AllocateStack();
   tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
   tc.frame.stack.push(result);
-}
-
-bool HIRBuilder::tryEmitLoadAttrInstanceValue311(
-    TranslationContext& tc,
-    const jit::BytecodeInstruction& bc_instr,
-    Register* receiver,
-    int name_idx) {
-#if PY_VERSION_HEX < 0x030C0000
-  if (!getConfig().specialized_opcodes ||
-      bc_instr.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE) {
-    return false;
-  }
-
-  const _Py_CODEUNIT* instr = codeUnit(code_) + bc_instr.opcodeIndex().value();
-  auto cache = reinterpret_cast<const _PyAttrCache*>(instr + 1);
-  uint32_t type_version = readCacheU32(cache->version);
-  if (type_version == 0) {
-    return false;
-  }
-
-  BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
-  Register* name_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
-
-  Register* type_version_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(type_version_reg, Type::fromCUInt(type_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      index_reg,
-      Type::fromCUInt(static_cast<uint64_t>(cache->index), TCUInt64));
-
-  Register* result = temps_.AllocateStack();
-  auto call = tc.emit<CallStatic>(
-      4,
-      result,
-      reinterpret_cast<void*>(JITRT_LoadAttrInstanceValueOrGeneric),
-      TOptObject);
-  call->SetOperand(0, receiver);
-  call->SetOperand(1, name_reg);
-  call->SetOperand(2, type_version_reg);
-  call->SetOperand(3, index_reg);
-  tc.emit<CheckExc>(result, result, tc.frame);
-  tc.frame.stack.push(result);
-  return true;
-#else
-  return false;
-#endif
 }
 
 void HIRBuilder::emitLoadMethod(TranslationContext& tc, int name_idx) {
@@ -4307,9 +5200,22 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
 #if PY_VERSION_HEX < 0x030C0000
+  // A monomorphic LOAD_METHOD_{WITH_VALUES,NO_DICT} site pins the cached
+  // function as a compile-time constant behind the guards the interpreter
+  // handler itself uses, so the call becomes a direct one.  WITH_DICT is
+  // left to the polymorphic method cache: a materialized instance dict keeps
+  // growing on long-lived objects (yaml's SafeLoader), every growth resets
+  // dk_version and a pinned site would deopt on every growth (yaml +6.5%).
+  // In the running state the site stays on the polymorphic method cache: a
+  // pinned site whose class is later mutated deopts on every call until the
+  // function is retired, which needs the despecializing recompile to be
+  // safe (that lands with the compile policy change).
   if (getConfig().state == jit::State::kRunning ||
-      !getConfig().specialized_opcodes ||
-      bc_instr.specializedOpcode() != LOAD_METHOD_WITH_VALUES) {
+      !getConfig().specialized_opcodes) {
+    return false;
+  }
+  const int lm_spec = bc_instr.specializedOpcode();
+  if (lm_spec != LOAD_METHOD_WITH_VALUES && lm_spec != LOAD_METHOD_NO_DICT) {
     return false;
   }
 
@@ -4317,7 +5223,8 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
   auto cache = reinterpret_cast<const _PyLoadMethodCache*>(instr + 1);
   uint32_t type_version = readCacheU32(cache->type_version);
   uint32_t keys_version = readCacheU32(cache->keys_version);
-  if (type_version == 0 || keys_version == 0) {
+  if (type_version == 0 ||
+      (lm_spec != LOAD_METHOD_NO_DICT && keys_version == 0)) {
     return false;
   }
 
@@ -4329,24 +5236,21 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
   auto func = reinterpret_cast<PyFunctionObject*>(descr);
   BorrowedRef<PyTypeObject> owner_type =
       resolveMethodOwnerType(func, preloader_.globals());
-  if (owner_type == nullptr || owner_type->tp_version_tag != type_version ||
-      !PyType_HasFeature(owner_type, Py_TPFLAGS_MANAGED_DICT)) {
+  if (owner_type == nullptr || owner_type->tp_version_tag != type_version) {
     return false;
   }
-
-  BorrowedRef<PyHeapTypeObject> heap_type{owner_type};
-  PyDictKeysObject* keys = heap_type->ht_cached_keys;
-  if (keys == nullptr || keys->dk_version != keys_version) {
-    return false;
+  if (lm_spec == LOAD_METHOD_WITH_VALUES) {
+    if (!PyType_HasFeature(owner_type, Py_TPFLAGS_MANAGED_DICT)) {
+      return false;
+    }
+    BorrowedRef<PyHeapTypeObject> heap_type{owner_type};
+    PyDictKeysObject* keys = heap_type->ht_cached_keys;
+    if (keys == nullptr || keys->dk_version != keys_version) {
+      return false;
+    }
   }
 
   Register* receiver = tc.frame.stack.pop();
-  Type expected_receiver_type = Type::fromTypeExact(owner_type);
-  if (!receiver->isA(expected_receiver_type)) {
-    auto guard = tc.emit<GuardType>(
-        receiver, expected_receiver_type, receiver, tc.frame);
-    receiver = guard->output();
-  }
 
   auto emit_guard =
       [&](Register* condition, Register* guilty, const char* descr) {
@@ -4356,64 +5260,59 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
         guard->setDescr(descr);
       };
 
+  // The interpreter's own check, on the RECEIVER: Py_TYPE(self)->
+  // tp_version_tag == cached version.  Version tags are unique, so this
+  // pins the receiver's exact type as well as the class dict state.  (A
+  // GuardType on the receiver is not a substitute: GuardTypeRemoval drops
+  // it when no later instruction consumes the refined type, and a guard on
+  // the constant owner class alone lets any same-layout instance through.)
+  Register* type_version_matches =
+      emitSlotTypeVersionMatches(tc, receiver, type_version);
+  emit_guard(type_version_matches, receiver, "LOAD_METHOD type version");
+
   Register* owner = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       owner, Type::fromObject(env_->addReference(BorrowedRef<>{owner_type})));
 
-  Register* current_type_version = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      current_type_version,
-      owner,
-      "tp_version_tag",
-      offsetof(PyTypeObject, tp_version_tag),
-      TCUInt32);
-  Register* expected_type_version = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      expected_type_version, Type::fromCUInt(type_version, TCUInt32));
-  Register* type_version_matches = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      type_version_matches,
-      PrimitiveCompareOp::kEqual,
-      current_type_version,
-      expected_type_version);
-  emit_guard(type_version_matches, receiver, "LOAD_METHOD type version");
+  if (lm_spec == LOAD_METHOD_WITH_VALUES) {
+    Register* dict_ptr = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        dict_ptr, receiver, "__dict__", -3 * sizeof(PyObject*), TCUInt64);
+    Register* zero = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt64));
+    Register* no_dict = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        no_dict, PrimitiveCompareOp::kEqual, dict_ptr, zero);
+    emit_guard(no_dict, receiver, "LOAD_METHOD managed dict check");
 
-  Register* dict_ptr = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      dict_ptr, receiver, "__dict__", -3 * sizeof(PyObject*), TCUInt64);
-  Register* zero = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(zero, Type::fromCUInt(0, TCUInt64));
-  Register* no_dict = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      no_dict, PrimitiveCompareOp::kEqual, dict_ptr, zero);
-  emit_guard(no_dict, receiver, "LOAD_METHOD managed dict check");
-
-  Register* keys_ptr = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      keys_ptr,
-      owner,
-      "ht_cached_keys",
-      offsetof(PyHeapTypeObject, ht_cached_keys),
-      TCUInt64);
-  Register* keys_obj = temps_.AllocateNonStack();
-  tc.emit<BitCast>(keys_obj, keys_ptr, TOptObject);
-  Register* current_keys_version = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      current_keys_version,
-      keys_obj,
-      "dk_version",
-      offsetof(PyDictKeysObject, dk_version),
-      TCUInt32);
-  Register* expected_keys_version = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      expected_keys_version, Type::fromCUInt(keys_version, TCUInt32));
-  Register* keys_version_matches = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      keys_version_matches,
-      PrimitiveCompareOp::kEqual,
-      current_keys_version,
-      expected_keys_version);
-  emit_guard(keys_version_matches, receiver, "LOAD_METHOD keys version");
+    Register* keys_ptr = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_ptr,
+        owner,
+        "ht_cached_keys",
+        offsetof(PyHeapTypeObject, ht_cached_keys),
+        TCUInt64);
+    Register* keys_obj = temps_.AllocateNonStack();
+    tc.emit<BitCast>(keys_obj, keys_ptr, TOptObject);
+    Register* current_keys_version = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        current_keys_version,
+        keys_obj,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_keys_version = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        expected_keys_version, Type::fromCUInt(keys_version, TCUInt32));
+    Register* keys_version_matches = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        keys_version_matches,
+        PrimitiveCompareOp::kEqual,
+        current_keys_version,
+        expected_keys_version);
+    emit_guard(keys_version_matches, receiver, "LOAD_METHOD keys version");
+  }
+  // NO_DICT: the type version alone pins the answer.
 
   Register* func_reg = temps_.AllocateStack();
   tc.emit<LoadConst>(
@@ -4521,7 +5420,20 @@ bool HIRBuilder::tryEmitLoadMethodOrAttrSuper311(
 
   BytecodeInstruction load_global = *bc_it;
   Register* global_super = temps_.AllocateStack();
+  // The `super` global of the zero-argument super() pattern took the helper
+  // form (JITRT_LoadGlobal: a globals miss plus a builtins hit, two
+  // dictionary lookups per call).  Emit it through the same guarded cached
+  // load every other LOAD_GLOBAL gets; the helper form stays the fallback
+  // when that declines.  The pattern consumes the CALL itself, so the
+  // oparg&1 NULL is never pushed.
+#if PY_VERSION_HEX < 0x030C0000
+  if (!tryEmitLoadGlobal311(
+          cfg, tc, load_global, pattern->global_super_idx, global_super)) {
+    tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
+  }
+#else
   tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
+#endif
 
   Register* type = temps_.AllocateStack();
   Register* receiver = nullptr;
@@ -5262,7 +6174,317 @@ void HIRBuilder::emitSequenceSet(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
+// SPIKE(RANGEITER): `for x in range(...)` is CALL of the pinned builtin range
+// type, GET_ITER and FOR_ITER back to back.  The range object is consumed by
+// the GET_ITER and never observable, so the fused call builds the iterator
+// that range_iter would return straight from the arguments
+// (JITRT_RangeIter311: exact ints that fit in a C long give the same
+// rangeiterobject; anything else runs range(...) and iter() in order), and
+// the FOR_ITER at the recorded offset iterates it in HIR.
+bool HIRBuilder::tryEmitRangeIter311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  static const bool spike_rangeiter =
+      Ci_SpikeGetenv("SPIKE_RANGEITER") != nullptr;
+  if (!spike_rangeiter || kwnames_ != nullptr) {
+    return false;
+  }
+  // A CALL site granted a compiled exception edge (SPIKE(EXCHANDLER)) keeps
+  // the generic call and its edge; the fused call only has the deopt.
+  if (Ci_ExcEdgeSiteGranted311(code_, bc_instr.baseOffset().value())) {
+    return false;
+  }
+  int nargs = bc_instr.oparg();
+  if (nargs < 1 || nargs > 3) {
+    return false;
+  }
+  auto code_size =
+      static_cast<Py_ssize_t>(countIndices(code_) * sizeof(_Py_CODEUNIT));
+  BCOffset get_iter_off = bc_instr.nextInstrOffset();
+  if (get_iter_off.value() >= code_size ||
+      block_map_.blocks.contains(get_iter_off)) {
+    return false;
+  }
+  BytecodeInstruction get_iter{code_, get_iter_off};
+  if (get_iter.opcode() != GET_ITER) {
+    return false;
+  }
+  BCOffset for_iter_off = get_iter.nextInstrOffset();
+  if (for_iter_off.value() >= code_size) {
+    return false;
+  }
+  BytecodeInstruction for_iter{code_, for_iter_off};
+  if (for_iter.opcode() != FOR_ITER) {
+    return false;
+  }
+  auto& stack = tc.frame.stack;
+  if (stack.size() < static_cast<std::size_t>(nargs) + 2) {
+    return false;
+  }
+  Register* callable = stack.top(nargs);
+  Register* self_slot = stack.top(nargs + 1);
+  Instr* callable_def = callable->instr();
+  if (callable_def == nullptr || !callable_def->IsGuardIs() ||
+      static_cast<const GuardIs*>(callable_def)->target() !=
+          reinterpret_cast<PyObject*>(&PyRange_Type)) {
+    return false;
+  }
+  Instr* self_def = self_slot->instr();
+  if (self_def == nullptr || !self_def->IsLoadConst() ||
+      !(static_cast<const LoadConst*>(self_def)->type() <= TNullptr)) {
+    return false;
+  }
+
+  Register* args[3] = {nullptr, nullptr, nullptr};
+  for (int i = nargs - 1; i >= 0; i--) {
+    args[i] = stack.pop();
+  }
+  stack.pop(); // the pinned range type; its GuardIs stays in the IR
+  stack.pop(); // NULL
+  Register* nargs_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(nargs_reg, Type::fromCInt(nargs, TCInt64));
+  Register* absent = nullptr;
+  for (auto& arg : args) {
+    if (arg == nullptr) {
+      if (absent == nullptr) {
+        absent = temps_.AllocateNonStack();
+        tc.emit<LoadConst>(absent, TNullptr);
+      }
+      arg = absent;
+    }
+  }
+  Register* raw = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      4, raw, reinterpret_cast<void*>(JITRT_RangeIter311), TObject | TNullptr);
+  call->SetOperand(0, nargs_reg);
+  call->SetOperand(1, args[0]);
+  call->SetOperand(2, args[1]);
+  call->SetOperand(3, args[2]);
+  // An exception (range() argument errors) is raised at the CALL, as the
+  // interpreter would.
+  Register* iter = temps_.AllocateStack();
+  tc.emit<CheckExc>(iter, raw, tc.frame);
+  stack.push(iter);
+  spike_range_for_iter_[for_iter_off.value()] = nargs;
+  // Shared with SPIKE(SLICEFAST); the translate loop consumes it at the very
+  // next instruction, so the two fusions can never overlap.
+  spike_skip_bc_offset_ = get_iter_off.value();
+  return true;
+}
+
+// SPIKE(RANGEITER): FOR_ITER over the iterator of a fused range(...) call:
+// rangeiter_next in HIR.  The loop value is produced as an int64 and boxed
+// by PrimitiveBox, which the arithmetic and subscript lowerings look through
+// and which box rematerialisation drops when only frame states use it.  The
+// index is written back every iteration, so the iterator stays exact for a
+// deopt anywhere in the body.  An iterator of another type (the
+// arbitrary-precision range iterator) re-executes FOR_ITER in the
+// interpreter.
+bool HIRBuilder::tryEmitRangeForIter311(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  auto found = spike_range_for_iter_.find(bc_instr.baseOffset().value());
+  if (found == spike_range_for_iter_.end()) {
+    return false;
+  }
+  int nargs = found->second;
+  // rangeiterobject (Objects/rangeobject.c, 3.11):
+  // {PyObject_HEAD; long index; long start; long step; long len;}
+  constexpr std::size_t kIndex = sizeof(PyObject);
+  constexpr std::size_t kStart = kIndex + sizeof(long);
+  constexpr std::size_t kStep = kStart + sizeof(long);
+  constexpr std::size_t kLen = kStep + sizeof(long);
+  auto& stack = tc.frame.stack;
+  Register* it = stack.top();
+  // A type test on ob_type rather than a GuardType: the fields below are raw
+  // loads that place no type requirement on the iterator, so a GuardType
+  // would count as unused and be removed by guard removal.
+  Register* it_type = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      it_type, it, "ob_type", offsetof(PyObject, ob_type), TType);
+  Register* range_iter_type = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      range_iter_type,
+      Type::fromObject(reinterpret_cast<PyObject*>(&PyRangeIter_Type)));
+  Register* is_range_iter = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      is_range_iter, PrimitiveCompareOp::kEqual, it_type, range_iter_type);
+  tc.emit<Guard>(is_range_iter, tc.frame);
+  Register* idx = temps_.AllocateNonStack();
+  tc.emit<LoadField>(idx, it, "index", kIndex, TCInt64);
+  Register* len = temps_.AllocateNonStack();
+  tc.emit<LoadField>(len, it, "len", kLen, TCInt64);
+  Register* in_range = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(in_range, PrimitiveCompareOp::kLessThan, idx, len);
+  BasicBlock* header = tc.block;
+  BasicBlock* take = cfg.AllocateBlock();
+  BasicBlock* footer = getBlockAtOff(bc_instr.getJumpTarget());
+  BasicBlock* body = getBlockAtOff(bc_instr.nextInstrOffset());
+  tc.emit<CondBranch>(in_range, take, footer);
+
+  tc.block = take;
+  // value = start + index * step, in unsigned arithmetic as rangeiter_next
+  // computes it; range(stop) has start 0 and step 1, range(a, b) step 1.
+  Register* value = idx;
+  if (nargs >= 2) {
+    Register* offset = idx;
+    if (nargs == 3) {
+      Register* step = temps_.AllocateNonStack();
+      tc.emit<LoadField>(step, it, "step", kStep, TCInt64);
+      offset = temps_.AllocateNonStack();
+      tc.emit<IntBinaryOp>(offset, BinaryOpKind::kMultiply, idx, step);
+    }
+    Register* start = temps_.AllocateNonStack();
+    tc.emit<LoadField>(start, it, "start", kStart, TCInt64);
+    value = temps_.AllocateNonStack();
+    tc.emit<IntBinaryOp>(value, BinaryOpKind::kAdd, start, offset);
+  }
+  Register* one = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(one, Type::fromCInt(1, TCInt64));
+  Register* next_idx = temps_.AllocateNonStack();
+  tc.emit<IntBinaryOp>(next_idx, BinaryOpKind::kAdd, idx, one);
+  // StoreField's previous operand is an optional object reference, even
+  // when the stored field is primitive. There is no object to decref here.
+  Register* previous = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(previous, TNullptr);
+  tc.emit<StoreField>(it, "index", kIndex, next_idx, TCInt64, previous);
+  Register* boxed = temps_.AllocateStack();
+  tc.emit<PrimitiveBox>(boxed, value, TCInt64, tc.frame);
+  stack.push(boxed);
+  tc.emit<Branch>(body);
+  BlockCanonicalizer canonicalizer;
+  canonicalizer.Run(take, temps_, stack);
+  spike_range_body_ = body;
+  spike_range_body_frame_ = tc.frame;
+  stack.pop();
+  tc.block = header;
+  return true;
+}
+
+// Admissibility of a function-valued global as a static keyword-binding
+// target: the signature envelope the simplify-time rewrite
+// (trySimplifyStaticKwCall311) accepts.  Anything outside it would only earn
+// a useless identity guard.
+static bool kwStaticPinnable311(PyObject* value) {
+  if (!PyFunction_Check(value)) {
+    return false;
+  }
+  auto* co = reinterpret_cast<PyCodeObject*>(
+      reinterpret_cast<PyFunctionObject*>(value)->func_code);
+  return !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) &&
+      co->co_kwonlyargcount == 0 &&
+      !(co->co_flags & CI_CO_STATICALLY_COMPILED) && co->co_argcount <= 16;
+}
+
+// Admissibility of a function-valued global as a static default-completion
+// target for a positional call with `nargs` arguments: the envelope of the
+// simplify-time resolveArgs path -- no varargs / varkeywords / keyword-only
+// parameters, fewer arguments than parameters, and enough defaults to fill
+// the rest.
+static bool defaultPinnable311(PyObject* value, int nargs) {
+  if (!PyFunction_Check(value)) {
+    return false;
+  }
+  auto* fn = reinterpret_cast<PyFunctionObject*>(value);
+  auto* co = reinterpret_cast<PyCodeObject*>(fn->func_code);
+  if ((co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) ||
+      co->co_kwonlyargcount != 0 ||
+      (co->co_flags & CI_CO_STATICALLY_COMPILED)) {
+    return false;
+  }
+  const int argcount = co->co_argcount;
+  const int defcount = fn->func_defaults == nullptr
+      ? 0
+      : static_cast<int>(PyTuple_GET_SIZE(fn->func_defaults));
+  return nargs < argcount && nargs + defcount >= argcount;
+}
+
+// The shape of the call fed by this LOAD_GLOBAL (oparg & 1, the NULL-slot
+// call-target form): whether its PRECALL was found, whether that PRECALL is
+// preceded by KW_NAMES, and its argument count.  Nested calls inside the
+// argument list are skipped by counting their NULL/self openers (PUSH_NULL,
+// LOAD_GLOBAL|1, LOAD_METHOD*) against their CALL / CALL_FUNCTION_EX
+// closers.  A comprehension call has no opener (its [func, iter] layout
+// doubles as the method-call shape), so its PRECALL surfaces at depth 0 and
+// the scan reports that call instead -- a conservative miss, since it is
+// never a keyword call and its argument count never matches an under-arity
+// shape of the loaded function by more than chance.  The answer only decides
+// whether the loaded value is pinned; correctness never depends on it.
+struct LoadGlobalCallShape311 {
+  bool found{false};
+  bool kw{false};
+  int nargs{0};
+};
+
+static LoadGlobalCallShape311 scanLoadGlobalCallShape311(
+    BorrowedRef<PyCodeObject> code,
+    const jit::BytecodeInstruction& bc_instr) {
+  LoadGlobalCallShape311 shape;
+  if (!(bc_instr.oparg() & 1)) {
+    return shape;
+  }
+  const int end_idx = static_cast<int>(countIndices(code));
+  int depth = 0;
+  int prev = -1;
+  jit::BytecodeInstruction cur = bc_instr.nextInstr();
+  for (int steps = 0; steps < 96 && cur.opcodeIndex().value() < end_idx;
+       ++steps, cur = cur.nextInstr()) {
+    const int op = cur.opcode();
+    switch (op) {
+      case PUSH_NULL:
+      case LOAD_METHOD:
+      case LOAD_METHOD_STATIC:
+      case LOAD_METHOD_SUPER:
+        ++depth;
+        break;
+      case LOAD_GLOBAL:
+        if (cur.oparg() & 1) {
+          ++depth;
+        }
+        break;
+      case PRECALL:
+        if (depth == 0) {
+          shape.found = true;
+          shape.kw = prev == KW_NAMES;
+          shape.nargs = cur.oparg();
+          return shape;
+        }
+        break;
+      case CALL:
+      case CALL_FUNCTION_EX:
+        if (depth == 0) {
+          return shape;
+        }
+        --depth;
+        break;
+      default:
+        if (cur.isReturn() || op == RAISE_VARARGS || op == RERAISE) {
+          return shape;
+        }
+        break;
+    }
+    prev = op;
+  }
+  return shape;
+}
+
+// LOAD_GLOBAL on 3.11, pure HIR around a per-site GlobalLoadCell311.  The
+// fast arm reads the live dk_version of the module and builtins keys,
+// compares each with the version recorded in the cell and loads the value
+// through the cell's slot (a same-key rebinding does not change dk_version,
+// so the value is read live).  A version that moved on -- a key added to or
+// removed from either dict -- takes the slow arm rather than a deopt: the
+// helper looks the name up the way the interpreter does, re-pins the cell
+// and returns the value, so the site is fast again on the next call and a
+// module that keeps growing its namespace never retires its compiled
+// functions.  The identity pins below (a function or class the simplifier
+// bound at compile time, a few builtins) still deopt when rebound.
+//
+// Both arms load borrowed values from stable storage, so their merge stays
+// borrowed and needs no extra reference-count operations on the fast arm.
+bool HIRBuilder::tryEmitLoadGlobal311(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr,
     int name_idx,
@@ -5270,77 +6492,235 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
   if (!getConfig().stable_frame || bc_instr.opcode() != LOAD_GLOBAL) {
     return false;
   }
-
   BorrowedRef<PyDictObject> globals = preloader_.globals();
-  if (globals->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
+  BorrowedRef<PyDictObject> builtins = preloader_.builtins();
+  if (globals == nullptr || builtins == nullptr ||
+      !PyDict_CheckExact(globals) || !PyDict_CheckExact(builtins)) {
+    return false;
+  }
+  // The cell outlives the HIR function, so it is taken from the JIT
+  // context's arena, like the other per-site caches.
+  auto* ctx =
+      static_cast<Context*>(cinderx::getModuleState()->jit_context.get());
+  if (ctx == nullptr) {
     return false;
   }
 
+  // The dict lookups and the cell allocation are serialized across compile
+  // threads like the other builder-side reads of module state.
+  ThreadedCompileSerialize guard;
   BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
+  bool from_builtins = false;
   PyObject* value = PyDict_GetItemWithError(globals, name);
   if (value == nullptr) {
     if (PyErr_Occurred()) {
       PyErr_Clear();
-    }
-    return false;
-  }
-
-  Py_ssize_t index = -1;
-  uint32_t keys_version = 0;
-  if (bc_instr.specializedOpcode() == LOAD_GLOBAL_MODULE) {
-    const _Py_CODEUNIT* instr =
-        codeUnit(code_) + bc_instr.opcodeIndex().value();
-    auto cache = reinterpret_cast<const _PyLoadGlobalCache*>(instr + 1);
-    keys_version = readCacheU32(cache->module_keys_version);
-    index = cache->index;
-  } else {
-    index = findActiveUnicodeDictEntryIndex(globals, name, value);
-    if (index < 0) {
       return false;
     }
-    keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
-  }
-  if (keys_version == 0) {
-    return false;
+    value = PyDict_GetItemWithError(builtins, name);
+    if (value == nullptr) {
+      // Absent from both at compile time: the generic load raises NameError
+      // or finds a later definition.
+      if (PyErr_Occurred()) {
+        PyErr_Clear();
+      }
+      return false;
+    }
+    from_builtins = true;
   }
 
+  GlobalLoadCell311* cell = ctx->allocateGlobalLoadCell311();
+  if (cell == nullptr) {
+    return false;
+  }
+  // The cell starts unpinned: the first call takes the slow arm, which
+  // pins it on the executing thread with the GIL held (the keys-version
+  // allocator and the entry tables are never touched from here).
+  cell->globals_only = !from_builtins;
+
+  Register* cell_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(cell_reg, Type::fromCPtr(cell));
   Register* globals_reg = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       globals_reg,
       Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
+  // The builtins dict is a fast-arm operand only for a builtins-resolved
+  // name; the name itself is a slow-arm operand.  Each arm materializes
+  // the constants it reads, so the fast arm carries none it does not.
+  auto emit_builtins_const = [&]() -> Register* {
+    Register* reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        reg, Type::fromObject(env_->addReference(BorrowedRef<>{builtins})));
+    return reg;
+  };
 
+  BasicBlock* check_builtins = from_builtins ? cfg.AllocateBlock() : nullptr;
+  BasicBlock* fast = cfg.AllocateBlock();
+  BasicBlock* slow = cfg.AllocateBlock();
+  BasicBlock* done = cfg.AllocateBlock();
+
+  auto emit_version_matches = [&](Register* dict_reg,
+                                  const char* field,
+                                  std::size_t expected_off) -> Register* {
+    Register* keys_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_reg, dict_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
+    Register* ver_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        ver_reg,
+        keys_reg,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(expected_reg, cell_reg, field, expected_off, TCUInt32);
+    Register* ok_reg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
+    return ok_reg;
+  };
+
+  Register* globals_ok = emit_version_matches(
+      globals_reg,
+      "globals_keys_version",
+      offsetof(GlobalLoadCell311, globals_keys_version));
+  if (from_builtins) {
+    // A builtins entry can be shadowed by a new module key, so both
+    // versions guard the slot.  A module entry cannot be shadowed: its
+    // site checks the globals version only.
+    tc.emit<CondBranch>(globals_ok, check_builtins, slow);
+    tc.block = check_builtins;
+    Register* builtins_ok = emit_version_matches(
+        emit_builtins_const(),
+        "builtins_keys_version",
+        offsetof(GlobalLoadCell311, builtins_keys_version));
+    tc.emit<CondBranch>(builtins_ok, fast, slow);
+  } else {
+    tc.emit<CondBranch>(globals_ok, fast, slow);
+  }
+
+  // A version match proves the pinned entry is live and holds a value (the
+  // dict zeroes its keys version on every insertion and deletion), so the
+  // slot is read without a NULL test; an unpinned cell carries a version
+  // no dict can have.
+  tc.block = fast;
+  Register* slot_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      slot_reg, cell_reg, "slot", offsetof(GlobalLoadCell311, slot), TCPtr);
+  Register* value_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(value_reg, slot_reg, "me_value", 0, TObject);
+  tc.emit<Assign>(result, value_reg);
+  tc.emit<Branch>(done);
+
+  tc.block = slow;
+  Register* builtins_reg = emit_builtins_const();
   Register* name_reg = temps_.AllocateNonStack();
   tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
-
-  Register* keys_version_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(keys_version_reg, Type::fromCUInt(keys_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
-
+  // The helper answers through stable storage (the pinned slot, the cell's
+  // held reference, or NULL storage with the NameError set), so the value
+  // is a borrowed load here just as on the fast arm and the merge below
+  // stays borrowed: no incref/decref pair on the fast arm.
+  Register* storage_reg = temps_.AllocateNonStack();
   auto call = tc.emit<CallStatic>(
-      4,
-      result,
-      reinterpret_cast<void*>(JITRT_LoadGlobalModuleValue),
-      TOptObject);
-  call->SetOperand(0, globals_reg);
-  call->SetOperand(1, name_reg);
-  call->SetOperand(2, keys_version_reg);
-  call->SetOperand(3, index_reg);
+      4, storage_reg, reinterpret_cast<void*>(JITRT_LoadGlobalRepin311), TCPtr);
+  call->SetOperand(0, cell_reg);
+  call->SetOperand(1, globals_reg);
+  call->SetOperand(2, builtins_reg);
+  call->SetOperand(3, name_reg);
+  Register* answer_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(answer_reg, storage_reg, "value", 0, TOptObject);
+  Register* checked_reg = temps_.AllocateNonStack();
+  tc.emit<CheckExc>(checked_reg, answer_reg, tc.frame);
+  tc.emit<Assign>(result, checked_reg);
+  tc.emit<Branch>(done);
 
+  tc.block = done;
+  // The identity pins below are deopt points and take their frame state
+  // from the snapshot preceding them in this block.
   tc.emitSnapshot();
-  auto guard = tc.emit<Guard>(result);
-  guard->setFrameState(tc.frame);
-  guard->setGuiltyReg(result);
-  guard->setDescr(
-      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
 
-  tc.emit<RefineType>(result, TObject, result);
+  // SPIKE(ISINSTFAST): pin static builtin types used as values so the
+  // simplifier can open isinstance(x, T). A LOAD_GLOBAL with the NULL-call
+  // bit set is a direct constructor call: pinning int there also narrows
+  // its result and introduces compact-long comparison guards for big ints.
+  static const bool spike_isinstfast =
+      Ci_SpikeGetenv("SPIKE_ISINSTFAST") != nullptr;
+  if (from_builtins) {
+    bool pin = false;
+    if (value == reinterpret_cast<PyObject*>(&PyType_Type)) {
+      pin = true;
+    } else if (
+        spike_isinstfast && !(bc_instr.oparg() & 1) &&
+        PyType_CheckExact(value) &&
+        !(reinterpret_cast<PyTypeObject*>(value)->tp_flags &
+          Py_TPFLAGS_HEAPTYPE)) {
+      pin = true;
+    } else if (
+        value == reinterpret_cast<PyObject*>(&PyRange_Type) &&
+        Ci_SpikeGetenv("SPIKE_RANGEITER") != nullptr) {
+      // Range fusion owns its builtin pin and does not depend on the
+      // independent isinstance/predicate specialization pass.
+      pin = true;
+    } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
+      const char* mname =
+          reinterpret_cast<PyCFunctionObject*>(value)->m_ml->ml_name;
+      // SPIKE(GETATTRDFL): getattr joins the pinned builtins so that the
+      // simplifier can open its default form.
+      static const bool spike_getattrdfl =
+          Ci_SpikeGetenv("SPIKE_GETATTRDFL") != nullptr;
+      pin = mname != nullptr &&
+          (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0 ||
+           (spike_getattrdfl && strcmp(mname, "getattr") == 0));
+    }
+    if (pin) {
+      auto is_guard = tc.emit<GuardIs>(result, value, result);
+      is_guard->setDescr(
+          fmt::format("LOAD_GLOBAL_BUILTIN pin: {}", PyUnicode_AsUTF8(name)));
+    }
+    return true;
+  }
+
+  // A function-valued global that is called with keywords is pinned by
+  // identity so the simplifier can bind the keyword arguments to parameter
+  // positions at compile time; the same pin serves a positional call with
+  // fewer arguments than parameters, so the simplifier's constant-callee
+  // default completion (resolveArgs) applies to module-global functions.
+  // Rebinding the global deopts at this load and the recompile re-pins the
+  // new value; a code object that keeps deopting here is retired by the ROI
+  // backoff like any other.
+  bool pin = false;
+  // The generic retry also drops speculative global-function pins.
+  if (PyFunction_Check(value) && !Ci_SpikeDespec311_IsMarked(code_)) {
+    LoadGlobalCallShape311 shape = scanLoadGlobalCallShape311(code_, bc_instr);
+    if (shape.found) {
+      pin = shape.kw ? kwStaticPinnable311(value)
+                     : defaultPinnable311(value, shape.nargs);
+    }
+  }
+  if (PyFunction_Check(value) && !Ci_SpikeDespec311_IsMarked(code_) &&
+      (getConfig().hir_opts.inliner || pin)) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_MODULE func: {}", PyUnicode_AsUTF8(name)));
+  }
+  // Pin a class-valued global so the attribute loads on it (`Cls.CONST`)
+  // can be resolved at compile time behind the class's version tag;
+  // rebinding the global deopts and re-specializes.  Only plain `type`
+  // metatypes: a metaclass with its own getattro (Enum) would turn every
+  // attribute load on the pinned class into a full PyObject_GetAttr through
+  // the type-receiver helper.
+  if (PyType_Check(value) && Py_TYPE(value) == &PyType_Type &&
+      Ci_Type_HasValidVersionTag(reinterpret_cast<PyTypeObject*>(value))) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_MODULE type: {}", PyUnicode_AsUTF8(name)));
+  }
   return true;
 }
 #endif
 
 void HIRBuilder::emitLoadGlobal(
+    [[maybe_unused]] CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   int name_idx = loadGlobalIndex(bc_instr.oparg());
@@ -5350,7 +6730,7 @@ void HIRBuilder::emitLoadGlobal(
   // Snapshot the pre-opcode stack so a GuardFailure re-executes
   // LOAD_GLOBAL without a second PUSH_NULL.  The NULL (oparg & 1) is
   // pushed only after the guard succeeds.
-  bool fast = tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
+  bool fast = tryEmitLoadGlobal311(cfg, tc, bc_instr, name_idx, result);
   if (bc_instr.oparg() & 1) {
     emitPushNull(tc);
   }
@@ -5702,21 +7082,176 @@ void HIRBuilder::emitPopJumpIfNone(
 }
 
 void HIRBuilder::emitStoreAttr(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
+#if PY_VERSION_HEX < 0x030C0000
+  // STORE_ATTR_INSTANCE_VALUE mirrors the interpreter's
+  // handler: version-pinned type, live values array, and an already-set
+  // slot are overwritten in place (the old value released); an unset slot
+  // would have to record insertion order, so that and every other case take
+  // the generic StoreAttr.
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_INSTANCE_VALUE &&
+      bc_instr.attrCacheTypeVersion() != 0) {
+    BorrowedRef<PyUnicodeObject> iv_name =
+        PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+    const char* iv_field = PyUnicode_AsUTF8(iv_name);
+    if (iv_field == nullptr) {
+      PyErr_Clear();
+      iv_field = "<unknown>";
+    }
+    size_t iv_offset =
+        static_cast<size_t>(bc_instr.attrCacheIndex()) * sizeof(PyObject*);
+    Register* matches = emitSlotTypeVersionMatches(
+        tc, receiver, bc_instr.attrCacheTypeVersion());
+    BasicBlock* fast_path = cfg.AllocateBlock();
+    BasicBlock* have_values = cfg.AllocateBlock();
+    BasicBlock* set_block = cfg.AllocateBlock();
+    BasicBlock* slow_path = cfg.AllocateBlock();
+    BasicBlock* done = cfg.AllocateBlock();
+    tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+    tc.block = fast_path;
+    Register* values_raw = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        values_raw,
+        receiver,
+        "__dict_values__",
+        -4 * sizeof(PyObject*),
+        TCUInt64);
+    tc.emit<CondBranch>(values_raw, have_values, slow_path);
+
+    tc.block = have_values;
+    // The values array is non-null on this arm; StoreField below requires an
+    // Object base (the shadow HIR verifier rejects OptObject there).
+    Register* values_obj = temps_.AllocateNonStack();
+    tc.emit<BitCast>(values_obj, values_raw, TObject);
+    Register* old_borrowed = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        old_borrowed, values_obj, iv_field, iv_offset, TOptObject);
+    BasicBlock* insert_block = cfg.AllocateBlock();
+    tc.emit<CondBranch>(old_borrowed, set_block, insert_block);
+
+    // Unset slot: the interpreter's insertion arm (value stored, insertion
+    // order recorded).  The shared keys already hold the name at this index
+    // by the specializer's contract, so no dict bookkeeping beyond that.
+    tc.block = insert_block;
+    Register* insert_index = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        insert_index,
+        Type::fromCInt(
+            static_cast<int64_t>(bc_instr.attrCacheIndex()), TCInt64));
+    auto insert_call = tc.emit<CallStatic>(
+        3,
+        temps_.AllocateNonStack(),
+        reinterpret_cast<void*>(JITRT_StoreSplitValueInsert311),
+        TCInt32);
+    insert_call->SetOperand(0, values_obj);
+    insert_call->SetOperand(1, insert_index);
+    insert_call->SetOperand(2, value);
+    // The values array belongs to the receiver and the BitCast above does
+    // not make that dependency visible to refcount insertion: a receiver
+    // whose last use is the values load would be released before the
+    // write (a temporary `f().x = v` dies in between).  Hold it until the
+    // write has happened.
+    tc.emit<UseObj>(receiver);
+    tc.emit<Branch>(done);
+
+    tc.block = set_block;
+    Register* previous = temps_.AllocateStack();
+    tc.emit<LoadField>(
+        previous,
+        values_obj,
+        iv_field,
+        iv_offset,
+        TOptObject,
+        /* borrowed= */ false);
+    tc.emit<StoreField>(
+        values_obj, iv_field, iv_offset, value, TOptObject, previous);
+    // Stock order: the new value is stored, the old value is released while
+    // the receiver is still held by the stack, then the receiver.  The two
+    // uses pin that order for refcount insertion.
+    tc.emit<UseObj>(previous);
+    tc.emit<UseObj>(receiver);
+    tc.emit<Branch>(done);
+
+    tc.block = slow_path;
+    tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+    tc.emit<Branch>(done);
+
+    tc.block = done;
+    return;
+  }
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // STORE_ATTR_WITH_HINT -- inline type-version check,
+  // then the lean helper above; anything it declines takes the generic
+  // StoreAttr (the polymorphic cache).
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_WITH_HINT &&
+      bc_instr.attrCacheTypeVersion() != 0) {
+    Register* matches = emitSlotTypeVersionMatches(
+        tc, receiver, bc_instr.attrCacheTypeVersion());
+    BasicBlock* fast_path = cfg.AllocateBlock();
+    BasicBlock* slow_path = cfg.AllocateBlock();
+    BasicBlock* done = cfg.AllocateBlock();
+    tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+    tc.block = fast_path;
+    BorrowedRef<> hs_name = PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+    Register* name_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(hs_name)));
+    Register* hint_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        hint_reg,
+        Type::fromCInt(
+            static_cast<int64_t>(bc_instr.attrCacheIndex()), TCInt64));
+    Register* handled = temps_.AllocateNonStack();
+    auto hs_call = tc.emit<CallStatic>(
+        4,
+        handled,
+        reinterpret_cast<void*>(JITRT_StoreAttrWithHint311),
+        TCInt32);
+    hs_call->SetOperand(0, receiver);
+    hs_call->SetOperand(1, name_reg);
+    hs_call->SetOperand(2, hint_reg);
+    hs_call->SetOperand(3, value);
+    tc.emit<CondBranch>(handled, done, slow_path);
+
+    tc.block = slow_path;
+    tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+    tc.emit<Branch>(done);
+
+    tc.block = done;
+    return;
+  }
+#endif
 #ifndef Py_GIL_DISABLED
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_ATTR_SLOT) {
     // STORE_ATTR oparg is always the co_names index; unlike LOAD_ATTR it does
     // not reserve a low bit for method-call stack shaping.
+    int slot_offset = 0;
+#if PY_VERSION_HEX < 0x030C0000
+    // see emitLoadAttr.  The 3.11 STORE_ATTR OBJECT_SLOT
+    // contract additionally excludes READONLY members.
+    if (bc_instr.attrCacheIndex() < sizeof(PyObject)) {
+      tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+      return;
+    }
+    slot_offset = bc_instr.attrCacheIndex();
+#else
     PyMemberDef* member_def =
         attrSlotMemberDef(code_, bc_instr, bc_instr.oparg());
     if (member_def == nullptr) {
       tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
       return;
     }
+    slot_offset = member_def->offset;
+#endif
     BorrowedRef<PyUnicodeObject> name =
         PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
     const char* field_name = PyUnicode_AsUTF8(name);
@@ -5731,16 +7266,15 @@ void HIRBuilder::emitStoreAttr(
         previous,
         receiver,
         field_name,
-        member_def->offset,
+        slot_offset,
         TOptObject,
         /* borrowed= */ false);
     tc.emit<StoreField>(
-        receiver,
-        field_name,
-        member_def->offset,
-        value,
-        TOptObject,
-        previous);
+        receiver, field_name, slot_offset, value, TOptObject, previous);
+    // Stock order (STORE_ATTR_SLOT): the old value is released while the
+    // receiver is still held by the stack, then the receiver.
+    tc.emit<UseObj>(previous);
+    tc.emit<UseObj>(receiver);
     return;
   }
 #endif
@@ -5773,12 +7307,30 @@ void HIRBuilder::moveOverwrittenStackRegisters(
 // living in registers for computation; the frame's copy is for observers,
 // owned by the frame and released by the existing clear paths
 // (JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear).
+bool HIRBuilder::frameLocalsWrittenThrough311() const {
+#if PY_VERSION_HEX < 0x030C0000
+  // Normal frames rebuild their observable locals from deopt metadata when
+  // they are materialized; a suspended generator's frame is observed in
+  // place (gi_frame.f_locals, inspect.getgeneratorlocals), so generator
+  // family code keeps localsplus current at every store, as stock does.
+  // A function with a compiled exception edge is observed the same way:
+  // the traceback entry created on entry into a compiled handler exposes the
+  // frame (f_locals, and the references it keeps alive) while the function
+  // keeps running in machine code, as the evaluator does after the deopt the
+  // edge replaces.
+  return getConfig().state == State::kRunning && code_ != nullptr &&
+      ((code_->co_flags & kCoFlagsAnyGenerator) || exc_edge_frame_locals_);
+#else
+  return false;
+#endif
+}
+
 void HIRBuilder::emitStoreFrameLocal311(
     [[maybe_unused]] TranslationContext& tc,
     [[maybe_unused]] int idx,
     [[maybe_unused]] Register* value) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (getConfig().state != State::kRunning) {
+  if (!frameLocalsWrittenThrough311()) {
     return;
   }
   Register* idx_reg = temps_.AllocateNonStack();
@@ -5795,7 +7347,7 @@ void HIRBuilder::emitStoreFrameLocal311(
 void HIRBuilder::emitLocalsplusWriteback311(
     [[maybe_unused]] TranslationContext& tc) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (getConfig().state != State::kRunning) {
+  if (!frameLocalsWrittenThrough311()) {
     return;
   }
   bool emitted = false;
@@ -5811,9 +7363,7 @@ void HIRBuilder::emitLocalsplusWriteback311(
   if (emitted) {
     // The write-through calls are not replayable, so any Snapshot before
     // them no longer dominates what follows; re-establish the resume
-    // point here.  The boundary logic reuses a trailing Snapshot in
-    // place, which would otherwise leave the stretch up to the next
-    // boundary with no FrameState for bindGuards to bind.
+    // point here.
     tc.emitSnapshot();
   }
 #endif
@@ -5918,6 +7468,18 @@ Register* HIRBuilder::emitArrayIndexGuard(
   tc.block = idx_ok;
   tc.emit<RefineType>(sub, TLongExact, sub);
   Register* unboxed_idx = temps_.AllocateStack();
+  // SPIKE(ARRIDX): compact ints unbox inline, wider ints take the generic
+  // store; the helper form paid a PyLong_AsSsize_t call plus an error probe.
+  static const bool spike_arridx = Ci_SpikeGetenv("SPIKE_ARRIDX") != nullptr;
+  if (spike_arridx) {
+    BasicBlock* idx_compact = cfg.AllocateBlock();
+    Register* is_compact = temps_.AllocateStack();
+    tc.emit<IsCompactLong>(is_compact, sub);
+    tc.emit<CondBranch>(is_compact, idx_compact, slow_path);
+    tc.block = idx_compact;
+    tc.emit<CompactLongUnbox>(unboxed_idx, sub);
+    return unboxed_idx;
+  }
   // Sequence indices overflow with IndexError, not numeric OverflowError.
   tc.emit<IndexUnbox>(unboxed_idx, sub);
   Register* neg_check = temps_.AllocateStack();
@@ -6075,6 +7637,28 @@ void HIRBuilder::emitStoreSubscr(
   Register* container = stack.pop();
   Register* value = stack.pop();
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (excEdgeSite311(bc_instr)) {
+    // At a granted site the store is the plain PyObject_SetItem call with
+    // its status tested by the edge; the specialised forms' guards would
+    // deopt past the compiled handler.
+    Register* status = temps_.AllocateNonStack();
+    auto call = tc.emit<CallStatic>(
+        3, status, reinterpret_cast<void*>(PyObject_SetItem), TCInt32);
+    call->SetOperand(0, container);
+    call->SetOperand(1, sub);
+    call->SetOperand(2, value);
+    Register* zero = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(zero, Type::fromCInt(0, TCInt32));
+    Register* is_neg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        is_neg, PrimitiveCompareOp::kLessThan, status, zero);
+    emitExcEdge311(
+        tc, bc_instr, nullptr, nullptr, is_neg, /* ok_when_true= */ false);
+    return;
+  }
+#endif
+
   int specialized_opcode = -1;
   if (getConfig().specialized_opcodes) {
     specialized_opcode = bc_instr.specializedOpcode();
@@ -6088,7 +7672,11 @@ void HIRBuilder::emitStoreSubscr(
     if (array_type != nullptr) {
       Type array_type_guard = Type::fromTypeExact(array_type);
       if (!hasArraySubscrStoreFastPathEvidence(
-              container, sub, value, array_type_guard)) {
+              container,
+              sub,
+              value,
+              array_type_guard,
+              bc_instr.isSubscrAdaptiveStuck())) {
         tc.emit<StoreSubscr>(container, sub, value, tc.frame);
         return;
       }
@@ -6160,6 +7748,18 @@ bool HIRBuilder::tryStoreSubscrArray(
 
   // typecode matched — bounds check + store
   tc.block = tc_ok;
+  // SPIKE(ARRIDX): the bounds check below is a helper whose own FrameState
+  // has the operands popped, which is right for its exception exit.
+  // Simplify replaces it with an inline compare + Guard, and a Guard replays
+  // the whole STORE_SUBSCR in the interpreter, so it needs the state from
+  // before the pops; record that state here for Simplify to find.
+  {
+    FrameState pre_pop = tc.frame;
+    pre_pop.stack.push(value);
+    pre_pop.stack.push(container);
+    pre_pop.stack.push(sub);
+    tc.emit<Snapshot>(pre_pop);
+  }
   auto adjusted_idx = temps_.AllocateStack();
   tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
   auto ob_item = temps_.AllocateStack();
@@ -6193,8 +7793,14 @@ void HIRBuilder::emitGetIter(TranslationContext& tc) {
 }
 
 void HIRBuilder::emitForIter(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (tryEmitRangeForIter311(cfg, tc, bc_instr)) {
+    return;
+  }
+#endif
   Register* iterator;
   if constexpr (PY_VERSION_HEX >= 0x030F0000) {
     iterator = tc.frame.stack.top(1);

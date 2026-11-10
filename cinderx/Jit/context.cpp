@@ -482,6 +482,20 @@ StoreAttrCache* Context::allocateStoreAttrCache() {
   return store_attr_caches_.allocate();
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+CallSiteEntryCache* Context::allocateCallSiteEntryCache() {
+  return call_site_entry_caches_.allocate();
+}
+
+SuperSiteCache311* Context::allocateSuperSiteCache311() {
+  return super_site_caches_.allocate();
+}
+
+GlobalLoadCell311* Context::allocateGlobalLoadCell311() {
+  return global_load_cells_311_.allocate();
+}
+#endif
+
 const Builtins& Context::builtins() {
   // Lock-free fast path followed by single-lock slow path during
   // initialization.
@@ -492,6 +506,7 @@ const Builtins& Context::builtins() {
 }
 
 void Context::unwatch(TypeDeoptPatcher* patcher) {
+  ThreadedCompileSerialize guard;
   type_deopt_patchers_[patcher->type()].erase(patcher);
 }
 
@@ -568,7 +583,24 @@ void Context::addDeferredFinalization(
       ThreadedRef<PyFunctionObject>::create(func), compiled);
 }
 
+void Context::deferCodeRuntimeRelease(CodeRuntime* runtime) {
+  ThreadedCompileSerialize guard;
+  deferred_release_runtimes_.push_back(runtime);
+}
+
 void Context::finalizeMultiThreadedCompile() {
+  // Runs on the main thread with the GIL held, after the workers joined.
+  // Release the runtimes the workers handed over: dropping their references
+  // decrements refcounts of objects shared between workers, which is only
+  // safe here.
+  for (CodeRuntime* runtime : deferred_release_runtimes_) {
+    runtime->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+    recycleCodeRuntime(runtime);
+#endif
+  }
+  deferred_release_runtimes_.clear();
+
   fixupFunctionEntryCachePostMultiThreadedCompile();
   watchPendingTypes();
 
@@ -591,10 +623,18 @@ namespace {
 struct PublicationSubjectMoved {};
 } // namespace
 
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+#endif
+
 bool Context::finalizeFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
 #if PY_VERSION_HEX < 0x030C0000
+  // A safe point for the deferred artifact reclamation: retired artifacts
+  // whose frames have since unwound are destroyed before a new one is
+  // published.
+  Ci_JitShell311_SweepGraveyard();
   // Every path that gives a function a machine-code entry point arrives
   // here: the direct compile, the batch and lazy paths, re-optimization of
   // a previously deopted function, and any re-attachment of an existing
@@ -867,13 +907,19 @@ bool Context::finalizeFunc(
   // Route 3.11 calls through the guarded entry, which re-checks the code
   // identity and the call form that compilation assumed before entering
   // machine code (see Jit/pyjit_311_gate.cpp).
-  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
 #if defined(CINDER_AARCH64)
+  // CPython 3.11 direct entry: the generated code carries the entry guard
+  // inline (code identity, recursion ledger, tracing precheck), so the
+  // generated vectorcall entry is installed directly, exactly like the 3.12+
+  // branch below.  The per-call C shell is kept only for other targets.
+  setVectorcall(func, compiled->vectorcallEntry());
+#else
+  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
   if (compiled->artifactGuardedEntry311() != nullptr) {
     entry = compiled->artifactGuardedEntry311();
   }
-#endif
   setVectorcall(func, entry);
+#endif
   if (hasFunctionEntryCache(func)) {
     void** indirect = findFunctionEntryCache(func);
     *indirect = compiled->staticEntry();
@@ -1443,6 +1489,10 @@ LifecycleSnapshot311 Context::lifecycleSnapshot311() {
   for (CodeRuntime& runtime : code_runtimes_) {
     snapshot.code_runtimes_allocated++;
     snapshot.code_runtimes_live += !runtime.isCleared();
+#if PY_VERSION_HEX < 0x030C0000
+    snapshot.subscript_caches += runtime.subscrCacheCount311();
+    snapshot.predicate_caches += runtime.predicateCacheCount311();
+#endif
   }
   return snapshot;
 }
@@ -1596,7 +1646,7 @@ void Context::clearForMultithreadedCompileTest() {
   for (auto& compiled : pinned) {
 #if PY_VERSION_HEX < 0x030C0000
     for (PyFunctionObject* func : compiled->functions()) {
-      if (func->vectorcall == compiled->artifactGuardedEntry311()) {
+      if (compiled->isInstalledEntry311(func->vectorcall)) {
         func->vectorcall = getInterpretedVectorcall(func);
       }
     }
@@ -1950,7 +2000,31 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
       (func != nullptr && _Py_IsImmortal(func)) ||
       (outer != nullptr && _Py_IsImmortal(outer));
   compiled_func.runtime_lifetime = code_runtime_lifetime_;
+#if PY_VERSION_HEX < 0x030C0000
+  bool runtime_adopted = false;
+  SCOPE_EXIT({
+    if (!runtime_adopted && compiled_func.runtime != nullptr) {
+      // No artifact owns these resources if allocating its Python object
+      // failed. Preserve that failure while releasing Python references.
+      PyObject *type, *value, *traceback;
+      PyErr_Fetch(&type, &value, &traceback);
+      compiled_func.runtime->releaseReferences();
+      recycleCodeRuntime(compiled_func.runtime);
+      if (compiled_func.code.data() != nullptr) {
+        auto* allocator = cinderx::getModuleState()->code_allocator.get();
+        auto error = allocator->releaseCode(
+            const_cast<std::byte*>(compiled_func.code.data()));
+        JIT_CHECK(
+            error == asmjit::kErrorOk, "Failed to release unpublished code");
+      }
+      PyErr_Restore(type, value, traceback);
+    }
+  });
+#endif
   auto compiled = CompiledFunction::create(std::move(compiled_func), immortal);
+#if PY_VERSION_HEX < 0x030C0000
+  runtime_adopted = compiled != nullptr;
+#endif
   if (compiled == nullptr) {
     return nullptr;
   }

@@ -11,8 +11,11 @@ def make_twin():
 
 
 def warm(func):
-    for value in range(8):
+    # Wait for the bounded IC gate without bypassing AutoJIT or donor promotion.
+    for value in range(512):
         assert func(value, value) == 5 * value
+        if jit.is_jit_compiled(func):
+            return True
     return jit.is_jit_compiled(func)
 
 

@@ -178,14 +178,14 @@ def main() -> int:
     # exercises dispatch, outer anchoring and fresh attachment under the
     # reference-count contract.
     scheduled = mode == "auto"
+    # Keep the production despecialization policy enabled in both JIT arms.
+    # The removed CINDERX_ADAPTIVE_DESPEC variable had no runtime consumer.
+    if scheduled:
+        # This arm measures steady-state scheduling and reference ownership,
+        # not startup wall time. Keep its compilation floor meaningful while
+        # testing the production grace default in the dedicated policy suite.
+        os.environ.setdefault("CINDERX_JIT_STARTUP_GRACE_MS", "0")
     if mode in ("jit", "auto"):
-        # 守卫自适应去特化会在案例中途卸载重编（共享 helper 跑热后被
-        # force_compile 会烘焙特化形，守卫风暴触发 despec）：产物切换
-        # 使烘焙引用集合变化，双快照协议无法与真实漂移区分（实测恰为
-        # 每案例 −1 且 despec 关闭即 0、不随迭代累积——记账工件而非
-        # 泄漏）。本判据只验证编译产物的逐迭代引用中性，despec 迁移
-        # 的引用平衡由其触发路径的 Ref 持有审计保证。
-        os.environ.setdefault("CINDERX_ADAPTIVE_DESPEC", "0")
         # The executing tier runs under the debug allocator from MR-04 on;
         # assert it rather than assume the caller set it.
         if executing:

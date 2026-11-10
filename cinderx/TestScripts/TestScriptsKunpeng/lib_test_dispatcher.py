@@ -96,9 +96,10 @@ class MessagePipe:
 
 class TestLog:
     def __init__(self) -> None:
-        self.path = tempfile.NamedTemporaryFile(
+        with tempfile.NamedTemporaryFile(
             prefix="testgate-dispatcher-", suffix=".json", delete=False
-        ).name
+        ) as f:
+            self.path = f.name
         self.test_order: list[str] = []
         self._serialize()
 

@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/hir/primitive_box_remat.h"
 
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/hir.h"
@@ -20,6 +21,7 @@ struct RematCandidate {
   Register* boxed;
   Register* unboxed;
   std::vector<Instr*> removable_uses;
+  bool int_box{false};
 };
 
 bool collectRemovableUses(
@@ -205,13 +207,21 @@ void PrimitiveBoxRemat::Run(Function& irfunc) {
       }
 
       auto& box = static_cast<PrimitiveBox&>(instr);
-      if (box.type() != TCDouble) {
+      // SPIKE(LONGSPEC): CInt64 boxes whose only remaining uses are frame
+      // states are removed the same way as CDouble ones; deopt reifies a
+      // kSigned live value with PyLong_FromSsize_t, which accepts any int64
+      // (the value need not be in compact range).
+      static const bool spike_longspec =
+          Ci_SpikeGetenv("SPIKE_LONGSPEC") != nullptr;
+      bool int_box = spike_longspec && box.type() == TCInt64;
+      if (box.type() != TCDouble && !int_box) {
         continue;
       }
 
       Register* boxed = box.output();
       Register* unboxed = box.value();
-      if (unboxed == nullptr || !(unboxed->type() <= TCDouble)) {
+      if (unboxed == nullptr ||
+          !(unboxed->type() <= (int_box ? TCInt64 : TCDouble))) {
         continue;
       }
 
@@ -220,8 +230,8 @@ void PrimitiveBoxRemat::Run(Function& irfunc) {
         continue;
       }
 
-      candidates.push_back(
-          RematCandidate{&box, boxed, unboxed, std::move(removable_uses)});
+      candidates.push_back(RematCandidate{
+          &box, boxed, unboxed, std::move(removable_uses), int_box});
       replacements.emplace(boxed, unboxed);
     }
   }
@@ -238,7 +248,11 @@ void PrimitiveBoxRemat::Run(Function& irfunc) {
   std::vector<std::unique_ptr<Instr>> removed_instrs;
 
   for (auto& candidate : candidates) {
-    if (!replaced.contains(candidate.boxed)) {
+    // A double box is only touched when a frame state actually referred to
+    // it (the pre-existing behaviour).  An int box is dead by construction
+    // once its frame-state references are rewritten and its UseType uses are
+    // dropped.
+    if (!candidate.int_box && !replaced.contains(candidate.boxed)) {
       continue;
     }
 

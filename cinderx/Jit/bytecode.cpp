@@ -2,6 +2,10 @@
 
 #include "cinderx/Jit/bytecode.h"
 
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
+
 extern "C" {
 #include "internal/pycore_code.h"
 }
@@ -168,8 +172,19 @@ int BytecodeInstruction::uninstrumentedOpcode() const {
   return uninstrument(code_, opcodeIndex().value());
 }
 
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code);
+
 int BytecodeInstruction::specializedOpcode() const {
   int opcode = uninstrumentedOpcode();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // A code granted a generic retry compiles as if never quickened; every
+  // guard-bearing specialized consumption collapses to the generic form in
+  // this single chokepoint.
+  if (Ci_SpikeDespec311_IsMarked(code_)) {
+    return unspecialize(opcode);
+  }
+#endif
 
   switch (opcode) {
     case BINARY_OP_ADD_FLOAT:
@@ -200,12 +215,18 @@ int BytecodeInstruction::specializedOpcode() const {
     case TO_BOOL_STR:
     case LOAD_ATTR_METHOD_WITH_VALUES:
 #endif
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+    case LOAD_ATTR_INSTANCE_VALUE:
+#endif
     case LOAD_ATTR_SLOT:
 #if PY_VERSION_HEX < 0x030C0000
     case LOAD_ATTR_INSTANCE_VALUE:
     case LOAD_METHOD_WITH_VALUES:
     case LOAD_METHOD_MODULE:
     case LOAD_GLOBAL_MODULE:
+    case STORE_ATTR_INSTANCE_VALUE:
+    case STORE_ATTR_WITH_HINT:
 #endif
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_SLOT:
@@ -218,6 +239,57 @@ int BytecodeInstruction::specializedOpcode() const {
     default:
       return unspecialize(opcode);
   }
+}
+
+bool BytecodeInstruction::isSubscrAdaptiveStuck() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_SUBSCR_ADAPTIVE && raw != STORE_SUBSCR_ADAPTIVE) {
+    return false;
+  }
+  // 3.11 zeroes the adaptive counter at quicken time and the first
+  // execution attempts to specialize: success replaces the opcode, and
+  // failure (or a later miss-driven despecialization) sets a nonzero
+  // backoff.  ADAPTIVE form with nonzero backoff therefore means "tried
+  // and failed", excluding never-executed cold sites.
+  uint16_t counter = cacheU16(kInlineCacheStartInstructionOffset);
+  return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
+#else
+  return false;
+#endif
+}
+
+char BytecodeInstruction::subscrArrayTypecode() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_SUBSCR_ADAPTIVE) {
+    return 0;
+  }
+  constexpr int kFuncVersionUnit = static_cast<int>(
+      offsetof(_PyBinarySubscrCache, func_version) / sizeof(_Py_CODEUNIT));
+  uint16_t mark =
+      cacheU16(kInlineCacheStartInstructionOffset + kFuncVersionUnit);
+  if ((mark & CI_SUBSCR_ARRTC_TAG_MASK) != CI_SUBSCR_ARRTC_TAG ||
+      mark == CI_SUBSCR_ARRTC_OTHER || mark == CI_SUBSCR_ARRTC_MIXED) {
+    return 0;
+  }
+  return static_cast<char>(mark & 0xFFu);
+#else
+  return 0;
+#endif
+}
+
+bool BytecodeInstruction::isBinaryOpAdaptiveStuck() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_OP_ADAPTIVE) {
+    return false;
+  }
+  uint16_t counter = cacheU16(kInlineCacheStartInstructionOffset);
+  return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
+#else
+  return false;
+#endif
 }
 
 int BytecodeInstruction::oparg() const {

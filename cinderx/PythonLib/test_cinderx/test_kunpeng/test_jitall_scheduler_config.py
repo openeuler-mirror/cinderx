@@ -66,6 +66,9 @@ def _run(tmp_path, **updates):
     }
     env["PYTHONPATH"] = os.pathsep.join(sorted(runtime_roots))
     env["CINDERX_JIT_MODE"] = "canary"
+    # These tests isolate call thresholds and flag precedence. Startup grace
+    # is exercised separately by test_scheduling_policy_311.
+    env["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
     env.update(updates)
     return subprocess.run(
         [sys.executable, "-c", CHILD],

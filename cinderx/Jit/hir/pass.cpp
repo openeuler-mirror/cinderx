@@ -121,7 +121,8 @@ RegUses collectDirectRegUses(Function& func) {
   return uses;
 }
 
-Type outputType(
+namespace {
+Type outputTypeImpl(
     const Instr& instr,
     const std::function<Type(std::size_t)>& get_op_type) {
   switch (instr.opcode()) {
@@ -260,7 +261,17 @@ Type outputType(
     // Many opcodes just return a possibly-null PyObject*. Some of these will
     // be further specialized based on the input types in the hopefully near
     // future.
-    case Opcode::kCallCFunc:
+    case Opcode::kCallCFunc: {
+      // The compiled-handler helpers with integer results.
+      switch (static_cast<const CallCFunc&>(instr).func()) {
+        case CallCFunc::Func::kJITRT_PopExcInfo311:
+          return TCUInt64;
+        case CallCFunc::Func::kJITRT_ExcMatch311:
+          return TCInt64;
+        default:
+          return TOptObject;
+      }
+    }
     case Opcode::kLoadCellItem:
     case Opcode::kLoadGlobalCached:
     case Opcode::kMatchClass:
@@ -592,9 +603,30 @@ Type outputType(
   JIT_ABORT("Bad opcode {}", static_cast<int>(instr.opcode()));
 }
 
+} // namespace
+
+// A raising instruction whose exception exit is a CFG edge leaves NULL in
+// its output on that edge; the CondBranch after it is the null test, and
+// the fall-through refines the type back to non-null.
+Type excEdgeOutputType(const Instr& instr, Type type) {
+  const DeoptBase* db = instr.asDeoptBase();
+  if (db != nullptr && db->excEdge() && instr.output() != nullptr &&
+      type <= TObject) {
+    return type | TNullptr;
+  }
+  return type;
+}
+
+Type outputType(
+    const Instr& instr,
+    const std::function<Type(std::size_t)>& get_op_type) {
+  return excEdgeOutputType(instr, outputTypeImpl(instr, get_op_type));
+}
+
 Type outputType(const Instr& instr) {
-  return outputType(
+  Type type = outputTypeImpl(
       instr, [&](std::size_t ind) { return instr.GetOperand(ind)->type(); });
+  return excEdgeOutputType(instr, type);
 }
 
 void reflowTypes(Function& func) {
@@ -843,8 +875,21 @@ bool removeUnreachableInstructions(Function& func) {
             std::unordered_set<Instr*>& instrs_using_reg = uses->second;
             const std::unordered_set<const BasicBlock*>& dom_set =
                 dom.getBlocksDominatedBy(target);
+            // The RefineType sits in the branch's block, so it only reaches
+            // uses in blocks that block dominates as well.  `target` may
+            // have other predecessors (a subscript diamond's shared generic
+            // arm, reached from several failed checks): a use there that is
+            // dominated by `target` but not by this block would otherwise be
+            // rewritten to a definition that does not dominate it -- and
+            // once this block is itself found unreachable and deleted, the
+            // use dangles (test_range.test_slice compiled `list(r)[slice]`
+            // into a list fast path keyed on the dangling, Bottom-typed
+            // register and crashed in CopyPropagation).
+            const std::unordered_set<const BasicBlock*>& branch_dom_set =
+                dom.getBlocksDominatedBy(cond_branch->block());
             for (Instr* instr : instrs_using_reg) {
-              if (dom_set.contains(instr->block())) {
+              if (dom_set.contains(instr->block()) &&
+                  branch_dom_set.contains(instr->block())) {
                 instr->ReplaceUsesOf(operand, refined_value);
               }
             }

@@ -33,6 +33,8 @@ def _clean_env():
 
 def run_program(name, *, mode="execute", threshold=THRESHOLD, timeout=120, **env):
     child_env = _clean_env()
+    # State-machine cases use an explicit steady-state scheduling policy.
+    child_env["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
     if mode is not None:
         child_env["CINDERX_JIT_MODE"] = mode
     if threshold is not None:
@@ -135,15 +137,43 @@ class Execute311Test(unittest.TestCase):
         self.assertTrue(payload["forced"])
         self.assertEqual(payload["forced_entered"], 1)
 
-    def test_generator_auto_default_is_off_but_explicit_compile_works(self):
-        payload = self.run_ok("generator_auto_off")
-        self.assertEqual(len(payload["events"]), 1)
-        self.assertEqual(
-            payload["events"][0]["result"], "REFUSE_SHAPE_GENERATOR_AUTO_DISABLED"
-        )
-        self.assertEqual(payload["disabled"], 1)
-        self.assertTrue(payload["forced"])
+    def test_generator_auto_default_is_on(self):
+        # Synchronous generators are scheduled like any other function: the
+        # body crosses the threshold, compiles, and every later resume enters
+        # machine code.
+        payload = self.run_ok("generator_auto_on")
+        self.assertEqual(payload["disabled"], 0)
+        self.assertTrue(payload["compiled"])
         self.assertGreater(payload["entered"], 0)
+        self.assertIn("installed", [e["result"] for e in payload["events"]])
+
+    def test_generator_yield_from_inside_with_block(self):
+        # 3.11's SEND replaces the sub-iterator with its result when the
+        # delegation finishes; the compiled generator must model that so the
+        # `with` block's exit is invoked on the context manager.
+        payload = self.run_ok("generator_yield_from_with")
+        self.assertIsNone(payload["error"])
+        self.assertTrue(payload["compiled"])
+        self.assertEqual(payload["first"], [1, 2, 3, 3])
+        self.assertEqual(payload["second"], [4, 5, 2, 20])
+        self.assertEqual(payload["last"], [4, 5, 2, 20])
+        self.assertEqual(payload["chained"], [1, 2, 3, 4, 5])
+        # One iteration: the plain delegation, then the nested one.
+        self.assertEqual(
+            payload["log"],
+            ["enter", "exit", "after"]
+            + ["enter", "enter", "enter", "exit", "after", "exit", "exit"],
+        )
+
+    def test_large_frame_initialisation(self):
+        # More than 4095 localsplus slots: the inline zeroing stores reach
+        # offsets the immediate form cannot encode.
+        payload = self.run_ok("large_frame_init", timeout=600)
+        self.assertTrue(payload["compiled"])
+        self.assertEqual(payload["length"], 4200)
+        self.assertEqual(payload["first"], 0)
+        self.assertEqual(payload["mid"], 4096)
+        self.assertEqual(payload["last"], 4199)
 
     # -- fresh function objects ----------------------------------------------
 
@@ -342,6 +372,9 @@ class Execute311Test(unittest.TestCase):
         self.assertGreater(payload["entry_delta"], 0)
 
     def test_frame_local_inline_preserves_materialized_frame_semantics(self):
+        # Generator frames write every store through to localsplus (the
+        # inline lowering under test); a normal frame's observable locals
+        # come from deopt metadata, so the child uses generators.
         payload = self.run_ok("frame_local_inline", threshold="2")
         self.assertTrue(all(payload["compiled"].values()))
         self.assertEqual(payload["stored"], 17)
@@ -353,6 +386,10 @@ class Execute311Test(unittest.TestCase):
     def test_third_party_evaluator_degrades_the_jit_safely(self):
         payload = self.run_ok("third_party_evaluator")
         self.assertEqual(payload["entered_ours"], 1)
+        # Entered from C (map / partial) straight after the swap, before any
+        # status query: the entry itself must divert.
+        self.assertTrue(payload["direct_values_ok"])
+        self.assertEqual(payload["entered_foreign_direct"], 0)
         self.assertFalse(payload["installed_foreign"])
         self.assertFalse(payload["compiled_foreign"])
         self.assertTrue(payload["values_ok"])
