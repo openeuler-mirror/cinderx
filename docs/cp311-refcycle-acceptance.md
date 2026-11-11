@@ -166,3 +166,18 @@ These checks support a reference-count observable difference, not a payload
 reference leak on the tested path. They do not establish leak freedom for all
 runtime allocations or other deoptimization routes. The existing deviation
 entry and runtime implementation were not changed by this investigation.
+
+## Running the regression from CI
+
+The CP311 PR gate invokes `test_execution_infra_311` from
+`cinderx/PythonLib`, where the repository's `ci_pipeline` package is not on
+the default import path. A local run that adds the repository root to
+`PYTHONPATH` hides this dependency. The refcycle regression now locates its
+harness root relative to the test file (supporting both checkout and staged
+layouts), and adds only that directory to this child's import path. Other
+children retain their existing environment; the source runtime package
+directory is not added.
+
+With `PYTHONPATH` unset, all 7 execution infrastructure tests pass from both
+the CI working directory and an independent staged tree. The 41 adapter,
+execution report and gate configuration tests also pass.
