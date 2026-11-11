@@ -348,7 +348,9 @@ driver_selftests() {
     ci_pipeline/test_semantic_naming.py \
     ci_pipeline/test_shutdown_stability.py \
     ci_pipeline/test_libtest_diff_311.py \
-    ci_pipeline/test_run_gate.py
+    ci_pipeline/test_run_gate.py \
+    ci_pipeline/tests/test_sync_src_openeuler.py \
+    ci_pipeline/tests/test_gitcode_webhook.py
 }
 
 test_release_daily() {
