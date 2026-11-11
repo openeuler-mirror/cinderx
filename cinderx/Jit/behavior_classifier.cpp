@@ -1260,6 +1260,14 @@ bool lowRoiReleaseActiveOrNote() {
 
 } // namespace
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+bool lowRoiReleaseIsActive() {
+  return getConfig().auto_classify_low_roi_warm_calls == 0 ||
+      g_low_roi_release_active.load(std::memory_order_relaxed);
+}
+#endif
+
 void resetLowRoiReleaseState() {
   g_low_roi_held_calls.store(0, std::memory_order_relaxed);
   g_low_roi_release_active.store(false, std::memory_order_relaxed);

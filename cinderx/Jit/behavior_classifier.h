@@ -138,6 +138,12 @@ ThresholdDecision computeThresholdForCode(
     const GateContext& context,
     uint32_t global);
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+// Query only: admission policy must not consume the held-call budget.
+bool lowRoiReleaseIsActive();
+#endif
+
 // Clears the process-wide held-call budget that gates the steady-state
 // LowRoi release. Runs in the child side of every fork (the budget's
 // evidence is per-process execution, and a fresh child has not executed

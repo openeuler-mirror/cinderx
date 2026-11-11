@@ -39,6 +39,10 @@ enum class ICStabilityReason : uint8_t {
   Changed,
   Overflow,
   LoopWork,
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+  ShortWarmup,
+#endif
 };
 
 inline const char* icStabilityReasonName(ICStabilityReason reason) {
@@ -75,6 +79,11 @@ inline const char* icStabilityReasonName(ICStabilityReason reason) {
       return "overflow";
     case ICStabilityReason::LoopWork:
       return "loop_work";
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+    case ICStabilityReason::ShortWarmup:
+      return "short_warmup";
+#endif
   }
   return "unsupported";
 }
@@ -93,6 +102,29 @@ inline ICStabilityReason icStabilityAdmissionBypassReason(
   return key.has_value() && key->loop_score > 0 ? ICStabilityReason::LoopWork
                                                 : ICStabilityReason::None;
 }
+
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+inline ICStabilityReason icStabilityAdmissionBypassReason(
+    ICStabilityReason existing,
+    const std::optional<StructureKey>& key,
+    uint32_t warmup_limit) {
+  existing = icStabilityAdmissionBypassReason(existing, key);
+  if (existing != ICStabilityReason::None) {
+    return existing;
+  }
+  // A short configured warmup cannot provide a complete spaced window.
+  // Extending it moves compilation of infrequently called functions into
+  // later application work. Keep the requested admission point; generated
+  // guards and normal deoptimization still protect speculative code.
+  constexpr uint64_t minimum_window =
+      1 + kICStabilitySampleInterval * (kICStabilityRequiredSamples - 1);
+  if (warmup_limit < minimum_window) {
+    return ICStabilityReason::ShortWarmup;
+  }
+  return ICStabilityReason::None;
+}
+#endif
 
 enum class ICStabilitySnapshotStatus : uint8_t {
   Observed,

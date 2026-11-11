@@ -19,7 +19,9 @@ SUPPORTED = (
 
 @unittest.skipUnless(SUPPORTED, "IC admission gate requires CPython 3.14 with GIL")
 class AutoJitICStabilityTests(unittest.TestCase):
-    def run_case(self, name, *, mode="auto:64", stability="1"):
+    def run_case(
+        self, name, *, mode="auto:64", stability="1", low_roi_warm_calls="0"
+    ):
         env = os.environ.copy()
         for key in list(env):
             if key.startswith("CINDERX_AUTOJIT_") or key in (
@@ -31,7 +33,7 @@ class AutoJitICStabilityTests(unittest.TestCase):
             CINDERX_PLUGIN_ENABLE="1",
             PYTHONJITAUTO=mode,
             PYTHONJITSPECIALIZEDOPCODES="1",
-            CINDERX_AUTOJIT_LOWROI_WARM_CALLS="0",
+            CINDERX_AUTOJIT_LOWROI_WARM_CALLS=low_roi_warm_calls,
             CINDERX_AUTOJIT_ROI_BACKOFF="0",
         )
         if stability is not None:
@@ -158,6 +160,47 @@ class AutoJitICStabilityTests(unittest.TestCase):
         self.assertEqual(result["event"]["ic_stability_reason"], "stable")
         self.assertEqual(result["event"]["ic_stability_samples"], 3)
         self.assertEqual(result["event"]["ic_stability_first_calls"], 56)
+
+    def test_short_warmup_keeps_original_admission_and_semantics(self):
+        for stability in (None, "1"):
+            with self.subTest(stability=stability):
+                event = self.run_case(
+                    "short_warmup", mode="auto:2", stability=stability
+                )["event"]
+                self.assertEqual(event["calls"], 2)
+                self.assertEqual(event["effective_limit"], 2)
+                self.assertEqual(event["ic_stability_admission_calls"], 2)
+                self.assertEqual(event["ic_stability_reason"], "short_warmup")
+                self.assertEqual(event["ic_stability_samples"], 0)
+                self.assertEqual(event["shape"]["loop_score"], 0)
+
+    def test_cold_process_keeps_existing_short_threshold_stability(self):
+        event = self.run_case(
+            "short_warmup", mode="auto:2",
+            low_roi_warm_calls="1000000000",
+        )["event"]
+        self.assertEqual(event["effective_limit"], 2)
+        self.assertIn(event["ic_stability_reason"], ("stable", "no_known_sites"))
+        self.assertEqual(event["shape"]["loop_score"], 0)
+
+    def test_setup_phase_keeps_stability_after_process_release(self):
+        event = self.run_case("setup_short_warmup", mode="auto:2")["event"]
+        self.assertTrue(event["startup_phase"])
+        self.assertTrue(event["setup_phase"])
+        self.assertEqual(event["effective_limit"], 2)
+        self.assertIn(event["ic_stability_reason"], ("stable", "no_known_sites"))
+
+    def test_short_global_threshold_preserves_long_effective_window(self):
+        event = self.run_case(
+            "long_effective_warmup", mode="auto:2",
+            low_roi_warm_calls="1000000000",
+        )["event"]
+        self.assertEqual(event["effective_limit"], 65535)
+        self.assertEqual(event["calls"], 65535)
+        self.assertEqual(event["ic_stability_reason"], "stable")
+        self.assertEqual(event["ic_stability_samples"], 3)
+        self.assertEqual(event["ic_stability_first_calls"], 65527)
+        self.assertEqual(event["shape"]["loop_score"], 0)
 
     def test_loop_work_keeps_low_original_threshold(self):
         event = self.run_case("low_threshold", mode="auto:2")["event"]

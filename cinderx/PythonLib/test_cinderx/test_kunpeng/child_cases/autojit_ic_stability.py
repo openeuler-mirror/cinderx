@@ -44,11 +44,11 @@ def warm(target, arguments, expected, *, minimum_calls=64):
     return target_event(target)
 
 
-def mature():
+def mature(minimum_calls=64):
     def target(value):
         return (value + 1) * 3
 
-    event = warm(target, (7,), 24)
+    event = warm(target, (7,), 24, minimum_calls=minimum_calls)
     for value in (-17, 0, 2**80, 2.5):
         assert target(value) == (value + 1) * 3
     try:
@@ -58,6 +58,25 @@ def mature():
     else:
         raise AssertionError("TypeError was swallowed")
     return {"event": event}
+
+
+def short_warmup():
+    return mature(minimum_calls=2)
+
+
+def setup_short_warmup():
+    cinderx._autojit_setup_enter()
+    try:
+        return mature(minimum_calls=2)
+    finally:
+        cinderx._autojit_setup_leave()
+
+
+def long_effective_warmup():
+    def target(value):
+        return value + 1.0
+
+    return {"event": warm(target, (7.0,), 8.0, minimum_calls=65535)}
 
 
 def inplace_numeric():
@@ -621,7 +640,9 @@ def instance_value_semantics():
 
 def main():
     cases = {case.__name__: case for case in (
-        mature, inplace_numeric, natural_late_stable, natural_wait_cap,
+        mature, short_warmup, setup_short_warmup, long_effective_warmup,
+        inplace_numeric,
+        natural_late_stable, natural_wait_cap,
         manual, cold_branch, all_unknown, no_sites, attribute_phases,
         subscript, instance_value_semantics, instance_value_type_churn,
         method_with_values,

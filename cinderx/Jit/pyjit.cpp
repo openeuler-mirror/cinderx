@@ -563,11 +563,35 @@ ICStabilityReason icStabilityBypassReason(
   return ICStabilityReason::None;
 }
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+ICStabilityReason icStabilityBypassForProcess(
+    ICStabilityReason existing,
+    const std::optional<StructureKey>& key,
+    uint32_t warmup_limit,
+    const GateContext& context) {
+  auto reason = icStabilityAdmissionBypassReason(existing, key, warmup_limit);
+  // Keep bootstrap and fresh fork children on their existing admission
+  // policy. A process-wide release is evidence of sustained work, not
+  // permission to make a short-lived process compile more eagerly.
+  if (reason == ICStabilityReason::ShortWarmup &&
+      (context.startup_phase || !lowRoiReleaseIsActive())) {
+    return existing;
+  }
+  return reason;
+}
+#endif
+
 void observeAutoJitICWarmup(
     BorrowedRef<PyCodeObject> code,
     const AutoJitGateState& state,
     uint32_t threshold,
     ICStabilityReason bypass_reason) {
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+  bypass_reason = icStabilityBypassForProcess(
+      bypass_reason, std::nullopt, threshold, state.context);
+#endif
   if (bypass_reason != ICStabilityReason::None || state.calls == 0) {
     return;
   }
@@ -881,7 +905,13 @@ PyObject* jitVectorcall(
       return entry(func_obj, stack, nargsf, kwnames);
     }
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+    stability_bypass = icStabilityBypassForProcess(
+        stability_bypass, key, effective_limit, state.context);
+#else
     stability_bypass = icStabilityAdmissionBypassReason(stability_bypass, key);
+#endif
     ICStabilityDecision stability;
     stability.first_calls = state.calls;
     stability.admission_calls = state.calls;
