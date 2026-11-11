@@ -18,6 +18,8 @@ import sys
 import types
 import unittest
 
+from ci_pipeline.jit311.semantic_conformance_adapters import refcycle_refcount_contract
+
 
 _MODE = os.environ["EXECUTION_COMPILE_ALL_MODE"]
 _LOG_DIR = Path(os.environ["EXECUTION_COMPILE_ALL_LOG_DIR"])
@@ -224,10 +226,23 @@ def _patched_call_test_method(self, method):
     function = getattr(method, "__func__", method)
     compile_result = _compile(module_name, function)
     before = _entries()
+    observation = {}
     try:
-        return _ORIGINAL_CALL_TEST_METHOD(self, method)
+        with refcycle_refcount_contract(
+            self, compiled=_MODE == "jit" and compile_result["compiled"]
+        ) as observation:
+            return _ORIGINAL_CALL_TEST_METHOD(self, method)
     finally:
         after = _entries()
+        if observation:
+            _write(
+                {
+                    "type": "assertion-contract",
+                    "test": self.id(),
+                    "contract": "refcycle-borrowed-getrefcount-argument",
+                    **observation,
+                }
+            )
         _write(
             {
                 "type": "test-call",
