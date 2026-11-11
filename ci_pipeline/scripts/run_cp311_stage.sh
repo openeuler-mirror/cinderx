@@ -341,6 +341,7 @@ driver_selftests() {
     ci_pipeline/test_jit311_shadow_surface.py \
     ci_pipeline/test_jit311_lifecycle_census.py \
     ci_pipeline/test_execution_report.py \
+    ci_pipeline/test_semantic_conformance_adapters.py \
     ci_pipeline/test_jit311_report_reasons.py \
     ci_pipeline/test_lifecycle_acceptance.py \
     ci_pipeline/test_refleak_verdict.py \

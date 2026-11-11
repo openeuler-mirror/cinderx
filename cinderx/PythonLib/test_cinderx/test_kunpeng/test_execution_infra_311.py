@@ -11,6 +11,78 @@ import unittest
     sys.version_info[:2] == (3, 11), "CPython 3.11 execution acceptance infrastructure"
 )
 class ExecutionInfra311Test(unittest.TestCase):
+    def test_refcycle_contract_keeps_finalization_and_garbage_checks(self):
+        result = self.run_child(
+            """
+            import gc, json, os, tempfile, unittest
+            from pathlib import Path
+            from unittest.mock import patch
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+            from test import support
+            from test.test_generators import FinalizationTest
+
+            fn = FinalizationTest.test_refcycle
+            assert cinderjit._jit311_compile_diagnostic(fn)["compiled"]
+            raw = unittest.TestResult()
+            FinalizationTest('test_refcycle').run(raw)
+            assert len(raw.failures) == 1 and not raw.errors
+            assert '2 not greater than 2' in raw.failures[0][1]
+            support.gc_collect()
+
+            with tempfile.TemporaryDirectory() as directory:
+                os.environ['EXECUTION_COMPILE_ALL_MODE'] = 'jit'
+                os.environ['EXECUTION_COMPILE_ALL_LOG_DIR'] = directory
+                from ci_pipeline.jit311 import semantic_conformance_hook
+                collect = support.gc_collect
+                was_enabled = gc.isenabled()
+                gc.disable()
+                outcomes = []
+                deltas = []
+                marker = object()
+                def polluted_collection():
+                    collect()
+                    gc.garbage.append(marker)
+                try:
+                    for collector in (collect, lambda: None, polluted_collection):
+                        case = FinalizationTest('test_refcycle')
+                        before = _cinderx._get_trigger_stats()['machine_code_entries']
+                        with patch.object(support, 'gc_collect', collector):
+                            outcome = unittest.TestResult()
+                            case.run(outcome)
+                        assert not outcome.errors, outcome.errors
+                        if collector is not collect:
+                            assert len(outcome.failures) == 1, outcome.failures
+                            expected = ('Lists differ' if collector is polluted_collection
+                                        else 'False is not true')
+                            assert expected in outcome.failures[0][1], outcome.failures
+                        assert 'assertGreater' not in vars(case)
+                        outcomes.append(outcome.wasSuccessful())
+                        deltas.append(_cinderx._get_trigger_stats()['machine_code_entries'] - before)
+                        if collector is polluted_collection:
+                            assert gc.garbage[-1] is marker
+                            gc.garbage.pop()
+                        collect()
+                finally:
+                    if was_enabled:
+                        gc.enable()
+                events = [json.loads(line) for path in Path(directory).glob('*.jsonl')
+                          for line in path.read_text().splitlines()]
+                observations = [event for event in events
+                                if event['type'] == 'assertion-contract']
+                # atexit must still have a writable journal directory.
+                import atexit
+                atexit.unregister(semantic_conformance_hook._summary)
+                print(json.dumps({'outcomes': outcomes, 'entries': deltas,
+                                  'observed': [event['observed'] for event in observations]}))
+            """
+        )
+        self.assertEqual(result["outcomes"], [True, False, False])
+        self.assertEqual(result["entries"], [1, 1, 1])
+        self.assertEqual(result["observed"], [2, 2, 2])
+
     def run_child(self, body: str, *, threshold="1000000"):
         env = {
             key: value
