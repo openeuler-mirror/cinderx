@@ -898,6 +898,155 @@ static PyObject* autojit_setup_depth(PyObject*, PyObject*) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+// A setup call must not add a Python frame: stdlib APIs use stacklevel for
+// warnings and inspect their callers. Keep descriptor binding and expose the
+// original function for signature introspection, but enter the scope in C.
+struct AutoJitSetupCallable {
+  PyObject_HEAD vectorcallfunc vectorcall;
+  PyObject* wrapped;
+  PyObject* provider;
+  PyObject* owner;
+  PyObject* weakrefs;
+};
+
+int setupCallableTraverse(
+    AutoJitSetupCallable* self,
+    visitproc visit,
+    void* arg) {
+  Py_VISIT(self->wrapped);
+  Py_VISIT(self->provider);
+  Py_VISIT(self->owner);
+  return 0;
+}
+
+int setupCallableClear(AutoJitSetupCallable* self) {
+  Py_CLEAR(self->wrapped);
+  Py_CLEAR(self->provider);
+  Py_CLEAR(self->owner);
+  return 0;
+}
+
+void setupCallableDealloc(AutoJitSetupCallable* self) {
+  PyObject_GC_UnTrack(self);
+  Py_TRASHCAN_BEGIN(self, setupCallableDealloc) if (self->weakrefs != nullptr) {
+    PyObject_ClearWeakRefs(reinterpret_cast<PyObject*>(self));
+  }
+  setupCallableClear(self);
+  PyObject_GC_Del(self);
+  Py_TRASHCAN_END
+}
+
+PyObject* setupCallableVectorcall(
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  auto* self = reinterpret_cast<AutoJitSetupCallable*>(callable);
+  if (self->wrapped == nullptr) {
+    PyErr_SetString(PyExc_RuntimeError, "cleared AutoJIT setup callable");
+    return nullptr;
+  }
+  if (Py_EnterRecursiveCall(" while calling an AutoJIT setup callable")) {
+    return nullptr;
+  }
+  jit::autoJitSetupEnter();
+  PyObject* result = PyObject_Vectorcall(self->wrapped, args, nargsf, kwnames);
+  jit::autoJitSetupLeave();
+  Py_LeaveRecursiveCall();
+  return result;
+}
+
+PyObject* setupCallableGet(PyObject* self, PyObject* obj, PyObject*) {
+  if (obj == nullptr || obj == Py_None) {
+    return Py_NewRef(self);
+  }
+  return PyMethod_New(self, obj);
+}
+
+PyObject* setupCallableGetAttr(PyObject* obj, PyObject* name) {
+  auto* self = reinterpret_cast<AutoJitSetupCallable*>(obj);
+  const char* attr = PyUnicode_AsUTF8(name);
+  if (attr == nullptr) {
+    return nullptr;
+  }
+  if (strcmp(attr, "__wrapped__") == 0 && self->wrapped != nullptr) {
+    return Py_NewRef(self->wrapped);
+  }
+  if (strcmp(attr, "_cinderx_autojit_setup_provider") == 0 &&
+      self->provider != nullptr) {
+    return Py_NewRef(self->provider);
+  }
+  if (self->wrapped != nullptr &&
+      (strcmp(attr, "__name__") == 0 || strcmp(attr, "__qualname__") == 0 ||
+       strcmp(attr, "__module__") == 0 || strcmp(attr, "__doc__") == 0 ||
+       strcmp(attr, "__annotations__") == 0)) {
+    return PyObject_GetAttr(self->wrapped, name);
+  }
+  PyObject* result = PyObject_GenericGetAttr(obj, name);
+  if (result == nullptr && self->wrapped != nullptr &&
+      PyErr_ExceptionMatches(PyExc_AttributeError)) {
+    PyErr_Clear();
+    return PyObject_GetAttr(self->wrapped, name);
+  }
+  return result;
+}
+
+int setupCallableSetAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  auto* self = reinterpret_cast<AutoJitSetupCallable*>(obj);
+  if (self->wrapped == nullptr ||
+      PyUnicode_CompareWithASCIIString(name, "__wrapped__") == 0 ||
+      PyUnicode_CompareWithASCIIString(
+          name, "_cinderx_autojit_setup_provider") == 0) {
+    PyErr_SetString(PyExc_AttributeError, "read-only setup wrapper attribute");
+    return -1;
+  }
+  return PyObject_SetAttr(self->wrapped, name, value);
+}
+
+PyObject* autojit_setup_wrap(PyObject* owner, PyObject* args) {
+  PyObject* wrapped;
+  PyObject* provider;
+  if (!PyArg_ParseTuple(args, "OU:_autojit_setup_wrap", &wrapped, &provider)) {
+    return nullptr;
+  }
+  if (!PyCallable_Check(wrapped)) {
+    PyErr_SetString(PyExc_TypeError, "setup target must be callable");
+    return nullptr;
+  }
+  // Lazy, GIL-protected initialization. Ordinary no-site initialization must
+  // not pay for a descriptor used only after a setup provider is imported.
+  static PyTypeObject type = {PyVarObject_HEAD_INIT(nullptr, 0)};
+  if (type.tp_name == nullptr) {
+    type.tp_name = "_cinderx.AutoJitSetupCallable";
+    type.tp_basicsize = sizeof(AutoJitSetupCallable);
+    type.tp_flags =
+        Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_HAVE_VECTORCALL;
+    type.tp_vectorcall_offset = offsetof(AutoJitSetupCallable, vectorcall);
+    type.tp_weaklistoffset = offsetof(AutoJitSetupCallable, weakrefs);
+    type.tp_call = PyVectorcall_Call;
+    type.tp_descr_get = setupCallableGet;
+    type.tp_getattro = setupCallableGetAttr;
+    type.tp_setattro = setupCallableSetAttr;
+    type.tp_traverse = reinterpret_cast<traverseproc>(setupCallableTraverse);
+    type.tp_clear = reinterpret_cast<inquiry>(setupCallableClear);
+    type.tp_dealloc = reinterpret_cast<destructor>(setupCallableDealloc);
+  }
+  if (PyType_Ready(&type) < 0) {
+    return nullptr;
+  }
+  auto* result = PyObject_GC_New(AutoJitSetupCallable, &type);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  result->vectorcall = setupCallableVectorcall;
+  result->wrapped = Py_NewRef(wrapped);
+  result->provider = Py_NewRef(provider);
+  result->owner = Py_NewRef(owner);
+  result->weakrefs = nullptr;
+  PyObject_GC_Track(result);
+  return reinterpret_cast<PyObject*>(result);
+}
+
 static PyObject* get_observe_stats(PyObject*, PyObject*) {
   return Ci_Observe311_Stats();
 }
@@ -1217,6 +1366,12 @@ PyMethodDef _cinderx_methods[] = {
      autojit_setup_depth,
      METH_NOARGS,
      PyDoc_STR("Return current AutoJIT setup provider depth.")},
+#if PY_VERSION_HEX < 0x030C0000
+    {"_autojit_setup_wrap",
+     autojit_setup_wrap,
+     METH_VARARGS,
+     PyDoc_STR("Wrap a setup callable without adding a Python frame.")},
+#endif
     {"_compile_perf_trampoline_pre_fork",
      compile_perf_trampoline_pre_fork,
      METH_NOARGS,

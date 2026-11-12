@@ -126,6 +126,14 @@ PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
   test_cinderx.test_kunpeng.test_admission_semantics_311 \
   > "$WORK/admission-semantics.log" 2>&1
 
+CINDERX_REQUIRE_CORO_INLINE=1 CINDERX_PLUGIN_ENABLE=1 \
+  CINDERX_EVAL_MODE=cinder CINDERX_JIT_MODE=execute PYTHONJITAUTO=4 \
+  PYTHONJITGENERATOR=1 PYTHONJITLIGHTWEIGHTFRAME=0 CINDERX_OSR_ENABLED=0 \
+  PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
+  test_cinderx.test_kunpeng.test_coroutine_call_inline_311 \
+  test_cinderx.test_kunpeng.test_subprocess_setup_311 \
+  > "$WORK/coroutine-call.log" 2>&1
+
 # Build sanity only: this shows the debug build CAN run the JIT.  The
 # trigger proof comes from the -R processes themselves, below.
 CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
