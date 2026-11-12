@@ -1,0 +1,34 @@
+--- a/specialize.c
++++ b/specialize.c
+@@ -555,7 +555,8 @@
+         }
+     }
+     else {
+-        if (type->tp_getattro != PyObject_GenericGetAttr) {
++        if (type->tp_getattro != PyObject_GenericGetAttr &&
++            !Ci_IsGetattrOnlyType_311(type)) {
+             *descr = NULL;
+             return GETSET_OVERRIDDEN;
+         }
+@@ -635,6 +636,10 @@
+     }
+     else {
+         if (!PyDict_CheckExact(dict)) {
++            SPECIALIZATION_FAIL(base_op, SPEC_FAIL_NO_DICT);
++            return 0;
++        }
++        if (!DK_IS_UNICODE(dict->ma_keys)) {
+             SPECIALIZATION_FAIL(base_op, SPEC_FAIL_NO_DICT);
+             return 0;
+         }
+@@ -1001,6 +1006,10 @@
+         }
+     }
+     if (dictkind != NO_DICT) {
++        if (!DK_IS_UNICODE(keys)) {
++            SPECIALIZATION_FAIL(LOAD_METHOD, SPEC_FAIL_NO_DICT);
++            goto fail;
++        }
+         Py_ssize_t index = _PyDictKeys_StringLookup(keys, name);
+         if (index != DKIX_EMPTY) {
+             SPECIALIZATION_FAIL(LOAD_METHOD, SPEC_FAIL_LOAD_METHOD_IS_ATTR);

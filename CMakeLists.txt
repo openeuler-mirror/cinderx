@@ -512,12 +512,7 @@ if (${PY_VERSION} EQUAL 3.11)
     ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
   )
   if (${ENABLE_INTERPRETER_LOOP})
-    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/coroutine_call.cmake)
-    cinderx_generate_coroutine_ceval_311("${GENERATED_HEADER_DIR}")
-    set_property(
-      SOURCE ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
-      APPEND PROPERTY INCLUDE_DIRECTORIES
-      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
+    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/attr-patches/apply.cmake)
     set(INTERP_SOURCES
       ${INTERP_SOURCES}
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c
@@ -576,6 +571,11 @@ file(WRITE ${CINDER_OPCODE_H} "${FILE_CONTENTS}")
 endif()
 
 add_library(interpreter ${INTERP_SOURCES})
+if (${PY_VERSION} EQUAL 3.11 AND ${ENABLE_INTERPRETER_LOOP})
+  target_compile_definitions(interpreter PRIVATE CINDERX_CP311_ATTR_PATH)
+  target_include_directories(interpreter PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
+endif()
 if (NOT ${PY_VERSION} EQUAL 3.11)
 target_include_directories(
   interpreter

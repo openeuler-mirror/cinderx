@@ -1,3 +1,61 @@
+# Attribute-mode defaults stay process-local; explicit overrides are inherited.
+import os
+import sys
+_attr_mode = os.environ.get('ATTR_PATH_MODE')
+_attr_expected = None
+
+def _attr_flag(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    if raw not in ('0', '1'):
+        raise ValueError(name + ' must be 0 or 1')
+    return int(raw)
+
+def _verify():
+    if _attr_mode == 'off':
+        if '_cinderx' in sys.modules:
+            raise RuntimeError('Native CinderX unexpectedly loaded in off mode')
+        return dict(evaluator=False, attribute=None, counters=None, jit=None)
+    import _cinderx
+    result = dict(evaluator=_cinderx.is_frame_evaluator_installed(),
+                  attribute=_cinderx._attr_path_status(),
+                  counters=_cinderx._attr_path_counters(),
+                  jit=_cinderx._get_trigger_stats(), native_path=_cinderx.__file__)
+    if not result['evaluator'] or any(result['jit'].values()):
+        raise RuntimeError('Attribute optimization requires active evaluator and zero JIT counters')
+    if _attr_expected is not None and result['attribute'] != _attr_expected:
+        raise RuntimeError('Attribute configuration mismatch: expected %r, got %r' %
+                           (_attr_expected, result['attribute']))
+    return result
+
+if _attr_mode is not None:
+    try:
+        if _attr_mode not in ('off', 'cinderx', 'cinderx_control'):
+            raise ValueError('Invalid ATTR_PATH_MODE')
+        if sys.version_info[:3] != (3, 11, 6):
+            raise RuntimeError('Attribute optimization requires CPython 3.11.6')
+        if _attr_mode != 'off':
+            if os.environ.get('CINDERX_DISABLE', '0').lower() in ('1','true','yes','on'):
+                raise RuntimeError('CINDERX_DISABLE conflicts with explicit attribute mode')
+            if os.environ.get('TORCH_MODULE_ATTR_FASTPATH','off') not in ('off','0',''):
+                raise RuntimeError('slot_native cannot be combined with attribute mode')
+            full = _attr_mode == 'cinderx'
+            _attr_expected = dict(
+                no_exception=_attr_flag('ATTR_PATH_NOEXC', full),
+                specialization=_attr_flag('ATTR_PATH_SPECIALIZE', full),
+                split_dict=_attr_flag('ATTR_PATH_SPLIT_HINT', full),
+                global_cache=_attr_flag('ATTR_PATH_GLOBAL_CACHE', True),
+                inline_call=_attr_flag('ATTR_PATH_INLINE_CALL', True),
+                diagnostics=_attr_flag('ATTR_PATH_DIAGNOSTICS', False))
+            import _cinderx
+            _cinderx.install_frame_evaluator()
+        _verify()
+    except Exception as error:
+        # site.addpackage catches Exception and continues; SystemExit must
+        # escape the .pth boundary so the application cannot run unoptimized.
+        raise SystemExit('ATTR_PATH_STARTUP_FAILED: ' + str(error)) from error
+
 import os
 import sys
 
@@ -28,7 +86,7 @@ def _cinderx_311_execute_mode():
     return os.environ.get("CINDERX_JIT_MODE", "off") in ("execute", "canary")
 
 
-if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
+if _attr_mode is None and _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     import _cinderx  # noqa: F401
 
     if _cinderx_jit_disabled():

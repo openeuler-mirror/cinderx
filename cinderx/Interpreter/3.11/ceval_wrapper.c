@@ -114,7 +114,49 @@ static inline void Ci_CodeWarmup_311(PyCodeObject* code) {
 #define _PyCode_Warmup Ci_CodeWarmup_311
 
 #define PyObject_Vectorcall Ci_PyObject_Vectorcall_311
+#ifdef CINDERX_CP311_ATTR_PATH
+#include "cinderx/Interpreter/3.11/specga.h"
+#include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/attr_config.h"
+#include "cinderx/Interpreter/3.11/global_cache311.h"
+extern vectorcallfunc Ci_JitShell311_CodeArtifactEntry(PyFunctionObject*);
+extern uint8_t Ci_JitGraveyardPending311;
+static int ci_inline_enabled_311;
+int Ci_PerfSupportInit311(void) {
+  const char* flag = getenv("ATTR_PATH_INLINE_CALL");
+  if (flag && strcmp(flag, "0") && strcmp(flag, "1")) {
+    PyErr_SetString(PyExc_ValueError, "ATTR_PATH_INLINE_CALL must be 0 or 1");
+    return -1;
+  }
+  ci_inline_enabled_311 = flag == NULL ? Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF : strcmp(flag, "1") == 0;
+  return Ci_GlobalCacheInit311();
+}
+static inline int Ci_CallInlineOK311(PyObject* fn) {
+  PyThreadState* ts = _PyThreadState_GET();
+  // Only JIT-off execution is changed. All counting/compilation modes retain
+  // the current dev entry path and its heat accounting/artifact dispatch.
+  return ci_inline_enabled_311 && Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF &&
+      !Ci_Observe311_Enabled && !Ci_JitGraveyardPending311 &&
+      !Ci_JitRecursionBoundary311_IsActive() &&
+      ts->interp->eval_frame == Ci_EvalFrame &&
+      ts->c_tracefunc == NULL && ts->c_profilefunc == NULL &&
+      PyFunction_Check(fn) &&
+      ((PyFunctionObject*)fn)->vectorcall == Ci_PyFunction_Vectorcall &&
+      Ci_JitShell311_CodeArtifactEntry((PyFunctionObject*)fn) == NULL;
+}
+
+#include "getattr_noexc.h"
+#define _PyDict_LoadGlobal(g,b,n) Ci_CachedLoadGlobalAt311((g),(b),(n),frame->prev_instr)
+#define PyObject_GetAttr Ci_InterpGetAttr311
+#define _PyObject_GetMethod Ci_InterpGetMethod311
+#include "ci311-attr/ceval.c"
+#undef _PyDict_LoadGlobal
+#undef PyObject_GetAttr
+#undef _PyObject_GetMethod
+#else
 #include "cinderx/Interpreter/3.11/coroutine_ceval.c"
+#endif
 #undef PyObject_Vectorcall
 #undef _PyCode_Warmup
 
