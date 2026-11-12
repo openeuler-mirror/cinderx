@@ -334,6 +334,14 @@ def test_cp311_execute_gates_propagate_failures(tmp_path):
         fake_python() {
             printf '%s\t%s\t%s\n' "$CINDERX_JIT_MODE" "$CINDERX_OSR_ENABLED" "$*"
             case " $* " in
+                *test_cinderx.test_kunpeng.test_coroutine_call_inline_311*)
+                    test "$CINDERX_REQUIRE_CORO_INLINE" = 1 || return 94
+                    test "$CINDERX_PLUGIN_ENABLE" = 1 || return 95
+                    test "$CINDERX_EVAL_MODE" = cinder || return 96
+                    test "$PYTHONJITAUTO" = 4 || return 97
+                    test "$PYTHONJITGENERATOR" = 1 || return 98
+                    test "$PYTHONJITLIGHTWEIGHTFRAME" = 0 || return 99
+                    return "$COROUTINE_RC" ;;
                 *test_cinderx.test_kunpeng.test_jit_immortalize*) return "$IMMORTAL_RC" ;;
                 *test_cinderx.test_kunpeng.test_admission_semantics_311*)
                     test "$CINDERX_PLUGIN_ENABLE" = 1 || return 90
@@ -346,7 +354,10 @@ def test_cp311_execute_gates_propagate_failures(tmp_path):
         }
         """
     ) + definition + "test_kunpeng\n"
-    for base_rc, immortal_rc, admission_rc in ((0, 0, 0), (7, 0, 0), (0, 9, 0), (0, 0, 11)):
+    for base_rc, coroutine_rc, immortal_rc, admission_rc in (
+        (0, 0, 0, 0), (7, 0, 0, 0), (0, 8, 0, 0),
+        (0, 0, 9, 0), (0, 0, 0, 11),
+    ):
         completed = subprocess.run(
             ["bash"],
             input=harness,
@@ -356,23 +367,35 @@ def test_cp311_execute_gates_propagate_failures(tmp_path):
                 **os.environ,
                 "REPO_ROOT": tmp_path.as_posix(),
                 "BASE_RC": str(base_rc),
+                "COROUTINE_RC": str(coroutine_rc),
                 "IMMORTAL_RC": str(immortal_rc),
                 "ADMISSION_RC": str(admission_rc),
             },
         )
-        assert completed.returncode == (base_rc or immortal_rc or admission_rc), completed.stderr
+        assert completed.returncode == (
+            base_rc or coroutine_rc or immortal_rc or admission_rc
+        ), completed.stderr
         calls = completed.stdout.splitlines()
-        assert len(calls) == (1 if base_rc else 2 if immortal_rc else 3), completed.stderr
+        expected_calls = 1 if base_rc else 2 if coroutine_rc else 3 if immortal_rc else 4
+        assert len(calls) == expected_calls, completed.stderr
         assert calls[0].startswith("off\t1\t"), calls
         if not base_rc:
             mode, osr, arguments = calls[1].split("\t", 2)
             assert (mode, osr) == ("execute", "0"), calls
             assert arguments.split() == [
                 "-m", "unittest", "-v",
+                "test_cinderx.test_kunpeng.test_coroutine_call_inline_311",
+                "test_cinderx.test_kunpeng.test_subprocess_setup_311",
+            ]
+        if not base_rc and not coroutine_rc:
+            mode, osr, arguments = calls[2].split("\t", 2)
+            assert (mode, osr) == ("execute", "0"), calls
+            assert arguments.split() == [
+                "-m", "unittest", "-v",
                 "test_cinderx.test_kunpeng.test_jit_immortalize",
             ]
-        if not base_rc and not immortal_rc:
-            mode, osr, arguments = calls[2].split("\t", 2)
+        if not base_rc and not coroutine_rc and not immortal_rc:
+            mode, osr, arguments = calls[3].split("\t", 2)
             assert (mode, osr) == ("execute", "0"), calls
             assert arguments.split() == [
                 "-m", "unittest", "-v",

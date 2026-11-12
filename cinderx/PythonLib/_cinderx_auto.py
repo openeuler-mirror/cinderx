@@ -235,6 +235,24 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
                     _is_process_pool_instance,
                 )
 
+    def _install_autojit_subprocess_provider(module):
+        if sys.version_info[:2] != (3, 11):
+            return
+        process = getattr(module, "Popen", None)
+        if not isinstance(process, type):
+            return
+        # Process creation and blocking wait are control-plane work, like pool
+        # setup. Do not hold this scope across __enter__: application code inside
+        # a Popen context must remain eligible for automatic compilation.
+        for attr in ("__init__", "wait"):
+            current = getattr(process, attr, None)
+            if isinstance(current, type(_install_autojit_subprocess_provider)) and getattr(
+                current, _AUTOJIT_SETUP_PROVIDER_MARKER, None
+            ) != "subprocess_popen":
+                setattr(
+                    process, attr, _cinderx._autojit_setup_wrap(current, "subprocess_popen")
+                )
+
     def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
         providers = _autojit_setup_provider_tokens(provider)
         if not providers:
@@ -261,6 +279,11 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
             module = sys.modules.get("multiprocessing.pool")
             if module is not None:
                 _install_autojit_multiprocessing_pool_provider(module)
+
+        if "subprocess_popen" in providers and fullname == "subprocess":
+            module = sys.modules.get("subprocess")
+            if module is not None:
+                _install_autojit_subprocess_provider(module)
 
     def _make_autojit_import_wrapper(original, provider):
         setup_provider = _autojit_setup_provider()
@@ -343,3 +366,4 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         _install_autojit_import_provider()
         _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
         _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+        _maybe_install_autojit_setup_provider_for_module("subprocess")

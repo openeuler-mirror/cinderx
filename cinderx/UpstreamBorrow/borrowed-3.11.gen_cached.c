@@ -1800,12 +1800,10 @@ PyObject* Ci_static_rand(PyObject* self) {
 }
 
 int init_upstream_borrow(void) {
-  const char* code_str =
-      "class GetAttr:\n"
-      "    def __getattr__(self, name): pass\n";
-
-  PyObject* code = NULL;
-  PyObject* globals = NULL;
+  PyObject* name = NULL;
+  PyObject* bases = NULL;
+  PyObject* namespace = NULL;
+  PyObject* getattr = NULL;
   PyObject* empty_dict = NULL;
   int result = -1;
 
@@ -1823,25 +1821,19 @@ int init_upstream_borrow(void) {
     goto error;
   }
 
-  code = Py_CompileString(code_str, "cinderx_getattr_init.py", Py_file_input);
-  if (code == NULL) {
+  // A heap type with __getattr__ gets CPython's native getattr hook, even
+  // when that attribute is not callable. We only capture the slot, never
+  // invoke it. Building the type directly avoids compiling and evaluating a
+  // throwaway Python class, while still asking CPython to select the slot.
+  name = PyUnicode_FromString("GetAttr");
+  bases = PyTuple_Pack(1, (PyObject*)&PyBaseObject_Type);
+  namespace = Py_BuildValue("{s:O}", "__getattr__", Py_None);
+  if (name == NULL || bases == NULL || namespace == NULL) {
     goto error;
   }
-  globals = PyDict_New();
-  if (globals == NULL) {
-    goto error;
-  }
-
-  PyObject* eval_result = PyEval_EvalCode(code, globals, globals);
-  if (eval_result == NULL) {
-    goto error;
-  }
-  Py_DECREF(eval_result);
-
-  PyObject* getattr = PyDict_GetItemString(globals, "GetAttr");
-  if (getattr == NULL || Py_TYPE(getattr) != &PyType_Type) {
-    PyErr_SetString(
-        PyExc_RuntimeError, "failed to initialize GetAttr: class not defined");
+  getattr = PyObject_CallFunctionObjArgs(
+      (PyObject*)&PyType_Type, name, bases, namespace, NULL);
+  if (getattr == NULL) {
     goto error;
   }
 
@@ -1856,8 +1848,10 @@ int init_upstream_borrow(void) {
   result = 0;
 
 error:
-  Py_XDECREF(code);
-  Py_XDECREF(globals);
+  Py_XDECREF(getattr);
+  Py_XDECREF(namespace);
+  Py_XDECREF(bases);
+  Py_XDECREF(name);
   Py_XDECREF(empty_dict);
   if (result < 0) {
     Py_CLEAR(ci_dict_version_clock);

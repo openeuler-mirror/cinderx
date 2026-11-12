@@ -1,6 +1,7 @@
 # CMake.
 
 *.cmake
+!Interpreter/3.11/coroutine_call.cmake
 CMakeCache.txt
 CMakeFiles
 _deps
