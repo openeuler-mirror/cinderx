@@ -6,13 +6,15 @@
 # none of the dev image's toolchain paths.  python3-devel is installed only
 # afterwards, strictly as a test-harness dependency for the canary evidence
 # suite.  The repo is not mounted either: only the test_cinderx test package
-# is, so every cinderx import in the kunpeng unittests resolves from the
-# installed wheel rather than a source checkout.
+# and the ci_pipeline acceptance harness are, so every cinderx import in
+# the kunpeng unittests resolves from the installed wheel rather than a
+# source checkout.
 #
 # Mounts (provided by ci_pipeline/build_cp311_wheel.py):
 #   /wheels             wheel directory, read-only
 #   /smoke/run.sh       this script
 #   /smoke/test_cinderx the unittest package, read-only
+#   /smoke/ci_pipeline  the acceptance harness, read-only
 set -Eeuo pipefail
 
 export PIP_DISABLE_PIP_VERSION_CHECK=1

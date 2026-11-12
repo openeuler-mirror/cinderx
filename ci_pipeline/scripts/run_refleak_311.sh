@@ -27,12 +27,16 @@ shift || true
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD_REQUIREMENTS="$REPO_ROOT/ci_pipeline/requirements-cp311-build.txt"
 PY_VERSION=3.11.6
-THRESHOLD=${PYTHONJITAUTO:-20}
-# -R <warmups>:<repetitions>.  regrtest reports a leak only when the
-# totals move in every repetition, so the repetitions are the judge.  Ten
-# warmups let threshold-triggered compilation settle before those measured
-# repetitions. Disable startup grace in the -R workers so delayed compilation
-# cannot first become eligible during the measured repetitions.
+# This gate measures compiled-code lifetime, not tiering latency. Compile on
+# the first eligible call so the ten -R warmups populate JIT code and caches.
+# With threshold 20, test_bool still compiles in measured repetitions 11-13;
+# those persistent initialization objects look like reference/block leaks.
+# Keep PYTHONJITAUTO as an explicit diagnostic override; production defaults
+# and the separate threshold-transition acceptance are unchanged.
+THRESHOLD=${PYTHONJITAUTO:-1}
+# Preserve CPython's original -R judge and three measured repetitions. No
+# reported leak is exempted. Disable startup grace in the -R workers so a
+# time-based delay cannot defer compilation into the measured repetitions.
 ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}
 BUILD_JOBS=${CINDERX_TEST_JOBS:-$(nproc)}
 case "$BUILD_JOBS" in
@@ -133,9 +137,9 @@ CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
   > "$WORK/probe.log" 2>&1
 cat "$WORK/probe.log"
 
-# Attestation for the -R run.  It only records; the evaluator is installed
-# by the product startup path, so what is attested is that path working,
-# not something this file did on its behalf.
+# Keep the upstream measurement driver and cache cleanup interpreted, then
+# attest both that isolation and real JIT entries in these same -R processes.
+# The shim never installs the evaluator; product startup still owns it.
 LEDGER="$WORK/refleak-trigger.log"
 : > "$LEDGER"
 START="$WORK/startup"
@@ -150,16 +154,25 @@ mkdir -p "$MODULE_LOG_DIR"
 : > "$WORK/regrtest.log"
 for MODULE in "${MODULES[@]}"; do
   MODULE_LOG="$MODULE_LOG_DIR/$MODULE.log"
+  MODULE_LEDGER="$MODULE_LOG_DIR/$MODULE.ledger"
   set +e
   env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
       CINDERX_JIT_STARTUP_GRACE_MS=0 \
-      CINDERX_REFLEAK_LEDGER="$LEDGER" \
+      CINDERX_REFLEAK_LEDGER="$MODULE_LEDGER" \
       PYTHONPATH="$START" \
     "$VENV_PY" -m test -R "$ROUNDS" "$MODULE" > "$MODULE_LOG" 2>&1
   MODULE_RC=$?
   printf '%s\n' "$MODULE_RC" > "$MODULE_LOG_DIR/$MODULE.exitcode"
   set -e
+  # Entries must belong to this module's original -R call, not startup,
+  # another module, or the observer. Keep separate ledgers for that proof.
+  if ! "$VENV_PY" -m ci_pipeline.jit311.refleak_verdict \
+      --attest "$MODULE_LEDGER" "$MODULE"; then
+    echo "refleak: $MODULE has no isolated -R process with real JIT entries"
+    exit 1
+  fi
+  awk -v module="$MODULE" '$6 == module' "$MODULE_LEDGER" >> "$LEDGER"
   if [ "$MODULE_RC" != 0 ] && [ "$MODULE_RC" != 2 ]; then
     echo "refleak: $MODULE exited abnormally ($MODULE_RC)"
     tail -30 "$MODULE_LOG"
@@ -195,6 +208,7 @@ fi
 # The proof, from the -R run itself.
 ROWS=$(grep -c . "$LEDGER" || true)
 INSTALLED=$(awk '$2 == "True"' "$LEDGER" | wc -l)
+ISOLATED=$(awk '$5 == "True"' "$LEDGER" | wc -l)
 ENTRIES=$(awk '$2 == "True" { total += $3 } END { print total + 0 }' "$LEDGER")
 echo "refleak: $ROWS attesting process(es), $INSTALLED with the evaluator" \
      "installed, $ENTRIES machine-code entries among them"
@@ -207,6 +221,10 @@ if [ "$INSTALLED" -lt 1 ]; then
   echo "CPython, so a clean -R says nothing about the JIT"
   exit 1
 fi
+if [ "$ISOLATED" -ne "$ROWS" ]; then
+  echo "refleak: the original measurement path was not interpreted in every process"
+  exit 1
+fi
 if [ "$ENTRIES" -le 0 ]; then
   echo "refleak: the -R processes installed the evaluator but never entered"
   echo "machine code; a leak in compiled-code lifetime could not have shown"
@@ -217,4 +235,5 @@ printf '{"modules":%d,"rounds":"%s","attesting_processes":%d,' \
 printf '"evaluator_installed_processes":%d,"machine_code_entries":%d,' \
   "$INSTALLED" "$ENTRIES" >> "$WORK/refleak-summary.json"
 printf '"reference_leaks":0}\n' >> "$WORK/refleak-summary.json"
+echo "refleak: $ISOLATED process(es) kept the measurement path interpreted"
 echo "refleak: -R $ROUNDS over ${#MODULES[@]} module(s), no leaks"
