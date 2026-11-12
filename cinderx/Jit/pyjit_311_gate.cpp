@@ -26,6 +26,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/3.11/cinder_opcode.h"
 #include "cinderx/Interpreter/3.11/observe.h"
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compile_budget.h"
@@ -53,6 +54,16 @@
 #if defined(__linux__)
 #include <pthread.h>
 #endif
+
+extern "C" uint64_t* const Ci_JitActiveFrames311Ptr;
+extern "C" uint8_t Ci_JitGraveyardPending311;
+
+extern "C" int Ci_JitShell311_CanUseOffEntry(void) {
+  auto* state = cinderx::getModuleState();
+  return state != nullptr && state->jit_context == nullptr &&
+      state->code_allocator == nullptr && *Ci_JitActiveFrames311Ptr == 0 &&
+      !Ci_JitGraveyardPending311 && !Ci_JitRecursionBoundary311_IsActive();
+}
 
 namespace {
 

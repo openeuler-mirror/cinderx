@@ -92,6 +92,7 @@ int Ci_EvalHook311_Install(void) {
 
   extern int Ci_PerfSupportInit311(void);
   if (Ci_PerfSupportInit311() < 0) { return -1; }
+  if (Ci_OffEntryConfigure311() < 0) { return -1; }
   _PyInterpreterState_SetEvalFrameFunc(interp, Ci_EvalFrame);
 
   // Read back rather than trusting the write: ownership is only real if the
@@ -132,6 +133,7 @@ Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
     return CI_EVAL_HOOK_ERROR;
   }
 
+  Ci_OffEntryInvalidate311();
   Ci_GlobalCacheClear311();
   if (_PyInterpreterState_GetEvalFrameFunc(interp) != Ci_EvalFrame) {
     // Someone replaced us while we were installed.  Restoring the pointer we

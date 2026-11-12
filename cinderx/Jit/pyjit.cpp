@@ -94,6 +94,7 @@ extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void);
 #endif
 #endif
 #include "cinderx/Interpreter/3.11/observe.h"
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
 extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
 #endif
 
@@ -6597,6 +6598,11 @@ int initialize() {
   }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Includes RuntimeTests force-init: revoke before any compiler capability
+  // can be created. Finalization does not re-enable the fast entry.
+  Ci_OffEntryInvalidate311();
+#endif
   getMutableConfig() = Config{};
   if (force_init.has_value()) {
     getMutableConfig().force_init = force_init;

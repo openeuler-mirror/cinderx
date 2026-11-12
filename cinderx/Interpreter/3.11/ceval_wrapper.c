@@ -134,6 +134,14 @@ int Ci_PerfSupportInit311(void) {
 }
 static inline int Ci_CallInlineOK311(PyObject* fn) {
   PyThreadState* ts = _PyThreadState_GET();
+  if (Ci_OffEntryEnabled311) {
+    // No compiler/artifacts can exist in this qualified state. Ownership and
+    // instrumentation remain dynamic and must still be checked at each call.
+    return ci_inline_enabled_311 && ts->interp->eval_frame == Ci_EvalFrame &&
+        ts->c_tracefunc == NULL && ts->c_profilefunc == NULL &&
+        PyFunction_Check(fn) &&
+        ((PyFunctionObject*)fn)->vectorcall == Ci_PyFunction_Vectorcall;
+  }
   // Only JIT-off execution is changed. All counting/compilation modes retain
   // the current dev entry path and its heat accounting/artifact dispatch.
   return ci_inline_enabled_311 && Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF &&
