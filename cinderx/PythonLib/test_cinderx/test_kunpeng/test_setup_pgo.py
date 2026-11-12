@@ -47,7 +47,7 @@ _REPOSITORY_WORKLOAD = str(
     / "pgo_train_workloads.py"
 )
 # Twelve serial scenarios, 120s each by default (see pgo_train_workloads.py).
-_WORST_CASE_DEFAULT = 12 * 120
+_WORST_CASE_DEFAULT = 19 * 120
 
 
 class PgoWorkloadTests(unittest.TestCase):
@@ -183,7 +183,7 @@ class PgoWorkloadTimeoutTests(unittest.TestCase):
                 "repository",
                 _REPOSITORY_WORKLOAD,
             ),
-            12 * 30,
+            19 * 30,
         )
 
     def test_explicit_override_is_never_below_the_worst_case(self) -> None:

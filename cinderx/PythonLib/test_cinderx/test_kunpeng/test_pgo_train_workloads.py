@@ -100,7 +100,7 @@ class PgoTrainingScenarioTests(unittest.TestCase):
         run.return_value = subprocess.CompletedProcess([], 0, "ok\n", "")
         counts = {name: 1 for name in workloads.SCENARIOS}
         workloads.run_training("/tmp/build-lib", counts, timeout=17)
-        self.assertEqual(run.call_count, 12)
+        self.assertEqual(run.call_count, len(workloads.training_plan()))
         for call in run.call_args_list:
             command = call.args[0]
             self.assertEqual(command[1], "-S")
@@ -114,11 +114,11 @@ class PgoTrainingScenarioTests(unittest.TestCase):
     def test_total_training_timeout_covers_every_scenario(self) -> None:
         self.assertEqual(
             workloads.total_training_timeout(30),
-            len(workloads.SCENARIOS) * 30,
+            len(workloads.training_plan()) * 30,
         )
         self.assertEqual(
             workloads.total_training_timeout(),
-            len(workloads.SCENARIOS) * workloads.DEFAULT_SCENARIO_TIMEOUT,
+            len(workloads.training_plan()) * workloads.DEFAULT_SCENARIO_TIMEOUT,
         )
         with self.assertRaisesRegex(ValueError, "must be positive"):
             workloads.total_training_timeout(0)
@@ -139,6 +139,29 @@ class PgoTrainingScenarioTests(unittest.TestCase):
         counts = {name: 1 for name in workloads.SCENARIOS}
         with self.assertRaisesRegex(RuntimeError, "PGO training failed"):
             workloads.run_training("/tmp/build-lib", counts)
+
+    def test_training_modes_preserve_execute_and_add_off_coverage(self):
+        with mock.patch.dict(workloads.os.environ, {"CINDERX_PGO_INTERPRETER_TRAINING": "1"}):
+            plan = workloads.training_plan()
+            self.assertEqual(plan[:12], [("execute", n) for n in workloads.SCENARIOS])
+            self.assertEqual(len(plan), 19)
+        with mock.patch.dict(workloads.os.environ, {"CINDERX_PGO_INTERPRETER_TRAINING": "0"}):
+            self.assertEqual(len(workloads.training_plan()), 12)
+            self.assertEqual(workloads.total_training_timeout(17), 12 * 17)
+        with mock.patch.dict(workloads.os.environ, {"CINDERX_PGO_INTERPRETER_TRAINING": "bad"}):
+            with self.assertRaises(ValueError):
+                workloads.training_plan()
+
+    def test_training_scrubs_inherited_runtime_policy(self):
+        environment = dict(ATTR_PATH_MODE="cinderx", CINDERX_JIT_DISABLE="1", PYTHONJITDISABLE="1")
+        workloads.configure_jit_environment(environment, {})
+        self.assertNotIn("ATTR_PATH_MODE", environment)
+        self.assertNotIn("PYTHONJITDISABLE", environment)
+        self.assertEqual(environment["CINDERX_JIT_MODE"], "execute")
+        self.assertEqual(environment["CINDERX_JIT_STARTUP_GRACE_MS"], "0")
+
+    def test_generic_attribute_training_checksum(self):
+        self.assertTrue(workloads.train_attribute_protocol(103))
 
     def test_training_module_has_no_third_party_imports(self) -> None:
         tree = ast.parse(Path(workloads.__file__).read_text(encoding="utf-8"))

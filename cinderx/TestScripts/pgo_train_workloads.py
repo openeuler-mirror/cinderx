@@ -47,6 +47,7 @@ JIT_TRAINING_ENVIRONMENT = {
     "PYTHONJITGENERATOR": "1",
     "CINDERX_OSR_ENABLED": "0",
     "PYTHONHASHSEED": "0",
+    "CINDERX_JIT_STARTUP_GRACE_MS": "0",
 }
 AUTO_JIT_THRESHOLD = int(JIT_TRAINING_ENVIRONMENT["PYTHONJITAUTO"])
 DEFAULT_SCENARIO_TIMEOUT = 120
@@ -82,8 +83,81 @@ def configure_jit_environment(
         raise RuntimeError(
             "_cinderx was imported before the training configuration was set"
         )
+    for key in list(environ):
+        if key.startswith(("ATTR_PATH_", "CINDERX_", "PYTHONJIT", "AUTO_JIT")):
+            del environ[key]
     environ.update(JIT_TRAINING_ENVIRONMENT)
     return dict(JIT_TRAINING_ENVIRONMENT)
+
+
+# Existing execute training is preserved in full. Interpreter phases use
+# generic application operations, not the held-out benchmark source code.
+INTERPRETER_SCENARIOS = (
+    "batch_records", "call_shapes", "record_processing", "stdlib_boundaries",
+    "generator_pipeline", "temporary_objects",
+)
+
+
+def training_plan() -> list[tuple[str, str]]:
+    flag = os.environ.get("CINDERX_PGO_INTERPRETER_TRAINING", "1")
+    if flag not in {"0", "1"}:
+        raise ValueError("CINDERX_PGO_INTERPRETER_TRAINING must be 0 or 1")
+    plan = [("execute", name) for name in SCENARIOS]
+    if flag == "1":
+        plan += [("off", name) for name in INTERPRETER_SCENARIOS]
+        plan += [("attribute", "attribute_protocol")]
+    return plan
+
+
+def initialize_interpreter(build_lib: str, mode: str):
+    configure_jit_environment()
+    os.environ.update(CINDERX_JIT_MODE="off", PYTHONJITDISABLE="1")
+    if mode == "attribute":
+        os.environ["ATTR_PATH_MODE"] = "cinderx"
+    sys.path.insert(0, str(Path(build_lib).resolve()))
+    import _cinderx
+    verify_extension_path(_cinderx.__file__, build_lib)
+    _cinderx.install_frame_evaluator()
+    if not _cinderx.is_frame_evaluator_installed():
+        raise RuntimeError("interpreter training did not install the evaluator")
+    status = _cinderx._attr_path_status()
+    if bool(status["no_exception"]) != (mode == "attribute"):
+        raise RuntimeError("wrong attribute training configuration")
+    if any(_cinderx._get_trigger_stats().values()):
+        raise RuntimeError("JIT activity during interpreter training")
+    return _cinderx
+
+
+class _FallbackRecord:
+    def __init__(self):
+        self.value = 7
+        self.storage = {"fallback": 11}
+        # Exercise materialized split dictionaries, not just inline values.
+        vars(self)
+
+    def __getattr__(self, name):
+        try:
+            return self.storage[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def read(self):
+        return self.value
+
+
+def train_attribute_protocol(repetitions: int) -> str:
+    records = [_FallbackRecord() for _ in range(8)]
+    total = 0
+    for i in range(repetitions):
+        record = records[i % len(records)]
+        total += record.value + record.fallback + record.read()
+        if i % 32 == 0:
+            try:
+                record.absent
+            except AttributeError:
+                total += 1
+    assert total == repetitions * 25 + (repetitions + 31) // 32
+    return f"attribute_checksum={total}"
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -642,7 +716,7 @@ def total_training_timeout(scenario_timeout: int = DEFAULT_SCENARIO_TIMEOUT) -> 
     """
     if scenario_timeout <= 0:
         raise ValueError("scenario timeout must be positive")
-    return len(SCENARIOS) * scenario_timeout
+    return len(training_plan()) * scenario_timeout
 
 
 def run_scenario(
@@ -692,7 +766,18 @@ def _run_child(
     repetitions: int,
     build_lib: str,
     scenario_timeout: int = DEFAULT_SCENARIO_TIMEOUT,
+    execution_mode: str = "execute",
 ) -> None:
+    if execution_mode != "execute":
+        _cinderx = initialize_interpreter(build_lib, execution_mode)
+        if name == "attribute_protocol":
+            detail = train_attribute_protocol(repetitions)
+        else:
+            detail = run_scenario(name, repetitions, build_lib, scenario_timeout)
+        if any(_cinderx._get_trigger_stats().values()):
+            raise RuntimeError("JIT activity during interpreter training")
+        print(f"{execution_mode}/{name}: {detail}; jit_entries=0")
+        return
     _cinderx, cinderjit = initialize_jit(build_lib)
     before = _cinderx._get_trigger_stats()["machine_code_entries"]
     deopt_before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
@@ -728,10 +813,10 @@ def run_training(
     failures = []
     started = time.perf_counter()
     print(
-        f"PGO training budget: {len(SCENARIOS)} scenarios x {timeout}s "
+        f"PGO training budget: {len(training_plan())} phases x {timeout}s "
         f"= up to {total_training_timeout(timeout)}s wall clock"
     )
-    for name in SCENARIOS:
+    for execution_mode, name in training_plan():
         command = [
             sys.executable,
             "-S",
@@ -739,7 +824,9 @@ def run_training(
             "--scenario",
             name,
             "--repetitions",
-            str(counts[name]),
+            str(counts.get(name, 300_000)),
+            "--execution-mode",
+            execution_mode,
             "--build-lib",
             str(Path(build_lib).resolve()),
             "--timeout",
@@ -769,7 +856,8 @@ def run_training(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-lib", required=True)
-    parser.add_argument("--scenario", choices=tuple(SCENARIOS))
+    parser.add_argument("--scenario", choices=(*SCENARIOS, "attribute_protocol"))
+    parser.add_argument("--execution-mode", choices=("execute", "off", "attribute"), default="execute")
     parser.add_argument("--repetitions", type=int)
     parser.add_argument(
         "--timeout",
@@ -795,6 +883,7 @@ def main() -> None:
             arguments.repetitions,
             arguments.build_lib,
             arguments.timeout,
+            arguments.execution_mode,
         )
 
 
