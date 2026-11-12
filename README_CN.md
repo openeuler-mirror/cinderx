@@ -4,6 +4,20 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 > English documentation: [README.md](README.md)
 
+## 中文使用文档
+
+首次使用建议先阅读快速入门；安装或升级前核对版本说明书中的配套环境和制品信息。源码构建、运行配置和故障处理分别见下表中的对应指南。
+
+| 文档 | 主要内容 |
+|---|---|
+| [快速入门](docs/zh/quick_start.md) | 通过最小 JIT 示例完成安装、启动和结果检查 |
+| [版本说明书](docs/zh/release_notes.md) | 发布版本、配套环境、制品、主要变更和使用限制 |
+| [编译构建指南](docs/zh/compilation_build_guide.md) | 准备开发环境、构建源码和打包 wheel |
+| [安装部署指南](docs/zh/installation_guide.md) | 获取和校验软件包，以及安装、升级、回退和卸载 |
+| [用户指南](docs/zh/user_guide.md) | 特性原理、使用场景、配置、运行维护和故障处理 |
+
+各指南中有差异的操作按 CPython 3.11、CPython 3.14 分别说明，共用流程集中描述。本文原有使用示例主要以 CPython 3.14 为例；使用 CPython 3.11 时，请按指南中的对应章节配置。
+
 ## 环境要求
 
 - Python 3.11/3.14
