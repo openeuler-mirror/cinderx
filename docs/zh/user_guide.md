@@ -57,11 +57,12 @@ JIT（即时编译器）把受支持函数的字节码转换为中间表示，�
 
 ### 选择解释器
 
-CP311 RPM 用于 openEuler SP5 AArch64 的 CPython 3.11.6；安装与维护见[安装部署指南](installation_guide.md#cpython-311-rpm)。按安装方式选择下面一行，为后续命令设置 `CINDERX_PY`：
+CP311 RPM 用于 openEuler 24.03 LTS-SP5 AArch64 的 CPython 3.11.6；安装与维护见[安装部署指南](installation_guide.md#cpython-311-rpm)。按安装方式选择下面一行，为后续命令设置 `CINDERX_PY`：
 
 | 安装方式 | 解释器设置 |
 |---|---|
 | wheel 安装到独立 venv | `CINDERX_PY="$PWD/.venv311/bin/python"` |
+| wheel 安装到 Conda 环境 | `conda activate cinderx311` 后设置 `CINDERX_PY="$(command -v python)"` |
 | RPM 安装到系统 | `CINDERX_PY=/usr/bin/python3.11` |
 | RPM 配合已创建的共享系统包 venv | `CINDERX_PY="$PWD/.venv311-rpm/bin/python"` |
 
@@ -115,10 +116,9 @@ CP311 使用普通帧，不支持 OSR 和轻量级帧执行。即使设置 `PYTH
 
 ### 启动与普通 JIT
 
-以下示例使用推荐的 CPython 3.14.3，开启分类模式，并保持普通帧和 OSR 关闭的配置：
+使用推荐的 CPython 3.14.3。wheel 安装到 venv 时，设置 `CINDERX_PY="$PWD/.venv314/bin/python"`；安装到 Conda 时，先 `conda activate cinderx314`，再设置 `CINDERX_PY="$(command -v python)"`。环境准备见[安装部署指南](installation_guide.md#cpython-314)。选择解释器后，开启分类模式，并保持普通帧和 OSR 关闭：
 
 ```bash
-CINDERX_PY="$PWD/.venv314/bin/python"
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
   "$CINDERX_PY" your_app.py
@@ -210,7 +210,7 @@ CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 \
 
 ### 检查身份与状态
 
-`CINDERX_PY` 沿用前面选择的解释器：wheel 指向安装包的 venv，CP311 RPM 指向 `/usr/bin/python3.11` 或已创建的共享系统包 venv。重新打开终端后，先将它设为该解释器的绝对路径。以下命令检查包身份和初始化状态；检查业务 JIT 状态时，还应带上对应版本的完整启动参数。
+`CINDERX_PY` 沿用前面选择的解释器：wheel 指向安装包的 venv 或 Conda 环境，CP311 RPM 指向 `/usr/bin/python3.11` 或已创建的共享系统包 venv。重新打开终端后，先将它设为该解释器的绝对路径。以下命令检查包身份和初始化状态；检查业务 JIT 状态时，还应带上对应版本的完整启动参数。
 
 ```bash
 "$CINDERX_PY" - <<'PY'

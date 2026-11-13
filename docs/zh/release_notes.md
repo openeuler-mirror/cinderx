@@ -26,21 +26,22 @@
 | 项目 | 配套信息 |
 |---|---|
 | Python | CPython 3.11.6 |
-| 操作系统 | openEuler 24.03 LTS-SP3，使用下列指定版本的发行版 Python 包 |
-| 发行版包 | `python3-3.11.6-34.oe2403sp3`；构建时使用同 NVR 的 `python3-devel` |
+| 操作系统 | openEuler 24.03 LTS-SP3 AArch64，Python 环境按下列方式二选一 |
+| 系统 Python 方式 | `python3-3.11.6-34.oe2403sp3`，可创建 venv；源码构建使用同 NVR 的 `python3-devel` |
+| Conda 方式 | CPython `3.11.6`，用于安装 wheel；系统仍需满足上述配套环境和 glibc 要求 |
 | wheel | `cinderx-2026.11.10.0-cp311-cp311-linux_aarch64.whl` |
 | 校验文件 | 同名 wheel 加 `.sha256` 后缀 |
 | 启动方式 | 插件开关、`CINDERX_EVAL_MODE=cinder`、`CINDERX_JIT_MODE=execute` 和数值阈值 |
 | 能力限制 | 不支持 `auto`／`auto:N` 行为分类、OSR 和轻量级帧执行 |
 
-该 wheel 为普通 Linux wheel，不是 CP314 fat wheel，也不承诺兼容所有提供 Python 3.11.6 的 Linux 发行版。
+该 wheel 为普通 Linux wheel，依赖 glibc 2.38 及以上。Python 环境可按安装指南选择系统 Python＋venv 或 Conda。系统动态库要求与所选 Python 环境分别检查。
 
 ### CPython 3.11 RPM
 
 | 项目 | 配套信息 |
 |---|---|
 | Python | 发行版提供的非调试 CPython 3.11.6 |
-| 操作系统与架构 | openEuler SP5，AArch64／ARM64 |
+| 操作系统与架构 | openEuler 24.03 LTS-SP5，AArch64／ARM64 |
 | RPM 包名 | `python3-cinderx` |
 | RPM 文件 | `python3-cinderx-2026.11.10.0-1.aarch64.rpm` |
 | Python 包版本 | `2026.11.10.0` |
@@ -57,7 +58,7 @@ RPM 的版本由 Python 包版本和打包发行号组成，`2026.11.10.0-1` 对
 
 | 项目 | 配套信息 |
 |---|---|
-| Python | CPython 3.14.0—3.14.3，推荐 3.14.3 |
+| Python | CPython 3.14.0—3.14.3，推荐 3.14.3；可使用已有 Python＋venv 或 Conda |
 | 操作系统 | Linux AArch64，推荐 openEuler 24.03 LTS-SP3；需满足 wheel 的平台标签和动态库依赖要求 |
 | wheel | `cinderx-2026.11.10.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl` |
 | 校验文件 | 同名 wheel 加 `.sha256` 后缀 |
@@ -118,4 +119,5 @@ RPM 的版本由 Python 包版本和打包发行号组成，`2026.11.10.0-1` 对
 | 日期 | 修改内容 | 变更原因 |
 |---|---|---|
 | 2026-11-12 | 增加五类中文资料，列出 v3.0.0 制品及开发分支后续变更 | 补齐用户资料并明确 CP311／CP314 使用边界 |
-| 2026-11-13 | 补充 CP311 RPM 的 SP5 配套、获取、部署和使用说明 | 增加 RPM 安装方式及系统解释器使用步骤 |
+| 2026-11-13 | 补充 CP311 RPM 的 openEuler 24.03 LTS-SP5 配套、获取、部署和使用说明 | 增加 RPM 安装方式及系统解释器使用步骤 |
+| 2026-11-13 | 增加 wheel 命令行取包与两种 Python 环境准备方式，调整快速入门顺序 | 便于按步骤安装、创建示例和运行 |

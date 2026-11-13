@@ -22,6 +22,18 @@ mkdir -p "$BUILD_ROOT"
 
 下文的 Docker 开发镜像预置编译器、CMake、测试和性能工具、CMake 源码依赖缓存 `/opt/cinderx-deps`，以及 Python wheelhouse `/opt/cinderx-pydeps`。源码、Dockerfile 或依赖改变后，重新构建相应镜像；挂载新源码不会自动更新镜像里已经安装的扩展。
 
+### 宿主 Python 环境
+
+宿主 Python 用于运行 `ci_pipeline/build_cp311_wheel.py` 等构建驱动。已有 Python 3.11 及以上时可直接使用；也可用 Conda 创建独立的驱动环境：
+
+```bash
+conda create -y --override-channels -c conda-forge python=3.11.6 pip -n cinderx-build
+conda activate cinderx-build
+python3 --version
+```
+
+容器内用于编译 CinderX 的 Python、头文件和工具链由对应 Dockerfile 准备。宿主 Conda 环境不改变容器中的目标解释器配置。
+
 ## CPython 3.11
 
 ### 环境要求
@@ -44,6 +56,8 @@ mkdir -p "$BUILD_ROOT"
 docker build -f Dockerfile.cp311-dev --build-arg BUILD_JOBS=8 \
   -t cinderx-dev:py311 .
 docker image inspect cinderx-dev:py311 --format '{{.Id}}'
+docker run --rm --workdir /tmp -e CINDERX_PLUGIN_ENABLE=0 cinderx-dev:py311 \
+  python3.11 -c 'import cinderx, _cinderx; assert cinderx.is_initialized(), cinderx.get_import_error(); print(cinderx.__file__, _cinderx.__file__)'
 ```
 
 镜像构建过程会安装当前源码的 CinderX。这里的 `BUILD_JOBS` 设置镜像内 `CINDERX_TEST_JOBS` 的初始值，不直接限制 CinderX wheel 编译；各阶段的并发设置见[构建并发的作用范围](#构建并发的作用范围)。
@@ -114,6 +128,8 @@ CINDERX_PLUGIN_ENABLE=0 CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 \
 ```bash
 docker build --build-arg BUILD_JOBS=8 -t cinderx-dev:py314 .
 docker image inspect cinderx-dev:py314 --format '{{.Id}}'
+docker run --rm --workdir /tmp -e CINDERX_PLUGIN_ENABLE=0 cinderx-dev:py314 \
+  python3.14 -c 'import cinderx, _cinderx; assert cinderx.is_initialized(), cinderx.get_import_error(); print(cinderx.__file__, _cinderx.__file__)'
 docker run --rm -it cinderx-dev:py314 bash
 ```
 
@@ -219,6 +235,7 @@ Python 依赖离线安装还需要完整 wheelhouse；门禁使用 `CINDERX_PIP_
 
 | 现象 | 检查与处理 |
 |---|---|
+| CP311 开发镜像隔离启动时找不到 CinderX | 发行版的 `-I` 或 `PYTHONNOUSERSITE=1` 会排除 `/usr/local` 安装目录；使用正常 site 启动，或在独立 venv 中安装 wheel |
 | 构建时找不到 Python headers 或 libpython | 确认目标解释器、headers、发行版包及 ABI 一致；CP311 重新执行锚定预检 |
 | 依赖拉取或 pip 失败 | 区分 CMake 源码缓存与 Python wheelhouse，检查固定版本、网络和镜像源 |
 | `Killed`、`cc1plus` 退出或 OOM | 先区分解释器、wheel、RuntimeTests 所处阶段，再调整该阶段的并发；参考上表并检查容器内存限额 |

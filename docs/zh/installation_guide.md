@@ -1,6 +1,6 @@
 # 安装部署指南
 
-本指南介绍 CinderX 二进制安装包（wheel、RPM）的获取、安装、升级、回退和卸载。先按系统、Python 版本和安装方式选择步骤：wheel 安装到虚拟环境，CPython 3.11 RPM 由系统软件包管理器安装。
+本指南介绍 CinderX 二进制安装包（wheel、RPM）的获取、安装、升级、回退和卸载。先按系统、Python 版本和安装方式选择步骤：wheel 安装到选定的 venv 或 Conda 环境，CPython 3.11 RPM 由系统软件包管理器安装。
 
 ## 配套版本与获取软件包
 
@@ -18,9 +18,30 @@
 | RPM 来源 | 发布方提供的 RPM 软件源；源地址待提供，也可安装已取得的本地 RPM |
 | 校验方式 | wheel 使用同一 Release 的 SHA256 文件；本地 RPM 使用配套的同名 `.sha256` 文件 |
 
+### wheel 下载方式
+
+网页下载和命令行下载任选一种，得到的文件相同。网页下载使用上面的 Release 入口；使用命令行时，先按目标 Python 选择文件名：
+
+| Python | 文件名设置 |
+|---|---|
+| CP311 | `wheel=cinderx-2026.11.10.0-cp311-cp311-linux_aarch64.whl` |
+| CP314 | `wheel=cinderx-2026.11.10.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl` |
+
+在工作目录中执行，两个下载都成功后校验：
+
+```bash
+release=v3.0.0
+base_url="https://gitcode.com/openeuler/cinderx/releases/download/$release"
+curl --fail --location --retry 3 --output "$wheel" "$base_url/$wheel" &&
+  curl --fail --location --retry 3 --output "$wheel.sha256" "$base_url/$wheel.sha256" &&
+  sha256sum -c "$wheel.sha256"
+```
+
+使用其他版本时，同时替换 Release、完整 wheel 文件名和校验文件。下面的安装步骤使用已下载并校验的本地文件。
+
 本分支的发布包与上游 PyPI 包有各自的版本和支持范围。需要本分支能力时，使用对应 Release 的明确文件；不要只执行无版本限制的 `pip install cinderx` 后假定拿到相同制品。
 
-为避免源码路径干扰已安装包的检查，以下命令在目标 Linux 主机的仓库外目录中执行，例如 `$HOME/cinderx-demo`。wheel 步骤使用 venv，`pip` 始终通过该环境的 Python 调用。RPM 步骤使用系统 `/usr/bin/python3.11`，安装、重装和卸载由具备系统软件包管理权限的用户执行。下载目录中保留准确的文件名，不用跨 Python 版本的 wheel 通配符安装。每一步成功后再继续；校验或安装失败时先处理错误。
+为避免源码路径干扰已安装包的检查，以下命令在目标 Linux 主机的仓库外目录中执行，例如 `$HOME/cinderx-demo`。wheel 步骤可选择已有 Python＋venv 或 Conda，`pip` 始终通过所选环境的 `CINDERX_PY` 调用。RPM 步骤使用系统 `/usr/bin/python3.11`，安装、重装和卸载由具备系统软件包管理权限的用户执行。下载目录中保留准确的文件名，不用跨 Python 版本的 wheel 通配符安装。每一步成功后再继续；校验或安装失败时先处理错误。
 
 包安装、重装和卸载命令显式设置 `CINDERX_PLUGIN_ENABLE=0`，避免包管理进程因继承业务环境而自动加载当前本地扩展。业务验证使用对应 Python 版本的完整启动配置，并保留默认的 site 初始化；`-S` 会跳过自动加载入口。
 
@@ -28,7 +49,7 @@
 
 本节使用 wheel；使用 RPM 时直接进入 [CPython 3.11 RPM](#cpython-311-rpm)。
 
-### 安装前检查
+### 方式一：系统 Python＋venv（推荐）
 
 支持环境为 openEuler 24.03 LTS-SP3 AArch64，使用以下指定版本的 CPython 3.11.6 发行版包。运行环境使用 `python3-3.11.6-34.oe2403sp3`；构建或使用头文件、测试 C API 时，使用版本和发行号相同的 `python3-devel`。
 
@@ -38,7 +59,7 @@ uname -m
 rpm -q python3
 test "$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' python3)" = \
   "3.11.6-34.oe2403sp3" &&
-CINDERX_PLUGIN_ENABLE=0 python3.11 - <<'PY'
+CINDERX_PLUGIN_ENABLE=0 /usr/bin/python3.11 - <<'PY'
 from pathlib import Path
 import platform
 import sys
@@ -59,6 +80,43 @@ PY
 
 确认发行版、RPM 版本、实际解释器路径与架构均符合要求。RPM 比较或 Python 检查返回非零时停止安装；其他发行版或自行编译的同号 Python 不因版本号相同就自动兼容。
 
+检查通过后创建虚拟环境，并选择该解释器：
+
+```bash
+CINDERX_PLUGIN_ENABLE=0 /usr/bin/python3.11 -m venv .venv311
+CINDERX_PY="$PWD/.venv311/bin/python"
+```
+
+### 方式二：Conda 环境（可选）
+
+已安装并初始化 Conda 时，可直接准备 CPython 3.11.6 环境。没有 Conda 时，可先安装 [Miniforge 的 Linux AArch64 版本](https://github.com/conda-forge/miniforge)。本方式用于安装 wheel；源码构建仍使用编译构建指南规定的发行版解释器、头文件和工具链。
+
+```bash
+conda create -y --override-channels -c conda-forge python=3.11.6 pip -n cinderx311
+conda activate cinderx311
+CINDERX_PY="$(command -v python)"
+getconf GNU_LIBC_VERSION
+CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" - <<'PY'
+import platform
+import sys
+import sysconfig
+
+print(sys.version)
+print(sys.executable)
+print(sysconfig.get_config_var("SOABI"))
+print("libc:", platform.libc_ver())
+if platform.python_implementation() != "CPython" or sys.version_info[:3] != (3, 11, 6):
+    raise SystemExit("Requires CPython 3.11.6")
+if platform.machine() != "aarch64" or sysconfig.get_config_var("Py_DEBUG"):
+    raise SystemExit("Requires AArch64 and a non-debug interpreter")
+libc, version = platform.libc_ver()
+if libc != "glibc" or tuple(int(x) for x in version.split(".")[:2]) < (2, 38):
+    raise SystemExit("This CP311 wheel requires glibc 2.38 or later")
+PY
+```
+
+CP311 wheel 的系统配套要求仍为 openEuler 24.03 LTS-SP3 AArch64。Conda 准备 Python 环境后，系统动态库也需满足要求；只升级环境内的 Python 不能补齐缺失的 `GLIBC_2.38`。Conda 运行环境使用自己的解释器，不套用前一方式中的 `/usr/bin/python3.11` 和发行版 RPM NVR 检查。
+
 ### 安装 wheel
 
 在 wheel 与校验文件所在目录执行：
@@ -66,13 +124,11 @@ PY
 ```bash
 wheel=cinderx-2026.11.10.0-cp311-cp311-linux_aarch64.whl
 sha256sum -c "$wheel.sha256" &&
-  CINDERX_PLUGIN_ENABLE=0 python3.11 -m venv .venv311 &&
-  VENV_PY="$PWD/.venv311/bin/python" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip install --no-index --no-deps "$wheel" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip show cinderx
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip install --no-index --no-deps "$wheel" &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip show cinderx
 ```
 
-需要相应系统包提供 `venv`／`ensurepip` 和 pip。创建环境失败时先补齐这些能力，避免把 wheel 安装到其他系统解释器。
+使用系统 Python＋venv 时，需要相应系统包提供 `venv`／`ensurepip` 和 pip；Conda 环境在创建时安装 pip。先确认 `CINDERX_PY` 指向所选环境，避免安装到其他解释器。
 
 ### 启动并验证
 
@@ -82,7 +138,7 @@ sha256sum -c "$wheel.sha256" &&
 CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
   CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
-  "$VENV_PY" hello_jit.py
+  "$CINDERX_PY" hello_jit.py
 ```
 
 CP311 的启动配置包括插件加载、帧求值器选择和 JIT 执行模式。日常使用按上例选择 `execute` 和数值调用阈值；`observe`、`shadow` 仅用于诊断。该版本不支持 `auto`／`auto:N` 行为分类、OSR 或轻量级帧执行。
@@ -91,7 +147,7 @@ CP311 的启动配置包括插件加载、帧求值器选择和 JIT 执行模式
 
 ### 安装前检查
 
-RPM 用于 openEuler SP5 AArch64，要求发行版提供的非调试 CPython 3.11.6。本包不适用于 CPython 3.14，也不适用于其他 3.11 补丁版本。运行安装不要求 `python3-devel`。
+RPM 用于 openEuler 24.03 LTS-SP5 AArch64，要求发行版提供的非调试 CPython 3.11.6。本包不适用于 CPython 3.14，也不适用于其他 3.11 补丁版本。运行安装不要求 `python3-devel`。
 
 ```bash
 cat /etc/os-release
@@ -117,7 +173,7 @@ if sysconfig.get_config_var("Py_ENABLE_SHARED") != 1:
 PY
 ```
 
-核对系统信息为目标 SP5，Python 版本、解释器路径和架构均符合要求后继续。RPM 会检查 Python 与动态库依赖；安装成功后还需执行下文的启动验证。
+核对系统信息为目标 openEuler 24.03 LTS-SP5，Python 版本、解释器路径和架构均符合要求后继续。RPM 会检查 Python 与动态库依赖；安装成功后还需执行下文的启动验证。
 
 ### 获取并安装 RPM
 
@@ -216,6 +272,25 @@ CINDERX_PLUGIN_ENABLE=0 dnf remove python3-cinderx
 
 ## CPython 3.14
 
+### 准备 Python 环境
+
+已有符合要求的 Python 时，推荐创建 venv：
+
+```bash
+CINDERX_PLUGIN_ENABLE=0 python3.14 -m venv .venv314
+CINDERX_PY="$PWD/.venv314/bin/python"
+```
+
+也可用已安装并初始化的 Conda 准备推荐的 3.14.3：
+
+```bash
+conda create -y --override-channels -c conda-forge python=3.14.3 pip -n cinderx314
+conda activate cinderx314
+CINDERX_PY="$(command -v python)"
+```
+
+下面的环境检查、安装和启动命令都使用所选解释器。RPM 不用于 CPython 3.14。
+
 ### 安装前检查
 
 发布包包含 CPython 3.14.0—3.14.3 对应的本地扩展，称为 fat wheel，推荐使用 3.14.3。目标平台为 Linux AArch64，推荐 openEuler 24.03 LTS-SP3。系统 C 库及其他动态库仍需满足 wheel 的平台和依赖要求。
@@ -223,7 +298,7 @@ CINDERX_PLUGIN_ENABLE=0 dnf remove python3-cinderx
 ```bash
 cat /etc/os-release
 uname -m
-CINDERX_PLUGIN_ENABLE=0 python3.14 - <<'PY'
+CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" - <<'PY'
 import platform
 import sys
 import sysconfig
@@ -250,10 +325,8 @@ PY
 ```bash
 wheel=cinderx-2026.11.10.0-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl
 sha256sum -c "$wheel.sha256" &&
-  CINDERX_PLUGIN_ENABLE=0 python3.14 -m venv .venv314 &&
-  VENV_PY="$PWD/.venv314/bin/python" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip install --no-index --no-deps "$wheel" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip show cinderx
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip install --no-index --no-deps "$wheel" &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip show cinderx
 ```
 
 ### 启动并验证
@@ -263,17 +336,17 @@ sha256sum -c "$wheel.sha256" &&
 ```bash
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=20 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
-  "$VENV_PY" hello_jit.py
+  "$CINDERX_PY" hello_jit.py
 ```
 
 CP314 使用上述启动参数即可。先以普通帧、OSR 关闭的配置完成基础验证，再按[用户指南](user_guide.md#cpython-314)选择其他能力。
 
 ## 安装结果与文件变化
 
-本节适用于 wheel 安装；RPM 的查询和验证见 [CPython 3.11 RPM](#cpython-311-rpm)。完成所选版本的 wheel 安装后，`VENV_PY` 指向目标虚拟环境的 Python。若重新打开终端，请先将它设为该解释器的绝对路径。以下检查适用于两个版本：
+本节适用于 wheel 安装；RPM 的查询和验证见 [CPython 3.11 RPM](#cpython-311-rpm)。完成所选版本的 wheel 安装后，`CINDERX_PY` 指向所选 venv 或 Conda 环境的 Python。若重新打开终端，请先将它设为该解释器的绝对路径。以下检查适用于两个版本：
 
 ```bash
-"$VENV_PY" - <<'PY' && CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip check
+"$CINDERX_PY" - <<'PY' && CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip check
 import importlib.metadata as metadata
 import cinderx
 
@@ -305,13 +378,13 @@ PY
 
 ## 升级与回退
 
-本节为两个 Python 版本的 wheel 维护流程，沿用目标环境的 `VENV_PY`。RPM 通过前文的 `dnf` 命令维护。业务验证仍使用前面对应版本的启动参数。升级前先阅读目标版本说明，确认目标 wheel 支持当前 Python 补丁版本和系统。
+本节为两个 Python 版本的 wheel 维护流程，沿用目标环境的 `CINDERX_PY`。RPM 通过前文的 `dnf` 命令维护。业务验证仍使用前面对应版本的启动参数。升级前先阅读目标版本说明，确认目标 wheel 支持当前 Python 补丁版本和系统。
 
 ### 保存旧环境信息
 
 ```bash
-CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip freeze > requirements-before.txt
-CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip show cinderx > cinderx-before.txt
+CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip freeze > requirements-before.txt
+CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip show cinderx > cinderx-before.txt
 ```
 
 保留原 wheel、对应校验文件、服务启动配置及业务验证结果。`pip freeze` 记录依赖版本，不替代旧 wheel 备份。优先新建环境安装候选包、验证后再切换服务，以便保留原环境回退。
@@ -325,9 +398,9 @@ NEW_WHEEL=/absolute/path/to/new/cinderx-package.whl
 OLD_WHEEL=/absolute/path/to/old/cinderx-package.whl
 
 (cd "$(dirname "$NEW_WHEEL")" && sha256sum -c "$(basename "$NEW_WHEEL").sha256") &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip install --no-index --no-deps --upgrade "$NEW_WHEEL" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip show cinderx &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip check
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip install --no-index --no-deps --upgrade "$NEW_WHEEL" &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip show cinderx &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip check
 ```
 
 如果以相同包版本替换了不同构建，pip 可能认为已经安装；确认确需替换后使用 `--force-reinstall`，并记录新旧哈希。安装完成后启动新进程，执行对应版本的 `hello_jit.py` 和业务验证，再恢复服务。
@@ -336,9 +409,9 @@ OLD_WHEEL=/absolute/path/to/old/cinderx-package.whl
 
 ```bash
 (cd "$(dirname "$OLD_WHEEL")" && sha256sum -c "$(basename "$OLD_WHEEL").sha256") &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip install --no-index --no-deps --force-reinstall "$OLD_WHEEL" &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip show cinderx &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip check
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip install --no-index --no-deps --force-reinstall "$OLD_WHEEL" &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip show cinderx &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip check
 ```
 
 恢复旧启动配置，启动新进程，并使用升级前适用于旧版本的检查验证回退结果；新增于新版本的功能不作为旧版的成功判据。如果 Python 补丁版本、系统或业务依赖也发生变化，恢复完整旧环境，不只替换 CinderX wheel。更新磁盘上的扩展文件不会替换已运行进程中加载的代码，因此升级和回退后都必须重启相关进程。
@@ -347,11 +420,11 @@ OLD_WHEEL=/absolute/path/to/old/cinderx-package.whl
 
 需要暂时关闭 JIT 时，在原启动命令中增加 `PYTHONJITDISABLE=1`，然后启动新进程。需要关闭 CinderX 的常规加载和初始化时，使用 `CINDERX_DISABLE=1`，并检查应用是否显式调用依赖 CinderX 的功能。单独移除自动插件开关只影响自动加载，应用显式导入仍需单独核对。
 
-以下命令卸载 venv 中的 wheel；RPM 使用前文的 `dnf remove python3-cinderx`。停止相关进程后执行：
+以下命令卸载所选 Python 环境中的 wheel；RPM 使用前文的 `dnf remove python3-cinderx`。停止相关进程后执行：
 
 ```bash
-CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip uninstall -y cinderx &&
-  CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" - <<'PY'
+CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" -m pip uninstall -y cinderx &&
+  CINDERX_PLUGIN_ENABLE=0 "$CINDERX_PY" - <<'PY'
 from importlib.metadata import PackageNotFoundError, version
 
 try:
@@ -369,10 +442,11 @@ PY
 
 | 现象 | 检查与处理 |
 |---|---|
+| CP311 导入提示缺少 `GLIBC_2.38` | 核对系统 C 库版本和 wheel 配套环境；创建 Conda 环境不会更换宿主系统的 glibc |
 | wheel 不支持当前平台 | 核对 `cp311`／`cp314`、AArch64、Python 补丁版本及发行版要求，不修改文件名强行安装 |
 | RPM 已安装，但 venv 中找不到包 | 使用 `/usr/bin/python3.11`，或用该解释器创建带 `--system-site-packages` 的 venv，并检查实际导入路径 |
-| RPM 安装提示依赖不满足 | 核对 SP5、AArch64、CPython 3.11.6 及配套动态库，从目标系统软件源补齐依赖 |
-| `pip` 显示已装，但运行时找不到包 | 比对 `VENV_PY`、`python -m pip show` 和实际导入路径，避免多个 Python 混用 |
+| RPM 安装提示依赖不满足 | 核对 openEuler 24.03 LTS-SP5、AArch64、CPython 3.11.6 及配套动态库，从目标系统软件源补齐依赖 |
+| `pip` 显示已装，但运行时找不到包 | 比对 `CINDERX_PY`、`python -m pip show` 和实际导入路径，避免多个 Python 混用 |
 | 本地扩展导入报 `undefined symbol`／依赖缺失 | 核对包来源、解释器 ABI 和系统动态库；保留完整错误，不从其他环境拼接扩展 |
 | CP314 加载器拒绝当前补丁版本 | 使用包实际覆盖的 3.14.0—3.14.3，或使用支持目标补丁版本的正式制品 |
 | 导入成功但 JIT 未开启 | 检查禁用变量；CP311 核对帧求值器和 `execute`，两条线均运行最小程序 |
