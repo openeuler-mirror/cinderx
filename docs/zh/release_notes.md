@@ -11,14 +11,15 @@
 | 发布日期 | 2026-11-10 |
 | 发布源码提交 | `cebb4ca7c5c46e9d9e034a9da4d7222bb6292724` |
 | wheel 包版本 | `2026.11.10.0` |
+| CP311 RPM 包版本 | `2026.11.10.0-1` |
 | 发布前一版本 | `v2.2.3` |
-| 资料核对日期 | 2026-11-12 |
+| 资料核对日期 | 2026-11-13 |
 
 发布 Tag 与 Python 包版本采用不同规则。源码构建默认生成日期型版本 `YYYY.MM.DD.PP`：日期可由 `SOURCE_DATE_EPOCH` 固定，末段补丁号由 `CINDERX_VERSION_PATCH` 指定；从源码分发包构建时则沿用其包元数据版本。因此 `v3.0.0` 安装后查询到的包版本是 `2026.11.10.0`。
 
 ## 软件版本配套信息
 
-本节分别列出 CPython 3.11 和 3.14 的发布制品。两类 wheel 不能互换，均面向 Linux AArch64；本次发布未提供 x86_64 wheel。
+本节分别列出 CPython 3.11 和 3.14 的制品及配套环境。CP311 提供 wheel 和 RPM 两种安装方式，CP314 使用 wheel；两条 Python 支持线不能互换安装包，均面向 Linux AArch64。
 
 ### CPython 3.11
 
@@ -33,6 +34,24 @@
 | 能力限制 | 不支持 `auto`／`auto:N` 行为分类、OSR 和轻量级帧执行 |
 
 该 wheel 为普通 Linux wheel，不是 CP314 fat wheel，也不承诺兼容所有提供 Python 3.11.6 的 Linux 发行版。
+
+### CPython 3.11 RPM
+
+| 项目 | 配套信息 |
+|---|---|
+| Python | 发行版提供的非调试 CPython 3.11.6 |
+| 操作系统与架构 | openEuler SP5，AArch64／ARM64 |
+| RPM 包名 | `python3-cinderx` |
+| RPM 文件 | `python3-cinderx-2026.11.10.0-1.aarch64.rpm` |
+| Python 包版本 | `2026.11.10.0` |
+| RPM 发行号 | `1` |
+| 获取方式 | 发布方提供的 RPM 软件源，地址待提供；也可安装取得的本地 RPM |
+| 本地文件校验 | 同名 RPM 加 `.sha256` 后缀 |
+| 安装位置 | 系统 `/usr/lib64/python3.11/site-packages` |
+| 使用的解释器 | `/usr/bin/python3.11`；普通 venv 默认不包含系统 RPM |
+| 启动方式与能力限制 | 与上述 CP311 wheel 相同 |
+
+RPM 的版本由 Python 包版本和打包发行号组成，`2026.11.10.0-1` 对应 Python 包版本 `2026.11.10.0`、RPM 发行号 `1`。RPM 安装与卸载由 `dnf` 管理，步骤见[安装部署指南](installation_guide.md#cpython-311-rpm)。
 
 ### CPython 3.14
 
@@ -99,3 +118,4 @@
 | 日期 | 修改内容 | 变更原因 |
 |---|---|---|
 | 2026-11-12 | 增加五类中文资料，列出 v3.0.0 制品及开发分支后续变更 | 补齐用户资料并明确 CP311／CP314 使用边界 |
+| 2026-11-13 | 补充 CP311 RPM 的 SP5 配套、获取、部署和使用说明 | 增加 RPM 安装方式及系统解释器使用步骤 |

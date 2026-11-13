@@ -1,6 +1,6 @@
 # 安装部署指南
 
-本指南介绍 CinderX 二进制安装包（wheel）的获取、安装、升级、回退和卸载。首次安装时先核对版本，再选择 CPython 3.11 或 3.14 的步骤；后面的升级和维护流程适用于两者。
+本指南介绍 CinderX 二进制安装包（wheel、RPM）的获取、安装、升级、回退和卸载。先按系统、Python 版本和安装方式选择步骤：wheel 安装到虚拟环境，CPython 3.11 RPM 由系统软件包管理器安装。
 
 ## 配套版本与获取软件包
 
@@ -12,17 +12,21 @@
 |---|---|
 | 产品版本 | `v3.0.0` |
 | wheel 元数据版本 | `2026.11.10.0` |
+| CP311 RPM 版本 | `2026.11.10.0-1`，包名 `python3-cinderx` |
 | 架构 | Linux AArch64／ARM64 |
-| 软件包来源 | `openeuler/cinderx` Release 附件 |
-| 校验方式 | 使用同一 Release 提供的 SHA256 文件 |
+| wheel 来源 | `openeuler/cinderx` Release 附件 |
+| RPM 来源 | 发布方提供的 RPM 软件源；源地址待提供，也可安装已取得的本地 RPM |
+| 校验方式 | wheel 使用同一 Release 的 SHA256 文件；本地 RPM 使用配套的同名 `.sha256` 文件 |
 
 本分支的发布包与上游 PyPI 包有各自的版本和支持范围。需要本分支能力时，使用对应 Release 的明确文件；不要只执行无版本限制的 `pip install cinderx` 后假定拿到相同制品。
 
-为避免源码路径干扰已安装包的检查，以下命令在目标 Linux 主机的仓库外目录中执行，例如 `$HOME/cinderx-demo`。使用 venv，`pip` 始终通过该环境的 Python 调用，不需要向系统 `site-packages` 写入。下载目录中保留准确的文件名，不用跨 Python 版本的 wheel 通配符安装。每一步成功后再继续；校验或安装失败时先处理错误。
+为避免源码路径干扰已安装包的检查，以下命令在目标 Linux 主机的仓库外目录中执行，例如 `$HOME/cinderx-demo`。wheel 步骤使用 venv，`pip` 始终通过该环境的 Python 调用。RPM 步骤使用系统 `/usr/bin/python3.11`，安装、重装和卸载由具备系统软件包管理权限的用户执行。下载目录中保留准确的文件名，不用跨 Python 版本的 wheel 通配符安装。每一步成功后再继续；校验或安装失败时先处理错误。
 
 包安装、重装和卸载命令显式设置 `CINDERX_PLUGIN_ENABLE=0`，避免包管理进程因继承业务环境而自动加载当前本地扩展。业务验证使用对应 Python 版本的完整启动配置，并保留默认的 site 初始化；`-S` 会跳过自动加载入口。
 
 ## CPython 3.11
+
+本节使用 wheel；使用 RPM 时直接进入 [CPython 3.11 RPM](#cpython-311-rpm)。
 
 ### 安装前检查
 
@@ -83,6 +87,133 @@ CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
 
 CP311 的启动配置包括插件加载、帧求值器选择和 JIT 执行模式。日常使用按上例选择 `execute` 和数值调用阈值；`observe`、`shadow` 仅用于诊断。该版本不支持 `auto`／`auto:N` 行为分类、OSR 或轻量级帧执行。
 
+## CPython 3.11 RPM
+
+### 安装前检查
+
+RPM 用于 openEuler SP5 AArch64，要求发行版提供的非调试 CPython 3.11.6。本包不适用于 CPython 3.14，也不适用于其他 3.11 补丁版本。运行安装不要求 `python3-devel`。
+
+```bash
+cat /etc/os-release
+uname -m
+rpm -q python3
+CINDERX_PLUGIN_ENABLE=0 /usr/bin/python3.11 - <<'PY'
+from pathlib import Path
+import platform
+import sys
+import sysconfig
+
+print(sys.version)
+print(sys.executable)
+print(sysconfig.get_config_var("SOABI"))
+if platform.python_implementation() != "CPython" or sys.version_info[:3] != (3, 11, 6):
+    raise SystemExit("Requires CPython 3.11.6")
+if Path(sys.executable).resolve() != Path("/usr/bin/python3.11").resolve():
+    raise SystemExit("Use the distribution /usr/bin/python3.11")
+if platform.machine() != "aarch64" or sysconfig.get_config_var("Py_DEBUG"):
+    raise SystemExit("Requires AArch64 and a non-debug interpreter")
+if sysconfig.get_config_var("Py_ENABLE_SHARED") != 1:
+    raise SystemExit("Requires the distribution shared libpython")
+PY
+```
+
+核对系统信息为目标 SP5，Python 版本、解释器路径和架构均符合要求后继续。RPM 会检查 Python 与动态库依赖；安装成功后还需执行下文的启动验证。
+
+### 获取并安装 RPM
+
+软件源地址由发布方提供，目前待提供。取得源配置后，按发布方说明启用该软件源，再查询可用版本并安装指定版本：
+
+```bash
+dnf list --showduplicates python3-cinderx
+CINDERX_PLUGIN_ENABLE=0 dnf install python3-cinderx-2026.11.10.0-1.aarch64
+```
+
+尚未配置软件源时，可将安装包 `python3-cinderx-2026.11.10.0-1.aarch64.rpm` 和同名 `.sha256` 文件放入工作目录，校验后从本地安装。以下 `dnf` 软件包管理命令在具备系统软件包管理权限的 shell 中执行：
+
+```bash
+rpm_file=python3-cinderx-2026.11.10.0-1.aarch64.rpm
+sha256sum -c "$rpm_file.sha256" &&
+  CINDERX_PLUGIN_ENABLE=0 dnf install "./$rpm_file" &&
+  rpm -q python3-cinderx &&
+  rpm -V python3-cinderx
+```
+
+软件包完整且未被修改时，`rpm -V` 无输出并返回 `0`。完全离线安装要求系统已经提供全部依赖，可在安装命令中增加 `--disablerepo='*'`；缺少依赖时先从配套软件源补齐，不使用 `--nodeps` 跳过检查。
+
+### 启动并验证
+
+RPM 安装到系统 `/usr/lib64/python3.11/site-packages`。先查询安装信息和实际导入位置：
+
+```bash
+rpm -q python3-cinderx
+CINDERX_PLUGIN_ENABLE=0 /usr/bin/python3.11 - <<'PY'
+from pathlib import Path
+import importlib.metadata as metadata
+import cinderx
+import _cinderx
+
+print("package version:", metadata.version("cinderx"))
+print("cinderx path:", cinderx.__file__)
+print("native path:", _cinderx.__file__)
+print("initialized:", cinderx.is_initialized())
+print("import error:", cinderx.get_import_error())
+if metadata.version("cinderx") != "2026.11.10.0":
+    raise SystemExit("Unexpected CinderX package version")
+root = Path("/usr/lib64/python3.11/site-packages")
+for module in (cinderx, _cinderx):
+    if not Path(module.__file__).resolve().is_relative_to(root):
+        raise SystemExit(f"{module.__name__} is loaded from another environment")
+if cinderx.get_import_error() is not None or not cinderx.is_initialized():
+    raise SystemExit("CinderX initialization failed")
+PY
+```
+
+准备[快速入门](quick_start.md#准备示例程序)中的 `hello_jit.py`，使用系统解释器启动新进程：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+  CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \
+  CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
+  /usr/bin/python3.11 hello_jit.py
+```
+
+成功时应看到 `initialized: True`、`import error: None`、`jit enabled: True`、`result: 3` 和 `compiled: True`。安装 RPM 不会自动为所有 Python 进程开启 JIT，业务启动时仍需设置上述参数，且保留默认的 site 初始化。
+
+### 在虚拟环境中使用系统 RPM
+
+普通 venv 默认隔离系统 `site-packages`，看不到通过 RPM 安装的 CinderX。需要在虚拟环境中复用系统 RPM 时，使用同一个发行版解释器新建允许访问系统包的环境：
+
+```bash
+CINDERX_PLUGIN_ENABLE=0 /usr/bin/python3.11 -m venv --system-site-packages .venv311-rpm
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+  CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \
+  CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
+  .venv311-rpm/bin/python hello_jit.py
+```
+
+该环境同时能访问其他系统 Python 包。需要完全隔离依赖时，选择 wheel 安装方式。RPM 管理的 CinderX 文件通过 `dnf` 维护，不在系统解释器中用 `pip` 覆盖或卸载同名包。
+
+### 重装、升级、回退与卸载
+
+维护前记录 `rpm -q python3-cinderx`、原 RPM 及其校验文件、启动配置和业务验证结果，并停止使用该包的相关进程。同版本重装可执行：
+
+```bash
+rpm_file=python3-cinderx-2026.11.10.0-1.aarch64.rpm
+sha256sum -c "$rpm_file.sha256" &&
+  CINDERX_PLUGIN_ENABLE=0 dnf reinstall "./$rpm_file" &&
+  rpm -V python3-cinderx
+```
+
+升级时使用发布方提供的新 RPM，先核对其系统、Python 配套要求并校验文件，再执行 `CINDERX_PLUGIN_ENABLE=0 dnf upgrade /absolute/path/to/new-package.rpm`。需要回退时，对保留的旧 RPM 执行相同的配套检查和校验，再执行 `CINDERX_PLUGIN_ENABLE=0 dnf downgrade /absolute/path/to/old-package.rpm`。维护后启动新进程，重新运行最小示例和业务检查。
+
+临时禁用 JIT 或 CinderX 分别使用 `PYTHONJITDISABLE=1`、`CINDERX_DISABLE=1`，含义见[用户指南](user_guide.md#通用配置与-api)。卸载使用：
+
+```bash
+CINDERX_PLUGIN_ENABLE=0 dnf remove python3-cinderx
+```
+
+随后执行 `rpm -q python3-cinderx`，应提示未安装并返回非零。在仓库外启动新的 `/usr/bin/python3.11` 进程，确认没有其他路径提供同名模块；共享系统包的 venv 也会随系统 RPM 卸载而失去该包。
+
 ## CPython 3.14
 
 ### 安装前检查
@@ -139,7 +270,7 @@ CP314 使用上述启动参数即可。先以普通帧、OSR 关闭的配置完�
 
 ## 安装结果与文件变化
 
-完成所选版本的安装后，`VENV_PY` 指向目标虚拟环境的 Python。若重新打开终端，请先将它设为该解释器的绝对路径。以下检查适用于两个版本：
+本节适用于 wheel 安装；RPM 的查询和验证见 [CPython 3.11 RPM](#cpython-311-rpm)。完成所选版本的 wheel 安装后，`VENV_PY` 指向目标虚拟环境的 Python。若重新打开终端，请先将它设为该解释器的绝对路径。以下检查适用于两个版本：
 
 ```bash
 "$VENV_PY" - <<'PY' && CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip check
@@ -174,7 +305,7 @@ PY
 
 ## 升级与回退
 
-以下流程适用于两个 Python 版本，沿用目标环境的 `VENV_PY`。业务验证仍使用前面对应版本的启动参数。升级前先阅读目标版本说明，确认目标 wheel 支持当前 Python 补丁版本和系统。
+本节为两个 Python 版本的 wheel 维护流程，沿用目标环境的 `VENV_PY`。RPM 通过前文的 `dnf` 命令维护。业务验证仍使用前面对应版本的启动参数。升级前先阅读目标版本说明，确认目标 wheel 支持当前 Python 补丁版本和系统。
 
 ### 保存旧环境信息
 
@@ -216,7 +347,7 @@ OLD_WHEEL=/absolute/path/to/old/cinderx-package.whl
 
 需要暂时关闭 JIT 时，在原启动命令中增加 `PYTHONJITDISABLE=1`，然后启动新进程。需要关闭 CinderX 的常规加载和初始化时，使用 `CINDERX_DISABLE=1`，并检查应用是否显式调用依赖 CinderX 的功能。单独移除自动插件开关只影响自动加载，应用显式导入仍需单独核对。
 
-停止相关进程后卸载：
+以下命令卸载 venv 中的 wheel；RPM 使用前文的 `dnf remove python3-cinderx`。停止相关进程后执行：
 
 ```bash
 CINDERX_PLUGIN_ENABLE=0 "$VENV_PY" -m pip uninstall -y cinderx &&
@@ -239,6 +370,8 @@ PY
 | 现象 | 检查与处理 |
 |---|---|
 | wheel 不支持当前平台 | 核对 `cp311`／`cp314`、AArch64、Python 补丁版本及发行版要求，不修改文件名强行安装 |
+| RPM 已安装，但 venv 中找不到包 | 使用 `/usr/bin/python3.11`，或用该解释器创建带 `--system-site-packages` 的 venv，并检查实际导入路径 |
+| RPM 安装提示依赖不满足 | 核对 SP5、AArch64、CPython 3.11.6 及配套动态库，从目标系统软件源补齐依赖 |
 | `pip` 显示已装，但运行时找不到包 | 比对 `VENV_PY`、`python -m pip show` 和实际导入路径，避免多个 Python 混用 |
 | 本地扩展导入报 `undefined symbol`／依赖缺失 | 核对包来源、解释器 ABI 和系统动态库；保留完整错误，不从其他环境拼接扩展 |
 | CP314 加载器拒绝当前补丁版本 | 使用包实际覆盖的 3.14.0—3.14.3，或使用支持目标补丁版本的正式制品 |
@@ -247,4 +380,4 @@ PY
 | 轻量级帧与 OSR 同开失败 | 选择一种帧／OSR 配置，见用户指南；CP311 使用普通帧 |
 | 升级后仍表现为旧版本 | 核对导入路径和包哈希，确认业务启动了新进程 |
 
-定位问题时收集所选 Release／SHA、wheel 哈希、系统和 Python 配置、启动命令及完整错误，参见[运行维护与故障处理](user_guide.md#运行维护与故障处理)。
+定位问题时收集所选 Release／SHA、wheel 或 RPM 的版本与哈希、系统和 Python 配置、启动命令及完整错误，参见[运行维护与故障处理](user_guide.md#运行维护与故障处理)。

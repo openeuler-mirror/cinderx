@@ -55,16 +55,27 @@ JIT（即时编译器）把受支持函数的字节码转换为中间表示，�
 
 ## CPython 3.11
 
+### 选择解释器
+
+CP311 RPM 用于 openEuler SP5 AArch64 的 CPython 3.11.6；安装与维护见[安装部署指南](installation_guide.md#cpython-311-rpm)。按安装方式选择下面一行，为后续命令设置 `CINDERX_PY`：
+
+| 安装方式 | 解释器设置 |
+|---|---|
+| wheel 安装到独立 venv | `CINDERX_PY="$PWD/.venv311/bin/python"` |
+| RPM 安装到系统 | `CINDERX_PY=/usr/bin/python3.11` |
+| RPM 配合已创建的共享系统包 venv | `CINDERX_PY="$PWD/.venv311-rpm/bin/python"` |
+
+普通 venv 默认无法访问系统 RPM。需要复用时，用 `/usr/bin/python3.11 -m venv --system-site-packages .venv311-rpm` 新建环境，并核对导入位置。系统 RPM 通过 `dnf` 维护，避免在相同系统目录中用 `pip` 覆盖其文件。
+
 ### 启动与执行模式
 
-以下命令使用已安装 CP311 wheel 的虚拟环境，`your_app.py` 替换为业务入口：
+设置 `CINDERX_PY` 后执行以下命令，`your_app.py` 替换为业务入口。wheel 和 RPM 使用相同的 CP311 启动参数：
 
 ```bash
-VENV_PY="$PWD/.venv311/bin/python"
 CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
   CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
-  "$VENV_PY" your_app.py
+  "$CINDERX_PY" your_app.py
 ```
 
 `CINDERX_EVAL_MODE=cinder` 选择 CinderX 帧求值器，`CINDERX_JIT_MODE=execute` 选择机器码执行模式。本例显式设置这两项，便于检查启动配置。`CINDERX_JIT_MODE` 默认是 `off`，可选模式如下：
@@ -107,10 +118,10 @@ CP311 使用普通帧，不支持 OSR 和轻量级帧执行。即使设置 `PYTH
 以下示例使用推荐的 CPython 3.14.3，开启分类模式，并保持普通帧和 OSR 关闭的配置：
 
 ```bash
-VENV_PY="$PWD/.venv314/bin/python"
+CINDERX_PY="$PWD/.venv314/bin/python"
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
-  "$VENV_PY" your_app.py
+  "$CINDERX_PY" your_app.py
 ```
 
 需要传统调用阈值调度时，将 `PYTHONJITAUTO` 改为正整数，例如 `20`。调用数达到阈值表示进入调度判断，不保证所有函数立即编译。
@@ -140,7 +151,7 @@ CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
   CINDERX_AUTOJIT_GATE_STATS=1 \
   CINDERX_AUTOJIT_GATE_STATS_FILE="$PWD/autojit-gate.jsonl" \
-  "$VENV_PY" your_app.py
+  "$CINDERX_PY" your_app.py
 ```
 
 阶段信号、运行收益退避（ROI backoff）及统计字段的完整说明见 [AutoJIT 专题](../../cinderx/Docs/README_CN.md#autojit-行为分类使用指南)。`cinderx.jit.auto()` 和 `compile_after_n_calls(N)` 配置传统调用阈值，不开启行为分类。
@@ -176,7 +187,7 @@ print(hot_loop(20_000))
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=10 \
   CINDERX_OSR_ENABLED=1 CINDERX_OSR_BACKEDGE_THRESHOLD=100 \
   PYTHONJITLIGHTWEIGHTFRAME=0 PYTHONJITDUMPHIR=1 \
-  "$VENV_PY" osr_demo.py
+  "$CINDERX_PY" osr_demo.py
 ```
 
 计算结果应为 `199990000`。HIR 日志可用于检查是否生成 `OSREntry`；确认入口实际执行及其性能收益，还需要运行时证据。禁用 JIT 后，OSR 也不会生效。
@@ -188,7 +199,7 @@ CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=10 \
 ```bash
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 \
   PYTHONJITLIGHTWEIGHTFRAME=1 CINDERX_OSR_ENABLED=0 \
-  "$VENV_PY" your_app.py
+  "$CINDERX_PY" your_app.py
 ```
 
 采用该配置启动后，`cinderjit.jit_frame_mode()` 应返回 `1`。`cinderx.is_lightweight_frames_enabled()` 只表示构建是否包含该能力，返回 `True` 不代表运行时已经启用。依赖 `sys._getframe()`、跟踪／性能分析回调（trace／profile）和异常栈的业务，还需检查相应路径的行为。
@@ -199,10 +210,10 @@ CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 \
 
 ### 检查身份与状态
 
-`VENV_PY` 沿用上面所选版本的虚拟环境解释器。重新打开终端后，先将它设为该解释器的绝对路径。以下命令检查包身份和初始化状态；检查业务 JIT 状态时，还应带上对应版本的完整启动参数。
+`CINDERX_PY` 沿用前面选择的解释器：wheel 指向安装包的 venv，CP311 RPM 指向 `/usr/bin/python3.11` 或已创建的共享系统包 venv。重新打开终端后，先将它设为该解释器的绝对路径。以下命令检查包身份和初始化状态；检查业务 JIT 状态时，还应带上对应版本的完整启动参数。
 
 ```bash
-"$VENV_PY" - <<'PY'
+"$CINDERX_PY" - <<'PY'
 import importlib.metadata as metadata
 import platform
 import sys
@@ -221,6 +232,8 @@ if cinderx.get_import_error() is not None or not cinderx.is_initialized():
 PY
 ```
 
+RPM 安装还可用 `rpm -q python3-cinderx` 查询发行版包版本，用 `rpm -V python3-cinderx` 核对文件完整性。`rpm` 查询结果与 Python 元数据、实际导入路径应对应同一份包。
+
 建议依次检查包和解释器的二进制接口（ABI）是否匹配、扩展是否初始化、JIT 是否启用、目标是否编译及执行，最后再分析性能。
 
 ### 记录日志
@@ -229,17 +242,18 @@ PY
 
 | 现象 | 下一步 |
 |---|---|
+| RPM 已装但业务进程找不到 CinderX | 检查业务实际解释器和 venv 隔离设置；使用系统 Python 或允许访问系统包的 venv |
 | 初始化失败 | 记录 `get_import_error()` 或完整启动 traceback；检查 ABI、禁用变量和参数冲突 |
 | JIT 启用但函数未编译 | 先检查阈值、函数支持范围及是否已停止自动编译；CP311 另查宽限期，CP314 另查列表和分类延后 |
 | 已编译但性能未改善 | 区分编译时间、机器码实际进入、deopt 和程序中非目标部分，不仅观察 compiled 状态 |
 | 开启帧访问或跟踪后行为变化 | 使用相同业务路径复现，记录帧模式和 trace／profile 配置 |
 | 本地扩展断言或崩溃 | 保留完整命令、退出状态、core／栈、包哈希和最小复现；恢复可用版本见安装指南 |
 
-反馈问题时附带版本／源码 SHA、系统与 Python 指纹、wheel 哈希、完整启动参数、预期与实际结果以及相关日志。日志和 core 中可能包含业务数据，分享前按业务要求处理。
+反馈问题时附带版本／源码 SHA、系统与 Python 指纹、wheel 或 RPM 的版本与哈希、完整启动参数、预期与实际结果以及相关日志。日志和 core 中可能包含业务数据，分享前按业务要求处理。
 
 ## 性能验证
 
-先确认业务结果，再比较相同硬件和资源配置下的基线与候选。记录 Python、源码／wheel 身份、JIT 模式、PGO／LTO、CPU affinity、进程／线程、预热、loops 和测量范围。
+先确认业务结果，再比较相同硬件和资源配置下的基线与候选。记录 Python、源码与安装包身份、JIT 模式、PGO／LTO、CPU affinity、进程／线程、预热、loops 和测量范围。
 
 分别评估启动时间、稳定运行时间、编译开销、内存和回退行为。最小示例不是性能结论；定向 benchmark 不替代全量或实际业务验收。使用 pyperformance 时，worker 还需继承所选版本的完整 JIT 环境。
 
