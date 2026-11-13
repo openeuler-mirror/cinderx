@@ -14,7 +14,10 @@ translation units include those patched copies.
 | 4 | `0004-jit-off-inline-call.patch` | `ceval.c` / CALL, CALL_PY_EXACT_ARGS, CALL_PY_WITH_DEFAULTS | Permit the existing inline frame path only when `Ci_CallInlineOK311()` succeeds. That guard requires JIT-off, evaluator ownership, default Python vectorcall, no trace/profile, no observer or conflicting JIT state/artifact. Parameter binding and frame construction remain upstream logic. |
 
 The fourth patch follows the third; its context is located after the global
-cache insertion.
+cache insertion. The generated wheel evaluator preserves dev's coroutine
+construction guard in generic `CALL` and `CALL_PY_EXACT_ARGS`, and additionally
+allows the JIT-off inline call path. The standalone interpreter keeps its
+coroutine-only generated source.
 
 ## Validation
 
@@ -23,8 +26,9 @@ The attribute, cache, call and startup regressions are documented in
 `test_cinderx.test_kunpeng.test_interp_patch_build_311` checks each patch and
 compares incremental outputs with a clean configure.
 
-`apply.cmake` registers all four patches in `CMAKE_CONFIGURE_DEPENDS`, so
-patch-only edits trigger configuration when invoking `cmake --build`.
+`apply.cmake` registers the pinned source files and all four patches in
+`CMAKE_CONFIGURE_DEPENDS`, so edits trigger configuration when invoking
+`cmake --build`.
 
 `apply.cmake` rejects input-hash mismatches and failed patch commands. It does
 not currently verify a post-patch hash or implement a general patch management

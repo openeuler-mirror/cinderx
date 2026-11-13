@@ -691,9 +691,15 @@ extern "C" PyObject* Ci_AttrMroStats311(void);
 static PyObject* interp_off_entry_enabled(PyObject*, PyObject*) {
   return PyBool_FromLong(Ci_OffEntryEnabled311 && Ci_EvalHook311_IsInstalled());
 }
-static PyObject* attr_mro_stats(PyObject*, PyObject*) { return Ci_AttrMroStats311(); }
-static PyObject* attr_path_status(PyObject*, PyObject*) { return Ci_AttrPathStatus311(); }
-static PyObject* attr_path_counters(PyObject*, PyObject*) { return Ci_AttrPathCounters311(); }
+static PyObject* attr_mro_stats(PyObject*, PyObject*) {
+  return Ci_AttrMroStats311();
+}
+static PyObject* attr_path_status(PyObject*, PyObject*) {
+  return Ci_AttrPathStatus311();
+}
+static PyObject* attr_path_counters(PyObject*, PyObject*) {
+  return Ci_AttrPathCounters311();
+}
 #endif
 PyObject* install_frame_evaluator(PyObject* /* mod */, PyObject* /* args */) {
   if (Ci_InitFrameEvalFunc() < 0) {
@@ -1286,11 +1292,22 @@ PyMethodDef _cinderx_methods[] = {
      PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
                "compiled-function creations and machine-code entries.")},
 #if PY_VERSION_HEX < 0x030C0000
-    {"_attr_mro_stats", attr_mro_stats, METH_NOARGS, "Type-cache qualification diagnostics."},
-    {"_interp_off_entry_enabled", interp_off_entry_enabled, METH_NOARGS,
+    {"_attr_mro_stats",
+     attr_mro_stats,
+     METH_NOARGS,
+     "Type-cache qualification diagnostics."},
+    {"_interp_off_entry_enabled",
+     interp_off_entry_enabled,
+     METH_NOARGS,
      "Whether the installed evaluator has a qualified JIT-off fast entry."},
-    {"_attr_path_status", attr_path_status, METH_NOARGS, "Attribute-path configuration."},
-    {"_attr_path_counters", attr_path_counters, METH_NOARGS, "Optional attribute-path counters, or None."},
+    {"_attr_path_status",
+     attr_path_status,
+     METH_NOARGS,
+     "Attribute-path configuration."},
+    {"_attr_path_counters",
+     attr_path_counters,
+     METH_NOARGS,
+     "Optional attribute-path counters, or None."},
 #endif
     {"install_frame_evaluator",
      install_frame_evaluator,

@@ -22,6 +22,3 @@ include cinderx/PythonLib/test_cinderx/test_kunpeng/_interp311_test_support.py
 include cinderx/PythonLib/test_cinderx/test_kunpeng/test_interp_*_311.py
 recursive-include cinderx/PythonLib/test_cinderx/test_kunpeng/fixtures/attr_path *.py *.c
 include docs/attribute-path-311.md
-include cinderx/_cinderx.version
-include cinderx/PythonLib/cinderx.pth
-include cinderx/PythonLib/_cinderx_auto.py

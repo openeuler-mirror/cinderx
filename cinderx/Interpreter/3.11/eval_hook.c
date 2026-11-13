@@ -91,8 +91,12 @@ int Ci_EvalHook311_Install(void) {
   }
 
   extern int Ci_PerfSupportInit311(void);
-  if (Ci_PerfSupportInit311() < 0) { return -1; }
-  if (Ci_OffEntryConfigure311() < 0) { return -1; }
+  if (Ci_PerfSupportInit311() < 0) {
+    return -1;
+  }
+  if (Ci_OffEntryConfigure311() < 0) {
+    return -1;
+  }
   _PyInterpreterState_SetEvalFrameFunc(interp, Ci_EvalFrame);
 
   // Read back rather than trusting the write: ownership is only real if the

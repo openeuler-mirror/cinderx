@@ -1,6 +1,8 @@
-# execute_process runs at configure time. Patch edits must trigger a new
+# execute_process runs at configure time. Input edits must trigger a new
 # configure even when the caller only invokes cmake --build.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream/ceval.c"
+  "${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream/specialize.c"
   "${CMAKE_CURRENT_LIST_DIR}/0001-specialize-getattr-only-types.patch"
   "${CMAKE_CURRENT_LIST_DIR}/0002-load-attr-with-hint-split-dict.patch"
   "${CMAKE_CURRENT_LIST_DIR}/0003-global-name-cache.patch"

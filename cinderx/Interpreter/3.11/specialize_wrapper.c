@@ -269,9 +269,10 @@ static uint32_t Ci_GetFunctionVersion_311(PyFunctionObject* function) {
 // Registration is a native trust boundary, not a Python opt-in for arbitrary
 // getters. A registered implementation must preserve GenericGetAttr hits and
 // only fall back to __getattr__ on misses. No unregistering/lifetime expiry.
-#include "cinderx/UpstreamBorrow/borrowed.h"
 #include "internal/pycore_pystate.h"
+
 #include "cinderx/Interpreter/3.11/specga.h"
+#include "cinderx/UpstreamBorrow/borrowed.h"
 int Ci_SpecGaEnabled_311;
 int Ci_SplitHintEnabled_311;
 static PyObject* ci_specga_default_getattribute;
@@ -347,10 +348,9 @@ static int Ci_IsGetattrOnlyType_311(PyTypeObject* type) {
   }
   return registered &&
       _PyType_Lookup(type, &_Py_ID(__getattribute__)) ==
-          ci_specga_default_getattribute &&
+      ci_specga_default_getattribute &&
       _PyType_Lookup(type, &_Py_ID(__getattr__)) != NULL;
 }
-
 
 #include "ci311-attr/specialize.c"
 #else

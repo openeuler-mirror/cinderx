@@ -26,13 +26,14 @@ int Ci_OffEntryConfigure311(void) {
   const char* flag = getenv("CINDERX_INTERP_OFF_ENTRY");
   Ci_OffEntryEnabled311 = 0;
   if (flag != NULL && strcmp(flag, "0") && strcmp(flag, "1")) {
-    PyErr_SetString(PyExc_ValueError, "CINDERX_INTERP_OFF_ENTRY must be 0 or 1");
+    PyErr_SetString(
+        PyExc_ValueError, "CINDERX_INTERP_OFF_ENTRY must be 0 or 1");
     return -1;
   }
   // Called only after successful, frozen mode configuration, before takeover.
   Ci_OffEntryEnabled311 = (flag == NULL || !strcmp(flag, "1")) &&
-      Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF &&
-      !Ci_Observe311_Enabled && Ci_JitShell311_CanUseOffEntry();
+      Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF && !Ci_Observe311_Enabled &&
+      Ci_JitShell311_CanUseOffEntry();
   return 0;
 }
 

@@ -93,8 +93,8 @@ extern "C" void Ci_JitShell311_SweepGraveyard(void);
 extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void);
 #endif
 #endif
-#include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
 extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
 #endif
 
