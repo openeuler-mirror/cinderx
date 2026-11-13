@@ -528,7 +528,7 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert "CINDERX_REFLEAK_PYTHON_SOURCE" in refleak_script
     assert "CINDERX_PIP_WHEELHOUSE" in refleak_script
     assert "--no-index" in refleak_script
-    assert "THRESHOLD=${PYTHONJITAUTO:-20}" in refleak_script
+    assert "THRESHOLD=${PYTHONJITAUTO:-1}" in refleak_script
     assert "ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}" in refleak_script
     assert "CINDERX_JIT_STARTUP_GRACE_MS=0" in refleak_script
     assert 'for MODULE in "${MODULES[@]}"' in refleak_script
@@ -539,6 +539,8 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert 'quickened_artifact.py' not in refleak_script
     assert 'PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}"' not in refleak_script
     assert refleak_script.count('PYTHONPATH="$START"') == 1
+    assert 'CINDERX_REFLEAK_LEDGER="$MODULE_LEDGER"' in refleak_script
+    assert '--attest "$MODULE_LEDGER" "$MODULE"' in refleak_script
 
 
 def test_cp311_container_scripts_resolve_bare_executable_names():

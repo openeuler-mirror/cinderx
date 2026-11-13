@@ -351,6 +351,7 @@ driver_selftests() {
     ci_pipeline/test_jit311_report_reasons.py \
     ci_pipeline/test_lifecycle_acceptance.py \
     ci_pipeline/test_refleak_verdict.py \
+    ci_pipeline/test_refleak_attestation.py \
     ci_pipeline/test_runtime_transition_report.py \
     ci_pipeline/test_semantic_naming.py \
     ci_pipeline/test_shutdown_stability.py \
