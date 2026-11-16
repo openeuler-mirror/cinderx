@@ -502,15 +502,23 @@ class CanaryExecute311Test(unittest.TestCase):
             def caller(fn, x):
                 return fn(x)
 
-            for _ in range(200):
-                caller(add1, 3)
+            # Production calls under our evaluator stay adaptive. Create
+            # the specialized input under stock, then restore the evaluator
+            # before compiling or executing any machine code.
+            _cinderx.remove_frame_evaluator()
+            try:
+                assert not _cinderx.is_frame_evaluator_installed()
+                for _ in range(200):
+                    assert caller(add1, 3) == 4
+            finally:
+                _cinderx.install_frame_evaluator()
+            assert _cinderx.is_frame_evaluator_installed()
             plain = [i.opname for i in dis.get_instructions(caller)]
             adaptive = [
                 i.opname for i in dis.get_instructions(caller, adaptive=True)
             ]
             specialized = [b for a, b in zip(plain, adaptive) if a != b]
-            assert any(name.startswith("CALL_") for name in specialized), (
-                specialized)
+            assert "CALL_PY_EXACT_ARGS" in specialized, specialized
 
             assert jit.force_compile_warm(caller) is True
             assert cinderjit.is_jit_compiled(caller)
