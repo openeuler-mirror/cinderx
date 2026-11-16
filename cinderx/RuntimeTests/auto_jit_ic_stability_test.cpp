@@ -72,6 +72,34 @@ TEST(AutoJitICStabilityTest, KnownNoLoopKeepsStabilityAdmission) {
       ICStabilityReason::None);
 }
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+TEST(AutoJitICStabilityTest, ShortWarmupDoesNotExtendOriginalAdmission) {
+  StructureKey key;
+  for (uint32_t limit : {0u, 1u, 2u, 8u}) {
+    EXPECT_EQ(
+        icStabilityAdmissionBypassReason(ICStabilityReason::None, key, limit),
+        ICStabilityReason::ShortWarmup);
+  }
+  EXPECT_EQ(
+      icStabilityAdmissionBypassReason(ICStabilityReason::None, key, 9),
+      ICStabilityReason::None);
+  EXPECT_EQ(
+      icStabilityAdmissionBypassReason(ICStabilityReason::None, key, 64),
+      ICStabilityReason::None);
+  key.loop_score = 1;
+  EXPECT_EQ(
+      icStabilityAdmissionBypassReason(ICStabilityReason::None, key, 2),
+      ICStabilityReason::LoopWork);
+  EXPECT_EQ(
+      icStabilityAdmissionBypassReason(ICStabilityReason::Explicit, key, 2),
+      ICStabilityReason::Explicit);
+  EXPECT_EQ(
+      icStabilityAdmissionBypassReason(ICStabilityReason::Disabled, key, 2),
+      ICStabilityReason::Disabled);
+}
+#endif
+
 TEST(AutoJitICStabilityTest, MissingStructureDoesNotInventLoopWork) {
   EXPECT_EQ(
       icStabilityAdmissionBypassReason(ICStabilityReason::None, std::nullopt),

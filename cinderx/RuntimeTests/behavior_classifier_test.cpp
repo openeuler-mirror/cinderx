@@ -89,6 +89,30 @@ class BehaviorClassifierTest : public LowRoiReleasedFixture<::testing::Test> {};
 class BehaviorClassifierRuntimeTest
     : public LowRoiReleasedFixture<RuntimeTest> {};
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+TEST_F(BehaviorClassifierTest, ReleaseQueryDoesNotSpendHeldCallBudget) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().auto_classify_low_roi_warm_calls = 8;
+  resetLowRoiReleaseState();
+  for (int i = 0; i < 32; ++i) {
+    EXPECT_FALSE(lowRoiReleaseIsActive());
+  }
+  GateContext steady_state{false};
+  StructureKey trivial{Family::Trivial};
+  for (int i = 0; i < 7; ++i) {
+    EXPECT_EQ(computeThreshold(trivial, steady_state, 2).limit, 65535);
+    EXPECT_FALSE(lowRoiReleaseIsActive());
+  }
+  EXPECT_EQ(computeThreshold(trivial, steady_state, 2).limit, 2);
+  EXPECT_TRUE(lowRoiReleaseIsActive());
+  resetLowRoiReleaseState();
+  EXPECT_FALSE(lowRoiReleaseIsActive());
+  getMutableConfig().auto_classify_low_roi_warm_calls = 0;
+  EXPECT_TRUE(lowRoiReleaseIsActive());
+}
+#endif
+
 TEST_F(BehaviorClassifierTest, LowRoiReleaseWaitsForHeldCallBudget) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().auto_classify_low_roi_warm_calls = 8;
