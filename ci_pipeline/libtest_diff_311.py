@@ -164,6 +164,9 @@ else:
         print("cinderx evaluator not installed after install call",
               file=sys.stderr)
         os._exit(78)
+    from _cinderx_test_contracts import install_dis_worker_contract
+
+    install_dis_worker_contract()
     ledger = os.environ.get("CINDERX_EXECUTE_TRIGGER_LEDGER")
     if ledger:
         # The execute differential needs proof that this arm actually ran
@@ -259,6 +262,13 @@ else:
             # the attestation proof.
             pass
 '''
+
+
+def provision_cinderx_startup(startup: Path) -> None:
+    startup.mkdir(parents=True, exist_ok=True)
+    (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE, encoding="utf-8")
+    adapters = Path(__file__).parent / "jit311/semantic_conformance_adapters.py"
+    (startup / "_cinderx_test_contracts.py").write_bytes(adapters.read_bytes())
 
 
 def read_attest(path: Path) -> tuple[int, bool]:
@@ -780,8 +790,7 @@ def provision_dual_arms(
     when an arm failed or the control was not pure.
     """
     startup = out / "startup"
-    startup.mkdir(parents=True, exist_ok=True)
-    (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
+    provision_cinderx_startup(startup)
     attest = out / arm_dir / "attest.log"
     attest.parent.mkdir(parents=True, exist_ok=True)
     for path in precreate:
@@ -1139,8 +1148,7 @@ def cmd_execute_gate(args: argparse.Namespace) -> int:
             print(f"EXECUTE-GATE: {exc}")
             return 3
         startup = out / "startup"
-        startup.mkdir(parents=True, exist_ok=True)
-        (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
+        provision_cinderx_startup(startup)
         attest = out / "execute" / "attest.log"
         ledger.parent.mkdir(parents=True, exist_ok=True)
         for path in (attest, ledger):

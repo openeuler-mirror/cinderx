@@ -127,10 +127,23 @@ def run(manifest_path: Path) -> dict:
     for family in families:
         function, invoke, expected = witnesses[family["witness"]]
         if id(function) not in warmed:
-            for _ in range(300):
-                actual = invoke()
-                if actual != expected:
-                    raise AssertionError((family["witness"], actual, expected))
+            # Ordinary calls stay adaptive under our evaluator. Warm this
+            # witness under the stock evaluator so the compiler still has
+            # to consume a real CALL_PY_EXACT_ARGS input after restoration.
+            stock_call = family["witness"] == "call-python-exact"
+            if stock_call:
+                assert _cinderx.is_frame_evaluator_installed()
+                _cinderx.remove_frame_evaluator()
+                assert not _cinderx.is_frame_evaluator_installed()
+            try:
+                for _ in range(300):
+                    actual = invoke()
+                    if actual != expected:
+                        raise AssertionError((family["witness"], actual, expected))
+            finally:
+                if stock_call:
+                    _cinderx.install_frame_evaluator()
+                    assert _cinderx.is_frame_evaluator_installed()
             warmed.add(id(function))
 
         adaptive = [
