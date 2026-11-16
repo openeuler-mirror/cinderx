@@ -2,7 +2,7 @@
 
 本指南介绍CinderX的主要功能、适用场景、配置方法和故障处理。先按CPython版本选择运行配置，再根据需要查看诊断和性能验证方法。下文将CPython 3.11、3.14分别简称为CP311、CP314。
 
-首次使用建议先完成[快速入门](quick_start.md)；安装、升级和环境管理见[安装部署指南](installation_guide.md)。本文对应的源码基线和发布包信息见[版本说明书](release_notes.md)。
+首次使用建议先完成[快速入门](quick_start.md)；安装、升级和环境管理见[安装部署指南](installation_guide.md)。本文对应的源码基线和发布包信息见[版本说明书](https://gitcode.com/openeuler/cinderx/releases)。
 
 ## 特性、架构与适用场景
 
