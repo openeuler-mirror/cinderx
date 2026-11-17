@@ -168,6 +168,7 @@ def smoke(runtime_image: str, out_dir: Path) -> None:
             "-v", f"{out_dir}:/wheels:ro",
             "-v", f"{scripts / 'smoke_cp311_wheel_in_runtime.sh'}:/smoke/run.sh:ro",
             "-v", f"{tests}:/smoke/test_cinderx:ro",
+            "-v", f"{REPO_ROOT / 'ci_pipeline'}:/smoke/ci_pipeline:ro",
             "-w", "/smoke",
             runtime_image,
             "bash", "/smoke/run.sh",

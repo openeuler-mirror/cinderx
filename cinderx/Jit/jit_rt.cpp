@@ -836,6 +836,19 @@ int64_t JITRT_ExcMatch311(PyObject*, PyObject*) {
 }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+// Generated prologues already know the artifact whose entry they are in.
+// Capture that target before binding can run Python or replace __code__.
+// Standalone synthetic code with no CompiledFunction keeps the old resolver.
+static vectorcallfunc argumentReentryForRuntime311(
+    PyFunctionObject* func,
+    jit::CodeRuntime* runtime) {
+  auto* compiled = runtime == nullptr ? nullptr : runtime->compiledFunction();
+  return compiled == nullptr ? JITRT_CAPTURE_REENTRY(func)
+                             : JITRT_GET_REENTRY(compiled->vectorcallEntry());
+}
+#endif
+
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
 // arguments.   We then turn around and dispatch to the
 // JITed function with the newly packed args.
@@ -844,6 +857,16 @@ int64_t JITRT_ExcMatch311(PyObject*, PyObject*) {
 // duplicate / unexpected keyword) falls back to the interpreter with
 // the original vectorcall layout.  A pending exception is returned
 // immediately and is never replayed.
+// Only CP311/AArch64 splits out the binding body. Its entry wrappers own the
+// activation, covering reentry capture as well as the body's reference cleanup.
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+static PyObject* callWithKeywordArgsAtReentry(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    vectorcallfunc reentry) {
+#else
 PyObject* JITRT_CallWithKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
@@ -851,6 +874,7 @@ PyObject* JITRT_CallWithKeywordArgs(
     PyObject* kwnames) {
   [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
+#endif
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
@@ -1005,6 +1029,29 @@ PyObject* JITRT_CallWithKeywordArgs(
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+PyObject* JITRT_CallWithKeywordArgs(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  PrologueActivation311 activation;
+  return callWithKeywordArgsAtReentry(
+      func, args, nargsf, kwnames, JITRT_CAPTURE_REENTRY(func));
+}
+
+PyObject* JITRT_CallWithKeywordArgsAtEntry311(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    jit::CodeRuntime* runtime) {
+  PrologueActivation311 activation;
+  return callWithKeywordArgsAtReentry(
+      func, args, nargsf, kwnames, argumentReentryForRuntime311(func, runtime));
+}
+#endif
+
 using staticvectorcallfunc = JITRT_StaticCallReturn (*)(
     PyObject* callable,
     PyObject* const* args,
@@ -1078,6 +1125,19 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
       (PyObject*)defaulted_args);
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+#ifdef _WIN32
+static PyObject*
+#else
+static JITRT_StaticCallReturn
+#endif
+callWithIncorrectArgcountAtReentry(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    int argcount,
+    vectorcallfunc reentry) {
+#else
 #ifdef _WIN32
 PyObject*
 #else
@@ -1090,6 +1150,7 @@ JITRT_CallWithIncorrectArgcount(
     int argcount) {
   [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
+#endif
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
@@ -1162,6 +1223,38 @@ JITRT_CallWithIncorrectArgcount(
       (PyObject*)defaulted_args);
 #endif
 }
+
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+#ifdef _WIN32
+PyObject*
+#else
+JITRT_StaticCallReturn
+#endif
+JITRT_CallWithIncorrectArgcount(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    int argcount) {
+  PrologueActivation311 activation;
+  return callWithIncorrectArgcountAtReentry(
+      func, args, nargsf, argcount, JITRT_CAPTURE_REENTRY(func));
+}
+
+JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcountAtEntry311(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    int argcount,
+    jit::CodeRuntime* runtime) {
+  PrologueActivation311 activation;
+  return callWithIncorrectArgcountAtReentry(
+      func,
+      args,
+      nargsf,
+      argcount,
+      argumentReentryForRuntime311(func, runtime));
+}
+#endif
 
 bool JITRT_PackStaticArgs(
     PyObject** args,
@@ -5687,6 +5780,14 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
   return BindKwStatus::Bound;
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+static PyObject* callWithKeywordArgsSimpleAtReentry(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    vectorcallfunc reentry) {
+#else
 PyObject* JITRT_CallWithKeywordArgsSimple(
     PyFunctionObject* func,
     PyObject** args,
@@ -5694,6 +5795,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     PyObject* kwnames) {
   [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
+#endif
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   JIT_DCHECK(
       !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)),
@@ -5730,3 +5832,26 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
 }
+
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+PyObject* JITRT_CallWithKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  PrologueActivation311 activation;
+  return callWithKeywordArgsSimpleAtReentry(
+      func, args, nargsf, kwnames, JITRT_CAPTURE_REENTRY(func));
+}
+
+PyObject* JITRT_CallWithKeywordArgsSimpleAtEntry311(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    jit::CodeRuntime* runtime) {
+  PrologueActivation311 activation;
+  return callWithKeywordArgsSimpleAtReentry(
+      func, args, nargsf, kwnames, argumentReentryForRuntime311(func, runtime));
+}
+#endif

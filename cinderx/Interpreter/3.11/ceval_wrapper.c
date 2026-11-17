@@ -20,6 +20,7 @@
 #include "internal/pycore_opcode.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Interpreter/3.11/coroutine_call.h"
 #include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
 #include "cinderx/Interpreter/3.11/interpreter_internal.h"
 
@@ -113,7 +114,7 @@ static inline void Ci_CodeWarmup_311(PyCodeObject* code) {
 #define _PyCode_Warmup Ci_CodeWarmup_311
 
 #define PyObject_Vectorcall Ci_PyObject_Vectorcall_311
-#include "upstream/ceval.c"
+#include "cinderx/Interpreter/3.11/coroutine_ceval.c"
 #undef PyObject_Vectorcall
 #undef _PyCode_Warmup
 

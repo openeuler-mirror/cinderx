@@ -512,6 +512,12 @@ if (${PY_VERSION} EQUAL 3.11)
     ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
   )
   if (${ENABLE_INTERPRETER_LOOP})
+    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/coroutine_call.cmake)
+    cinderx_generate_coroutine_ceval_311("${GENERATED_HEADER_DIR}")
+    set_property(
+      SOURCE ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
+      APPEND PROPERTY INCLUDE_DIRECTORIES
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
     set(INTERP_SOURCES
       ${INTERP_SOURCES}
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c

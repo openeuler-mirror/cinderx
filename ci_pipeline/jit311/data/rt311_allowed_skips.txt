@@ -1,6 +1,8 @@
 # Capability-gated CPython 3.11 RuntimeTests skips (shadow-only, generators,
 # slots, later MRs).  Census refuses any skip not listed here.  Green-family
 # tests must not appear.  C byte order.
+ASMGeneratorTest.Aarch64PointerLiteralPoolUsesNaturalAlignment
+ASMGeneratorTest.BindingEntryTailStubsPreserveCallSlots311
 ASMGeneratorTest.CallBoundMethod
 ASMGeneratorTest.CallCFunction
 ASMGeneratorTest.CallPythonFunction
@@ -63,6 +65,9 @@ AutoJit311Test.OuterFunctionAnchorsTheNestedArtifact
 AutoJit311Test.OuterRowsAreErasedAcrossACodeSwap
 AutoJit311Test.SizeRefusalIsNotInheritedByLaterRequests
 AutoJit311Test.UncompilingOneMemberRetiresTheArtifactForAll
+AutoJit311Test.ZeroAttachBudgetByCodeRunsInsideSuppressedScopes
+AutoJit311Test.ZeroAttachBudgetCachedEntryRechecksCodeAndRetirement
+AutoJit311Test.ZeroAttachBudgetInvokesByCodeWithoutAttaching
 BackendTest.ExplicitLIRSubKeepsRhsRegisterLiveAcrossOutputDefine
 CodePatcherTest.DeoptPatch
 DeoptSite311Test.ForcedAndOrganicEnterTheSameRestore

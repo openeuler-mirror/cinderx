@@ -1,7 +1,7 @@
 {
   "format": "cp311-stdlib-canary-deopts-v1",
   "python": "3.11.6",
-  "baseline_source": "591e1fb2c0ccdb16aba3e6256d76153f666b13d4",
+  "baseline_source": "8748dac8fa71c0719b3efe62be583158ff8232a0",
   "total": 358,
   "sites": [
     {
@@ -284,5 +284,8 @@
       "resume_offset": 66,
       "count": 1
     }
-  ]
+  ],
+  "stdlib_sources": {
+    "ipaddress.py": "c4a22d96741ef70d49120cd31f942a35094e666021af9b663446bd68dacdb9bd"
+  }
 }

@@ -48,6 +48,11 @@ def install_hook() -> None:
 
     cinderx.init()
     _cinderx.install_frame_evaluator()
+    from ci_pipeline.jit311.semantic_conformance_adapters import (
+        install_dis_worker_contract,
+    )
+
+    install_dis_worker_contract()
     cinderjit._jit311_reset_entry_ledger()
 
     def ownership() -> dict:

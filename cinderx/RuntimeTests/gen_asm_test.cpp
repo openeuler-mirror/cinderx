@@ -7,13 +7,19 @@
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/builder.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 #include "cinderx/module_state.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace asmjit;
 using namespace jit;
@@ -38,6 +44,349 @@ class ASMGeneratorTest : public RuntimeTest {
         func_obj, key, std::move(*compiled_func));
   }
 };
+
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+TEST_F(ASMGeneratorTest, BindingEntryTailStubsPreserveCallSlots311) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  auto check_binding_tail = [&](const CompiledFunction& artifact,
+                                std::initializer_list<uint64_t> helpers,
+                                bool checks_argcount) {
+    auto bytes = artifact.codeBuffer();
+    auto read = [&](size_t offset) {
+      uint32_t instruction;
+      std::memcpy(&instruction, bytes.data() + offset, sizeof(instruction));
+      return instruction;
+    };
+    size_t code_end = bytes.size();
+    for (size_t offset = 0; offset + 4 <= code_end; offset += 4) {
+      const uint32_t instruction = read(offset);
+      if ((instruction & 0xff000000u) == 0x58000000u) {
+        int32_t immediate = (instruction >> 5) & 0x7ffff;
+        if (immediate & 0x40000) {
+          immediate -= 0x80000;
+        }
+        const int64_t literal =
+            static_cast<int64_t>(offset) + static_cast<int64_t>(immediate) * 4;
+        if (literal > static_cast<int64_t>(offset) &&
+            static_cast<uint64_t>(literal) <= bytes.size() - 8) {
+          code_end = std::min(code_end, static_cast<size_t>(literal));
+        }
+      }
+    }
+    auto pointer_move = [&](size_t& cursor, unsigned reg, uint64_t& value) {
+      if (cursor + 4 > code_end) {
+        return false;
+      }
+      uint32_t instruction = read(cursor);
+      const uint32_t opcode = instruction & 0x7f800000u;
+      if ((instruction & 31u) != reg ||
+          (opcode != 0x52800000u && opcode != 0x12800000u)) {
+        return false; // MOVZ/MOVN starts the pointer materialization.
+      }
+      bool wide = (instruction & 0x80000000u) != 0;
+      const unsigned shift = ((instruction >> 21) & 3u) * 16;
+      if (!wide && shift >= 32) {
+        return false;
+      }
+      value = static_cast<uint64_t>((instruction >> 5) & 0xffffu) << shift;
+      if (opcode == 0x12800000u) {
+        value = ~value;
+      }
+      value &= wide ? ~uint64_t{0} : uint64_t{0xffffffff};
+      cursor += 4;
+      while (cursor + 4 <= code_end) {
+        instruction = read(cursor);
+        if ((instruction & 0x7f800000u) != 0x72800000u ||
+            (instruction & 31u) != reg) {
+          break;
+        }
+        wide = (instruction & 0x80000000u) != 0;
+        const unsigned part_shift = ((instruction >> 21) & 3u) * 16;
+        if (!wide && part_shift >= 32) {
+          return false;
+        }
+        value = (value & ~(uint64_t{0xffff} << part_shift)) |
+            (static_cast<uint64_t>((instruction >> 5) & 0xffffu) << part_shift);
+        // AsmJit encodeMovSequence32 can emit MOVZ Xreg + MOVK Wreg for
+        // low-address pointers. Every W write zero-extends the full Xreg;
+        // a later MOVK Xreg may then populate its upper halfwords again.
+        value &= wide ? ~uint64_t{0} : uint64_t{0xffffffff};
+        cursor += 4;
+      }
+      return true;
+    };
+    std::vector<std::pair<uint64_t, size_t>> calls;
+    for (size_t offset = 0; offset + 4 <= code_end; offset += 4) {
+      size_t cursor = offset;
+      uint64_t runtime = 0;
+      uint64_t helper = 0;
+      if (!pointer_move(cursor, 4, runtime) ||
+          !pointer_move(cursor, 16, helper) || cursor + 4 > code_end ||
+          read(cursor) != 0xd61f0200u || // BR X16: no extra frame/LR write.
+          std::find(helpers.begin(), helpers.end(), helper) == helpers.end()) {
+        continue;
+      }
+      EXPECT_EQ(runtime, reinterpret_cast<uint64_t>(artifact.runtime()));
+      size_t references = 0;
+      size_t caller = bytes.size();
+      for (size_t pc = 0; pc + 12 <= offset; pc += 4) {
+        const uint32_t instruction = read(pc);
+        if ((instruction & 0xfc000000u) != 0x94000000u) {
+          continue;
+        }
+        int64_t immediate = instruction & 0x03ffffffu;
+        if (immediate & 0x02000000) {
+          immediate -= 0x04000000;
+        }
+        if (static_cast<int64_t>(pc) + immediate * 4 !=
+            static_cast<int64_t>(offset)) {
+          continue;
+        }
+        ++references;
+        caller = pc;
+        EXPECT_EQ(read(pc + 4), 0xd503201fu)
+            << "local BL must keep its NOP slot";
+        EXPECT_EQ(read(pc + 8) & 0xfc000000u, 0x14000000u)
+            << "the eight-byte call must be followed by the prologue-exit jump";
+      }
+      EXPECT_EQ(references, 1u);
+      calls.emplace_back(helper, caller);
+    }
+    ASSERT_EQ(calls.size(), helpers.size());
+    for (uint64_t helper : helpers) {
+      EXPECT_EQ(
+          std::count_if(
+              calls.begin(),
+              calls.end(),
+              [&](const auto& call) { return call.first == helper; }),
+          1);
+    }
+    if (checks_argcount) {
+      ASSERT_EQ(calls.size(), 2u);
+      std::sort(calls.begin(), calls.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second;
+      });
+      const size_t wrong_count = calls[1].second;
+      // Two BL+NOP+exit-jump slots separated by MOV argc/CMP/B.EQ. No x4
+      // materialization remains before the body, preserving the old 24B gap.
+      EXPECT_EQ(wrong_count - calls[0].second, 24u);
+      ASSERT_GE(wrong_count, 4u);
+      const uint32_t branch = read(wrong_count - 4);
+      ASSERT_EQ(branch & 0xff00001fu, 0x54000000u); // B.EQ
+      int32_t immediate = (branch >> 5) & 0x7ffff;
+      if (immediate & 0x40000) {
+        immediate -= 0x80000;
+      }
+      EXPECT_EQ(
+          static_cast<int64_t>(wrong_count - 4) +
+              static_cast<int64_t>(immediate) * 4,
+          static_cast<int64_t>(wrong_count + 12));
+    }
+  };
+  const char* binding_source = R"(
+def binding_simple(first, second=9):
+    return first + second
+def binding_general(first, *, second=9):
+    return first + second
+def binding_variadic(first, *rest, **kwargs):
+    return first + len(rest) + len(kwargs)
+)";
+  Ref<PyObject> simple(compileAndGet(binding_source, "binding_simple"));
+  ASSERT_NE(simple, nullptr);
+  auto simple_code = GenerateCode(simple);
+  ASSERT_NE(simple_code, nullptr);
+  check_binding_tail(
+      *simple_code.get(),
+      {reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsSimpleAtEntry311),
+       reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountAtEntry311)},
+      true);
+  auto four = Ref<>::steal(PyLong_FromLong(4));
+  auto five = Ref<>::steal(PyLong_FromLong(5));
+  ASSERT_NE(four, nullptr);
+  ASSERT_NE(five, nullptr);
+  PyObject* default_args[] = {four};
+  auto entry_before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto default_result =
+      Ref<>::steal(simple_code->invoke(simple, default_args, 1));
+  ASSERT_NE(default_result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(default_result), 13);
+  EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
+  auto second_name = Ref<>::steal(PyUnicode_FromString("second"));
+  ASSERT_NE(second_name, nullptr);
+  auto names = Ref<>::steal(PyTuple_Pack(1, second_name.get()));
+  ASSERT_NE(names, nullptr);
+  PyObject* keyword_args[] = {four, five};
+  entry_before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto keyword_result = Ref<>::steal(
+      simple_code->vectorcallEntry()(simple, keyword_args, 1, names));
+  ASSERT_NE(keyword_result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(keyword_result), 9);
+  EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
+  for (const char* name : {"binding_general", "binding_variadic"}) {
+    Ref<PyObject> owner(getGlobal(name));
+    auto artifact = GenerateCode(owner);
+    ASSERT_NE(artifact, nullptr);
+    check_binding_tail(
+        *artifact.get(),
+        {reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsAtEntry311)},
+        false);
+    entry_before = jit::triggerStatsSnapshot().machine_code_entries;
+    auto answer = Ref<>::steal(artifact->invoke(owner, default_args, 1));
+    ASSERT_NE(answer, nullptr);
+    EXPECT_EQ(
+        PyLong_AsLong(answer),
+        std::strcmp(name, "binding_general") == 0 ? 13 : 4);
+    EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
+  }
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(ASMGeneratorTest, Aarch64PointerLiteralPoolUsesNaturalAlignment) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  const auto saved = getConfig();
+  SCOPE_EXIT(getMutableConfig() = saved);
+  // These functions use the production contiguous text layout. Split sections
+  // have their own allocation/section-offset contract and are not needed to
+  // reproduce an odd instruction count before this shared literal pool.
+  getMutableConfig().multiple_code_sections = false;
+  size_t total_literal_sites = 0;
+  auto check_literals = [&](const CompiledFunction& compiled) {
+    auto code = compiled.codeBuffer();
+    ASSERT_GE(code.size(), sizeof(uint64_t));
+    auto read_word = [&](size_t offset) {
+      uint32_t word;
+      std::memcpy(&word, code.data() + offset, sizeof(word));
+      return word;
+    };
+    size_t instruction_end = code.size();
+    size_t literal_sites = 0;
+    size_t unaligned_sites = 0;
+    size_t first_unaligned = code.size();
+    for (size_t offset = 0; offset + sizeof(uint32_t) <= instruction_end;
+         offset += sizeof(uint32_t)) {
+      const uint32_t word = read_word(offset);
+      // LDR Xt, label: opc=01, V=0, fixed 011000, signed imm19 at 23:5.
+      // Its PC is this instruction's address, and the displacement is imm19*4.
+      if ((word & 0xff000000u) != 0x58000000u) {
+        continue;
+      }
+      int32_t immediate = (word >> 5) & 0x7ffff;
+      if (immediate & 0x40000) {
+        immediate -= 0x80000;
+      }
+      const int64_t target =
+          static_cast<int64_t>(offset) + static_cast<int64_t>(immediate) * 4;
+      if (target < 0 ||
+          static_cast<uint64_t>(target) > code.size() - sizeof(uint64_t)) {
+        continue; // A literal outside this artifact is not its local pool.
+      }
+      ASSERT_GT(target, static_cast<int64_t>(offset));
+      // All env.const_pool_labels entries are referenced by LDR X and emitted
+      // after executable code. The smallest forward target is therefore the
+      // data boundary. Stop there rather than decode pointer data as opcodes.
+      instruction_end = std::min(instruction_end, static_cast<size_t>(target));
+      ++literal_sites;
+      const uintptr_t address = reinterpret_cast<uintptr_t>(code.data()) +
+          static_cast<uintptr_t>(target);
+      if (address % alignof(uint64_t) != 0) {
+        ++unaligned_sites;
+        first_unaligned =
+            std::min(first_unaligned, static_cast<size_t>(target));
+      }
+    }
+    EXPECT_GT(literal_sites, 0u);
+    EXPECT_EQ(unaligned_sites, 0u)
+        << "code size=" << code.size() << " pool offset=" << instruction_end
+        << " first unaligned literal=" << first_unaligned;
+    total_literal_sites += literal_sites;
+  };
+
+  runCode("def literal_supplier(): return 17\n");
+  const char* sources[] = {
+      "def literal_owner(callee, value): return callee()\n",
+      "def literal_owner(callee, value): return callee(value)\n",
+      "def literal_owner(callee, value): return callee(value, 3)\n",
+      "def literal_owner(value, fallback): return value.get('aligned', "
+      "fallback)\n",
+  };
+  auto seventeen = Ref<>::steal(PyLong_FromLong(17));
+  auto negative = Ref<>::steal(PyLong_FromLong(-17));
+  auto mapping = Ref<>::steal(PyDict_New());
+  ASSERT_NE(seventeen, nullptr);
+  ASSERT_NE(negative, nullptr);
+  ASSERT_NE(mapping, nullptr);
+  ASSERT_EQ(PyDict_SetItemString(mapping, "aligned", seventeen), 0);
+  for (size_t i = 0; i < 4; ++i) {
+    SCOPED_TRACE(i);
+    Ref<PyObject> owner(compileAndGet(sources[i], "literal_owner"));
+    ASSERT_NE(owner, nullptr);
+    auto compiled = GenerateCode(owner);
+    ASSERT_NE(compiled, nullptr);
+    check_literals(*compiled.get());
+    // Dynamic ordinary callees emit the non-function dispatch stub even when
+    // a particular invocation supplies a Python function or a static type.
+    Ref<> callee = i == 0 ? getGlobal("literal_supplier")
+        : i == 1
+        ? Ref<>::create(PyDict_GetItemString(PyEval_GetBuiltins(), "abs"))
+        : Ref<>::create(PyDict_GetItemString(PyEval_GetBuiltins(), "max"));
+    ASSERT_NE(callee, nullptr);
+    PyObject* args[] = {
+        i == 3 ? mapping.get() : callee.get(),
+        i == 1 ? negative.get() : seventeen.get()};
+    const auto entries_before =
+        jit::triggerStatsSnapshot().machine_code_entries;
+    auto result = Ref<>::steal(compiled->invoke(owner, args, 2));
+    ASSERT_NE(result, nullptr);
+    EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entries_before);
+    EXPECT_EQ(PyLong_AsLong(result), 17);
+    EXPECT_EQ(PyErr_Occurred(), nullptr);
+  }
+
+  const char* sparse_source = R"(
+from array import array
+y = array('d', [0.0, 0.0])
+val = array('d', [2.0, 3.0, 4.0])
+row = array('i', [0, 2, 3])
+col = array('i', [0, 1, 0])
+x = array('d', [5.0, 7.0])
+def sparse_literal_owner(M, y, val, row, col, x, num_iterations):
+    for _ in range(num_iterations):
+        for r in range(M):
+            total = 0.0
+            for i in range(row[r], row[r + 1]):
+                total += x[col[i]] * val[i]
+            y[r] = total
+    return y
+)";
+  Ref<PyObject> sparse(compileAndGet(sparse_source, "sparse_literal_owner"));
+  ASSERT_NE(sparse, nullptr);
+  auto compiled_sparse = GenerateCode(sparse);
+  ASSERT_NE(compiled_sparse, nullptr);
+  check_literals(*compiled_sparse.get());
+  auto two = Ref<>::steal(PyLong_FromLong(2));
+  auto y = getGlobal("y");
+  auto values = getGlobal("val");
+  auto rows = getGlobal("row");
+  auto columns = getGlobal("col");
+  auto x = getGlobal("x");
+  PyObject* sparse_args[] = {two, y, values, rows, columns, x, two};
+  const auto entries_before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto result = Ref<>::steal(compiled_sparse->invoke(sparse, sparse_args, 7));
+  ASSERT_NE(result, nullptr);
+  EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entries_before);
+  EXPECT_EQ(result.get(), y.get());
+  auto first = Ref<>::steal(PySequence_GetItem(result, 0));
+  auto second = Ref<>::steal(PySequence_GetItem(result, 1));
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(PyFloat_AsDouble(first), 31.0);
+  EXPECT_EQ(PyFloat_AsDouble(second), 20.0);
+  EXPECT_GE(total_literal_sites, 12u);
+  RecordProperty(
+      "literal_sites_checked", static_cast<int>(total_literal_sites));
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+#endif // PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
 
 #if PY_VERSION_HEX < 0x030C0000
 class ShadowCompileTest : public RuntimeTest {};

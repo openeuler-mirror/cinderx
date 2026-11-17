@@ -1573,23 +1573,36 @@ extern "C" PyObject* Ci_JitShell311_CodeArtifactVectorcall(
   // the observe statistics included) and every later call is direct.  The
   // by-code dispatch below serves the objects the budget refuses; the
   // budget is read here so that those pay no observer probe per call.
-  if (Ci_code_extra_jit311_attach_count(extra) <
-          jit::getConfig().fresh_attach_budget &&
-      Ci_Observe311_OfferFreshAttach(func) &&
-      func->vectorcall != Ci_PyFunction_Vectorcall) {
-    return func->vectorcall(func_obj, args, nargsf, kwnames);
+  const bool offer_attachment = Ci_code_extra_jit311_attach_count(extra) <
+      jit::getConfig().fresh_attach_budget;
+  if (offer_attachment) {
+    if (Ci_Observe311_OfferFreshAttach(func) &&
+        func->vectorcall != Ci_PyFunction_Vectorcall) {
+      return func->vectorcall(func_obj, args, nargsf, kwnames);
+    }
+    // Only the offer can run Python between the first lookup and invocation.
+    // Revalidate after it even if it declined: a callback can retire the
+    // artifact or replace __code__. With an exhausted attachment budget,
+    // pinning above is just an incref and the first lookup is still current.
+    if (codeArtifactFor311(func, &extra) != compiled) {
+      return func->vectorcall(func_obj, args, nargsf, kwnames);
+    }
   }
-  // The offer ran Python: the artifact may have been retired (the pin keeps
-  // it allocated, nothing more) and the function's code may have moved.
-  // Resolve again and leave through the function's own entry when the
-  // answer is no longer this artifact.
-  if (codeArtifactFor311(func, &extra) != compiled) {
-    return func->vectorcall(func_obj, args, nargsf, kwnames);
-  }
-  if (cStackSoftLimitReached311()) {
+#if defined(CINDER_AARCH64)
+  // The generated guard diverts an exhausted Python recursion budget before
+  // checking its C-stack limit. Keep the shell's old priority when both
+  // limits are exhausted, while leaving ordinary calls to the inline guard.
+  const bool check_c_stack = PyThreadState_GET()->recursion_remaining <= 0;
+#else
+  const bool check_c_stack = true;
+#endif
+  if (check_c_stack && cStackSoftLimitReached311()) {
     PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
     return nullptr;
   }
+  // AArch64's generated vectorcall entry checks the C-stack limit before
+  // binding arguments or linking a frame, including first-use TLS setup.
+  // Do not repeat that check in the outer dispatch shell.
   InvocationArtifactScope invocation(compiled);
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }

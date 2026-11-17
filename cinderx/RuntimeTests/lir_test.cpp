@@ -296,6 +296,178 @@ static size_t countOpcode(
   return count;
 }
 
+#if defined(CINDER_AARCH64)
+static void expectBindingTailCall311(
+    const jit::lir::Function& function,
+    const codegen::Environ& env,
+    uint64_t helper) {
+  size_t calls = 0;
+  for (const auto& stub : env.binding_entry_stubs_311) {
+    if (stub.helper != helper) {
+      continue;
+    }
+    ++calls;
+    ASSERT_TRUE(stub.label.isValid());
+    ASSERT_NE(stub.call, nullptr);
+    ASSERT_EQ(stub.call->opcode(), Instruction::kCall);
+    ASSERT_EQ(stub.call->getNumInputs(), 1u);
+    ASSERT_TRUE(stub.call->getInput(0)->isLabel());
+    ASSERT_TRUE(stub.call->getInput(0)->getDefine()->hasAsmLabel());
+    EXPECT_EQ(
+        stub.call->getInput(0)->getDefine()->getAsmLabel().id(),
+        stub.label.id());
+  }
+  EXPECT_EQ(calls, 1u) << function;
+  // Runtime materialization is performed by the recorded tail stub, never
+  // by these front-of-body blocks. The emitter pads each local call to 8B.
+  EXPECT_FALSE(hasImmediate(function, helper)) << function;
+  EXPECT_FALSE(hasImmediate(function, reinterpret_cast<uint64_t>(env.code_rt)));
+  for (const auto* block : function.basicblocks()) {
+    for (const auto& instruction : block->instructions()) {
+      EXPECT_FALSE(
+          instruction->opcode() == Instruction::kMove &&
+          instruction->output()->isReg() &&
+          instruction->output()->getPhyRegister() == codegen::ARGUMENT_REGS[4]);
+    }
+  }
+}
+
+TEST_F(LIRGeneratorTest, Python311BindingProloguePassesRuntimeInFifthRegister) {
+  const char* sources[] = {
+      "def binding_owner(first, second=1): return first\n",
+      "def binding_owner(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, "
+      "a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, "
+      "a20, a21, a22, a23, a24, a25, a26, a27, a28, a29): return a0\n",
+  };
+  for (int i = 0; i < 2; ++i) {
+    SCOPED_TRACE(i);
+    Ref<PyFunctionObject> owner(compileAndGet(sources[i], "binding_owner"));
+    ASSERT_NE(owner, nullptr);
+    hir::Function irfunc;
+    irfunc.setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    CodeRuntime runtime{owner};
+    asmjit::CodeHolder code;
+    ASSERT_EQ(code.init(asmjit::Environment::host()), asmjit::kErrorOk);
+    asmjit::a64::Builder assembler{&code};
+    codegen::Environ env;
+    env.as = &assembler;
+    env.code_rt = &runtime;
+    jit::lir::Function function{&irfunc};
+    GenerateArgcountCheckBlocks(
+        &function, &irfunc, &env, asmjit::Label{}, asmjit::Label{});
+    const uint64_t keyword_helper = i == 0
+        ? reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsSimpleAtEntry311)
+        : reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsAtEntry311);
+    ASSERT_EQ(env.binding_entry_stubs_311.size(), 2u);
+    expectBindingTailCall311(function, env, keyword_helper);
+    expectBindingTailCall311(
+        function,
+        env,
+        reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountAtEntry311));
+    EXPECT_FALSE(hasImmediate(
+        function, reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsSimple)));
+    EXPECT_FALSE(hasImmediate(
+        function, reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgs)));
+    EXPECT_FALSE(hasImmediate(
+        function, reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount)));
+
+    ASSERT_EQ(function.basicblocks().size(), 2u);
+    const auto* keyword_null = findOpcode(function, Instruction::kBranchZ);
+    ASSERT_NE(keyword_null, nullptr);
+    EXPECT_EQ(
+        keyword_null->getInput(0)->getBasicBlock(), function.basicblocks()[1]);
+    // A successful argcount comparison skips the defaults tail call; no x4
+    // materialization remains in either front-of-body path.
+    bool matched_count_branches = false;
+    bool checked_binding_call = false;
+    for (const auto& instruction : function.basicblocks()[1]->instructions()) {
+      if (instruction->opcode() == Instruction::kBranchE) {
+        matched_count_branches = true;
+      }
+      for (const auto& stub : env.binding_entry_stubs_311) {
+        if (stub.call == instruction.get()) {
+          EXPECT_TRUE(matched_count_branches) << function;
+          checked_binding_call = true;
+        }
+      }
+    }
+    EXPECT_TRUE(matched_count_branches) << function;
+    EXPECT_TRUE(checked_binding_call) << function;
+  }
+}
+
+TEST_F(LIRGeneratorTest, Python311VariadicBindingProloguePassesCurrentRuntime) {
+  const char* sources[] = {
+      "def binding_owner(first, *rest, **kwargs): return first\n",
+      "def binding_owner(first, *, option=1): return first\n",
+  };
+  for (const char* source : sources) {
+    SCOPED_TRACE(source);
+    Ref<PyFunctionObject> owner(compileAndGet(source, "binding_owner"));
+    ASSERT_NE(owner, nullptr);
+    hir::Function irfunc;
+    irfunc.setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    CodeRuntime runtime{owner};
+    asmjit::CodeHolder code;
+    ASSERT_EQ(code.init(asmjit::Environment::host()), asmjit::kErrorOk);
+    asmjit::a64::Builder assembler{&code};
+    codegen::Environ env;
+    env.as = &assembler;
+    env.code_rt = &runtime;
+    jit::lir::Function function{&irfunc};
+    GenerateArgcountCheckBlocks(
+        &function, &irfunc, &env, asmjit::Label{}, asmjit::Label{});
+    ASSERT_EQ(function.basicblocks().size(), 1u);
+    ASSERT_EQ(env.binding_entry_stubs_311.size(), 1u);
+    expectBindingTailCall311(
+        function,
+        env,
+        reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsAtEntry311));
+    EXPECT_EQ(findOpcode(function, Instruction::kBranchE), nullptr);
+    EXPECT_FALSE(hasImmediate(
+        function, reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgs)));
+    EXPECT_FALSE(hasImmediate(
+        function,
+        reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsSimpleAtEntry311)));
+    EXPECT_FALSE(hasImmediate(
+        function,
+        reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountAtEntry311)));
+  }
+}
+
+TEST_F(LIRGeneratorTest, Python311PrimitiveDoubleBindingKeepsFPReturnHelper) {
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def binding_owner(first, second=1): return first\n", "binding_owner"));
+  ASSERT_NE(owner, nullptr);
+  hir::Function irfunc;
+  irfunc.setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+  irfunc.return_type = hir::TCDouble;
+  CodeRuntime runtime{owner};
+  asmjit::CodeHolder code;
+  ASSERT_EQ(code.init(asmjit::Environment::host()), asmjit::kErrorOk);
+  asmjit::a64::Builder assembler{&code};
+  codegen::Environ env;
+  env.as = &assembler;
+  env.code_rt = &runtime;
+  jit::lir::Function function{&irfunc};
+  GenerateArgcountCheckBlocks(
+      &function, &irfunc, &env, asmjit::Label{}, asmjit::Label{});
+  ASSERT_EQ(env.binding_entry_stubs_311.size(), 1u);
+  EXPECT_TRUE(hasImmediate(
+      function,
+      reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)));
+  EXPECT_FALSE(hasImmediate(
+      function,
+      reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountAtEntry311)));
+  EXPECT_FALSE(hasImmediate(
+      function, reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount)));
+  expectBindingTailCall311(
+      function,
+      env,
+      reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgsSimpleAtEntry311));
+}
+#endif // defined(CINDER_AARCH64)
+
 class LoopBoxing311Test : public LIRGeneratorTest {};
 
 TEST_F(LoopBoxing311Test, DirectIntegerBoxingKeepsCacheAndAllocationGuards) {

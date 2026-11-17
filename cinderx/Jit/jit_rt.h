@@ -527,6 +527,29 @@ PyObject* JITRT_VectorcallTstate(
 extern "C" void* g_JITRT_Vectorcall311_slot;
 extern "C" void* g_JITRT_Call311_slot;
 
+#if defined(CINDER_AARCH64)
+// Five-argument generated-prologue ABI: runtime belongs to the invoking
+// artifact and survives binder callbacks through PrologueActivation311.
+PyObject* JITRT_CallWithKeywordArgsAtEntry311(
+    PyFunctionObject*,
+    PyObject**,
+    size_t,
+    PyObject*,
+    jit::CodeRuntime*);
+PyObject* JITRT_CallWithKeywordArgsSimpleAtEntry311(
+    PyFunctionObject*,
+    PyObject**,
+    size_t,
+    PyObject*,
+    jit::CodeRuntime*);
+JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcountAtEntry311(
+    PyFunctionObject*,
+    PyObject**,
+    size_t,
+    int,
+    jit::CodeRuntime*);
+#endif
+
 // Runs the periodic work the eval breaker requested after a C callable
 // returned `res` through the direct dispatch stub (handle_periodic_activities
 // semantics): returns `res`, or NULL with `res` released when the pending

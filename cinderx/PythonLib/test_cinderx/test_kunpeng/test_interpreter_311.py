@@ -9,9 +9,9 @@ import unittest
 def _specialization_target(value, offset=0):
     """Module-level callee with a default, reached via LOAD_GLOBAL.
 
-    Both properties matter: the global lookup specializes to
-    LOAD_GLOBAL_MODULE, and the defaulted signature to
-    CALL_PY_WITH_DEFAULTS.
+    The global lookup can specialize to LOAD_GLOBAL_MODULE, while calls
+    with either explicit or defaulted arguments must retain CALL_ADAPTIVE
+    under the CinderX evaluator so the callee still enters PEP 523.
     """
     return value + offset
 
@@ -107,27 +107,43 @@ class Interpreter311Tests(unittest.TestCase):
         next(other)
         other.close()
 
-    def test_specialization_reaches_the_specialized_form(self) -> None:
-        # The interpreter must still quicken and specialize under our
-        # evaluator; the disassembly names the specialized opcode.
+    def test_global_specializes_while_ordinary_calls_keep_adaptive_backoff(
+        self,
+    ) -> None:
+        # LOAD_GLOBAL may specialize, but the evaluator rejects ordinary
+        # CALL specialization. Both argument shapes must keep that backoff.
         import dis
 
-        namespace = {"_specialization_target": _specialization_target}
-        exec(
-            "def loop():\n"
-            "    for i in [1, 2, 3] * 3:\n"
-            "        _specialization_target(i)\n",
-            namespace,
-        )
-        loop = namespace["loop"]
+        for arguments, expected in (("i", 18), ("i, 3", 45)):
+            with self.subTest(arguments=arguments):
+                namespace = {"_specialization_target": _specialization_target}
+                exec(
+                    "def loop():\n"
+                    "    total = 0\n"
+                    "    for i in [1, 2, 3] * 3:\n"
+                    f"        total += _specialization_target({arguments})\n"
+                    "    return total\n",
+                    namespace,
+                )
+                loop = namespace["loop"]
 
-        # Enough iterations for the call site to leave its adaptive backoff.
-        for _ in range(30):
-            loop()
+                for _ in range(30):
+                    self.assertEqual(loop(), expected)
 
-        text = dis.Bytecode(loop, adaptive=True).dis()
-        self.assertIn("LOAD_GLOBAL_MODULE", text)
-        self.assertIn("CALL_PY_WITH_DEFAULTS", text)
+                instructions = list(
+                    dis.get_instructions(loop, adaptive=True, show_caches=True)
+                )
+                self.assertIn("LOAD_GLOBAL_MODULE", [i.opname for i in instructions])
+                calls = [
+                    index
+                    for index, instr in enumerate(instructions)
+                    if instr.opname.startswith("CALL")
+                ]
+                self.assertEqual(len(calls), 1)
+                call = calls[0]
+                self.assertEqual(instructions[call].opname, "CALL_ADAPTIVE")
+                self.assertEqual(instructions[call + 1].opname, "CACHE")
+                self.assertRegex(instructions[call + 1].argrepr, r"^counter: [1-9]\d*$")
 
     def test_frame_introspection(self) -> None:
         def inner():

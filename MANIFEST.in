@@ -1,6 +1,10 @@
 include CMakeLists.txt
 include ci_pipeline/cmake_options.py
 recursive-include cinderx *.cpp *.c *.h CMakeLists.txt
+include cinderx/Interpreter/3.11/coroutine_call.cmake
+include cinderx/_cinderx.version
+include cinderx/PythonLib/cinderx.pth
+include cinderx/PythonLib/_cinderx_auto.py
 recursive-include cinderx/UpstreamBorrow *.template *.md *.txt *.html
 
 # Opcode directories have invalid Python package names (e.g. opcodes/3.14) so

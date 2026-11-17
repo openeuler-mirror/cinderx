@@ -420,6 +420,78 @@ print(json.dumps({
         )
         self.assertGreaterEqual(payload["total"], 1)
 
+    def test_post_publication_frame_is_counted_inside_scopes(self) -> None:
+        # An import/setup scope stops counting and scheduling, not the record
+        # of a published code object running interpreted again: the JIT-ALL
+        # acceptance reads a zero here as "published, never re-entered".
+        for scope in ("import", "setup"):
+            with self.subTest(scope=scope):
+                payload = run_child(
+                    PREAMBLE
+                    + """\
+import sys
+
+def published(value):
+    return value + 1
+
+def cold(value):
+    return value - 1
+
+def mine(stats, name):
+    return [e for e in stats["events"] if e["qualname"] == name]
+
+assert published(1) == 2
+before = _cinderx._get_observe_stats()
+
+def trace(frame, event, arg):
+    return trace
+
+getattr(_cinderx, "_autojit_%s_enter")()
+try:
+    sys.settrace(trace)
+    try:
+        assert published(2) == 3
+    finally:
+        sys.settrace(None)
+    for i in range(3):
+        assert cold(i) == i - 1
+    inside = _cinderx._get_observe_stats()
+finally:
+    getattr(_cinderx, "_autojit_%s_leave")()
+print(json.dumps({
+    "before": mine(before, "published"),
+    "inside": mine(inside, "published"),
+    "cold": mine(inside, "cold"),
+    "events": [len(before["events"]), len(inside["events"])],
+    "total": [
+        before["post_publication_interpreted_frames"],
+        inside["post_publication_interpreted_frames"],
+    ],
+    "attached": [before["fresh_attachments"], inside["fresh_attachments"]],
+}))
+"""
+                    % (scope, scope),
+                    CINDERX_JIT_MODE="execute",
+                    PYTHONJITAUTO="1",
+                )
+                self.assertEqual(len(payload["before"]), 1)
+                self.assertEqual(payload["before"][0]["result"], "installed")
+                self.assertEqual(
+                    payload["before"][0]["post_publication_interpreted_frames"],
+                    0,
+                )
+                # The interpreted re-entry inside the scope is recorded...
+                self.assertEqual(len(payload["inside"]), 1)
+                self.assertEqual(
+                    payload["inside"][0]["post_publication_interpreted_frames"],
+                    1,
+                )
+                self.assertEqual(payload["total"][1], payload["total"][0] + 1)
+                # ...while nothing was scheduled or attached there.
+                self.assertEqual(payload["cold"], [])
+                self.assertEqual(payload["events"][1], payload["events"][0])
+                self.assertEqual(payload["attached"][1], payload["attached"][0])
+
     def test_canary_is_the_test_spelling_of_execute(self) -> None:
         # Same machinery, same policy, reported under its own name so the
         # earlier gate legs keep their configuration and their evidence.

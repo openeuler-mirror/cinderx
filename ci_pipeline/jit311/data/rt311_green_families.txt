@@ -41,3 +41,4 @@ LoopAllocationFailure311Test
 TupleLayout311Test
 HirCSENonceTest
 CodeLayoutTest
+CallSpecialization311Test

@@ -982,6 +982,18 @@ void emitLIRBlocks(
 
       env->suppress_annotations = !pending_annotation.empty();
       autogen::AutoTranslator::getInstance().translateInstr(env, instr.get());
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+      // A local BL occupies four bytes; preserve the eight-byte external
+      // helper-call slot without changing the generic LIR Nop contract.
+      if (instr->opcode() == lir::Instruction::kCall) {
+        for (const auto& binding : env->binding_entry_stubs_311) {
+          if (binding.call == instr.get()) {
+            as->nop();
+            break;
+          }
+        }
+      }
+#endif
       env->suppress_annotations = false;
 
       if (!pending_annotation.empty()) {
@@ -3673,6 +3685,29 @@ bool NativeGenerator::hasStaticEntry() const {
   return (code->co_flags & CI_CO_STATICALLY_COMPILED);
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+void NativeGenerator::emitAarch64BindingEntryStubs311(
+    const asmjit::CodeHolder& code) {
+  if (env_.binding_entry_stubs_311.empty()) {
+    return;
+  }
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  for (const auto& binding : env_.binding_entry_stubs_311) {
+    auto cursor = as_->cursor();
+    as_->bind(binding.label);
+    // The prologue's BL already put its return address in LR and built its
+    // minimal frame. Do not make another frame or overwrite LR: the helper
+    // returns directly to the original call slot's NOP/prologue-exit branch.
+    // These moves cannot run Python; the helper's activation then protects
+    // artifact/runtime lifetime across binding callbacks and cleanup.
+    as_->mov(a64::x4, reinterpret_cast<uint64_t>(env_.code_rt));
+    as_->mov(a64::x16, binding.helper);
+    as_->br(a64::x16);
+    env_.addAnnotation("Argument binding entry tail stub (3.11)", cursor);
+  }
+}
+#endif
+
 void NativeGenerator::generatePrologueBlocks(lir::BasicBlock* frameSetupBlock) {
   // Pre-assign finish_frame_setup to the frame setup block so
   // generateAssemblyBody binds it at the block's start.
@@ -3731,6 +3766,9 @@ void NativeGenerator::generatePrologueBlocks(lir::BasicBlock* frameSetupBlock) {
     lir::GenerateArgcountCheckBlocks(
         lir_func_.get(),
         GetFunction(),
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+        &env_,
+#endif
         env_.correct_arg_count,
         env_.prologue_exit);
   }
@@ -4167,6 +4205,9 @@ void NativeGenerator::generateCode(
   emitAarch64StoreAttrInvokeStub311(codeholder);
   emitAarch64VcDirectStub311(codeholder);
   emitAarch64ExactLongAddSubStubs(codeholder);
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  emitAarch64BindingEntryStubs311(codeholder);
+#endif
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();
@@ -4184,6 +4225,19 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_AARCH64)
   // Emit constant pool data for MovConstPool instructions. Each entry is an
   // 8-byte value loaded via PC-relative ldr.
+#if PY_VERSION_HEX < 0x030C0000
+  if (!env_.const_pool_labels.empty()) {
+    // Instructions are only 4-byte aligned. Keep pointer literals naturally
+    // aligned even when an out-of-line stub has an odd instruction count.
+    if (is_shadow_compile_) {
+      ASM_CHECK_THROW(as_->align(AlignMode::kData, sizeof(uint64_t)));
+    } else {
+      ASM_CHECK(
+          as_->align(AlignMode::kData, sizeof(uint64_t)),
+          GetFunction()->fullname);
+    }
+  }
+#endif
   for (auto& [value, label] : env_.const_pool_labels) {
     as_->bind(label);
     as_->embed(&value, sizeof(value));

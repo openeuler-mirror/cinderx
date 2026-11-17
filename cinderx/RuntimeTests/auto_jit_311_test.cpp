@@ -18,9 +18,11 @@
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/3.11/observe.h"
+#include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -30,6 +32,9 @@
 #include <cstring>
 #include <optional>
 #include <string>
+
+extern "C" uint32_t Ci_AutoJit_OpenScopes;
+extern "C" int Ci_AutoJit_ThreadInScope(void);
 
 #define SKIP_311_EXECUTABLE_COMPILE()                                     \
   do {                                                                    \
@@ -597,6 +602,196 @@ except RuntimeError:
   EXPECT_EQ(Ci_JitShell311_TakeExecuteRefusal(), nullptr)
       << "a failed request reported a refusal it did not produce";
   EXPECT_FALSE(isJitCompiled(c));
+}
+
+TEST_F(AutoJit311Test, ZeroAttachBudgetInvokesByCodeWithoutAttaching) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  struct RestoreBudget {
+    uint32_t saved{jit::getConfig().fresh_attach_budget};
+    ~RestoreBudget() {
+      jit::getMutableConfig().fresh_attach_budget = saved;
+    }
+  } restore;
+  jit::getMutableConfig().fresh_attach_budget = 0;
+  runCode(kFactorySource);
+  auto first = makeInstance("factory(1)");
+  ASSERT_EQ(jit::compileFunction(first), jit::Result::OK);
+  auto fresh = makeInstance("factory(7)");
+  ASSERT_FALSE(isJitCompiled(fresh));
+  ASSERT_EQ(fresh->vectorcall, Ci_PyFunction_Vectorcall);
+  ASSERT_EQ(
+      Ci_JitShell311_CodeArtifactEntry(fresh),
+      Ci_JitShell311_CodeArtifactVectorcall);
+  auto* extra =
+      codeExtraIfExists(reinterpret_cast<PyCodeObject*>(fresh->func_code));
+  ASSERT_NE(extra, nullptr);
+  const auto attachments = Ci_code_extra_jit311_attach_count(extra);
+  const auto before = jit::triggerStatsSnapshot();
+  void* invocation_before = Ci_JitShell311_InvocationArtifact();
+  auto x = Ref<>::steal(PyLong_FromLong(2));
+  auto y = Ref<>::steal(PyLong_FromLong(3));
+  PyObject* args[] = {x, y};
+  auto result = Ref<>::steal(Ci_JitShell311_CodeArtifactVectorcall(
+      reinterpret_cast<PyObject*>(fresh.get()), args, 2, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 27);
+  const auto after = jit::triggerStatsSnapshot();
+  EXPECT_GT(after.machine_code_entries, before.machine_code_entries);
+  EXPECT_EQ(
+      after.compiled_function_creations, before.compiled_function_creations);
+  EXPECT_EQ(Ci_code_extra_jit311_attach_count(extra), attachments);
+  EXPECT_FALSE(isJitCompiled(fresh));
+  EXPECT_EQ(fresh->vectorcall, Ci_PyFunction_Vectorcall);
+  EXPECT_EQ(Ci_JitShell311_InvocationArtifact(), invocation_before);
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(AutoJit311Test, ZeroAttachBudgetCachedEntryRechecksCodeAndRetirement) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  struct RestoreBudget {
+    uint32_t saved{jit::getConfig().fresh_attach_budget};
+    ~RestoreBudget() {
+      jit::getMutableConfig().fresh_attach_budget = saved;
+    }
+  } restore;
+  jit::getMutableConfig().fresh_attach_budget = 0;
+  runCode(kFactorySource);
+  auto first = makeInstance("factory(1)");
+  ASSERT_EQ(jit::compileFunction(first), jit::Result::OK);
+  auto recoded = makeInstance("factory(7)");
+  auto retired = makeInstance("factory(9)");
+  vectorcallfunc cached_entry = Ci_JitShell311_CodeArtifactEntry(recoded);
+  ASSERT_EQ(cached_entry, Ci_JitShell311_CodeArtifactVectorcall);
+  ASSERT_EQ(Ci_JitShell311_CodeArtifactEntry(retired), cached_entry);
+
+  runCode(R"(
+def other_factory(k):
+    def other(x, y):
+        return x + y + k + 100
+    return other
+)");
+  auto replacement = makeInstance("other_factory(0)");
+  // Both code objects have one closure cell; the function must use its new
+  // body with its own existing cell, rather than the previously cached body.
+  ASSERT_EQ(
+      PyObject_SetAttrString(recoded, "__code__", replacement->func_code), 0);
+  EXPECT_EQ(Ci_JitShell311_CodeArtifactEntry(recoded), nullptr);
+  auto x = Ref<>::steal(PyLong_FromLong(2));
+  auto y = Ref<>::steal(PyLong_FromLong(3));
+  PyObject* args[] = {x, y};
+  auto changed = Ref<>::steal(cached_entry(
+      reinterpret_cast<PyObject*>(recoded.get()), args, 2, nullptr));
+  ASSERT_NE(changed, nullptr);
+  EXPECT_EQ(PyLong_AsLong(changed), 112);
+
+  jit::uncompile(first);
+  EXPECT_EQ(Ci_JitShell311_CodeArtifactEntry(retired), nullptr);
+  const auto before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto fallback = Ref<>::steal(cached_entry(
+      reinterpret_cast<PyObject*>(retired.get()), args, 2, nullptr));
+  ASSERT_NE(fallback, nullptr);
+  EXPECT_EQ(PyLong_AsLong(fallback), 33);
+  EXPECT_EQ(jit::triggerStatsSnapshot().machine_code_entries, before);
+  EXPECT_FALSE(isJitCompiled(retired));
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(AutoJit311Test, ZeroAttachBudgetByCodeRunsInsideSuppressedScopes) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  struct RestoreBudget {
+    uint32_t saved{jit::getConfig().fresh_attach_budget};
+    ~RestoreBudget() {
+      jit::getMutableConfig().fresh_attach_budget = saved;
+    }
+  } restore;
+  struct SuppressedScope {
+    explicit SuppressedScope(bool is_setup) : setup{is_setup} {
+      if (setup) {
+        jit::autoJitSetupEnter();
+      } else {
+        jit::autoJitImportEnter();
+      }
+    }
+    ~SuppressedScope() {
+      if (setup) {
+        jit::autoJitSetupLeave();
+      } else {
+        jit::autoJitImportLeave();
+      }
+    }
+    bool setup;
+  };
+  jit::getMutableConfig().fresh_attach_budget = 0;
+  ASSERT_EQ(Ci_Observe311_Configure(), 0);
+  ASSERT_NE(Ci_Observe311_Enabled, 0);
+  ASSERT_EQ(jit::autoJitImportDepth(), 0u);
+  ASSERT_EQ(jit::autoJitSetupDepth(), 0u);
+  ASSERT_EQ(Ci_AutoJit_ThreadInScope(), 0);
+  const uint32_t scopes_before =
+      __atomic_load_n(&Ci_AutoJit_OpenScopes, __ATOMIC_RELAXED);
+  runCode(kFactorySource);
+  auto first = makeInstance("factory(1)");
+  ASSERT_EQ(jit::compileFunction(first), jit::Result::OK);
+  auto* code = reinterpret_cast<PyCodeObject*>(first->func_code);
+  auto* extra = codeExtraIfExists(code);
+  ASSERT_NE(extra, nullptr);
+  ASSERT_EQ(Ci_code_extra_jit311_attach_count(extra), 0u);
+  for (bool setup : {false, true}) {
+    SCOPED_TRACE(setup ? "setup" : "import");
+    // This independent cold function provides a positive control: OnFrame
+    // must count it immediately after the scope, while counting nothing in it.
+    Ref<PyFunctionObject> probe(compileAndGet(
+        "def scope_observer_probe(value): return value\n",
+        "scope_observer_probe"));
+    ASSERT_NE(probe, nullptr);
+    auto* probe_code = reinterpret_cast<PyCodeObject*>(probe->func_code);
+    const uint64_t probe_before = Ci_Observe311_CallCount(probe_code);
+    const uint64_t code_before = Ci_Observe311_CallCount(code);
+    {
+      SuppressedScope scope{setup};
+      EXPECT_EQ(jit::autoJitImportDepth(), setup ? 0u : 1u);
+      EXPECT_EQ(jit::autoJitSetupDepth(), setup ? 1u : 0u);
+      EXPECT_EQ(Ci_AutoJit_ThreadInScope(), 1);
+      EXPECT_EQ(
+          __atomic_load_n(&Ci_AutoJit_OpenScopes, __ATOMIC_RELAXED),
+          scopes_before + 1);
+      auto fresh = makeInstance(setup ? "factory(9)" : "factory(7)");
+      ASSERT_FALSE(isJitCompiled(fresh));
+      ASSERT_EQ(
+          Ci_JitShell311_CodeArtifactEntry(fresh),
+          Ci_JitShell311_CodeArtifactVectorcall);
+      Ci_Observe311_OnFrame(probe, probe_code, nullptr);
+      Ci_Observe311_OnFrame(fresh, code, nullptr);
+      EXPECT_EQ(Ci_Observe311_CallCount(probe_code), probe_before);
+      EXPECT_EQ(Ci_Observe311_CallCount(code), code_before);
+      auto x = Ref<>::steal(PyLong_FromLong(2));
+      auto y = Ref<>::steal(PyLong_FromLong(3));
+      PyObject* args[] = {x, y};
+      const auto before = jit::triggerStatsSnapshot();
+      auto result = Ref<>::steal(Ci_JitShell311_CodeArtifactVectorcall(
+          reinterpret_cast<PyObject*>(fresh.get()), args, 2, nullptr));
+      ASSERT_NE(result, nullptr);
+      EXPECT_EQ(PyLong_AsLong(result), setup ? 33 : 27);
+      const auto after = jit::triggerStatsSnapshot();
+      EXPECT_GT(after.machine_code_entries, before.machine_code_entries);
+      EXPECT_EQ(
+          after.compiled_function_creations,
+          before.compiled_function_creations);
+      EXPECT_EQ(Ci_code_extra_jit311_attach_count(extra), 0u);
+      EXPECT_FALSE(isJitCompiled(fresh));
+      EXPECT_EQ(Ci_Observe311_CallCount(probe_code), probe_before);
+      EXPECT_EQ(Ci_Observe311_CallCount(code), code_before);
+    }
+    EXPECT_EQ(jit::autoJitImportDepth(), 0u);
+    EXPECT_EQ(jit::autoJitSetupDepth(), 0u);
+    EXPECT_EQ(Ci_AutoJit_ThreadInScope(), 0);
+    EXPECT_EQ(
+        __atomic_load_n(&Ci_AutoJit_OpenScopes, __ATOMIC_RELAXED),
+        scopes_before);
+    Ci_Observe311_OnFrame(probe, probe_code, nullptr);
+    EXPECT_EQ(Ci_Observe311_CallCount(probe_code), probe_before + 1);
+    EXPECT_EQ(PyErr_Occurred(), nullptr);
+  }
 }
 
 #endif

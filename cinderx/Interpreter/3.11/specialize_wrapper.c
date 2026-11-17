@@ -30,6 +30,7 @@
 #include "opcode.h"
 
 #include "cinderx/Common/spike_env.h"
+#include "cinderx/Interpreter/3.11/coroutine_call.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
 #include "cinderx/Interpreter/interpreter.h"
@@ -251,14 +252,10 @@ static uint32_t Ci_GetFunctionVersion_311(PyFunctionObject* function) {
 #define _PyDictKeys_StringLookup Cix_PyDictKeys_StringLookup
 #define _PyDict_GetItemHint Cix_PyDict_GetItemHint
 
-// CALL and BINARY_SUBSCR specialization bakes a callee entry point into the
-// cache, so upstream declines both whenever a PEP 523 evaluator is installed:
-// it cannot know what that evaluator does with the frame. Ours is the stock
-// 3.11.6 loop, hash-locked against the target's own sources and incapable of
-// executing machine code in this build, so those caches stay valid under it
-// and the checks are answered as if no hook were installed. Any other
-// evaluator -- a third party's, or a future one that runs compiled code --
-// keeps upstream's refusal.
+// The wrappers below preserve the PEP 523 checks in the pristine specializer.
+// CALL may hide our evaluator only when its execution handler can inline the
+// callee; ordinary functions must still enter the evaluator for AutoJIT.
+// BINARY_SUBSCR retains its existing trusted-evaluator handling.
 #define _Py_Specialize_Call Ci_SpecializeCallInner_311
 #define _Py_Specialize_BinarySubscr Ci_SpecializeBinarySubscrInner_311
 
@@ -304,8 +301,15 @@ int _Py_Specialize_Call(
     _Py_CODEUNIT* instr,
     int nargs,
     PyObject* kwnames) {
-  PyInterpreterState* interp = _PyInterpreterState_GET();
-  _PyFrameEvalFunction saved = Ci_HideTrustedEvaluator_311(interp);
+  PyThreadState* tstate = _PyThreadState_GET();
+  PyInterpreterState* interp = tstate->interp;
+  _PyFrameEvalFunction saved = interp->eval_frame;
+  // Otherwise CALL_PY_EXACT_ARGS immediately deoptimizes back to CALL under
+  // our evaluator, repeatedly paying specialization and rejection costs.
+  if (saved == Ci_EvalFrame &&
+      Ci_CanInlineCoroutineCall311(tstate, callable, nargs, kwnames)) {
+    interp->eval_frame = NULL;
+  }
   int result = Ci_SpecializeCallInner_311(callable, instr, nargs, kwnames);
   interp->eval_frame = saved;
   return result;

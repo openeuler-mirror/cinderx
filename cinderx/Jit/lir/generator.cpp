@@ -1011,6 +1011,9 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
 void GenerateArgcountCheckBlocks(
     Function* lir_func,
     const hir::Function* func,
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+    codegen::Environ* env,
+#endif
     asmjit::Label correct_args_label,
     asmjit::Label prologue_exit) {
   bool returns_primitive_double = func->returnsPrimitiveDouble();
@@ -1018,6 +1021,20 @@ void GenerateArgcountCheckBlocks(
   bool have_varargs = code->co_flags & (CO_VARARGS | CO_VARKEYWORDS);
   bool will_check_argcount = !have_varargs && code->co_kwonlyargcount == 0;
   int num_args = func->numArgs();
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  auto keyword_helper = num_args < 30
+      ? JITRT_CallWithKeywordArgsSimpleAtEntry311
+      : JITRT_CallWithKeywordArgsAtEntry311;
+  auto append_binding_call = [&](BasicBlock* block, uint64_t helper) {
+    JIT_CHECK(
+        env != nullptr && env->as != nullptr,
+        "binding stub needs an assembler");
+    asmjit::Label label = env->as->newLabel();
+    auto* call =
+        block->allocateInstr(Instruction::kCall, nullptr, AsmLbl{label});
+    env->binding_entry_stubs_311.push_back({label, helper, call});
+  };
+#endif
 
   // Register assignments (vectorcall convention):
   //   ARGUMENT_REGS[0] — callable (PyObject*)
@@ -1047,6 +1064,11 @@ void GenerateArgcountCheckBlocks(
         Instruction::kBranchZ, nullptr, Lbl{argcount_check});
     kw_dispatch->addSuccessor(argcount_check);
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+    // The simple binder uses a bounded stack argument array.
+    append_binding_call(
+        kw_dispatch, reinterpret_cast<uint64_t>(keyword_helper));
+#else
     kw_dispatch->allocateInstr(
         Instruction::kCall,
         nullptr,
@@ -1055,6 +1077,7 @@ void GenerateArgcountCheckBlocks(
         Imm{reinterpret_cast<uint64_t>(
             num_args < 30 ? JITRT_CallWithKeywordArgsSimple
                           : JITRT_CallWithKeywordArgs)});
+#endif
     kw_dispatch->allocateInstr(
         Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
@@ -1106,10 +1129,26 @@ void GenerateArgcountCheckBlocks(
           Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
 
       // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+      if (returns_primitive_double) {
+        // Keep the FP aggregate-return ABI and its original external call.
+        argcount_check->allocateInstr(
+            Instruction::kCall,
+            nullptr,
+            Imm{reinterpret_cast<uint64_t>(
+                JITRT_CallWithIncorrectArgcountFPReturn)});
+      } else {
+        append_binding_call(
+            argcount_check,
+            reinterpret_cast<uint64_t>(
+                JITRT_CallWithIncorrectArgcountAtEntry311));
+      }
+#else
       auto helper = returns_primitive_double
           ? reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcountFPReturn)
           : reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
       argcount_check->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
+#endif
       argcount_check->allocateInstr(
           Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
     }
@@ -1121,10 +1160,15 @@ void GenerateArgcountCheckBlocks(
 
     emitAnnotation(kw_dispatch, "Keyword argument dispatch (varargs/kwonly)");
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+    auto helper = JITRT_CallWithKeywordArgsAtEntry311;
+    append_binding_call(kw_dispatch, reinterpret_cast<uint64_t>(helper));
+#else
     kw_dispatch->allocateInstr(
         Instruction::kCall,
         nullptr,
         Imm{reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgs)});
+#endif
     kw_dispatch->allocateInstr(
         Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
   }

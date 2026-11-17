@@ -171,6 +171,9 @@ class NativeGenerator {
   void emitAarch64StoreAttrInvokeStub311(const asmjit::CodeHolder& code);
   void emitAarch64VcDirectStub311(const asmjit::CodeHolder& code);
   void emitAarch64ExactLongAddSubStubs(const asmjit::CodeHolder& code);
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  void emitAarch64BindingEntryStubs311(const asmjit::CodeHolder& code);
+#endif
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   Py_ssize_t giJITDataOffset();
   void generateStaticEntryPoint(

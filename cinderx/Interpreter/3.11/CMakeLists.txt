@@ -12,6 +12,9 @@ find_package(
   REQUIRED)
 
 set(REPOSITORY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../..")
+set(GENERATED_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+include(${CMAKE_CURRENT_LIST_DIR}/coroutine_call.cmake)
+cinderx_generate_coroutine_ceval_311("${GENERATED_HEADER_DIR}")
 
 add_library(
   cinderx_cpython311_interpreter
@@ -31,6 +34,8 @@ target_include_directories(
   cinderx_cpython311_interpreter
   PRIVATE
   "${REPOSITORY_ROOT}"
+  "${GENERATED_HEADER_DIR}"
+  "${CMAKE_CURRENT_LIST_DIR}/upstream"
   "${Python_INCLUDE_DIRS}"
   "${Python_INCLUDE_DIRS}/internal")
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")

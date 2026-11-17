@@ -33,6 +33,8 @@
 #include <strings.h>
 
 int Ci_Observe311_Enabled;
+extern uint32_t Ci_AutoJit_OpenScopes;
+int Ci_AutoJit_ThreadInScope(void);
 
 static int ci_observe_configured;
 static Ci_JitMode311 ci_observe_mode;
@@ -59,6 +61,9 @@ static uint64_t ci_observe_fresh_attachments;
 static uint64_t ci_observe_auto_jit_disabled_codes;
 static uint64_t ci_observe_late_deferrals;
 static uint64_t ci_observe_post_publication_interpreted_frames;
+// Set once any slot has been marked published, cleared only on finalize: a
+// cheap "nothing to record" answer for frames inside an import/setup scope.
+static int ci_observe_any_published;
 
 // One slot per code object ever observed.  The key is the code's address,
 // which is only ever trusted together with `dead`: the code-extra free
@@ -697,6 +702,33 @@ uint64_t Ci_Observe311_CallCount(PyCodeObject* code) {
   return slot == NULL ? 0 : slot->count;
 }
 
+// A published code object reached the interpreter again.
+static void observe_count_post_publication(Ci_ObserveSlot* slot) {
+  slot->post_publication_interpreted_frames++;
+  ci_observe_post_publication_interpreted_frames++;
+  if (slot->event_index >= 0 && slot->event_index < ci_observe_event_count) {
+    ci_observe_events[slot->event_index].post_publication_interpreted_frames =
+        slot->post_publication_interpreted_frames;
+  }
+}
+
+// The same record for a frame inside an import/setup scope, under the
+// conditions the full path would have recorded it.  Find-only: a code
+// object without a slot was never published, and nothing here schedules,
+// attaches or counts towards the threshold.
+static void observe_note_post_publication_frame(
+    PyFunctionObject* func,
+    PyCodeObject* code) {
+  if (_Py_IsFinalizing() || PyErr_Occurred() != NULL ||
+      code != (PyCodeObject*)func->func_code) {
+    return;
+  }
+  Ci_ObserveSlot* slot = observe_slot_find(code);
+  if (slot != NULL && slot->published) {
+    observe_count_post_publication(slot);
+  }
+}
+
 void Ci_Observe311_OnFrame(
     PyFunctionObject* func,
     PyCodeObject* code,
@@ -710,6 +742,19 @@ void Ci_Observe311_OnFrame(
   // resume re-enters this hook at full price (a nested yield-from chain once
   // per level per item).  Synchronous generators are admitted and observed.
   if (code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) {
+    return;
+  }
+  // Inside an import/setup scope nothing is scheduled or attached, so the
+  // frame is neither counted nor offered anywhere; code there starts
+  // counting once the scope closes.  A published code object that is back
+  // in the interpreter (tracing, a foreign evaluator) is still recorded as
+  // such: that count is evidence about execution, not scheduling.
+  if (ci_observe_execute &&
+      __atomic_load_n(&Ci_AutoJit_OpenScopes, __ATOMIC_RELAXED) != 0 &&
+      Ci_AutoJit_ThreadInScope()) {
+    if (ci_observe_any_published) {
+      observe_note_post_publication_frame(func, code);
+    }
     return;
   }
   // Observation stops where normal execution stops: nothing is counted
@@ -794,14 +839,7 @@ static void observe_on_frame_locked(
     // installed an artifact; the attach entry point tells the two apart
     // cheaply and says when to stop asking for this code object.
     if (slot->published) {
-      slot->post_publication_interpreted_frames++;
-      ci_observe_post_publication_interpreted_frames++;
-      if (slot->event_index >= 0 &&
-          slot->event_index < ci_observe_event_count) {
-        ci_observe_events[slot->event_index]
-            .post_publication_interpreted_frames =
-            slot->post_publication_interpreted_frames;
-      }
+      observe_count_post_publication(slot);
     }
     if (slot->attachable) {
       observe_offer_attach(slot, func);
@@ -883,6 +921,7 @@ static void observe_on_frame_locked(
         // change.
         slot->attachable = 1;
         slot->published = 1;
+        ci_observe_any_published = 1;
       } else if (strcmp(result, CI_JIT_RESULT_311_DEFERRED) == 0) {
         // The attempt was withheld rather than made: everything the
         // scheduler did is undone, and the next frame that finds the JIT
@@ -1104,4 +1143,5 @@ void Ci_Observe311_Finalize(void) {
   ci_observe_auto_jit_disabled_codes = 0;
   ci_observe_late_deferrals = 0;
   ci_observe_post_publication_interpreted_frames = 0;
+  ci_observe_any_published = 0;
 }

@@ -47,6 +47,18 @@ struct Environ {
   asmjit::Label prologue_exit;
   asmjit::Label wrapper_exit;
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+  // Post-regalloc prologue calls use a local BL followed by one explicit NOP
+  // (the original external-call slot is eight bytes). Runtime materialization
+  // lives in the tail stub so cold binding paths do not shift the body.
+  struct BindingEntryStub311 {
+    asmjit::Label label;
+    uint64_t helper;
+    const jit::lir::Instruction* call;
+  };
+  std::vector<BindingEntryStub311> binding_entry_stubs_311;
+#endif
+
   // Static type check jump table, resolved after code generation.
   void** static_typecheck_table{nullptr};
   std::vector<std::pair<int, jit::lir::BasicBlock*>>

@@ -19,15 +19,33 @@ bool isEnabledProvider(std::string_view provider) {
 
 } // namespace
 
+} // namespace jit
+
+// The CPython 3.11 frame observer skips threads inside an import/setup scope:
+// scheduling defers there anyway, so counting and asking the scheduler on
+// every call is pure overhead.  Ci_AutoJit_OpenScopes counts open scopes over
+// all threads, so the common case (no scope open) costs one relaxed load
+// before the thread-local check.
+extern "C" {
+uint32_t Ci_AutoJit_OpenScopes = 0;
+int Ci_AutoJit_ThreadInScope(void) {
+  return jit::t_auto_jit_import_depth > 0 || jit::t_auto_jit_setup_depth > 0;
+}
+}
+
+namespace jit {
+
 void autoJitImportEnter() {
   if (t_auto_jit_import_depth != std::numeric_limits<uint32_t>::max()) {
     ++t_auto_jit_import_depth;
+    __atomic_fetch_add(&Ci_AutoJit_OpenScopes, 1, __ATOMIC_RELAXED);
   }
 }
 
 void autoJitImportLeave() {
   if (t_auto_jit_import_depth > 0) {
     --t_auto_jit_import_depth;
+    __atomic_fetch_sub(&Ci_AutoJit_OpenScopes, 1, __ATOMIC_RELAXED);
   }
 }
 
@@ -38,12 +56,14 @@ uint32_t autoJitImportDepth() {
 void autoJitSetupEnter() {
   if (t_auto_jit_setup_depth != std::numeric_limits<uint32_t>::max()) {
     ++t_auto_jit_setup_depth;
+    __atomic_fetch_add(&Ci_AutoJit_OpenScopes, 1, __ATOMIC_RELAXED);
   }
 }
 
 void autoJitSetupLeave() {
   if (t_auto_jit_setup_depth > 0) {
     --t_auto_jit_setup_depth;
+    __atomic_fetch_sub(&Ci_AutoJit_OpenScopes, 1, __ATOMIC_RELAXED);
   }
 }
 

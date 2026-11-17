@@ -7,7 +7,7 @@ name = "cinderx"
 description = "Extension aimed at improving the performance of the Python runtime"
 dynamic = ["version"]
 requires-python = ">= 3.11.0, < 3.16"
-readme = "README.md"
+readme = "README_Opensource.md"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["performance", "jit", "compiler", "optimization", "cinder"]

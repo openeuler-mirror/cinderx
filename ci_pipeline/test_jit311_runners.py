@@ -867,34 +867,73 @@ def test_unexpected_organic_deopt_turns_red():
     assert any("organic_deopt_hits == 0" in error for error in errors)
 
 
-def test_stdlib_organic_deopt_count_drift_turns_red():
-    for drift in (36, 225, 289, 294, 356, 357, 359):
+@pytest.mark.parametrize("source_sha,total", [
+    ("c4a22d96741ef70d49120cd31f942a35094e666021af9b663446bd68dacdb9bd", 358),
+    ("8fc7549ef3ea782afc6dd9215e61baa72c8cf1047399bf60c221241f5f5355e1", 360),
+])
+def test_stdlib_organic_deopt_count_drift_turns_red(monkeypatch, source_sha, total):
+    manifest = runners._stdlib_canary_manifest_for_source(source_sha)
+    monkeypatch.setattr(runners, "stdlib_canary_manifest", lambda python=None: manifest)
+    for drift in (36, 225, 289, 294, 296, 356, 357, 358, 359, 360, 361):
+        if drift == total:
+            continue
         errors = [
             error
             for judge in runners.stdlib_canary_runner().judges
             for error in judge({"organic_deopt_hits": drift})
         ]
-        assert any("organic_deopt_hits == 358" in error for error in errors)
+        assert any(f"organic_deopt_hits == {total}" in error for error in errors)
+
+
+def test_stdlib_canary_rejects_unknown_source_identity():
+    with pytest.raises(ValueError, match="unsupported ipaddress.py source SHA256"):
+        runners._stdlib_canary_manifest_for_source("0" * 64)
+
+
+def test_stdlib_canary_rejects_missing_or_changed_child_source_identity():
+    for source_sha in runners.STDLIB_CANARY_PROFILES:
+        path = runners._stdlib_canary_manifest_for_source(source_sha)
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        assert runners._check_stdlib_source(
+            {"stdlib_sources": {"ipaddress.py": source_sha}}, manifest
+        ) == []
+        for evidence in ({}, None, {"stdlib_sources": {}},
+                         {"stdlib_sources": {"ipaddress.py": "0" * 64}}):
+            assert runners._check_stdlib_source(evidence, manifest)
+        other_sha = next(sha for sha in runners.STDLIB_CANARY_PROFILES if sha != source_sha)
+        assert runners._check_stdlib_source(
+            {"stdlib_sources": {"ipaddress.py": other_sha}}, manifest
+        )
 
 
 def test_stdlib_canary_has_real_entries_and_exact_deopt_sites(monkeypatch):
     # Import coverage must not wait on the product's wall-clock grace period,
     # including a longer grace requested by the parent environment.
     monkeypatch.setenv("CINDERX_JIT_STARTUP_GRACE_MS", "60000")
-    result = runners.run(runners.stdlib_canary_runner())
+    spec = runners.stdlib_canary_runner()
+    expected_total = json.loads(spec.deopt_manifest.read_text(encoding="utf-8"))["total"]
+    result = runners.run(spec)
     assert result.ok, result.summary()
-    assert result.report["organic_deopt_hits"] == 358
+    assert result.report["organic_deopt_hits"] == expected_total
     assert result.report["machine_code_entries"] > 0
 
 
+def test_stdlib_canary_rejects_changed_child_source(tmp_path):
+    fake_source = tmp_path / "ipaddress.py"
+    fake_source.write_text("# unexpected stdlib source\n", encoding="utf-8")
+    spec = runners.stdlib_canary_runner()
+    spec.payload += f"sys.modules['ipaddress'].__file__ = {str(fake_source)!r}\n"
+    result = runners.run(spec)
+    assert result.returncode == 0
+    assert not result.ok
+    assert any("stdlib source identity mismatch" in error for error in result.errors)
+
+
 def test_stdlib_canary_retry_opt_out_restores_previous_fingerprint(tmp_path):
-    spec = runners.stdlib_canary_runner(
-        judges=runners.execute_holds(expected_organic_deopts=294)
-        + [runners.expect("target_modules_attempted", "==", 72)]
-    )
+    spec = runners.stdlib_canary_runner()
     spec.env["CINDERX_JIT_DESPECIALIZE"] = "0"
     spec.asserted_env["CINDERX_JIT_DESPECIALIZE"] = "0"
-    manifest = json.loads(spec.deopt_manifest.read_text())
+    manifest = json.loads(spec.deopt_manifest.read_text(encoding="utf-8"))
     retry_site = {
         "filename": "re/_parser.py",
         "qualname": "SubPattern.__getitem__",
@@ -905,37 +944,46 @@ def test_stdlib_canary_retry_opt_out_restores_previous_fingerprint(tmp_path):
     }
     assert manifest["sites"].count(retry_site) == 1
     manifest["sites"].remove(retry_site)
-    manifest["total"] = 294
+    manifest["total"] -= retry_site["count"]
+    expected_total = manifest["total"]
+    spec.judges = runners.execute_holds(expected_organic_deopts=expected_total) + [
+        runners.expect("target_modules_attempted", "==", 72)
+    ]
     spec.deopt_manifest = tmp_path / "without-generic-retry.json"
-    spec.deopt_manifest.write_text(json.dumps(manifest))
+    spec.deopt_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     result = runners.run(spec)
     assert result.ok, result.summary()
-    assert result.report["organic_deopt_hits"] == 294
+    assert result.report["organic_deopt_hits"] == expected_total
 
 
-def test_stdlib_deopt_fingerprint_rejects_equal_total_drift():
+@pytest.mark.parametrize("source_sha", list(runners.STDLIB_CANARY_PROFILES))
+def test_stdlib_deopt_fingerprint_rejects_equal_total_drift(source_sha):
     from copy import deepcopy
     from ci_pipeline.jit311.deopt_fingerprint import check
-    manifest = json.loads(runners.stdlib_canary_runner().deopt_manifest.read_text())
+    manifest_path = runners._stdlib_canary_manifest_for_source(source_sha)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    total = manifest["total"]
     rows = []
     for site in manifest["sites"]:
         row = dict(site, transition="deopt", deopt_reason=site["reason"],
                    forced=False, instrumentation=False)
         rows.extend(deepcopy(row) for _ in range(site["count"]))
     ledger = {"dropped": 0, "rows": rows}
-    assert check(ledger, manifest, 358) == []
+    assert check(ledger, manifest, total) == []
+    assert check(ledger, manifest, 358 if total == 360 else 360)
     drift = deepcopy(ledger)
     drift["rows"][0]["deopt_reason"] = "UnexpectedReason"
-    assert check(drift, manifest, 358)
+    assert check(drift, manifest, total)
     for field in ("filename", "qualname", "cause_offset", "resume_offset"):
         drift = deepcopy(ledger)
         drift["rows"][0][field] = 99999 if field.endswith("offset") else "unexpected"
-        assert check(drift, manifest, 358)
+        assert check(drift, manifest, total)
     for bad in ({"dropped": 1, "rows": rows}, {"dropped": 0, "rows": rows[:-1]}, {}, None):
-        assert check(bad, manifest, 358)
-    drift = deepcopy(ledger)
-    drift["rows"][0]["forced"] = True
-    assert check(drift, manifest, 358)
+        assert check(bad, manifest, total)
+    for field in ("forced", "instrumentation"):
+        drift = deepcopy(ledger)
+        drift["rows"][0][field] = True
+        assert check(drift, manifest, total)
 
 
 def test_green_gate_refuses_skips(tmp_path):
@@ -1184,7 +1232,15 @@ def test_canary_population_resolves_cp311_deferred_fixture(tmp_path):
 
 def test_recovered_execution_cases_are_in_canary_population():
     population = _canary_population()
-    assert len({node for node in population if node.startswith("ASMGeneratorTest.")}) == 46
+    asm_population = {
+        node for node in population if node.startswith("ASMGeneratorTest.")
+    }
+    binding_layout_cases = {
+        "ASMGeneratorTest.Aarch64PointerLiteralPoolUsesNaturalAlignment",
+        "ASMGeneratorTest.BindingEntryTailStubsPreserveCallSlots311",
+    }
+    assert binding_layout_cases <= asm_population
+    assert len(asm_population - binding_layout_cases) == 46
     assert {"NewASMGeneratorTest.Linear", "NewASMGeneratorTest.DiamondControlBlock"} <= population
     assert {
         "HIRBuildDeferredTest." + name for name in (

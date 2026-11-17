@@ -17,6 +17,33 @@ from types import SimpleNamespace
 import ci_pipeline.libtest_diff_311 as libtest_diff
 
 
+def test_cinderx_startup_carries_standalone_contracts(tmp_path):
+    import subprocess
+    import sys
+
+    startup = tmp_path / "startup"
+    libtest_diff.provision_cinderx_startup(startup)
+    assert "install_dis_worker_contract" in (
+        startup / "sitecustomize.py"
+    ).read_text(encoding="utf-8")
+    helper = startup / "_cinderx_test_contracts.py"
+    assert helper.read_bytes() == (
+        libtest_diff.Path(libtest_diff.__file__).parent
+        / "jit311/semantic_conformance_adapters.py"
+    ).read_bytes()
+    subprocess.run(
+        [
+            sys.executable, "-I", "-c",
+            "import sys; sys.path.insert(0, sys.argv[1]); "
+            "import _cinderx_test_contracts; "
+            "assert '_cinderx' not in sys.modules",
+            str(startup),
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+
+
 def test_off_gate_runs_each_440_arm_once_and_publishes_report(
     tmp_path, monkeypatch
 ):

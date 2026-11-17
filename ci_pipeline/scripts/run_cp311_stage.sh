@@ -289,6 +289,12 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_global_load_repin_311 \
     test_cinderx.test_kunpeng.test_global_call_optimizations_311 \
     test_cinderx.test_kunpeng.test_lightweight_frames &&
+    CINDERX_REQUIRE_CORO_INLINE=1 CINDERX_PLUGIN_ENABLE=1 \
+      CINDERX_EVAL_MODE=cinder CINDERX_JIT_MODE=execute PYTHONJITAUTO=4 \
+      PYTHONJITGENERATOR=1 PYTHONJITLIGHTWEIGHTFRAME=0 CINDERX_OSR_ENABLED=0 \
+      "$PYTHON" -m unittest -v \
+      test_cinderx.test_kunpeng.test_coroutine_call_inline_311 \
+      test_cinderx.test_kunpeng.test_subprocess_setup_311 &&
     # This regression must execute JIT code; the parent PR suite defaults to off.
     CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 "$PYTHON" -m unittest -v \
       test_cinderx.test_kunpeng.test_jit_immortalize &&
@@ -341,9 +347,11 @@ driver_selftests() {
     ci_pipeline/test_jit311_shadow_surface.py \
     ci_pipeline/test_jit311_lifecycle_census.py \
     ci_pipeline/test_execution_report.py \
+    ci_pipeline/test_semantic_conformance_adapters.py \
     ci_pipeline/test_jit311_report_reasons.py \
     ci_pipeline/test_lifecycle_acceptance.py \
     ci_pipeline/test_refleak_verdict.py \
+    ci_pipeline/test_refleak_attestation.py \
     ci_pipeline/test_runtime_transition_report.py \
     ci_pipeline/test_semantic_naming.py \
     ci_pipeline/test_shutdown_stability.py \

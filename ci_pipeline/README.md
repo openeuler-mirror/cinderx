@@ -45,10 +45,14 @@ generators, JIT retirement, tracing, recursion and allocation failure.
 Daily requires the original Py_DEBUG `-R 10:3` run to succeed for every module.
 All reported reference, memory-block or FD leaks fail; there is no counter
 artifact exemption or successful-rerun substitute. The stdlib import canary
-also checks 358 organic deopts and their complete site/reason fingerprint.
+also pins one complete deopt fingerprint by the SHA256 of the imported
+`ipaddress.py`: upstream CPython 3.11.6 has 358 events; the openEuler
+private-network backport has 360, including two bounded IPv6 integer guards.
+Unknown source identities fail, and the child attests its imported source.
 This import-coverage sweep disables startup grace while retaining the default
-bounded generic retry. Its retry opt-out regression removes the same 64 retry events, retaining the 294-event
-fingerprint; product scheduling tests exercise the normal startup grace.
+bounded generic retry. Its retry opt-out regression removes the same 64 retry
+events from the selected fingerprint (294 upstream, 296 openEuler); product
+scheduling tests exercise the normal startup grace.
 Compiled-execution and lifetime probes also disable startup grace to prove
 their target paths immediately; the refleak build-sanity probe compiles
 explicitly, while the original `-R` workers retain their own execution proof.

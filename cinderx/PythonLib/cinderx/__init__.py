@@ -649,6 +649,8 @@ def _autojit_setup_provider() -> str:
     if provider is not None:
         return provider
     if _autojit_scheduling_is_configured():
+        if sys.version_info[:2] == (3, 11):
+            return "lib2to3_main,multiprocessing_pool,subprocess_popen"
         return "lib2to3_main,multiprocessing_pool"
     return "off"
 
@@ -798,6 +800,25 @@ def _install_autojit_multiprocessing_pool_provider(module: object) -> None:
             )
 
 
+def _install_autojit_subprocess_provider(module: object) -> None:
+    if sys.version_info[:2] != (3, 11):
+        return
+    from _cinderx import _autojit_setup_wrap
+
+    process = getattr(module, "Popen", None)
+    if not isinstance(process, type):
+        return
+    # Release the scope on return; the body of a Popen context is user work.
+    for attr in ("__init__", "wait"):
+        current = getattr(process, attr, None)
+        if isinstance(current, type(_install_autojit_subprocess_provider)) and getattr(
+            current, _AUTOJIT_SETUP_PROVIDER_MARKER, None
+        ) != "subprocess_popen":
+            setattr(
+                process, attr, _autojit_setup_wrap(current, "subprocess_popen")
+            )
+
+
 def _maybe_install_autojit_setup_provider_for_module(
     fullname: str, provider: str | None = None
 ) -> None:
@@ -827,6 +848,11 @@ def _maybe_install_autojit_setup_provider_for_module(
         module = sys.modules.get("multiprocessing.pool")
         if module is not None:
             _install_autojit_multiprocessing_pool_provider(module)
+
+    if "subprocess_popen" in providers and fullname == "subprocess":
+        module = sys.modules.get("subprocess")
+        if module is not None:
+            _install_autojit_subprocess_provider(module)
 
 
 # The wrapper below replaces importlib._bootstrap._find_and_load, so it
@@ -931,6 +957,7 @@ def init() -> None:
         _install_autojit_import_provider()
         _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
         _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+        _maybe_install_autojit_setup_provider_for_module("subprocess")
     finally:
         if suppress_setup:
             _autojit_setup_leave()

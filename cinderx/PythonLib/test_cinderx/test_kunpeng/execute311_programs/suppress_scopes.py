@@ -1,5 +1,6 @@
-"""Inside an import/setup scope (SUPPRESS_SCOPE env) nothing dispatches and
-nothing is spent; the first frame after the scope closes dispatches."""
+"""Inside an import/setup scope (SUPPRESS_SCOPE env) nothing dispatches,
+nothing is spent and nothing is counted; after the scope closes the code needs
+the full threshold of its own calls before it dispatches."""
 import os
 
 import _cinderx
@@ -19,6 +20,9 @@ inside = observe()
 inside_compiled = cinderjit.is_jit_compiled(hot)
 leave()
 
+for _ in range(T - 1):
+    assert hot(3, 2) == 6
+below = observe()
 assert hot(3, 2) == 6
 after = observe()
 b = entries()
@@ -30,6 +34,9 @@ emit(
     ],
     inside_compiled=inside_compiled,
     spent=inside["auto_jit_disabled_codes"] - before,
+    below_events=[
+        e["result"] for e in below["events"] if e["qualname"] == "hot"
+    ],
     after_events=[
         e["result"] for e in after["events"] if e["qualname"] == "hot"
     ],

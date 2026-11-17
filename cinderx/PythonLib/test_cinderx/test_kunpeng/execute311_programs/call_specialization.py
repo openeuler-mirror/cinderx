@@ -1,5 +1,5 @@
-"""The interpreted caller keeps stock CALL specialization; the compiled
-callee is entered through its vectorcall entry on every call."""
+"""The interpreted caller keeps ordinary CALLs adaptive; builtin precalls
+can specialize and the compiled callee is entered on every call."""
 import dis
 
 from _harness import emit, entries

@@ -165,6 +165,7 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
             env["JIT311_DEOPT_PATH"] = str(deopt_path)
         preamble = CHILD_PREAMBLE
         if spec.deopt_manifest is not None:
+            manifest = json.loads(spec.deopt_manifest.read_text(encoding="utf-8"))
             # Construct this in the parent: extra os.environ lookups after
             # native initialization would themselves change the import canary.
             preamble = preamble.replace(
@@ -172,8 +173,19 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
                 "cinderjit._jit311_reset_transition_ledger()\n", 1)
             preamble = preamble.replace(
                 '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:',
+                '    _ledger = _cinderjit_module._jit311_transition_ledger()\n'
+                + (
+                    # This runs after the evaluator and counters are frozen.
+                    # Importing ipaddress before the sweep would hide its
+                    # import-time coverage and change the workload.
+                    '    import hashlib\n'
+                    '    with open(sys.modules["ipaddress"].__file__, "rb") as _stdlib_fp:\n'
+                    '        _source_sha = hashlib.sha256(_stdlib_fp.read()).hexdigest()\n'
+                    '    _ledger["stdlib_sources"] = {"ipaddress.py": _source_sha}\n'
+                    if "stdlib_sources" in manifest else ""
+                ) +
                 '    with open(os.environ["JIT311_DEOPT_PATH"], "w") as fp:\n'
-                '        json.dump(_cinderjit_module._jit311_transition_ledger(), fp)\n'
+                '        json.dump(_ledger, fp)\n'
                 '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:', 1)
         source = preamble + _env_assertions(spec.asserted_env)
         source += spec.payload
@@ -225,7 +237,7 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
             from ci_pipeline.jit311.deopt_fingerprint import check
             try:
                 ledger = json.loads(deopt_path.read_text())
-                manifest = json.loads(spec.deopt_manifest.read_text())
+                errors.extend(_check_stdlib_source(ledger, manifest))
                 errors.extend(check(ledger, manifest, snap.get("organic_deopt_hits")))
             except (OSError, ValueError, TypeError) as exc:
                 errors.append(f"deopt fingerprint unavailable: {exc}")
@@ -555,12 +567,74 @@ def stdlib_shadow_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     )
 
 
-def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
+STDLIB_CANARY_PROFILES = {
+    # The upstream 3.11.6 image used by the official PR gate.
+    "c4a22d96741ef70d49120cd31f942a35094e666021af9b663446bd68dacdb9bd":
+        "stdlib_canary_deopts.json",
+    # openEuler backports the IPv4/IPv6 private-network classification fix.
+    "8fc7549ef3ea782afc6dd9215e61baa72c8cf1047399bf60c221241f5f5355e1":
+        "stdlib_canary_deopts_openeuler.json",
+}
+
+
+def _stdlib_canary_manifest_for_source(source_sha: str) -> Path:
+    try:
+        filename = STDLIB_CANARY_PROFILES[source_sha]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported ipaddress.py source SHA256: {source_sha!r}; "
+            "attribute the import ledger before adding a stdlib profile"
+        ) from exc
+    return REPO_ROOT / "ci_pipeline/jit311/data" / filename
+
+
+def stdlib_canary_manifest(python: str | None = None) -> Path:
+    """Pin one manifest by input identity, before running the JIT workload."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
+    }
+    env["CINDERX_JIT_MODE"] = "off"
+    proc = subprocess.run(
+        [python or sys.executable, "-c",
+         "import hashlib, importlib.util, pathlib\n"
+         "origin = importlib.util.find_spec('ipaddress').origin\n"
+         "print(hashlib.sha256(pathlib.Path(origin).read_bytes()).hexdigest())\n"],
+        env=env, capture_output=True, timeout=30, check=True,
+    )
+    source_sha = proc.stdout.decode("ascii").strip()
+    path = _stdlib_canary_manifest_for_source(source_sha)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("stdlib_sources") != {"ipaddress.py": source_sha}:
+        raise ValueError("stdlib profile does not match its pinned source identity")
+    return path
+
+
+def _check_stdlib_source(ledger: dict, manifest: dict) -> list[str]:
+    if "stdlib_sources" not in manifest:
+        return []
+    actual = ledger.get("stdlib_sources") if isinstance(ledger, dict) else None
+    expected = manifest["stdlib_sources"]
+    if (not isinstance(expected, dict)
+            or set(expected) != {"ipaddress.py"}
+            or expected["ipaddress.py"] not in STDLIB_CANARY_PROFILES):
+        return [f"invalid stdlib source identity: {expected!r}"]
+    if actual != expected:
+        return [f"stdlib source identity mismatch: expected={expected!r}, got={actual!r}"]
+    return []
+
+
+def stdlib_canary_runner(
+    *, judges: list[Judge] | None = None, python: str | None = None
+) -> RunnerSpec:
     """The same 72-module import canary under canary EXECUTION: the
     aggressive threshold organically compiles and executes every eligible
     stdlib function met during import (MR-04 acceptance: no crashes, the
     ledger closed, machine code genuinely entered).  The debug allocator
-    turns silent heap misuse into loud failures."""
+    turns silent heap misuse into loud failures. Pass the same python as
+    run() when executing this spec under another interpreter."""
+    manifest_path = stdlib_canary_manifest(python)
+    expected_total = json.loads(manifest_path.read_text(encoding="utf-8"))["total"]
     payload = (
         "import importlib\n"
         f"_targets = {STDLIB_SHADOW_MODULES!r}\n"
@@ -638,17 +712,24 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # re._compiler._optimize_charset (UnhandledException, 2+1). Three
     # baseline/head rounds and F/S/I ablations in the gate's isolated
     # CPython 3.11.6 venv preserve every old site.
-    # Disabling generic retry still removes only its 64-event site, leaving
-    # 294 events, including all 69 admission events.
+    # The upstream 3.11.6 import workload has 358 events. openEuler's
+    # private-network fix adds IPv6Network('2001:1::1/128') and
+    # IPv6Network('2001:1::2/128') at module initialization: their 128-bit
+    # accumulators add exactly two GuardFailure events at cause 707,
+    # resume 1414. Pin one complete fingerprint by the source SHA256;
+    # never select a profile from the observed deopt count. The child also
+    # attests the source it actually imported after scheduling is frozen.
+    # Disabling generic retry removes the same 64-event site in either
+    # profile (294 upstream, 296 openEuler).
     # Preserve the exact total AND the independently attributed site/reason
     # fingerprint; equal totals must not hide a different failure path.
-    default = execute_holds(expected_organic_deopts=358) + [
+    default = execute_holds(expected_organic_deopts=expected_total) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
     return RunnerSpec(
         name="canary_stdlib_72",
-        deopt_manifest=REPO_ROOT / "ci_pipeline/jit311/data/stdlib_canary_deopts.json",
+        deopt_manifest=manifest_path,
         payload=payload,
         env={
             "CINDERX_JIT_MODE": "canary",
@@ -1609,7 +1690,7 @@ def run_all(python: str | None = None) -> list[RunResult]:
         canary_execute_runner(),
         execute_auto_runner(),
         exception_semantics_runner(),
-        stdlib_canary_runner(),
+        stdlib_canary_runner(python=python),
     ]
     results = [run(spec, python=python) for spec in specs]
     return results
