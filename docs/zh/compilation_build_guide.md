@@ -2,7 +2,7 @@
 
 源码构建分为开发安装和发布打包：开发安装用于在当前环境中运行和调试，发布打包用于生成可交付的wheel。先完成通用准备，再选择CPython 3.11或3.14的对应步骤。
 
-## 工具链与源码准备
+## 准备源码
 
 在Linux AArch64主机操作，准备Git、Docker和Python 3.11及以上的宿主解释器。宿主Python用于运行构建驱动脚本；实际编译使用容器中的目标解释器、头文件和工具链。镜像构建及首次依赖获取需要可用的软件源和网络。每一步成功后再继续。进入交互容器后，需先退出容器，再执行后文标明在宿主上运行的命令。
 
@@ -22,9 +22,9 @@ mkdir -p "$BUILD_ROOT"
 
 下文的Docker开发镜像预置编译器、CMake、测试和性能工具、CMake源码依赖缓存`/opt/cinderx-deps`，以及Python wheelhouse `/opt/cinderx-pydeps`。源码、Dockerfile或依赖改变后，重新构建相应镜像；挂载新源码不会自动更新镜像里已经安装的扩展。
 
-### 宿主Python环境
+## 准备Python环境
 
-宿主Python用于运行`ci_pipeline/build_cp311_wheel.py`等构建驱动。已有Python 3.11及以上时可直接使用；也可用Conda创建独立的驱动环境：
+宿主Python用于运行`ci_pipeline/build_cp311_wheel.py`等构建驱动。已有Python 3.11及以上时可直接使用；也可用Conda创建独立的驱动环境。
 
 ```bash
 conda create -y --override-channels -c conda-forge python=3.11.6 pip -n cinderx-build
@@ -50,25 +50,28 @@ python3 --version
 
 ### 构建开发与测试镜像
 
-在仓库根目录执行：
+在仓库根目录执行。
 
 ```bash
 docker build -f Dockerfile.cp311-dev --build-arg BUILD_JOBS=8 \
   -t cinderx-dev:py311 .
+
+# 确认镜像构建成功并记录镜像ID
 docker image inspect cinderx-dev:py311 --format '{{.Id}}'
+# 启动临时容器验证Cinderx模块能够正常导入
 docker run --rm --workdir /tmp -e CINDERX_PLUGIN_ENABLE=0 cinderx-dev:py311 \
   python3.11 -c 'import cinderx, _cinderx; assert cinderx.is_initialized(), cinderx.get_import_error(); print(cinderx.__file__, _cinderx.__file__)'
 ```
 
 镜像构建过程会安装当前源码的CinderX。这里的`BUILD_JOBS`设置镜像内`CINDERX_TEST_JOBS`的初始值，不直接限制CinderX wheel编译；各阶段的并发设置见[构建并发的作用范围](#构建并发的作用范围)。
 
-需要在镜像内检查源码安装时：
+启动`cinderx-dev:py311`容器，并直接进入容器内部的 bash 命令行界面，方便你手动调试或运行测试。
 
 ```bash
 docker run --rm -it cinderx-dev:py311 bash
 ```
 
-在容器的`/workspace/cinderx`执行：
+当您进入容器修改了`CinderX`源码，想要快速重新编译并测试效果（增量编译）时，在容器的`/workspace/cinderx`执行以下命令。
 
 ```bash
 CINDERX_PLUGIN_ENABLE=0 CMAKE_BUILD_PARALLEL_LEVEL=8 \
@@ -79,7 +82,7 @@ CINDERX_PLUGIN_ENABLE=0 CMAKE_BUILD_PARALLEL_LEVEL=8 \
 
 ### 构建发布wheel
 
-回到宿主的仓库根目录执行：
+回到宿主的仓库根目录执行以下命令，将当前源码并行编译打包成一个标准的Python安装包。
 
 ```bash
 CMAKE_BUILD_PARALLEL_LEVEL=8 \
@@ -103,7 +106,7 @@ CMAKE_BUILD_PARALLEL_LEVEL=8 \
 
 当前`setup.py`在CPython 3.11上默认开启PGO和LTO。PGO先构建插桩扩展，再运行仓库训练场景，最后使用profile重建；训练或profile检查失败时，构建失败。
 
-需要快速开发构建时，在开发容器中显式关闭两项：
+需要快速开发构建时，在开发容器中显式关闭两项。快速编译当前源码，并强制覆盖安装到 python3.11 环境中
 
 ```bash
 CINDERX_PLUGIN_ENABLE=0 CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 \
@@ -113,7 +116,7 @@ CINDERX_PLUGIN_ENABLE=0 CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 \
 
 上述开关用于容器内的开发安装。发布构建驱动仅传递其定义的宿主参数，使用该入口时应按驱动说明配置，并记录与默认值不同的参数。
 
-最小运行验证按[快速入门](quick_start.md#cpython-311)执行。完整开发者验证见[CI指南](../../ci_pipeline/README_CN.md)：CP311 PR使用专用suite，不能把CP314的RuntimeTests命令直接换解释器后当作同等验证。
+最小运行验证按[快速入门](quick_start.md#验证安装成功)执行。完整开发者验证见[CI指南](../../ci_pipeline/README_CN.md)：CP311 PR使用专用suite，不能把CP314的RuntimeTests命令直接换解释器后当作同等验证。
 
 ## CPython 3.14
 
@@ -123,7 +126,7 @@ CINDERX_PLUGIN_ENABLE=0 CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 \
 
 ### 构建开发与测试镜像
 
-在宿主的仓库根目录执行：
+在宿主的仓库根目录执行。
 
 ```bash
 docker build --build-arg BUILD_JOBS=8 -t cinderx-dev:py314 .
@@ -133,7 +136,7 @@ docker run --rm --workdir /tmp -e CINDERX_PLUGIN_ENABLE=0 cinderx-dev:py314 \
 docker run --rm -it cinderx-dev:py314 bash
 ```
 
-在容器的`/workspace/cinderx`进行源码安装：
+在容器的`/workspace/cinderx`进行源码安装。
 
 ```bash
 CINDERX_PLUGIN_ENABLE=0 CMAKE_BUILD_PARALLEL_LEVEL=8 \
@@ -183,7 +186,7 @@ python3 ci_pipeline/build_cp314_manylinux_fat_wheel.py \
 
 驱动分别为CPython 3.14.0、3.14.1、3.14.2和3.14.3构建普通wheel，经`auditwheel`修复后合为一个fat wheel。包内加载器根据当前Python的补丁版本选择对应本地扩展。
 
-主要输出为：
+主要输出为。
 
 - wheelhouse下的最终`cinderx-<version>-cp314-cp314-...aarch64.whl`。
 - 构建目录中的`ordinary`、`repaired`、`logs`和`work`。驱动内部名为`fat`的输出映射到`--wheelhouse-dir`，本例为`$BUILD_ROOT/cp314/wheelhouse`。
@@ -205,7 +208,7 @@ python3 ci_pipeline/build_cp314_manylinux_fat_wheel.py \
   --cmake-build-parallel-level 8 --makeflags=-j8
 ```
 
-这组参数会改变构建类型和优化配置，使用时应在构建记录中注明。默认冒烟检查验证导入等基础能力；完整功能测试和性能验收需另行执行。最小运行验证见[快速入门](quick_start.md#cpython-314)，完整门禁和覆盖率见[CI指南](../../ci_pipeline/README_CN.md)。
+这组参数会改变构建类型和优化配置，使用时应在构建记录中注明。默认冒烟检查验证导入等基础能力；完整功能测试和性能验收需另行执行。最小运行验证见[快速入门](quick_start.md)，完整门禁和覆盖率见[CI指南](../../ci_pipeline/README_CN.md)。
 
 ## 依赖缓存与构建记录
 
