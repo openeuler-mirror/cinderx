@@ -688,6 +688,7 @@ extern "C" void Ci_AttrPathConfigSnapshot311(void);
 extern "C" PyObject* Ci_AttrPathStatus311(void);
 extern "C" PyObject* Ci_AttrPathCounters311(void);
 extern "C" PyObject* Ci_AttrMroStats311(void);
+extern "C" PyObject* Ci_RegisterTorchRegistry311(PyObject*, PyObject*);
 static PyObject* interp_off_entry_enabled(PyObject*, PyObject*) {
   return PyBool_FromLong(Ci_OffEntryEnabled311 && Ci_EvalHook311_IsInstalled());
 }
@@ -1308,6 +1309,10 @@ PyMethodDef _cinderx_methods[] = {
      attr_path_counters,
      METH_NOARGS,
      "Optional attribute-path counters, or None."},
+    {"_register_torch_registry_311",
+     Ci_RegisterTorchRegistry311,
+     METH_VARARGS,
+     "Register the verified PyTorch 2.10 attribute handler for this experiment."},
 #endif
     {"install_frame_evaluator",
      install_frame_evaluator,

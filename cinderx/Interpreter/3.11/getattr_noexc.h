@@ -25,6 +25,8 @@ static unsigned long long ci_mro_calls_311, ci_mro_hits_311, ci_mro_scans_311;
 static unsigned long long ci_mro_rejects_311, ci_mro_base_visits_311;
 static unsigned long long ci_mro_cached_fallbacks_311;
 
+#include "torch_registry311.h"
+
 // Mirrors CPython 3.11.6 _PyType_Lookup's cache-hit conditions. This reads
 // the current interpreter's cache; it neither fills it nor runs Python.
 static PyObject*
@@ -95,6 +97,13 @@ int Ci_InterpGetattr311_Init(void) {
   ci_mro_cache_enabled_311 = cache == NULL || strcmp(cache, "1") == 0;
   ci_interp_getattr_enabled = ci_attr_noexc_config_311;
   ci_interp_getattr_counting = ci_attr_diagnostics_config_311;
+  const char* registry = getenv("ATTR_PATH_TORCH_REGISTRY");
+  if (registry != NULL && strcmp(registry, "0") && strcmp(registry, "1")) {
+    PyErr_SetString(PyExc_ValueError, "ATTR_PATH_TORCH_REGISTRY must be 0 or 1");
+    return -1;
+  }
+  ci_torch_registry_requested_311 = ci_interp_getattr_enabled &&
+      (registry == NULL || strcmp(registry, "1") == 0);
   if (ci_interp_getattr_enabled && Ci_tp_getattr_hook == NULL) {
     PyErr_SetString(
         PyExc_RuntimeError, "CPython getattr hook is not initialized");
@@ -115,7 +124,7 @@ int Ci_InterpGetattr311_Init(void) {
 // Configuration is separate from optional diagnostic counters.
 PyObject* Ci_AttrPathStatus311(void) {
   return Py_BuildValue(
-      "{s:i,s:i,s:i,s:i,s:i,s:i}",
+      "{s:i,s:i,s:i,s:i,s:i,s:i,s:i}",
       "no_exception",
       ci_interp_getattr_enabled,
       "specialization",
@@ -126,6 +135,8 @@ PyObject* Ci_AttrPathStatus311(void) {
       ci_global_cache_enabled_311,
       "inline_call",
       ci_inline_enabled_311,
+      "torch_registry_requested",
+      ci_torch_registry_requested_311,
       "diagnostics",
       ci_interp_getattr_counting);
 }
@@ -134,7 +145,7 @@ PyObject* Ci_AttrPathCounters311(void) {
   if (!ci_interp_getattr_counting)
     Py_RETURN_NONE;
   return Py_BuildValue(
-      "{s:K,s:K,s:K,s:K,s:K,s:K}",
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
       "attribute_hits",
       ci_interp_getattr_hits,
       "attribute_misses",
@@ -145,6 +156,8 @@ PyObject* Ci_AttrPathCounters311(void) {
       ci_interp_getattr_errors,
       "global_hits",
       ci_global_cache_hits_311,
+      "torch_registry_hits",
+      ci_torch_registry_hits_311,
       "global_misses",
       ci_global_cache_misses_311);
 }
@@ -238,16 +251,21 @@ static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
     if (ci_interp_getattr_counting) {
       ci_interp_getattr_misses++;
     }
-    // Preserve CPython 3.11 typeobject.c:call_attribute descriptor binding
-    // and invoke the original handler; do not implement its logic in C.
-    descrgetfunc bind = Py_TYPE(handler)->tp_descr_get;
-    PyObject* bound =
-        bind == NULL ? NULL : bind(handler, obj, (PyObject*)Py_TYPE(obj));
-    PyObject* callable = bind == NULL ? handler : bound;
-    if (callable != NULL) {
-      result = PyObject_CallOneArg(callable, name);
+    if (ci_torch_registry_requested_311 && handler == ci_torch_handler_311) {
+      result = Ci_TryTorchRegistry311(obj, name, handler);
     }
-    Py_XDECREF(bound);
+    if (result == NULL && !PyErr_Occurred()) {
+      // Preserve CPython 3.11 descriptor binding for all other handlers,
+      // unsupported layouts, and genuine registry misses.
+      descrgetfunc bind = Py_TYPE(handler)->tp_descr_get;
+      PyObject* bound =
+          bind == NULL ? NULL : bind(handler, obj, (PyObject*)Py_TYPE(obj));
+      PyObject* callable = bind == NULL ? handler : bound;
+      if (callable != NULL) {
+        result = PyObject_CallOneArg(callable, name);
+      }
+      Py_XDECREF(bound);
+    }
   }
   Py_DECREF(handler);
   if (result == NULL) {

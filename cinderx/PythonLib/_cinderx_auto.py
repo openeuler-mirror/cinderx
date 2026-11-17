@@ -3,6 +3,7 @@ import os
 import sys
 _attr_mode = os.environ.get('ATTR_PATH_MODE')
 _attr_expected = None
+_torch_registry_state = 'disabled'
 
 def _attr_flag(name, default):
     raw = os.environ.get(name)
@@ -29,6 +30,169 @@ def _verify():
                            (_attr_expected, result['attribute']))
     return result
 
+def register_torch_registry():
+    """Register a PyTorch attribute handler that matches the reference implementation."""
+    global _torch_registry_state
+    from types import FunctionType, GetSetDescriptorType
+
+    torch = sys.modules.get('torch')
+    module = sys.modules.get('torch.nn.modules.module')
+    if torch is None or module is None:
+        return False
+    cls = vars(module).get('Module')
+    if type(cls) is not type or cls.__base__ is not object or cls is not torch.nn.Module:
+        return False
+    handler = vars(cls).get('__getattr__')
+    descriptor = vars(cls).get('__dict__')
+    if (type(handler) is not FunctionType or handler.__globals__ is not vars(module) or
+            type(descriptor) is not GetSetDescriptorType or descriptor.__objclass__ is not cls):
+        return False
+
+    reference = """
+def __getattr__(self, name):
+    if "_parameters" in self.__dict__:
+        _parameters = self.__dict__["_parameters"]
+        if name in _parameters:
+            return _parameters[name]
+    if "_buffers" in self.__dict__:
+        _buffers = self.__dict__["_buffers"]
+        if name in _buffers:
+            return _buffers[name]
+    if "_modules" in self.__dict__:
+        modules = self.__dict__["_modules"]
+        if name in modules:
+            return modules[name]
+    raise AttributeError(
+        f"'{type(self).__name__}' object has no attribute '{name}'"
+    )
+"""
+    namespace = {}
+    exec(compile(reference, '<torch registry reference>', 'exec', dont_inherit=True), namespace)
+    expected = namespace['__getattr__'].__code__
+    code = handler.__code__
+    fields = ('co_code', 'co_names', 'co_varnames', 'co_freevars', 'co_cellvars',
+              'co_flags', 'co_argcount', 'co_posonlyargcount', 'co_kwonlyargcount',
+              'co_exceptiontable', 'co_stacksize', 'co_nlocals')
+    if any(getattr(code, field) != getattr(expected, field) for field in fields):
+        return False
+    if (len(code.co_consts) != len(expected.co_consts) or
+            any(type(a) is not type(b) or a != b for a, b in zip(code.co_consts, expected.co_consts))):
+        return False
+    import _cinderx
+    _cinderx._register_torch_registry_311(handler, code, descriptor)
+    _torch_registry_state = 'registered'
+    return True
+
+
+def _register_loaded_torch():
+    global _torch_registry_state
+    try:
+        if not register_torch_registry():
+            _torch_registry_state = 'unsupported'
+    except Exception:
+        # A package without a matching handler still imports and uses Python.
+        _torch_registry_state = 'registration_error'
+
+
+def _install_torch_registry_hook():
+    from importlib.machinery import PathFinder, SourceFileLoader
+
+    global _torch_registry_state
+    if 'torch' in sys.modules:
+        _register_loaded_torch()
+        return
+    if PathFinder not in sys.meta_path:
+        _torch_registry_state = 'unsupported_loader'
+        return
+
+    class TorchRegistryFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            global _torch_registry_state
+            if fullname != 'torch' or target is not None:
+                return None
+            if self in sys.meta_path:
+                sys.meta_path.remove(self)
+            spec = PathFinder.find_spec(fullname, path, target)
+            if spec is None or type(spec.loader) is not SourceFileLoader:
+                _torch_registry_state = 'unsupported_loader'
+                return spec
+            loader = spec.loader
+            original = loader.exec_module
+            if 'exec_module' in vars(loader):
+                _torch_registry_state = 'unsupported_loader'
+                return spec
+
+            def exec_module(module):
+                # Restore the normal loader before running package code.
+                del loader.exec_module
+                original(module)
+                _register_loaded_torch()
+
+            loader.exec_module = exec_module
+            return spec
+
+    sys.meta_path.insert(sys.meta_path.index(PathFinder), TorchRegistryFinder())
+    _torch_registry_state = 'pending'
+
+
+def attr_status():
+    """Report live state in the acceptance system's V24 schema."""
+    native = sys.modules.get('_cinderx')
+    result = dict(
+        mode=_attr_mode if _attr_mode is not None else 'off',
+        pid=os.getpid(),
+        python=sys.version,
+        executable=sys.executable,
+        native_loaded=native is not None,
+        evaluator=False,
+        torch_registry_state=_torch_registry_state,
+    )
+    if native is not None:
+        flags = native._attr_path_status()
+        result.update(
+            native_path=native.__file__,
+            evaluator=native.is_frame_evaluator_installed(),
+            attribute=dict(
+                flags,
+                enabled=flags['no_exception'],
+                counting=flags['diagnostics'],
+                specialize_enabled=flags['specialization'],
+                split_hint_enabled=flags['split_dict'],
+                global_cache_enabled=flags['global_cache'],
+                inline_entry_ready=flags['inline_call'],
+            ),
+            jit=native._get_trigger_stats(),
+        )
+    return result
+
+
+def _enable_acceptance_reports(folder):
+    import atexit
+    import json
+    from pathlib import Path
+
+    destination = Path(folder).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+
+    def write_report(phase):
+        _verify()
+        result = attr_status()
+        report = destination / ('cinderx-%s-%s.json' % (result['pid'], phase))
+        temporary = report.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+        temporary.replace(report)
+
+    def finish():
+        try:
+            write_report('end')
+        except BaseException as error:
+            print('ATTR_PATH_INVALID_RESULT: %s' % error, file=sys.stderr, flush=True)
+            os._exit(78)
+
+    write_report('start')
+    atexit.register(finish)
+
+
 if _attr_mode is not None:
     try:
         if _attr_mode not in ('off', 'cinderx', 'cinderx_control'):
@@ -41,16 +205,23 @@ if _attr_mode is not None:
             if os.environ.get('TORCH_MODULE_ATTR_FASTPATH','off') not in ('off','0',''):
                 raise RuntimeError('slot_native cannot be combined with attribute mode')
             full = _attr_mode == 'cinderx'
+            no_exception = _attr_flag('ATTR_PATH_NOEXC', full)
             _attr_expected = dict(
-                no_exception=_attr_flag('ATTR_PATH_NOEXC', full),
+                no_exception=no_exception,
                 specialization=_attr_flag('ATTR_PATH_SPECIALIZE', full),
                 split_dict=_attr_flag('ATTR_PATH_SPLIT_HINT', full),
                 global_cache=_attr_flag('ATTR_PATH_GLOBAL_CACHE', True),
                 inline_call=_attr_flag('ATTR_PATH_INLINE_CALL', True),
+                torch_registry_requested=no_exception and _attr_flag('ATTR_PATH_TORCH_REGISTRY', True),
                 diagnostics=_attr_flag('ATTR_PATH_DIAGNOSTICS', False))
             import _cinderx
             _cinderx.install_frame_evaluator()
         _verify()
+        if _attr_expected is not None and _attr_expected['torch_registry_requested']:
+            _install_torch_registry_hook()
+        report_folder = os.environ.get('ATTR_PATH_REPORT_DIR')
+        if _attr_mode != 'off' and report_folder:
+            _enable_acceptance_reports(report_folder)
     except Exception as error:
         # site.addpackage catches Exception and continues; SystemExit must
         # escape the .pth boundary so the application cannot run unoptimized.
