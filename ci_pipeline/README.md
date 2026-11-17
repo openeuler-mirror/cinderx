@@ -125,6 +125,21 @@ Daily-only. Python 3.14 keeps the existing pipeline and runs in this order:
 If `runtime` or coverage post-processing fails, the pipeline stops before
 running later suites.
 
+### CPython 3.11 attribute-path acceptance
+
+On Linux AArch64 with CPython 3.11.6, run SC01–SC04 and the same-name
+field conversion test (SC05-S1) against the supplied CinderX wheel:
+
+```bash
+CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
+python3.11 ci_pipeline/run_gate.py --suite cp311_attr_path
+```
+
+A C compiler and CPython headers are needed for the test probes. The registry
+fixture uses a minimal PyTorch mock to exercise automatic registration and the
+C lookup. The suite keeps JIT off and writes its standard `summary.json` and
+logs under `build/testgate/cp311_attr_path-*/`.
+
 ### Daily Compat Gate
 
 `daily` reuses the main PR gate flow, then fans out the wheel compatibility

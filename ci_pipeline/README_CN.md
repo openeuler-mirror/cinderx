@@ -108,6 +108,23 @@ Daily 产物。完整 Lib/test differential 仍只在 Daily 运行。Python 3.14
 
 如果 `runtime` 或覆盖率后处理失败，pipeline 会在进入后续 suite 前停止。
 
+### CPython 3.11 属性路径专项
+
+在 Linux AArch64、CPython 3.11.6 环境中指定待测 CinderX wheel，即可单独运行
+SC01–SC04 和 SC05-S1 的同名字段转换用例：
+
+```bash
+CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
+python3.11 ci_pipeline/run_gate.py --suite cp311_attr_path
+```
+
+安装在本次运行的独立 venv。需要 C 编译器和 CPython 3.11.6 头文件编译测试
+探针。SC05-S1 从测试目录导入最小 PyTorch mock，验证自动注册和实际 C 补查，
+无需安装 PyTorch。专项子进程保持 JIT 关闭，C 补查关闭和开启两档均检查 JIT 计数。
+标准报告和各阶段日志在 `build/testgate/cp311_attr_path-*/`，
+其中 `summary.json` 记录测试结果，setup 日志记录 CinderX wheel 的 SHA256。
+十模型实机对照走 NPU 验收流程。
+
 ### Daily 兼容性门禁
 
 `daily` 复用 PR 门禁的主体流程，并额外展开 wheel 兼容性矩阵：

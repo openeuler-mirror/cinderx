@@ -1,0 +1,28 @@
+fail_fast = true
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "setup_attr_path_311"
+phase = "setup"
+command = '"$CINDERX_TEST_PYTHON" -I ci_pipeline/cp311_attr_path.py setup "{run_dir}"'
+[jobs.env]
+ATTR_PATH_MODE = "off"
+CINDERX_PLUGIN_ENABLE = "0"
+CINDERX_JIT_MODE = "off"
+CINDERX_JIT_DISABLE = "1"
+PYTHONJITDISABLE = "1"
+
+[[jobs]]
+name = "test_attr_path_311"
+phase = "test"
+command = '"{run_dir}/venv/bin/python" -I ci_pipeline/cp311_attr_path.py test "{run_dir}"'
+[jobs.env]
+ATTR_PATH_MODE = "off"
+CINDERX_PLUGIN_ENABLE = "0"
+CINDERX_JIT_MODE = "off"
+CINDERX_JIT_DISABLE = "1"
+PYTHONJITDISABLE = "1"

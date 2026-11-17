@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import _key_probe
+
 cases = {}
 
 def capture(fn):
@@ -27,6 +29,7 @@ class Hook:
         return "method"
 
 obj = Hook()
+original_getattr = Hook.__getattr__
 obj.x = 11
 warm(attr, obj)
 cases["instance_value"] = attr(obj)
@@ -39,15 +42,19 @@ del obj.x
 cases["delete_to_fallback"] = attr(obj)
 Hook.__getattr__ = lambda self, name: "changed:" + name
 cases["replace_getattr"] = attr(obj)
+Hook.__getattr__ = original_getattr
+cases["restore_getattr_first_read"] = attr(obj)
 obj.x = 13
 warm(attr, obj)
 Hook.__getattribute__ = lambda self, name: 99 if name == "x" else object.__getattribute__(self, name)
 cases["replace_getattribute"] = attr(obj)
 del Hook.__getattribute__
+cases["restore_getattribute_first_read"] = attr(obj)
 warm(attr, obj)
 Hook.x = property(lambda self: 14)
 cases["late_data_descriptor"] = attr(obj)
 del Hook.x
+cases["remove_descriptor_first_read"] = attr(obj)
 
 class Alternate(Hook):
     @property
@@ -57,12 +64,19 @@ warm(attr, obj)
 obj.__class__ = Alternate
 cases["change_class"] = attr(obj)
 obj.__class__ = Hook
+cases["restore_class_first_read"] = attr(obj)
+original_dict = obj.__dict__
 obj.__dict__ = {"x": 16}
+assert _key_probe.dict_layout(obj.__dict__) == "combined_unicode"
+cases["replace_dict_first_read"] = attr(obj)
 warm(attr, obj)
 cases["replace_dict"] = attr(obj)
+obj.__dict__ = original_dict
+cases["restore_dict_first_read"] = attr(obj)
 obj.__dict__ = {"x": 17, "f": lambda: "instance-method"}
 cases["method_instance_shadow"] = method(obj)
 del obj.__dict__["f"]
+cases["method_unshadow_first_call"] = method(obj)
 warm(method, obj)
 cases["method_unshadow"] = method(obj)
 obj.f = lambda: "late-shadow"
@@ -101,6 +115,8 @@ d = Derived()
 warm(method, d)
 Derived.__bases__ = (BaseB, Hook)
 cases["change_bases"] = method(d)
+Derived.__bases__ = (BaseA, Hook)
+cases["restore_bases_first_call"] = method(d)
 
 class Custom(Hook):
     def __getattribute__(self, name):
@@ -136,6 +152,7 @@ for raises in (False, True):
     dictionary = {Collision(): 0, "x": 24}
     raises = desired
     o.__dict__ = dictionary
+    assert _key_probe.dict_layout(o.__dict__) == "combined_general"
     events.clear()
     first = capture(lambda: attr(o))
     # Attempt enough reads to trigger specialization retries.
@@ -217,10 +234,38 @@ def attribute_caches(fn):
 
 
 materialized = Materialized()
+assert _key_probe.dict_layout(materialized.__dict__) == "split"
 inline = InlineValues()
 inline.x = 30
 slot = Slots()
 slot.x = 31
+
+cx = None
+split_enabled = False
+if os.environ["ATTR_PATH_MODE"] == "cinderx":
+    import _cinderx as cx
+    split_enabled = bool(cx._attr_path_status()["split_dict"])
+    assert split_enabled == (os.environ.get("ATTR_PATH_SPLIT_HINT", "1") == "1")
+
+
+def check_path(fn, value, expected):
+    warm(fn, value)
+    if cx is None:
+        return
+    before = attribute_caches(fn)
+    hits = cx._attr_path_counters()["attribute_hits"]
+    warm(fn, value, 16)
+    generic_hits = cx._attr_path_counters()["attribute_hits"] - hits
+    after = attribute_caches(fn)
+    if fn is split_read:
+        assert generic_hits == (0 if split_enabled else 16), (split_enabled, generic_hits, after)
+        if not split_enabled:
+            return
+    assert expected in [opname for opname, _ in after], (fn.__name__, after)
+    # The specialized opcode must execute without consuming miss counters.
+    assert before == after, (fn.__name__, before, after)
+
+
 for fn, value, expected in (
     (split_read, materialized, "LOAD_ATTR_WITH_HINT"),
     (inline_read, inline, "LOAD_ATTR_INSTANCE_VALUE"),
@@ -229,14 +274,15 @@ for fn, value, expected in (
     (nodict_method, slot, "LOAD_METHOD_NO_DICT"),
     (inline_method, inline, "LOAD_METHOD_WITH_VALUES"),
 ):
-    warm(fn, value)
-    if os.environ["ATTR_PATH_MODE"] == "cinderx":
-        before = attribute_caches(fn)
-        warm(fn, value, 16)
-        after = attribute_caches(fn)
-        assert expected in [opname for opname, _ in after], (fn.__name__, after)
-        # The specialized opcode must execute without consuming miss counters.
-        assert before == after, (fn.__name__, before, after)
+    check_path(fn, value, expected)
+
+original_dict = materialized.__dict__
+materialized.__dict__ = {"x": 28}
+cases["warmed_split_replaced_first_read"] = split_read(materialized)
+materialized.__dict__ = original_dict
+cases["warmed_split_restored_first_read"] = split_read(materialized)
+check_path(split_read, materialized, "LOAD_ATTR_WITH_HINT")
+cases["warmed_split_restored_rewarmed"] = split_read(materialized)
 
 if "_cinderx" in sys.modules:
     import _cinderx

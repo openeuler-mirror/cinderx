@@ -35,6 +35,18 @@ static PyObject* call_n(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
   return result;
 }
+static PyObject* dict_layout(PyObject* self, PyObject* obj) {
+  if (!PyDict_CheckExact(obj)) {
+    PyErr_SetString(PyExc_TypeError, "exact dict required");
+    return NULL;
+  }
+  PyDictObject* d = (PyDictObject*)obj;
+  if (d->ma_values != NULL) {
+    return PyUnicode_FromString("split");
+  }
+  return PyUnicode_FromString(
+      DK_IS_UNICODE(d->ma_keys) ? "combined_unicode" : "combined_general");
+}
 static PyObject* clear_type_cache(PyObject* self, PyObject* args) {
   return PyLong_FromUnsignedLong(PyType_ClearCache());
 }
@@ -76,6 +88,7 @@ static PyMethodDef methods[] = {
     {"clear_type_cache", clear_type_cache, METH_NOARGS, NULL},
     {"type_info", type_info, METH_O, NULL},
     {"snapshot", snapshot, METH_O, NULL},
+    {"dict_layout", dict_layout, METH_O, NULL},
     {"call_n", call_n, METH_VARARGS, NULL},
     {NULL}};
 static struct PyModuleDef module =

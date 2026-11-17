@@ -23,12 +23,22 @@ def run_cases():
     capture('instance_miss',lambda:b.missing)
     capture('builtin_getattr',lambda:getattr(b,'missing'))
     capture('builtin_hasattr',lambda:hasattr(b,'missing'))
+    class ChangingValue:
+        calls = 0
+        def __getattr__(self,name):
+            self.calls += 1
+            return self.calls
+    varying = ChangingValue()
+    capture('getattr_result_not_cached',lambda:[varying.missing,getattr(varying,'missing',None)])
+    assert result['getattr_result_not_cached']['value'] == [1,2]
     b.__getattr__=lambda n:('wrong-instance-hook',n)
     capture('instance_hook_ignored',lambda:b.another)
     class Missing:
         def __getattr__(self,name):raise AttributeError('final '+name)
     m=Missing();capture('final_error',lambda:m.absent,m)
+    capture('builtin_missing_error',lambda:getattr(m,'absent'),m)
     capture('builtin_default',lambda:getattr(m,'absent',99),m)
+    capture('builtin_hasattr_missing',lambda:hasattr(m,'absent'))
     class ExistingContext:
         def __getattr__(self,name):raise AttributeError('kept',name='original',obj='sentinel')
     e=ExistingContext();capture('existing_error_context',lambda:e.absent,e)
@@ -44,6 +54,13 @@ def run_cases():
     class DescriptorOwner(Basic):value=Descriptor()
     e=DescriptorOwner();e.__dict__['value']=88
     capture('data_descriptor_priority',lambda:e.value,e)
+    class NonDataDescriptor:
+        def __get__(self,obj,owner):events.append('nondata');return 37
+    class NonDataOwner(Basic):value=NonDataDescriptor()
+    e=NonDataOwner()
+    capture('nondata_descriptor_read',lambda:e.value,e)
+    e.value=88
+    capture('nondata_descriptor_shadow',lambda:e.value,e)
     class Props(Basic):
         @property
         def good(self):events.append('good');return 41
@@ -112,8 +129,28 @@ def run_cases():
     capture('module_fallback',lambda:mod.missing,mod)
     class Methods(Basic):
         def real(self,x):return x+1
+        @staticmethod
+        def static(x):return ('static',x)
+        @classmethod
+        def class_method(cls,x):return (cls.__name__,x)
         def __getattr__(self,name):return lambda x:('dynamic-method',name,x)
-    e=Methods();capture('load_method_hit',lambda:e.real(4),e);capture('load_method_miss',lambda:e.dynamic(4),e)
+    def call_real(obj):return obj.real(4)
+    e=Methods()
+    for _ in range(200):assert call_real(e) == 5
+    capture('load_method_hit',lambda:call_real(e),e);capture('load_method_miss',lambda:e.dynamic(4),e)
+    assert e.real.__self__ is e
+    assert e.class_method.__self__ is Methods
+    assert e.static is Methods.static
+    capture('static_method_call',lambda:e.static(4),e)
+    capture('class_method_call',lambda:e.class_method(4),e)
+    e.real = lambda x: ('instance', x)
+    capture('callable_method_shadow', lambda: call_real(e), e)
+    e.real = 0
+    capture('noncallable_method_shadow', lambda: call_real(e), e)
+    assert result['noncallable_method_shadow']['error'] == 'TypeError'
+    del e.real
+    capture('restored_method', lambda: call_real(e), e)
+    assert result['restored_method'] == result['load_method_hit']
     capture('active_exception_context',lambda:outer_exception(b))
     class Recursive:
         def __getattr__(self,name):return self.again

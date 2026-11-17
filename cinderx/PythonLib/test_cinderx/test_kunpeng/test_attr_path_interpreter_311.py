@@ -16,6 +16,8 @@ class AttrPathInterpreter311Tests(Interpreter311Case):
         stock = self.run_case("case_specga.py", "off", output=True)
         optimized = self.run_case("case_specga.py", output=True)
         self.assertEqual(stock, optimized)
+        without_split_hint = self.run_case("case_specga.py", output=True, ATTR_PATH_SPLIT_HINT="0")
+        self.assertEqual(stock, without_split_hint)
 
     def test_instance_dictionary_errors(self):
         self.run_case("case_dict_attributeerror.py")
