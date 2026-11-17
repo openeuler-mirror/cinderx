@@ -11,10 +11,10 @@
 | 产品版本 | `v3.0.0` |
 | wheel元数据版本 | `2026.11.10.0` |
 | CP311 RPM版本 | `2026.11.10.0-1`，包名`python3-cinderx` |
-| 架构 | Linux AArch64／ARM64 |
+| 架构 | Linux AArch64/ARM64 |
 | wheel来源 | `openeuler/cinderx` Release附件 |
-| RPM来源 | 发布方提供的RPM软件源；源地址待提供，也可安装已取得的本地RPM |
-| 校验方式 | wheel使用同一Release的SHA256文件；本地RPM使用配套的同名`.sha256`文件 |
+| RPM来源 | 暂未公开发布。已取得RPM时，参见[本地安装步骤](#获取并安装rpm)安装。 |
+| 校验方式 | wheel使用同一Release的SHA256文件。通过软件源安装的RPM由DNF自动校验。 |
 
 ## CPython 3.11
 
@@ -56,12 +56,7 @@
         预期输出：
 
         ```output
-        NAME="openEuler"
-        VERSION="24.03 (LTS-SP3)"
-        ID="openEuler"
-        VERSION_ID="24.03"
-        PRETTY_NAME="openEuler 24.03 (LTS-SP3)"
-        ANSI_COLOR="0;31"
+        aarch64
         ```
 
     3. 查询RPM包管理器安装的Python版本号。
@@ -73,7 +68,7 @@
         预期输出：
 
         ```output
-        python3-3.11.6-38.oe2403sp3.aarch64
+        python3-3.11.6-34.oe2403sp3.aarch64
         ```
 
 2. 校验Python运行时与编译参数。
@@ -101,7 +96,7 @@
     预期输出：
 
     ```output
-    3.11.6 (main, Jul 20 2026, 20:03:57) [GCC 12.3.1 (openEuler 12.3.1-110.oe2403sp3)]
+    3.11.6 (main, Jul  8 2026, 04:34:09) [GCC 12.3.1 (openEuler 12.3.1-110.oe2403sp3)]
     aarch64
     cpython-311-aarch64-linux-gnu
     1
@@ -139,7 +134,7 @@
 
 2. 检查底层库并校验Python兼容性。
 
-    1. 查询系统glbc版本。
+    1. 查询系统glibc版本。
 
         ```bash
         # 检查系统底层库
@@ -327,32 +322,29 @@ PY
 
 ### 获取并安装RPM
 
-软件源地址由发布方提供，目前待提供。取得源配置后，按发布方说明启用该软件源，再查询可用版本并安装指定版本：
+以下dnf命令在具备系统软件包管理权限的shell中执行。
 
-```bash
-# 在源码仓库外准备工作目录。
-mkdir -p "$HOME/cinderx-demo"
-cd "$HOME/cinderx-demo"
+#### 本地安装
 
-dnf list --showduplicates python3-cinderx
-CINDERX_PLUGIN_ENABLE=0 dnf install python3-cinderx-2026.11.10.0-1.aarch64
+在RPM文件所在目录执行以下命令，将文件名替换为实际取得的文件名。
+
+```shell
+CINDERX_PLUGIN_ENABLE=0 dnf install ./python3-cinderx-2026.11.10.0-1.aarch64.rpm
 ```
 
-尚未配置软件源时，可将安装包`python3-cinderx-2026.11.10.0-1.aarch64.rpm`和同名`.sha256`文件放入工作目录，校验后从本地安装。以下`dnf`软件包管理命令在具备系统软件包管理权限的shell中执行：
+完全离线安装要求系统已经提供全部依赖，可在安装命令中增加--disablerepo='*'；缺少依赖时先从配套软件源补齐，不使用--nodeps 跳过检查。
 
-```bash
-rpm_file=python3-cinderx-2026.11.10.0-1.aarch64.rpm
-sha256sum -c "$rpm_file.sha256" &&
-  CINDERX_PLUGIN_ENABLE=0 dnf install "./$rpm_file" &&
-  rpm -q python3-cinderx &&
-  rpm -V python3-cinderx
+#### 软件源安装
+
+正式软件源开放后，按发布公告配置软件源，再执行以下命令。下载的RPM由DNF自动校验。
+
+```shell
+CINDERX_PLUGIN_ENABLE=0 dnf install python3-cinderx
 ```
-
-软件包完整且未被修改时，`rpm -V`无输出并返回`0`。完全离线安装要求系统已经提供全部依赖，可在安装命令中增加`--disablerepo='*'`；缺少依赖时先从配套软件源补齐，不使用`--nodeps`跳过检查。
 
 ### 验证安装结果
 
-RPM安装到系统`/usr/lib64/python3.11/site-packages`。先查询安装信息和实际导入位置：
+RPM安装到系统`/usr/lib64/python3.11/site-packages`。如需核对已安装文件，可运行`rpm -V python3-cinderx`。先查询安装信息和实际导入位置：
 
 ```bash
 rpm -q python3-cinderx
@@ -405,16 +397,15 @@ CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
 
 ### 重装、升级、回退与卸载
 
-维护前记录`rpm -q python3-cinderx`、原RPM及其校验文件、启动配置和业务验证结果，并停止使用该包的相关进程。同版本重装可执行：
+维护前记录`rpm -q python3-cinderx`、原RPM、启动配置和业务验证结果，并停止使用该包的相关进程。同版本重装可执行：
 
 ```bash
 rpm_file=python3-cinderx-2026.11.10.0-1.aarch64.rpm
-sha256sum -c "$rpm_file.sha256" &&
-  CINDERX_PLUGIN_ENABLE=0 dnf reinstall "./$rpm_file" &&
+CINDERX_PLUGIN_ENABLE=0 dnf reinstall "./$rpm_file" &&
   rpm -V python3-cinderx
 ```
 
-升级时使用发布方提供的新RPM，先核对其系统、Python配套要求并校验文件，再执行`CINDERX_PLUGIN_ENABLE=0 dnf upgrade /absolute/path/to/new-package.rpm`。需要回退时，对保留的旧RPM执行相同的配套检查和校验，再执行`CINDERX_PLUGIN_ENABLE=0 dnf downgrade /absolute/path/to/old-package.rpm`。维护后启动新进程，重新运行最小示例和业务检查。
+升级时使用发布方提供的新RPM，先核对其系统、Python配套要求，再执行`CINDERX_PLUGIN_ENABLE=0 dnf upgrade /absolute/path/to/new-package.rpm`。需要回退时，对保留的旧RPM执行相同的配套检查，再执行`CINDERX_PLUGIN_ENABLE=0 dnf downgrade /absolute/path/to/old-package.rpm`。维护后启动新进程，重新运行最小示例和业务检查。
 
 临时禁用JIT或CinderX分别使用`PYTHONJITDISABLE=1`、`CINDERX_DISABLE=1`，含义见[用户指南](user_guide.md#通用配置与api)。卸载使用：
 
