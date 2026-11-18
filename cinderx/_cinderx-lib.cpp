@@ -1312,7 +1312,8 @@ PyMethodDef _cinderx_methods[] = {
     {"_register_torch_registry_311",
      Ci_RegisterTorchRegistry311,
      METH_VARARGS,
-     "Register the verified PyTorch 2.10 attribute handler for this experiment."},
+     "Register the verified PyTorch 2.10 attribute handler for this "
+     "experiment."},
 #endif
     {"install_frame_evaluator",
      install_frame_evaluator,

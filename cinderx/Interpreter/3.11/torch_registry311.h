@@ -1,5 +1,6 @@
 // Experimental substitute for a verified torch.nn.Module.__getattr__.
-// Included from getattr_noexc.h. No type slots or registry contents are changed.
+// Included from getattr_noexc.h. No type slots or registry contents are
+// changed.
 
 static int ci_torch_registry_requested_311;
 static unsigned long long ci_torch_registry_hits_311;
@@ -20,7 +21,8 @@ PyObject* Ci_RegisterTorchRegistry311(PyObject* self, PyObject* args) {
       !PyFunction_Check(handler) ||
       ((PyFunctionObject*)handler)->func_code != code ||
       !Py_IS_TYPE(descriptor, &PyGetSetDescr_Type)) {
-    PyErr_SetString(PyExc_RuntimeError, "Unsupported torch registry registration");
+    PyErr_SetString(
+        PyExc_RuntimeError, "Unsupported torch registry registration");
     return NULL;
   }
   if (ci_torch_handler_311 != NULL) {
@@ -28,7 +30,8 @@ PyObject* Ci_RegisterTorchRegistry311(PyObject* self, PyObject* args) {
         descriptor == ci_torch_dict_descriptor_311) {
       Py_RETURN_NONE;
     }
-    PyErr_SetString(PyExc_RuntimeError, "Torch registry handler already registered");
+    PyErr_SetString(
+        PyExc_RuntimeError, "Torch registry handler already registered");
     return NULL;
   }
   const char* keys[] = {"_parameters", "_buffers", "_modules"};
@@ -60,8 +63,7 @@ PyObject* Ci_RegisterTorchRegistry311(PyObject* self, PyObject* args) {
 }
 
 static inline int Ci_IsExactUnicodeDict311(PyObject* obj) {
-  return PyDict_CheckExact(obj) &&
-      DK_IS_UNICODE(((PyDictObject*)obj)->ma_keys);
+  return PyDict_CheckExact(obj) && DK_IS_UNICODE(((PyDictObject*)obj)->ma_keys);
 }
 
 static int Ci_TorchDictProtocol311(PyTypeObject* type, PyThreadState* tstate) {
@@ -88,8 +90,8 @@ static int Ci_TorchDictProtocol311(PyTypeObject* type, PyThreadState* tstate) {
       _PyType_Lookup(type, name) == ci_torch_dict_descriptor_311;
 }
 
-static PyObject* Ci_TryTorchRegistry311(
-    PyObject* obj, PyObject* name, PyObject* handler) {
+static PyObject*
+Ci_TryTorchRegistry311(PyObject* obj, PyObject* name, PyObject* handler) {
   PyFunctionObject* fn = (PyFunctionObject*)handler;
   PyThreadState* tstate = _PyThreadState_GET();
   PyTypeObject* type = Py_TYPE(obj);
@@ -109,7 +111,8 @@ static PyObject* Ci_TryTorchRegistry311(
     return NULL;
   }
   for (int i = 0; i < 3; i++) {
-    PyObject* registry = PyDict_GetItemWithError(dict, ci_torch_registry_names_311[i]);
+    PyObject* registry =
+        PyDict_GetItemWithError(dict, ci_torch_registry_names_311[i]);
     if (registry == NULL) {
       if (PyErr_Occurred()) {
         return NULL;

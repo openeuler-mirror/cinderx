@@ -99,7 +99,8 @@ int Ci_InterpGetattr311_Init(void) {
   ci_interp_getattr_counting = ci_attr_diagnostics_config_311;
   const char* registry = getenv("ATTR_PATH_TORCH_REGISTRY");
   if (registry != NULL && strcmp(registry, "0") && strcmp(registry, "1")) {
-    PyErr_SetString(PyExc_ValueError, "ATTR_PATH_TORCH_REGISTRY must be 0 or 1");
+    PyErr_SetString(
+        PyExc_ValueError, "ATTR_PATH_TORCH_REGISTRY must be 0 or 1");
     return -1;
   }
   ci_torch_registry_requested_311 = ci_interp_getattr_enabled &&
