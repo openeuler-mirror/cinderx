@@ -16,6 +16,27 @@
 // is no CinderX table to initialize.
 void Ci_InitOpcodes() {}
 
+int Ci_OffEntryEnabled311;
+
+void Ci_OffEntryInvalidate311(void) {
+  Ci_OffEntryEnabled311 = 0;
+}
+
+int Ci_OffEntryConfigure311(void) {
+  const char* flag = getenv("CINDERX_INTERP_OFF_ENTRY");
+  Ci_OffEntryEnabled311 = 0;
+  if (flag != NULL && strcmp(flag, "0") && strcmp(flag, "1")) {
+    PyErr_SetString(
+        PyExc_ValueError, "CINDERX_INTERP_OFF_ENTRY must be 0 or 1");
+    return -1;
+  }
+  // Called only after successful, frozen mode configuration, before takeover.
+  Ci_OffEntryEnabled311 = (flag == NULL || !strcmp(flag, "1")) &&
+      Ci_Observe311_Mode() == CI_JIT_MODE_311_OFF && !Ci_Observe311_Enabled &&
+      Ci_JitShell311_CanUseOffEntry();
+  return 0;
+}
+
 static _Thread_local int ci_jit_recursion_boundary_active;
 
 int Ci_JitRecursionBoundary311_IsActive(void) {
@@ -54,6 +75,9 @@ extern void Ci_JitShell311_SweepGraveyard(void);
 
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
+  if (Ci_OffEntryEnabled311) {
+    return Ci_EvalFrameDefault_311(tstate, frame, throwflag);
+  }
   if (Ci_JitRecursionBoundary311_IsActive()) {
     Ci_JitRecursionBoundary311_Refuse(tstate);
     return NULL;

@@ -1,0 +1,33 @@
+--- a/ceval.c
++++ b/ceval.c
+@@ -3037,6 +3037,30 @@
+         TARGET(LOAD_GLOBAL_ADAPTIVE) {
+             assert(cframe.use_tracing == 0);
+             _PyLoadGlobalCache *cache = (_PyLoadGlobalCache *)next_instr;
++            // Portable early cache. Let the first specialization attempt run;
++            // module/global sites can therefore retain their native fast opcode.
++            if (ci_global_cache_enabled_311 && ci_global_cache_route_311 != 0 &&
++                !(ADAPTIVE_COUNTER_IS_ZERO(cache)) &&
++                PyDict_CheckExact(GLOBALS()) && PyDict_CheckExact(BUILTINS())) {
++                PyObject *ci_name = GETITEM(names, oparg >> 1);
++                PyObject *ci_result = Ci_TryEarlyGlobal311(
++                    (PyDictObject*)GLOBALS(), (PyDictObject*)BUILTINS(),
++                    ci_name, frame->prev_instr);
++                if (ci_result != NULL) {
++                    // Preserve adaptive progress so a formerly failing module
++                    // lookup may re-specialize after its namespace settles.
++                    if (ci_global_cache_route_311 >= 3) {
++                        DECREMENT_ADAPTIVE_COUNTER(cache);
++                    }
++                    int ci_push_null = oparg & 1;
++                    PEEK(0) = NULL;
++                    JUMPBY(INLINE_CACHE_ENTRIES_LOAD_GLOBAL);
++                    STACK_GROW(ci_push_null + 1);
++                    Py_INCREF(ci_result);
++                    SET_TOP(ci_result);
++                    DISPATCH();
++                }
++            }
+             if (ADAPTIVE_COUNTER_IS_ZERO(cache)) {
+                 PyObject *name = GETITEM(names, oparg>>1);
+                 next_instr--;

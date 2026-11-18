@@ -14,3 +14,11 @@ recursive-include cinderx/PythonLib/opcodes *.py
 # The CPython 3.11 PGO trainer is run directly from an extracted source
 # distribution before a wheel exists.
 recursive-include cinderx/TestScripts *.py
+
+# Required inputs for the CPython 3.11 build-directory patch series.
+recursive-include cinderx/Interpreter/3.11/attr-patches *.cmake *.patch *.md
+include cinderx/PythonLib/test_cinderx/test_kunpeng/test_attr_path_interpreter_311.py
+include cinderx/PythonLib/test_cinderx/test_kunpeng/_interp311_test_support.py
+include cinderx/PythonLib/test_cinderx/test_kunpeng/test_interp_*_311.py
+recursive-include cinderx/PythonLib/test_cinderx/test_kunpeng/fixtures/attr_path *.py *.c
+include docs/attribute-path-311.md

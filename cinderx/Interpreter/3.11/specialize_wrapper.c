@@ -262,7 +262,97 @@ static uint32_t Ci_GetFunctionVersion_311(PyFunctionObject* function) {
 #define _PyCode_Quicken Ci_QuickenBytecode_311
 #define _Py_QuickenedCount ci_quickening_scratch_311
 
+#ifdef CINDERX_CP311_ATTR_PATH
+// Registration is a native trust boundary, not a Python opt-in for arbitrary
+// getters. A registered implementation must preserve GenericGetAttr hits and
+// only fall back to __getattr__ on misses. No unregistering/lifetime expiry.
+#include "internal/pycore_pystate.h"
+
+#include "cinderx/Interpreter/3.11/specga.h"
+#include "cinderx/UpstreamBorrow/borrowed.h"
+int Ci_SpecGaEnabled_311;
+int Ci_SplitHintEnabled_311;
+static PyObject* ci_specga_default_getattribute;
+static getattrofunc ci_specga_hooks[8];
+static size_t ci_specga_hook_count;
+
+int Ci_RegisterGetattrHook_311(getattrofunc hook) {
+  if (hook == NULL || hook == PyObject_GenericGetAttr ||
+      _PyInterpreterState_GET() != PyInterpreterState_Main()) {
+    PyErr_SetString(PyExc_ValueError, "invalid getattr-only hook registration");
+    return -1;
+  }
+  for (size_t i = 0; i < ci_specga_hook_count; i++) {
+    if (ci_specga_hooks[i] == hook) {
+      return 0;
+    }
+  }
+  if (ci_specga_hook_count == 8) {
+    PyErr_SetString(PyExc_RuntimeError, "getattr-only hook registry is full");
+    return -1;
+  }
+  ci_specga_hooks[ci_specga_hook_count++] = hook;
+  return 0;
+}
+
+static int Ci_SpecGaFlag_311(const char* name, int* result) {
+  const char* value = getenv(name);
+  if (value == NULL) {
+    *result = Ci_AttrPathMode311() == 3;
+  } else if (strcmp(value, "1") == 0) {
+    *result = 1;
+  } else if (strcmp(value, "0") == 0) {
+    *result = 0;
+  } else {
+    PyErr_Format(PyExc_ValueError, "%s must be 0 or 1", name);
+    return -1;
+  }
+  return 0;
+}
+
+int Ci_InitGetattrHooks_311(void) {
+  if (Ci_SpecGaFlag_311("ATTR_PATH_SPECIALIZE", &Ci_SpecGaEnabled_311) < 0 ||
+      Ci_SpecGaFlag_311("ATTR_PATH_SPLIT_HINT", &Ci_SplitHintEnabled_311) < 0) {
+    return -1;
+  }
+  // Common Borrow initialization already captures this from a probe class,
+  // before evaluator installation. No Python or GC runs in the specializer.
+  if (Ci_tp_getattr_hook == NULL) {
+    PyErr_SetString(PyExc_RuntimeError, "native getattr hook unavailable");
+    return -1;
+  }
+  ci_specga_default_getattribute =
+      _PyType_Lookup(&PyBaseObject_Type, &_Py_ID(__getattribute__));
+  if (ci_specga_default_getattribute == NULL) {
+    PyErr_SetString(PyExc_RuntimeError, "object getter unavailable");
+    return -1;
+  }
+  return Ci_RegisterGetattrHook_311(Ci_tp_getattr_hook);
+}
+
+#include "attr_type_guard.h"
+
+static int Ci_IsGetattrOnlyType_311(PyTypeObject* type) {
+  if (!Ci_SpecGaEnabled_311 || !Ci_AttrHasUnicodeMro311(type)) {
+    return 0;
+  }
+  int registered = 0;
+  for (size_t i = 0; i < ci_specga_hook_count; i++) {
+    if (type->tp_getattro == ci_specga_hooks[i]) {
+      registered = 1;
+      break;
+    }
+  }
+  return registered &&
+      _PyType_Lookup(type, &_Py_ID(__getattribute__)) ==
+      ci_specga_default_getattribute &&
+      _PyType_Lookup(type, &_Py_ID(__getattr__)) != NULL;
+}
+
+#include "ci311-attr/specialize.c"
+#else
 #include "upstream/specialize.c"
+#endif
 
 #undef _PyCode_Quicken
 #undef _Py_QuickenedCount

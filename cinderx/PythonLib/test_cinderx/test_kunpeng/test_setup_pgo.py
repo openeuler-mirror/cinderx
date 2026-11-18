@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 def _load_setup_function(name: str):
@@ -46,8 +47,6 @@ _REPOSITORY_WORKLOAD = str(
     / "TestScripts"
     / "pgo_train_workloads.py"
 )
-# Twelve serial scenarios, 120s each by default (see pgo_train_workloads.py).
-_WORST_CASE_DEFAULT = 12 * 120
 
 
 class PgoWorkloadTests(unittest.TestCase):
@@ -170,35 +169,32 @@ class PgoWorkloadTests(unittest.TestCase):
 
 
 class PgoWorkloadTimeoutTests(unittest.TestCase):
-    def test_repository_default_covers_worst_case(self) -> None:
-        self.assertEqual(
-            pgo_workload_timeout({}, "repository", _REPOSITORY_WORKLOAD),
-            _WORST_CASE_DEFAULT,
-        )
+    def test_repository_timeout_matches_training_configuration(self) -> None:
+        flag = "CINDERX_PGO_INTERPRETER_TRAINING"
+        for interpreter_training, scenario_count in ((None, 19), ("0", 12), ("1", 19)):
+            with mock.patch.dict(os.environ):
+                if interpreter_training is None:
+                    os.environ.pop(flag, None)
+                else:
+                    os.environ[flag] = interpreter_training
 
-    def test_repository_scenario_timeout_scales_the_budget(self) -> None:
-        self.assertEqual(
-            pgo_workload_timeout(
-                {"CINDERX_PGO_SCENARIO_TIMEOUT": "30"},
-                "repository",
-                _REPOSITORY_WORKLOAD,
-            ),
-            12 * 30,
-        )
-
-    def test_explicit_override_is_never_below_the_worst_case(self) -> None:
-        clamped = pgo_workload_timeout(
-            {"CINDERX_PGO_WORKLOAD_TIMEOUT": "600"},
-            "repository",
-            _REPOSITORY_WORKLOAD,
-        )
-        self.assertEqual(clamped, _WORST_CASE_DEFAULT)
-        honored = pgo_workload_timeout(
-            {"CINDERX_PGO_WORKLOAD_TIMEOUT": "5000"},
-            "repository",
-            _REPOSITORY_WORKLOAD,
-        )
-        self.assertEqual(honored, 5000)
+                default_budget = scenario_count * 120
+                cases = (
+                    ({}, default_budget),
+                    ({"CINDERX_PGO_SCENARIO_TIMEOUT": "30"}, scenario_count * 30),
+                    ({"CINDERX_PGO_WORKLOAD_TIMEOUT": "600"}, default_budget),
+                    ({"CINDERX_PGO_WORKLOAD_TIMEOUT": "5000"}, 5000),
+                )
+                for overrides, expected in cases:
+                    with self.subTest(
+                        interpreter_training=interpreter_training, overrides=overrides
+                    ):
+                        self.assertEqual(
+                            pgo_workload_timeout(
+                                overrides, "repository", _REPOSITORY_WORKLOAD
+                            ),
+                            expected,
+                        )
 
     def test_non_repository_workload_keeps_the_fixed_default(self) -> None:
         self.assertEqual(pgo_workload_timeout({}, "custom", None), 600)
