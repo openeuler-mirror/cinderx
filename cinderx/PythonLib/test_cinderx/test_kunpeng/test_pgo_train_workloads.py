@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import logging
 from pathlib import Path
 import subprocess
 import tempfile
@@ -50,6 +51,26 @@ class PgoTrainingScenarioTests(unittest.TestCase):
         }
         self.assertEqual(len(results), 12)
         self.assertTrue(all(results.values()))
+
+    def test_stdlib_workload_uses_a_scoped_clock(self) -> None:
+        original_time = logging.time
+        original_start = logging._startTime
+        milliseconds = []
+
+        def capture(record: logging.LogRecord) -> bool:
+            milliseconds.append(record.msecs)
+            return True
+
+        logger = logging.getLogger("cinderx-pgo-workload")
+        logger.addFilter(capture)
+        self.addCleanup(logger.removeFilter, capture)
+
+        for _ in range(2):
+            workloads.train_stdlib_boundaries(129)
+            self.assertIs(logging.time, original_time)
+            self.assertEqual(logging._startTime, original_start)
+
+        self.assertEqual(milliseconds, [125.0, 375.0, 625.0, 875.0, 125.0] * 2)
 
     def test_missing_extra_and_zero_counts_are_rejected(self) -> None:
         counts = self.small_counts()
@@ -124,21 +145,44 @@ class PgoTrainingScenarioTests(unittest.TestCase):
             workloads.total_training_timeout(0)
 
     @mock.patch.object(workloads.subprocess, "run")
-    def test_startup_imports_uses_configurable_timeout(self, run: mock.Mock) -> None:
+    def test_startup_imports_wrapper_launches_children_without_jit(
+        self, run: mock.Mock
+    ) -> None:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
-        workloads.run_scenario(
-            "startup_imports", 2, "/tmp/build-lib", scenario_timeout=45
-        )
-        self.assertEqual(run.call_count, 2)
+        counts = workloads.TRAINING_REPETITIONS
+        with (
+            mock.patch.dict(workloads.os.environ, {"CINDERX_JIT_MODE": "off"}),
+            mock.patch.dict(workloads.sys.modules),
+            mock.patch.object(workloads, "initialize_jit") as initialize_jit,
+        ):
+            workloads.sys.modules.pop("_cinderx", None)
+            workloads._run_child(
+                "startup_imports", counts["startup_imports"], "/tmp/build-lib", 45
+            )
+        initialize_jit.assert_not_called()
+        self.assertEqual(run.call_count, 4)
         for call in run.call_args_list:
+            self.assertEqual(call.args[0][1:3], ["-S", "-c"])
             self.assertEqual(call.kwargs["timeout"], 45)
+            self.assertEqual(call.kwargs["env"]["CINDERX_JIT_MODE"], "execute")
 
     @mock.patch.object(workloads.subprocess, "run")
-    def test_child_failure_prevents_training_success(self, run: mock.Mock) -> None:
-        run.side_effect = subprocess.CalledProcessError(1, ["python"])
+    def test_training_aggregates_child_timeouts_and_failures(self, run: mock.Mock) -> None:
+        def finish(command, **kwargs):
+            scenario = command[command.index("--scenario") + 1]
+            if scenario == "startup_imports":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if scenario == "asyncio_tasks":
+                raise subprocess.CalledProcessError(1, command, stderr="child failed")
+            return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+        run.side_effect = finish
         counts = {name: 1 for name in workloads.SCENARIOS}
-        with self.assertRaisesRegex(RuntimeError, "PGO training failed"):
-            workloads.run_training("/tmp/build-lib", counts)
+        with self.assertRaisesRegex(RuntimeError, "PGO training failed") as error:
+            workloads.run_training("/tmp/build-lib", counts, timeout=17)
+        self.assertRegex(str(error.exception), r"startup_imports:[^\n]*timed out after 17")
+        self.assertIn("asyncio_tasks: child failed", str(error.exception))
+        self.assertEqual(run.call_count, len(workloads.training_plan()))
 
     def test_training_modes_preserve_execute_and_add_off_coverage(self):
         with mock.patch.dict(workloads.os.environ, {"CINDERX_PGO_INTERPRETER_TRAINING": "1"}):
@@ -153,12 +197,18 @@ class PgoTrainingScenarioTests(unittest.TestCase):
                 workloads.training_plan()
 
     def test_training_scrubs_inherited_runtime_policy(self):
-        environment = dict(ATTR_PATH_MODE="cinderx", CINDERX_JIT_DISABLE="1", PYTHONJITDISABLE="1")
+        environment = dict(
+            ATTR_PATH_MODE="cinderx",
+            CINDERX_JIT_DISABLE="1",
+            CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS="60000",
+            PYTHONJITDISABLE="1",
+        )
         workloads.configure_jit_environment(environment, {})
         self.assertNotIn("ATTR_PATH_MODE", environment)
         self.assertNotIn("PYTHONJITDISABLE", environment)
         self.assertEqual(environment["CINDERX_JIT_MODE"], "execute")
         self.assertEqual(environment["CINDERX_JIT_STARTUP_GRACE_MS"], "0")
+        self.assertEqual(environment["CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS"], "0")
 
     def test_generic_attribute_training_checksum(self):
         self.assertTrue(workloads.train_attribute_protocol(103))

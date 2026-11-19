@@ -78,6 +78,11 @@ def source_date_epoch() -> str | None:
 
 
 def build(image: str, out_dir: Path, git_sha: str, deps_cache: Path | None) -> Path:
+    profile_path = os.environ.get("CINDERX_CP311_SECCOMP_PROFILE")
+    seccomp = Path(profile_path).expanduser().resolve() if profile_path else None
+    if seccomp is not None and not seccomp.is_file():
+        raise SystemExit(f"CPython 3.11 seccomp profile is not a file: {seccomp}")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     # Scoped to this build's own tag: the release wheelhouse is shared with
     # the cp314 fat wheel, which must survive a cp311 rebuild.
@@ -104,7 +109,10 @@ def build(image: str, out_dir: Path, git_sha: str, deps_cache: Path | None) -> P
         "-e", "CINDERX_GIT_SHA",
         "-e", "CINDERX_BUILDER_IMAGE",
         "-e", "CINDERX_GIT_INSECURE",
+        "-e", "CINDERX_REPRODUCIBLE_PGO",
     ]
+    if seccomp is not None:
+        cmd += ["--security-opt", f"seccomp={seccomp}"]
     # Opt-in local FetchContent cache, the repo's documented offline
     # mechanism (README: CINDERX_LOCAL_DEPS).
     if deps_cache is not None:

@@ -242,6 +242,8 @@ def ensure_cinderx_not_loaded(modules: dict[str, object]) -> None:
 def pgo_workload_environment(
     source: dict[str, str],
     build_lib: str,
+    *,
+    reproducible: bool = False,
 ) -> dict[str, str]:
     environment = dict(source)
     for name in (
@@ -262,6 +264,8 @@ def pgo_workload_environment(
             "CINDERX_PLUGIN_ENABLE": "0",
         }
     )
+    if reproducible:
+        environment["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
     return environment
 
 
@@ -417,6 +421,10 @@ class BuildCommand(build):
 
     def run(self) -> None:
         enable_pgo = build_switch_enabled("CINDERX_ENABLE_PGO")
+        if not enable_pgo and is_env_flag_enabled(
+            os.environ.get("CINDERX_REPRODUCIBLE_PGO")
+        ):
+            raise RuntimeError("CINDERX_REPRODUCIBLE_PGO requires PGO to be enabled")
         self._apply_local_to_build_ext()
 
         if enable_pgo:
@@ -437,6 +445,16 @@ class BuildCommand(build):
         is_clang = "clang" in cc
         py_version = compute_py_version()
         is_cp311 = py_version == "3.11"
+        reproducible = is_env_flag_enabled(os.environ.get("CINDERX_REPRODUCIBLE_PGO"))
+        setarch = None
+        if reproducible:
+            if not is_cp311 or is_clang or sys.platform != "linux":
+                raise RuntimeError(
+                    "CINDERX_REPRODUCIBLE_PGO requires CPython 3.11 and GCC on Linux"
+                )
+            setarch = shutil.which("setarch")
+            if setarch is None:
+                raise RuntimeError("CINDERX_REPRODUCIBLE_PGO requires setarch from util-linux")
 
         print_section("PGO STAGE 1/3: Building with profile generation instrumentation")
 
@@ -450,7 +468,9 @@ class BuildCommand(build):
 
         cinderx_so_dir = os.path.abspath(os.path.join(os.getcwd(), self.build_lib))
         if is_cp311:
-            workload_env = pgo_workload_environment(os.environ, cinderx_so_dir)
+            workload_env = pgo_workload_environment(
+                os.environ, cinderx_so_dir, reproducible=reproducible
+            )
             pgo_metadata_dir = os.path.join(self.build_temp, "pgo_data")
             os.makedirs(pgo_metadata_dir, exist_ok=True)
         else:
@@ -537,6 +557,8 @@ if __name__ == "__main__":
             )
         if is_clang:
             workload_args["cwd"] = clang_pgo_dir
+        if setarch is not None:
+            workload_cmd = [setarch, platform.machine(), "-R", *workload_cmd]
         subprocess.run(workload_cmd, **workload_args)
 
         if is_clang:
@@ -828,6 +850,14 @@ class BuildExt(build_ext):
                 use=self.cinderx_pgo_stage == PgoStage.USE,
                 profile_path=self.cinderx_pgo_profile_path,
             )
+        )
+
+        reproducible_pgo = (
+            self.cinderx_pgo_stage != PgoStage.DISABLED
+            and is_env_flag_enabled(os.environ.get("CINDERX_REPRODUCIBLE_PGO"))
+        )
+        cmake_args.append(
+            f"-DENABLE_REPRODUCIBLE_PGO={'ON' if reproducible_pgo else 'OFF'}"
         )
 
         # LTO configuration

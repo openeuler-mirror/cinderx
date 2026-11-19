@@ -126,6 +126,16 @@ class PgoWorkloadTests(unittest.TestCase):
         self.assertNotIn("PYTHONHOME", environment)
         self.assertNotIn("PYTHONUSERBASE", environment)
 
+    def test_reproducible_pgo_disables_startup_grace_only_for_the_workload(self) -> None:
+        source = {"CINDERX_JIT_STARTUP_GRACE_MS": "100"}
+        default = pgo_workload_environment(source, "/tmp/build-lib")
+        reproducible = pgo_workload_environment(
+            source, "/tmp/build-lib", reproducible=True
+        )
+        self.assertEqual(default["CINDERX_JIT_STARTUP_GRACE_MS"], "100")
+        self.assertEqual(reproducible["CINDERX_JIT_STARTUP_GRACE_MS"], "0")
+        self.assertEqual(source["CINDERX_JIT_STARTUP_GRACE_MS"], "100")
+
     def test_preloaded_extension_stops_the_build(self) -> None:
         ensure_cinderx_not_loaded({})
         with self.assertRaisesRegex(RuntimeError, "already loaded"):

@@ -102,6 +102,24 @@ CMAKE_BUILD_PARALLEL_LEVEL=8 \
 
 该产物是针对指定openEuler环境构建的普通Linux wheel。构建脚本静态链接C++ 运行库并检查依赖；它的兼容范围由实际构建和运行环境决定，修改文件名不会改变兼容性。
 
+### 可复现 PGO 构建
+
+在使用 GCC 和 CMake 3.21 及以上版本的 Linux 构建环境中，设置
+`CINDERX_REPRODUCIBLE_PGO=1` 可为 CPython 3.11 的 PGO 插桩和重编分配稳定的 GCC 编译及链接种子。
+训练使用 `setarch -R` 并把 JIT 启动宽限期设为 `0`，作用范围为训练进程及其子进程。
+
+若容器的 seccomp 策略限制 `setarch`，通过 `CINDERX_CP311_SECCOMP_PROFILE` 指定构建容器的策略文件。
+在部署的默认策略上允许 `personality(0x40000)` 即可支持该训练调用。
+
+```bash
+CINDERX_REPRODUCIBLE_PGO=1 \
+CINDERX_CP311_SECCOMP_PROFILE=/path/to/cp311-builder-seccomp.json \
+  python3 ci_pipeline/build_release_wheels.py --only cp311 \
+  --wheelhouse-dir "$BUILD_ROOT/cp311/wheelhouse"
+```
+
+逐字节比对使用相同的源码、构建镜像、工具链和容器内构建路径，每轮生成并使用自己的 profile。
+
 ### 构建参数与验证
 
 当前`setup.py`在CPython 3.11上默认开启PGO和LTO。PGO先构建插桩扩展，再运行仓库训练场景，最后使用profile重建；训练或profile检查失败时，构建失败。
