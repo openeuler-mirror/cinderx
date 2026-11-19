@@ -6,12 +6,14 @@ from tempfile import TemporaryDirectory
 import tarfile
 from types import SimpleNamespace
 import unittest
+from urllib.error import HTTPError
 from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from ci_pipeline.build_with_tag import gitcode_response as responses  # noqa: E402
 from ci_pipeline.build_with_tag import sync_src_openeuler as s  # noqa: E402
 
 PINS = {
@@ -39,6 +41,45 @@ def deps_tar(top="cinderx-deps-ba5d5c5756f6", head=None, config_extra="", extra=
         for args in extra:
             add(*args)
     return buf.getvalue()
+
+
+class ApiResponseLimitTests(unittest.TestCase):
+    def test_success_body_has_byte_limit(self):
+        api = s.Api("")
+        for payload, result in ((b"[]", (200, [])), (b"[] ", None)):
+            with self.subTest(payload=payload):
+                body = io.BytesIO(payload)
+                body.status = 200
+                with mock.patch.object(responses, "MAX_JSON_RESPONSE_BYTES", 2), \
+                     mock.patch.object(s.urllib.request, "urlopen", return_value=body), \
+                     mock.patch.object(body, "read", wraps=body.read) as read:
+                    if result is None:
+                        with self.assertRaisesRegex(RuntimeError, "response exceeds 2 bytes"):
+                            api.call("GET", "/pulls")
+                    else:
+                        self.assertEqual(api.call("GET", "/pulls"), result)
+                    read.assert_called_once_with(3)
+                self.assertTrue(body.closed)
+
+    def test_disallowed_error_uses_bounded_excerpt(self):
+        body = io.BytesIO(b"large error response")
+        error = HTTPError("https://example.com", 500, "error", {}, body)
+        with mock.patch.object(responses, "MAX_ERROR_RESPONSE_BYTES", 4), \
+             mock.patch.object(s.urllib.request, "urlopen", side_effect=error), \
+             mock.patch.object(body, "read", wraps=body.read) as read:
+            with self.assertRaisesRegex(RuntimeError, r"returned 500: larg$"):
+                s.Api("").call("GET", "/pulls")
+            read.assert_called_once_with(4)
+        self.assertTrue(body.closed)
+
+    def test_missing_release_needs_only_error_status(self):
+        body = io.BytesIO(b"large error response")
+        error = HTTPError("https://example.com", 404, "missing", {}, body)
+        with mock.patch.object(s.urllib.request, "urlopen", side_effect=error), \
+             mock.patch.object(body, "read", wraps=body.read) as read:
+            self.assertIsNone(s.Api("").release_commit("owner/repo", "v1.2.3"))
+            read.assert_not_called()
+        self.assertTrue(body.closed)
 
 
 class PureHelpers(unittest.TestCase):

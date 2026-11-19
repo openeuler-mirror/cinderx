@@ -6,13 +6,71 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from urllib.error import HTTPError
 import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from ci_pipeline.build_with_tag import gitcode_response as responses  # noqa: E402
 from ci_pipeline.build_with_tag import gitcode_webhook as webhook  # noqa: E402
+
+
+class ResponseLimitTests(unittest.TestCase):
+    def test_json_response_is_bounded_without_content_length(self):
+        for payload, too_large in ((b'{"ok":true}', False), (b'{"ok":true} ', True)):
+            with self.subTest(payload=payload):
+                body = io.BytesIO(payload)
+                body.status = 200
+                with mock.patch.object(responses, "MAX_JSON_RESPONSE_BYTES", 11), \
+                     mock.patch.object(webhook.urllib.request, "urlopen", return_value=body), \
+                     mock.patch.object(body, "read", wraps=body.read) as read:
+                    if too_large:
+                        with self.assertRaisesRegex(RuntimeError, "response exceeds 11 bytes"):
+                            webhook.request_json("GET", "/release")
+                    else:
+                        self.assertEqual(webhook.request_json("GET", "/release"), (200, {"ok": True}))
+                    read.assert_called_once_with(12)
+                self.assertTrue(body.closed)
+
+    def test_missing_release_closes_error_after_bounded_read(self):
+        body = io.BytesIO(b"large error response")
+        error = HTTPError("https://example.com", 404, "missing", {}, body)
+        with mock.patch.object(responses, "MAX_ERROR_RESPONSE_BYTES", 4), \
+             mock.patch.object(webhook.urllib.request, "urlopen", side_effect=error), \
+             mock.patch.object(body, "read", wraps=body.read) as read:
+            self.assertIsNone(webhook.existing_release_commit("v1.2.3"))
+            read.assert_called_once_with(4)
+        self.assertTrue(body.closed)
+
+    def test_upload_uses_status_on_success_and_reads_bounded_error_excerpt(self):
+        path = mock.Mock(spec=Path, name="asset")
+        path.name = "test.whl"
+        path.read_bytes.return_value = b"wheel"
+        for status in (204, 500):
+            with self.subTest(status=status):
+                body = io.BytesIO(b"" if status == 204 else b"large error response")
+                body.status = status
+                urlopen = (
+                    {"return_value": body} if status == 204 else
+                    {"side_effect": HTTPError("https://example.com", status, "error", {}, body)}
+                )
+                with mock.patch.object(webhook, "request_json", return_value=(200, {"url": "https://example.com"})), \
+                     mock.patch.object(webhook, "validate_upload_url"), \
+                     mock.patch.object(responses, "MAX_ERROR_RESPONSE_BYTES", 4), \
+                     mock.patch.object(webhook.urllib.request, "urlopen", **urlopen), \
+                     mock.patch.object(body, "read", wraps=body.read) as read:
+                    log = io.StringIO()
+                    if status == 204:
+                        webhook.upload_asset("v1.2.3", path, log)
+                        self.assertIn("status=204", log.getvalue())
+                        read.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, r"returned 500: larg$"):
+                            webhook.upload_asset("v1.2.3", path, log)
+                        read.assert_called_once_with(4)
+                self.assertTrue(body.closed)
 
 
 class GitCodeWebhookTests(unittest.TestCase):
