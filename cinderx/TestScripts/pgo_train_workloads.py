@@ -25,6 +25,7 @@ import asyncio
 from contextlib import contextmanager
 import gc
 import io
+from itertools import count
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import pickle
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from typing import Callable, Iterator, MutableMapping
 import weakref
 
@@ -48,6 +50,7 @@ JIT_TRAINING_ENVIRONMENT = {
     "CINDERX_OSR_ENABLED": "0",
     "PYTHONHASHSEED": "0",
     "CINDERX_JIT_STARTUP_GRACE_MS": "0",
+    "CINDERX_AUTOJIT_ROI_AGING_INTERVAL_MS": "0",
 }
 AUTO_JIT_THRESHOLD = int(JIT_TRAINING_ENVIRONMENT["PYTHONJITAUTO"])
 DEFAULT_SCENARIO_TIMEOUT = 120
@@ -359,16 +362,34 @@ def train_stdlib_boundaries(repetitions: int) -> str:
     logger.handlers[:] = [handler]
     logger.propagate = False
     logger.setLevel(logging.INFO)
+    # Exercise milliseconds on both sides of the small-int cache limit
+    # in a fixed order, independent of the wall clock.
+    old_time, old_start_time = logging.time, logging._startTime
+    if isinstance(old_start_time, int):
+        # Newer logging versions use nanoseconds for LogRecord timestamps.
+        start_ns = 1_700_000_000_000_000_000
+        clock = count(start_ns + 125_000_000, 250_000_000)
+        logging.time = SimpleNamespace(time_ns=clock.__next__)
+        logging._startTime = start_ns
+    else:
+        start_time = 1_700_000_000.0
+        clock = count(start_time + 0.125, 0.25)
+        logging.time = SimpleNamespace(time=clock.__next__)
+        logging._startTime = start_time
     checksum = 0
-    for index in range(repetitions):
-        checksum += len(json.loads(encoded_json)["items"])
-        checksum += len(pickle.loads(encoded_pickle)["items"])
-        if index % 32 == 0:
-            logger.info("batch %d", index)
-    handler.flush()
-    if "INFO:batch" not in stream.getvalue() or checksum != repetitions * 40:
-        raise AssertionError("standard-library conversions produced wrong results")
-    logger.handlers.clear()
+    try:
+        for index in range(repetitions):
+            checksum += len(json.loads(encoded_json)["items"])
+            checksum += len(pickle.loads(encoded_pickle)["items"])
+            if index % 32 == 0:
+                logger.info("batch %d", index)
+        handler.flush()
+        if "INFO:batch" not in stream.getvalue() or checksum != repetitions * 40:
+            raise AssertionError("standard-library conversions produced wrong results")
+    finally:
+        logging.time = old_time
+        logging._startTime = old_start_time
+        logger.handlers.clear()
     return f"round_trips={repetitions} checksum={checksum}"
 
 
@@ -778,6 +799,13 @@ def _run_child(
             raise RuntimeError("JIT activity during interpreter training")
         print(f"{execution_mode}/{name}: {detail}; jit_entries=0")
         return
+    if name == "startup_imports":
+        # Keep the scenario subprocess and its timeout. Its children train
+        # the import paths while the wrapper only orchestrates their launches.
+        configure_jit_environment()
+        detail = run_scenario(name, repetitions, build_lib, scenario_timeout)
+        print(f"{name}: {detail}")
+        return
     _cinderx, cinderjit = initialize_jit(build_lib)
     before = _cinderx._get_trigger_stats()["machine_code_entries"]
     deopt_before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
@@ -791,7 +819,7 @@ def _run_child(
     elapsed = time.perf_counter() - started
 
     after = _cinderx._get_trigger_stats()["machine_code_entries"]
-    if name not in {"startup_imports", "asyncio_tasks"} and after <= before:
+    if name != "asyncio_tasks" and after <= before:
         raise RuntimeError(f"scenario {name} did not enter newly compiled code")
     if name == "runtime_changes":
         deopt_after = _cinderx._get_trigger_stats()["organic_deopt_hits"]

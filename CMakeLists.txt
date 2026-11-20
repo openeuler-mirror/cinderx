@@ -19,6 +19,7 @@ set(PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR}/cinderx)
 
 option(ENABLE_PGO_GENERATE "Build with PGO profile generation" OFF)
 option(ENABLE_PGO_USE "Build with PGO profile use" OFF)
+option(ENABLE_REPRODUCIBLE_PGO "Use stable GCC seeds for CPython 3.11 PGO" OFF)
 option(ENABLE_COVERAGE "Build with GCC coverage instrumentation" OFF)
 set(PGO_PROFILE_FILE "" CACHE STRING "Path to PGO profile data")
 
@@ -339,6 +340,22 @@ if(ENABLE_RUNTIME_TESTS)
     REQUIRED)
 else()
   find_package(Python ${PY_VERSION} EXACT COMPONENTS Interpreter Development.Module REQUIRED)
+endif()
+
+if(ENABLE_REPRODUCIBLE_PGO)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT PY_VERSION STREQUAL "3.11"
+      OR NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "ENABLE_REPRODUCIBLE_PGO requires CPython 3.11 and GCC on Linux")
+  endif()
+  if(CMAKE_VERSION VERSION_LESS "3.21")
+    message(FATAL_ERROR "ENABLE_REPRODUCIBLE_PGO requires CMake 3.21 for linker launchers")
+  endif()
+  foreach(lang IN ITEMS C CXX)
+    foreach(kind IN ITEMS COMPILER LINKER)
+      list(PREPEND CMAKE_${lang}_${kind}_LAUNCHER "${Python_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ci_pipeline/gcc_pgo_launcher.py" "${CMAKE_BINARY_DIR}")
+    endforeach()
+  endforeach()
 endif()
 
 # Some of our files are partially generated from CPython source, and they

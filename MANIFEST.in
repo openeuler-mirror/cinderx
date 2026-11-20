@@ -1,5 +1,6 @@
 include CMakeLists.txt
 include ci_pipeline/cmake_options.py
+include ci_pipeline/gcc_pgo_launcher.py
 recursive-include cinderx *.cpp *.c *.h CMakeLists.txt
 include cinderx/Interpreter/3.11/coroutine_call.cmake
 include cinderx/_cinderx.version
