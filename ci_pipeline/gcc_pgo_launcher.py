@@ -14,7 +14,9 @@ import sys
 def main() -> None:
     build_dir, *command = sys.argv[1:]
     if "-o" in command:
-        output = Path(command[command.index("-o") + 1]).resolve()
+        # A preceding compiler launcher can have its own -o option.
+        output_index = len(command) - command[::-1].index("-o")
+        output = Path(command[output_index]).resolve()
         phase = "compile" if "-c" in command else "link"
         target = os.path.relpath(output, build_dir)
         seed = hashlib.sha256(f"{phase}:{target}".encode()).hexdigest()[:16]

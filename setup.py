@@ -239,6 +239,26 @@ def ensure_cinderx_not_loaded(modules: dict[str, object]) -> None:
         )
 
 
+def reproducible_pgo_setarch_prefix() -> list[str]:
+    setarch = shutil.which("setarch")
+    if setarch is None:
+        raise RuntimeError("CINDERX_REPRODUCIBLE_PGO requires setarch from util-linux")
+    prefix = [setarch, platform.machine(), "-R"]
+    probe = subprocess.run(
+        [*prefix, sys.executable, "-I", "-S", "-c", "pass"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode:
+        raise RuntimeError(
+            "CINDERX_REPRODUCIBLE_PGO cannot disable ASLR with setarch -R. "
+            "For container builds, allow personality(ADDR_NO_RANDOMIZE) in the "
+            "seccomp policy (CINDERX_CP311_SECCOMP_PROFILE). "
+            f"setarch exited with status {probe.returncode}. {probe.stderr.strip()}"
+        )
+    return prefix
+
+
 def pgo_workload_environment(
     source: dict[str, str],
     build_lib: str,
@@ -446,15 +466,13 @@ class BuildCommand(build):
         py_version = compute_py_version()
         is_cp311 = py_version == "3.11"
         reproducible = is_env_flag_enabled(os.environ.get("CINDERX_REPRODUCIBLE_PGO"))
-        setarch = None
+        setarch_prefix = []
         if reproducible:
             if not is_cp311 or is_clang or sys.platform != "linux":
                 raise RuntimeError(
                     "CINDERX_REPRODUCIBLE_PGO requires CPython 3.11 and GCC on Linux"
                 )
-            setarch = shutil.which("setarch")
-            if setarch is None:
-                raise RuntimeError("CINDERX_REPRODUCIBLE_PGO requires setarch from util-linux")
+            setarch_prefix = reproducible_pgo_setarch_prefix()
 
         print_section("PGO STAGE 1/3: Building with profile generation instrumentation")
 
@@ -557,8 +575,8 @@ if __name__ == "__main__":
             )
         if is_clang:
             workload_args["cwd"] = clang_pgo_dir
-        if setarch is not None:
-            workload_cmd = [setarch, platform.machine(), "-R", *workload_cmd]
+        if setarch_prefix:
+            workload_cmd = [*setarch_prefix, *workload_cmd]
         subprocess.run(workload_cmd, **workload_args)
 
         if is_clang:
