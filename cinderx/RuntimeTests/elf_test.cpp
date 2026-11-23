@@ -1,5 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/elf/reader.h"
@@ -11,10 +12,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -70,26 +73,21 @@ void verifyElf(std::span<const std::byte> bytes) {
   ASSERT_TRUE(sectionExists(bytes, elf::kFuncNoteSectionName));
 }
 
-std::filesystem::path gdbElfPath(const char* function_name, void* code_addr) {
-  std::array<char, 256> path;
+std::filesystem::path gdbElfPath(
+    const std::filesystem::path& directory,
+    const char* function_name,
+    void* code_addr) {
+  std::array<char, 256> filename;
   int size = std::snprintf(
-      path.data(),
-      path.size(),
-      "/tmp/cinder_%s_%p_elf",
+      filename.data(),
+      filename.size(),
+      "cinder_%s_%p_elf",
       function_name,
       code_addr);
   JIT_CHECK(
-      size > 0 && static_cast<size_t>(size) < path.size(),
-      "Failed to format GDB JIT ELF path");
-  return path.data();
-}
-
-std::string readFileBytes(const std::filesystem::path& path) {
-  std::ifstream file{path, std::ios::binary};
-  JIT_CHECK(file.is_open(), "Failed to open {}", path.string());
-  return {
-      std::istreambuf_iterator<char>{file},
-      std::istreambuf_iterator<char>{}};
+      size > 0 && static_cast<size_t>(size) < filename.size(),
+      "Failed to format GDB JIT ELF filename");
+  return directory / filename.data();
 }
 
 class ScopedGdbConfig {
@@ -207,9 +205,23 @@ TEST_F(ElfTest, GdbJitElfUsesBuildMachine) {
   std::array<std::byte, 4> code{
       std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
   void* code_addr = code.data();
-  std::filesystem::path path = gdbElfPath(function_name, code_addr);
+  std::optional<std::string> saved_tmpdir;
+  if (const char* tmpdir = std::getenv("TMPDIR")) {
+    saved_tmpdir.emplace(tmpdir);
+  }
+  std::filesystem::path temp_root =
+      saved_tmpdir && !saved_tmpdir->empty() ? *saved_tmpdir : "/tmp";
+  auto temp_dir = (temp_root / "cinderx-gdb-elf-XXXXXX").string();
+  ASSERT_NE(mkdtemp(temp_dir.data()), nullptr);
+  std::error_code cleanup_error;
+  SCOPE_EXIT(std::filesystem::remove_all(temp_dir, cleanup_error);
+             EXPECT_FALSE(cleanup_error) << cleanup_error.message());
 
-  std::filesystem::remove(path);
+  ASSERT_EQ(setenv("TMPDIR", temp_dir.c_str(), 1), 0);
+  SCOPE_EXIT(int result = saved_tmpdir
+                 ? setenv("TMPDIR", saved_tmpdir->c_str(), 1)
+                 : unsetenv("TMPDIR");
+             EXPECT_EQ(result, 0));
 
   ScopedGdbConfig gdb_config;
 
@@ -223,8 +235,11 @@ TEST_F(ElfTest, GdbJitElfUsesBuildMachine) {
           0),
       1);
 
-  auto bytes = readFileBytes(path);
-  std::filesystem::remove(path);
+  auto path = gdbElfPath(temp_dir, function_name, code_addr);
+  std::ifstream file{path, std::ios::binary};
+  ASSERT_TRUE(file.is_open()) << "Failed to open " << path;
+  std::string bytes{
+      std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
   auto byte_span = std::as_bytes(std::span{bytes});
   constexpr size_t kMachineOffset = offsetof(elf::FileHeader, machine);
   ASSERT_GE(byte_span.size(), kMachineOffset + sizeof(std::uint16_t));

@@ -1,5 +1,5 @@
+import os
 from pathlib import Path
-import shutil
 import sys
 
 import cinderx
@@ -44,10 +44,10 @@ def dump_elf(output: Path) -> None:
 
 
 def gdb_jit_elf(output: Path) -> None:
-    tmp_dir = Path("/tmp")
-    pattern = "cinder_PyFunctionObject_*_elf"
-    before = {path.resolve() for path in tmp_dir.glob(pattern)}
-
+    tmpdir = os.environ.get("TMPDIR")
+    assert tmpdir and Path(tmpdir).resolve() == output.parent.resolve(), (
+        f"expected TMPDIR to be the ELF output directory {output.parent}, got {tmpdir!r}"
+    )
     initialize_jit()
 
     def gdb_jit_elf_machine_target(value):
@@ -57,16 +57,9 @@ def gdb_jit_elf(output: Path) -> None:
         skip("force_compile returned False")
 
     assert gdb_jit_elf_machine_target(14) == 42
-    after = {path.resolve() for path in tmp_dir.glob(pattern)}
-    matches = sorted(
-        after - before,
-        key=lambda path: path.stat().st_mtime_ns,
-    )
-    assert matches, f"no GDB JIT ELF files matched {pattern!r}"
-
-    shutil.copyfile(matches[-1], output)
-    for generated_path in matches:
-        generated_path.unlink(missing_ok=True)
+    matches = list(output.parent.glob("cinder_PyFunctionObject_*_elf"))
+    assert len(matches) == 1, f"expected one GDB JIT ELF file, got {matches!r}"
+    matches[0].rename(output)
 
 
 CASES = {

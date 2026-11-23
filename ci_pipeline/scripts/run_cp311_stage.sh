@@ -362,6 +362,10 @@ driver_selftests() {
 }
 
 test_release_daily() {
+  # Validate GDB ELF output independently of full-suite pytest collection.
+  run_step_continue gdb_jit_elf_311 "$PYTHON" -m unittest discover -v \
+    -s "$REPO_ROOT/cinderx/PythonLib/test_cinderx/test_kunpeng" \
+    -p test_elf_machine.py -k test_gdb_jit_elf_uses_build_machine
   run_step_continue asan_runtime_tests ci_pipeline/scripts/run_asan_build_311.sh \
     "$RUN_DIR/asan-build"
   run_step_continue debug_build ci_pipeline/scripts/run_debug_build_311.sh \

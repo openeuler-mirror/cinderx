@@ -156,12 +156,15 @@ class ElfMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             elf_path = tmp_path / "gdb_jit.elf"
-            _run_child(
-                "gdb-jit-elf",
-                elf_path,
-                tmp_path,
-                _subprocess_env(PYTHONJITGDBWRITEELF="1"),
+            # Keep automatic compilation out of this short subprocess.
+            env = _subprocess_env(
+                TMPDIR=str(tmp_path),
+                PYTHONJITGDBWRITEELF="1",
+                CINDERX_JIT_MODE="execute",
+                PYTHONJITAUTO="1000000",
             )
+            env.pop("PYTHONJITALL", None)
+            _run_child("gdb-jit-elf", elf_path, tmp_path, env)
 
             self.assertEqual(_read_elf_machine(elf_path), expected_machine)
             _assert_external_tools_report_machine(self, elf_path)
