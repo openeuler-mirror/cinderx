@@ -8,6 +8,7 @@
 #include "cinderx/Jit/hir/instr_effects.h"
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 
+#include <optional>
 #include <stack>
 #include <vector>
 
@@ -75,7 +76,7 @@ void updateMaterializedPosition311(
     Instr& instr,
     BeginInlinedFunction* parent,
     int& prev_published_bc,
-    int& prev_emitted_lno_or_bc,
+    std::optional<int>& prev_emitted_lno_or_bc,
     Instr*& last_emitted,
     UpdateOne&& update_one) {
   auto target_code = parent == nullptr ? func.code : parent->code();
@@ -86,7 +87,7 @@ void updateMaterializedPosition311(
       published = bc_instr.nextInstrOffset().asIndex() - 1;
     }
     if (published.value() != prev_published_bc) {
-      prev_emitted_lno_or_bc = INT_MAX;
+      prev_emitted_lno_or_bc.reset();
       update_one();
       JIT_DCHECK(last_emitted != nullptr, "missing position update");
       last_emitted->setBytecodeOffset(published);
@@ -119,7 +120,7 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
     auto parent = cur.parent;
     worklist.pop();
 
-    int prev_emitted_lno_or_bc = INT_MAX;
+    std::optional<int> prev_emitted_lno_or_bc;
 #if PY_VERSION_HEX < 0x030C0000
     int prev_published_bc = INT_MAX;
 #endif
@@ -179,7 +180,7 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         parents[begin] = parent;
         parent = begin;
         last_emitted = nullptr;
-        prev_emitted_lno_or_bc = INT_MAX;
+        prev_emitted_lno_or_bc.reset();
 #if PY_VERSION_HEX < 0x030C0000
         prev_published_bc = INT_MAX;
 #endif
@@ -190,7 +191,7 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         parent =
             parents[static_cast<EndInlinedFunction&>(instr).matchingBegin()];
         last_emitted = nullptr;
-        prev_emitted_lno_or_bc = INT_MAX;
+        prev_emitted_lno_or_bc.reset();
 #if PY_VERSION_HEX < 0x030C0000
         prev_published_bc = INT_MAX;
 #endif
