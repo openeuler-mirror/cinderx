@@ -37,8 +37,10 @@ import zlib
 from pathlib import Path
 
 if __package__:
+    from .gitcode_response import read_error_excerpt, read_json_response_body
     from .release_tag import HASH_PREFIX, PACKAGE_TAG, release_recorded_commit, tag_slug, valid_tag
 else:
+    from gitcode_response import read_error_excerpt, read_json_response_body
     from release_tag import HASH_PREFIX, PACKAGE_TAG, release_recorded_commit, tag_slug, valid_tag
 
 GIT_HOST = "https://gitcode.com"
@@ -443,11 +445,19 @@ class Api:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
-                status, text = resp.status, resp.read().decode("utf-8", "replace")
+                status = resp.status
+                if status in allow:
+                    return status, {}
+                if status not in ok:
+                    text = read_error_excerpt(resp, 500)
+                    raise RuntimeError(f"{method} {path} returned {status}: {text}")
+                text = read_json_response_body(resp, f"{method} {path} returned {status}")
         except urllib.error.HTTPError as exc:
-            status, text = exc.code, exc.read().decode("utf-8", "replace")
-        if status not in ok and status not in allow:
-            raise RuntimeError(f"{method} {path} returned {status}: {text[:500]}")
+            with exc:
+                if exc.code in allow:
+                    return exc.code, {}
+                text = read_error_excerpt(exc, 500)
+            raise RuntimeError(f"{method} {path} returned {exc.code}: {text}") from exc
         try:
             return status, (json.loads(text) if text else {})
         except json.JSONDecodeError:

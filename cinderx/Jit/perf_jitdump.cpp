@@ -319,7 +319,7 @@ std::FILE* copyFile(const std::string& from_name, const std::string& to_name) {
         "Couldn't open {} for reading ({})", from_name, string_error(errno));
     return nullptr;
   }
-  auto to = std::fopen(to_name.c_str(), "w+");
+  auto to = std::fopen(to_name.c_str(), "w+x");
   if (to == nullptr) {
     std::fclose(from);
     JIT_LOG("Couldn't open {} for writing ({})", to_name, string_error(errno));
@@ -328,21 +328,25 @@ std::FILE* copyFile(const std::string& from_name, const std::string& to_name) {
 
   char buf[4096];
   while (true) {
-    auto bytes_read = std::fread(&buf, 1, sizeof(buf), from);
-    auto bytes_written = std::fwrite(&buf, 1, bytes_read, to);
-    if (bytes_read < sizeof(buf) && std::feof(from)) {
-      // We finished successfully.
-      std::fflush(to);
-      std::fclose(from);
-      return to;
+    auto bytes_read = std::fread(buf, 1, sizeof(buf), from);
+    if (std::ferror(from) ||
+        std::fwrite(buf, 1, bytes_read, to) != bytes_read) {
+      break;
     }
-    if (bytes_read == 0 || bytes_written < bytes_read) {
-      JIT_LOG("Error copying {} to {}", from_name, to_name);
-      std::fclose(from);
-      std::fclose(to);
-      return nullptr;
+    if (std::feof(from)) {
+      if (std::fflush(to) == 0) {
+        std::fclose(from);
+        return to;
+      }
+      break;
     }
   }
+
+  JIT_LOG("Error copying {} to {}", from_name, to_name);
+  std::fclose(from);
+  std::fclose(to);
+  unlink(to_name.c_str());
+  return nullptr;
 }
 
 // Copy the contents of the parent perf map file to the child perf map file.
@@ -486,6 +490,35 @@ void copyFileInfo(FileInfo& info) {
 }
 
 void copyParentPidMap() {
+#if PY_VERSION_HEX < 0x030C0000
+  if (g_pid_map.file != nullptr && isJitUsable()) {
+    // CPython 3.11 writes through g_pid_map directly. Keep the copy open at
+    // EOF so the child can add entries and pass the map on at its next fork.
+    auto child_filename =
+        fmt::format(fmt::runtime(g_pid_map.filename_format), getpid());
+    if (child_filename == g_pid_map.filename) {
+      return;
+    }
+
+    std::fclose(g_pid_map.file);
+    unlink(child_filename.c_str());
+    g_pid_map.file = copyFile(g_pid_map.filename, child_filename);
+    if (g_pid_map.file == nullptr) {
+      // Still allow the child to record newly compiled functions.
+      g_pid_map.file = std::fopen(child_filename.c_str(), "w+x");
+      if (g_pid_map.file == nullptr) {
+        JIT_LOG(
+            "Couldn't open {} for writing ({})",
+            child_filename,
+            string_error(errno));
+        g_pid_map = {};
+        return;
+      }
+    }
+    g_pid_map.filename = std::move(child_filename);
+    return;
+  }
+#endif
   copyFileInfo(g_pid_map);
 }
 

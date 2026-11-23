@@ -18,8 +18,10 @@ import urllib.request
 from pathlib import Path
 
 if __package__:
+    from .gitcode_response import read_error_excerpt, read_json_response_body
     from .release_tag import release_recorded_commit, valid_tag
 else:
+    from gitcode_response import read_error_excerpt, read_json_response_body
     from release_tag import release_recorded_commit, valid_tag
 
 
@@ -273,15 +275,15 @@ def request_json(method, path, params=None, body=None, expected=(200, 201)):
     req = urllib.request.Request(api_url(path, params), data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            payload = resp.read()
-            text = payload.decode("utf-8", "replace") if payload else ""
-            parsed = json.loads(text) if text else {}
             if resp.status not in expected:
-                raise RuntimeError(f"{method} {path} returned {resp.status}: {text[:1000]}")
-            return resp.status, parsed
+                text = read_error_excerpt(resp, 1000)
+                raise RuntimeError(f"{method} {path} returned {resp.status}: {text}")
+            text = read_json_response_body(resp, f"{method} {path} returned {resp.status}")
+            return resp.status, json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"{method} {path} returned {exc.code}: {text[:1000]}") from exc
+        with exc:
+            text = read_error_excerpt(exc, 1000)
+        raise RuntimeError(f"{method} {path} returned {exc.code}: {text}") from exc
 
 
 def existing_release_commit(tag):
@@ -672,13 +674,14 @@ def upload_asset(tag, file_path, log):
     req = urllib.request.Request(upload_url, data=data, headers=headers, method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            text = resp.read().decode("utf-8", "replace")
             if resp.status < 200 or resp.status >= 300:
-                raise RuntimeError(f"PUT returned {resp.status}: {text[:1000]}")
+                text = read_error_excerpt(resp, 1000)
+                raise RuntimeError(f"PUT returned {resp.status}: {text}")
             log_line(log, f"uploaded {name}, status={resp.status}, bytes={len(data)}")
     except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"PUT upload for {name} returned {exc.code}: {text[:1000]}") from exc
+        with exc:
+            text = read_error_excerpt(exc, 1000)
+        raise RuntimeError(f"PUT upload for {name} returned {exc.code}: {text}") from exc
 
 
 def build_and_publish(tag, sha, publish=True):

@@ -495,6 +495,12 @@ case "$STAGE" in
     ;;
   test_release)
     require_candidate
+    # The helper forces real compilation, so an inactive JIT fails the step.
+    run_step test_perfmap_fork_311 timeout 30 env \
+      CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+      CINDERX_JIT_MODE=execute PYTHONJITAUTO=10000 \
+      "$PYTHON" -B -X jit-perfmap \
+      "$REPO_ROOT/cinderx/PythonLib/test_cinderx/perf_fork_helper.py" --cp311
     run_step test_kunpeng test_kunpeng
     run_step generator_refcount_matrix generator_refcount_matrix
     run_step bytecode_support bytecode_support
