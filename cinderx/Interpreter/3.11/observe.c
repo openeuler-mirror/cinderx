@@ -58,6 +58,7 @@ static int ci_observe_compiling;
 
 static uint64_t ci_observe_codes_seen;
 static uint64_t ci_observe_events_dropped;
+static uint64_t ci_observe_event_names_dropped;
 static uint64_t ci_observe_fresh_attachments;
 static uint64_t ci_observe_auto_jit_disabled_codes;
 static uint64_t ci_observe_late_deferrals;
@@ -109,6 +110,9 @@ static size_t ci_observe_watched;
 enum {
   CI_OBSERVE_INITIAL_EVENTS = 1024,
   CI_OBSERVE_MAX_EVENTS = 65536,
+  // Both limits include the trailing NUL of each stored name.
+  CI_OBSERVE_MAX_EVENT_NAME_BYTES = 4096,
+  CI_OBSERVE_EVENT_NAME_BUDGET = 8 * 1024 * 1024,
 };
 
 // One recorded scheduling decision.
@@ -130,6 +134,7 @@ typedef struct {
 static Ci_ObserveEvent* ci_observe_events;
 static Py_ssize_t ci_observe_event_count;
 static size_t ci_observe_event_capacity;
+static size_t ci_observe_event_name_bytes;
 
 // The product's "no machine code" switches, spelled the way the startup
 // module (_cinderx_auto.py) reads them.
@@ -566,15 +571,23 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
   }
 }
 
-// A private UTF-8 copy of a Python string, or NULL.
-//
-// NULL covers both "the code object carries no such name" and "the name
-// has no UTF-8 form" -- a lone surrogate in a qualname, which this
-// runtime already refuses to compile for.  Neither is worth failing a
-// diagnostic record over, and the error must not escape into the
-// interpreted call that is merely passing through.
+// Return a private UTF-8 copy. Leave the name unset if it is missing,
+// cannot be encoded, exceeds either size limit, or cannot be allocated.
+// Keep the event and suppress encoding errors so recording cannot break
+// the interpreted call.
 static char* observe_copy_utf8(PyObject* text) {
   if (text == NULL || !PyUnicode_Check(text)) {
+    return NULL;
+  }
+  size_t max_size = CI_OBSERVE_EVENT_NAME_BUDGET - ci_observe_event_name_bytes;
+  if (max_size > CI_OBSERVE_MAX_EVENT_NAME_BYTES) {
+    max_size = CI_OBSERVE_MAX_EVENT_NAME_BYTES;
+  }
+  // Each code point needs at least one UTF-8 byte. Avoid converting strings
+  // that cannot fit even before accounting for multibyte characters.
+  if (PyUnicode_IS_READY(text) &&
+      (size_t)PyUnicode_GET_LENGTH(text) >= max_size) {
+    ci_observe_event_names_dropped++;
     return NULL;
   }
   Py_ssize_t size = 0;
@@ -583,12 +596,18 @@ static char* observe_copy_utf8(PyObject* text) {
     PyErr_Clear();
     return NULL;
   }
-  char* copy = malloc((size_t)size + 1);
+  if ((size_t)size >= max_size) {
+    ci_observe_event_names_dropped++;
+    return NULL;
+  }
+  size_t bytes = (size_t)size + 1;
+  char* copy = malloc(bytes);
   if (copy == NULL) {
     return NULL;
   }
   memcpy(copy, utf8, (size_t)size);
   copy[size] = '\0';
+  ci_observe_event_name_bytes += bytes;
   return copy;
 }
 
@@ -1078,6 +1097,10 @@ PyObject* Ci_Observe311_Stats(void) {
           ci_shared_autojit_classify ? Py_True : Py_False) < 0 ||
       stats_set_uint(stats, "codes_seen", ci_observe_codes_seen) < 0 ||
       stats_set_uint(stats, "events_dropped", ci_observe_events_dropped) < 0 ||
+      stats_set_uint(
+          stats, "event_names_dropped", ci_observe_event_names_dropped) < 0 ||
+      stats_set_uint(stats, "event_name_bytes", ci_observe_event_name_bytes) <
+          0 ||
       stats_set_uint(stats, "fresh_attachments", ci_observe_fresh_attachments) <
           0 ||
       stats_set_uint(
@@ -1130,6 +1153,7 @@ void Ci_Observe311_Finalize(void) {
   ci_observe_events = NULL;
   ci_observe_event_count = 0;
   ci_observe_event_capacity = 0;
+  ci_observe_event_name_bytes = 0;
 
   if (ci_observe_file != NULL) {
     fclose(ci_observe_file);
@@ -1148,6 +1172,7 @@ void Ci_Observe311_Finalize(void) {
   ci_shared_autojit_threshold = 0;
   ci_observe_codes_seen = 0;
   ci_observe_events_dropped = 0;
+  ci_observe_event_names_dropped = 0;
   ci_observe_fresh_attachments = 0;
   ci_observe_auto_jit_disabled_codes = 0;
   ci_observe_late_deferrals = 0;

@@ -282,6 +282,44 @@ print(json.dumps({
         )
         self.assertIn("filename", payload["events"][0])
 
+    def test_ledger_limits_names_by_utf8_bytes(self) -> None:
+        payload = run_child(
+            PREAMBLE
+            + """\
+def fits(value):
+    return value + 1
+
+def over_limit(value):
+    return value + 2
+
+# Both filenames fit in character count. Only the first fits in UTF-8,
+# including the trailing NUL used by the ledger.
+fits.__code__ = fits.__code__.replace(co_filename=chr(233) * 2047 + "x")
+over_limit.__code__ = over_limit.__code__.replace(co_filename=chr(233) * 2048)
+before = _cinderx._get_observe_stats()
+for i in range(@T@):
+    a = fits(i)
+    b = over_limit(i)
+after = _cinderx._get_observe_stats()
+print(json.dumps({
+    "events": {
+        event["qualname"]: event["filename"]
+        for event in after["events"]
+        if event["qualname"] in ("fits", "over_limit")
+    },
+    "dropped": after["event_names_dropped"] - before["event_names_dropped"],
+    "stored_bytes": after["event_name_bytes"] - before["event_name_bytes"],
+    "results": [a, b],
+}))
+"""
+        )
+        self.assertEqual(
+            payload["events"], {"fits": chr(233) * 2047 + "x", "over_limit": None}
+        )
+        self.assertEqual(payload["dropped"], 1)
+        self.assertEqual(payload["stored_bytes"], 4096 + len("fits\0over_limit\0"))
+        self.assertEqual(payload["results"], [THRESHOLD, THRESHOLD + 1])
+
     def test_off_mode_observes_nothing(self) -> None:
         payload = run_child(
             PREAMBLE
