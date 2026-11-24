@@ -17,6 +17,7 @@ from cinderx.test_support import ENCODING, skip_unless_jit, subprocess_env
 
 class PerfMapTests(unittest.TestCase):
     @skip_unless_jit("Runs a subprocess with the JIT enabled")
+    @unittest.skipIf(sys.version_info[:2] == (3, 11), "Requires lazy_compile")
     def test_forked_pid_map(self) -> None:
         helper_file = os.path.join(
             os.path.dirname(__file__),
@@ -58,3 +59,25 @@ class PerfMapTests(unittest.TestCase):
         self.assertEqual(find_mapped_funcs("parent"), {"main", "parent", "compute"})
         self.assertEqual(find_mapped_funcs("child1"), {"main", "child1", "compute"})
         self.assertEqual(find_mapped_funcs("child2"), {"main", "child2", "compute"})
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and sys.version_info[:2] == (3, 11),
+        "Exercises the Linux CPython 3.11 perf map writer",
+    )
+    @skip_unless_jit("Requires the CPython 3.11 execute mode")
+    def test_forked_pid_map_cp311(self) -> None:
+        helper_file = os.path.join(os.path.dirname(__file__), "perf_fork_helper.py")
+        proc = subprocess.run(
+            [sys.executable, "-X", "jit-perfmap", helper_file, "--cp311"],
+            capture_output=True,
+            encoding=ENCODING,
+            env={
+                **subprocess_env(),
+                "CINDERX_PLUGIN_ENABLE": "1",
+                "CINDERX_EVAL_MODE": "cinder",
+                "CINDERX_JIT_MODE": "execute",
+                "PYTHONJITAUTO": "10000",
+            },
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

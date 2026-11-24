@@ -1,0 +1,26 @@
+--- a/ceval.c
++++ b/ceval.c
+@@ -3560,13 +3560,22 @@
+             PyDictObject *dict = *(PyDictObject **)_PyObject_ManagedDictPointer(owner);
+             DEOPT_IF(dict == NULL, LOAD_ATTR);
+             assert(PyDict_CheckExact((PyObject *)dict));
++            /* A replaced/general-key dict may invoke equality during lookup.
++             * Do not skip those observable calls using an old hint. */
++            DEOPT_IF(!DK_IS_UNICODE(dict->ma_keys), LOAD_ATTR);
+             PyObject *name = GETITEM(names, oparg);
+             uint16_t hint = cache->index;
+             DEOPT_IF(hint >= (size_t)dict->ma_keys->dk_nentries, LOAD_ATTR);
+             if (DK_IS_UNICODE(dict->ma_keys)) {
+                 PyDictUnicodeEntry *ep = DK_UNICODE_ENTRIES(dict->ma_keys) + hint;
+                 DEOPT_IF(ep->me_key != name, LOAD_ATTR);
+-                res = ep->me_value;
++                if (dict->ma_values != NULL) {
++                    DEOPT_IF(!Ci_SplitHintEnabled_311, LOAD_ATTR);
++                    res = dict->ma_values->values[hint];
++                }
++                else {
++                    res = ep->me_value;
++                }
+             }
+             else {
+                 PyDictKeyEntry *ep = DK_ENTRIES(dict->ma_keys) + hint;

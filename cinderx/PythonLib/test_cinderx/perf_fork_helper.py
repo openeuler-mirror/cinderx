@@ -3,6 +3,7 @@
 
 import multiprocessing
 import os
+from pathlib import Path
 import sys
 
 import cinderx.jit
@@ -63,6 +64,63 @@ def schedule_compilation() -> None:
     cinderx.jit.lazy_compile(compute)
 
 
+def parent_only(n):
+    return n + 2
+
+
+def child_only(n):
+    return n + 1
+
+
+def check_cp311_pid_maps():
+    import cinderjit
+
+    def compile_symbol(func):
+        if not cinderjit.force_compile(func) or not cinderjit.is_jit_compiled(func):
+            raise RuntimeError(f"JIT compilation failed for {func.__name__}")
+
+    def map_path():
+        return Path(f"/tmp/perf-{os.getpid()}.map")
+
+    def check_fork(inherited, compile_in_child=False):
+        pid = os.fork()
+        if pid == 0:
+            path = map_path()
+            try:
+                if path.read_bytes() != inherited:
+                    raise RuntimeError("Child map lacks the inherited entries")
+                if compile_in_child:
+                    compile_symbol(child_only)
+                    entries = path.read_bytes()
+                    if not entries.startswith(inherited):
+                        raise RuntimeError("Child compilation replaced the inherited entries")
+                    appended = entries[len(inherited):]
+                    if b"__CINDER_JIT:__main__:child_only\n" not in appended:
+                        raise RuntimeError("Child map lacks the newly compiled symbol")
+                    check_fork(entries)
+            finally:
+                path.unlink(missing_ok=True)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+        if status != 0:
+            raise RuntimeError(f"Child {pid} exited with wait status {status}")
+        if map_path().read_bytes() != inherited:
+            raise RuntimeError("Child compilation changed the parent map")
+
+    path = map_path()
+    try:
+        compile_symbol(parent_only)
+        entries = path.read_bytes()
+        if b"__CINDER_JIT:__main__:parent_only\n" not in entries:
+            raise RuntimeError("Parent map lacks the pre-fork symbol")
+        check_fork(entries, compile_in_child=True)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--cp311"]:
+        check_cp311_pid_maps()
+        sys.exit(0)
     schedule_compilation()
     sys.exit(main())

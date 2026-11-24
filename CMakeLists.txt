@@ -19,6 +19,7 @@ set(PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR}/cinderx)
 
 option(ENABLE_PGO_GENERATE "Build with PGO profile generation" OFF)
 option(ENABLE_PGO_USE "Build with PGO profile use" OFF)
+option(ENABLE_REPRODUCIBLE_PGO "Use stable GCC seeds for CPython 3.11 PGO" OFF)
 option(ENABLE_COVERAGE "Build with GCC coverage instrumentation" OFF)
 set(PGO_PROFILE_FILE "" CACHE STRING "Path to PGO profile data")
 
@@ -341,6 +342,22 @@ else()
   find_package(Python ${PY_VERSION} EXACT COMPONENTS Interpreter Development.Module REQUIRED)
 endif()
 
+if(ENABLE_REPRODUCIBLE_PGO)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT PY_VERSION STREQUAL "3.11"
+      OR NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "ENABLE_REPRODUCIBLE_PGO requires CPython 3.11 and GCC on Linux")
+  endif()
+  if(CMAKE_VERSION VERSION_LESS "3.21")
+    message(FATAL_ERROR "ENABLE_REPRODUCIBLE_PGO requires CMake 3.21 for linker launchers")
+  endif()
+  foreach(lang IN ITEMS C CXX)
+    foreach(kind IN ITEMS COMPILER LINKER)
+      list(PREPEND CMAKE_${lang}_${kind}_LAUNCHER "${Python_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ci_pipeline/gcc_pgo_launcher.py" "${CMAKE_BINARY_DIR}")
+    endforeach()
+  endforeach()
+endif()
+
 # Some of our files are partially generated from CPython source, and they
 # expect to be able to include files relative to Include/internal.
 set(Python_INCLUDE_DIRS ${Python_INCLUDE_DIRS} "${Python_INCLUDE_DIRS}/internal")
@@ -512,12 +529,7 @@ if (${PY_VERSION} EQUAL 3.11)
     ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
   )
   if (${ENABLE_INTERPRETER_LOOP})
-    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/coroutine_call.cmake)
-    cinderx_generate_coroutine_ceval_311("${GENERATED_HEADER_DIR}")
-    set_property(
-      SOURCE ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
-      APPEND PROPERTY INCLUDE_DIRECTORIES
-      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
+    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/attr-patches/apply.cmake)
     set(INTERP_SOURCES
       ${INTERP_SOURCES}
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c
@@ -576,6 +588,11 @@ file(WRITE ${CINDER_OPCODE_H} "${FILE_CONTENTS}")
 endif()
 
 add_library(interpreter ${INTERP_SOURCES})
+if (${PY_VERSION} EQUAL 3.11 AND ${ENABLE_INTERPRETER_LOOP})
+  target_compile_definitions(interpreter PRIVATE CINDERX_CP311_ATTR_PATH)
+  target_include_directories(interpreter PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
+endif()
 if (NOT ${PY_VERSION} EQUAL 3.11)
 target_include_directories(
   interpreter

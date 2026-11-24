@@ -1,0 +1,39 @@
+--- a/ceval.c
++++ b/ceval.c
+@@ -4726,7 +4750,7 @@
+             PyObject *function = PEEK(total_args + 1);
+             int positional_args = total_args - KWNAMES_LEN();
+             // Check if the call can be inlined or not
+-            if (Py_TYPE(function) == &PyFunction_Type && tstate->interp->eval_frame == NULL) {
++            if (Py_TYPE(function) == &PyFunction_Type && (Ci_CanInlineCoroutineCall311(tstate, function, total_args, call_shape.kwnames) || Ci_CallInlineOK311(function))) {
+                 int code_flags = ((PyCodeObject*)PyFunction_GET_CODE(function))->co_flags;
+                 PyObject *locals = code_flags & CO_OPTIMIZED ? NULL : PyFunction_GET_GLOBALS(function);
+                 STACK_SHRINK(total_args);
+@@ -4826,12 +4850,12 @@
+
+         TARGET(CALL_PY_EXACT_ARGS) {
+             assert(call_shape.kwnames == NULL);
+-            DEOPT_IF(tstate->interp->eval_frame, CALL);
+             _PyCallCache *cache = (_PyCallCache *)next_instr;
+             int is_meth = is_method(stack_pointer, oparg);
+             int argcount = oparg + is_meth;
+             PyObject *callable = PEEK(argcount + 1);
+             DEOPT_IF(!PyFunction_Check(callable), CALL);
++            DEOPT_IF(!Ci_CanInlineCoroutineCall311(tstate, callable, argcount, call_shape.kwnames) && !Ci_CallInlineOK311(callable), CALL);
+             PyFunctionObject *func = (PyFunctionObject *)callable;
+             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
+             PyCodeObject *code = (PyCodeObject *)func->func_code;
+@@ -4860,12 +4884,12 @@
+
+         TARGET(CALL_PY_WITH_DEFAULTS) {
+             assert(call_shape.kwnames == NULL);
+-            DEOPT_IF(tstate->interp->eval_frame, CALL);
+             _PyCallCache *cache = (_PyCallCache *)next_instr;
+             int is_meth = is_method(stack_pointer, oparg);
+             int argcount = oparg + is_meth;
+             PyObject *callable = PEEK(argcount + 1);
+             DEOPT_IF(!PyFunction_Check(callable), CALL);
++            DEOPT_IF(tstate->interp->eval_frame && !Ci_CallInlineOK311(callable), CALL);
+             PyFunctionObject *func = (PyFunctionObject *)callable;
+             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
+             PyCodeObject *code = (PyCodeObject *)func->func_code;

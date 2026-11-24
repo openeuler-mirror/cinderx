@@ -2,15 +2,75 @@ import hashlib
 import io
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
+from urllib.error import HTTPError
 import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from ci_pipeline.build_with_tag import gitcode_response as responses  # noqa: E402
 from ci_pipeline.build_with_tag import gitcode_webhook as webhook  # noqa: E402
+
+
+class ResponseLimitTests(unittest.TestCase):
+    def test_json_response_is_bounded_without_content_length(self):
+        for payload, too_large in ((b'{"ok":true}', False), (b'{"ok":true} ', True)):
+            with self.subTest(payload=payload):
+                body = io.BytesIO(payload)
+                body.status = 200
+                with mock.patch.object(responses, "MAX_JSON_RESPONSE_BYTES", 11), \
+                     mock.patch.object(webhook.urllib.request, "urlopen", return_value=body), \
+                     mock.patch.object(body, "read", wraps=body.read) as read:
+                    if too_large:
+                        with self.assertRaisesRegex(RuntimeError, "response exceeds 11 bytes"):
+                            webhook.request_json("GET", "/release")
+                    else:
+                        self.assertEqual(webhook.request_json("GET", "/release"), (200, {"ok": True}))
+                    read.assert_called_once_with(12)
+                self.assertTrue(body.closed)
+
+    def test_missing_release_closes_error_after_bounded_read(self):
+        body = io.BytesIO(b"large error response")
+        error = HTTPError("https://example.com", 404, "missing", {}, body)
+        with mock.patch.object(responses, "MAX_ERROR_RESPONSE_BYTES", 4), \
+             mock.patch.object(webhook.urllib.request, "urlopen", side_effect=error), \
+             mock.patch.object(body, "read", wraps=body.read) as read:
+            self.assertIsNone(webhook.existing_release_commit("v1.2.3"))
+            read.assert_called_once_with(4)
+        self.assertTrue(body.closed)
+
+    def test_upload_uses_status_on_success_and_reads_bounded_error_excerpt(self):
+        path = mock.Mock(spec=Path, name="asset")
+        path.name = "test.whl"
+        path.read_bytes.return_value = b"wheel"
+        for status in (204, 500):
+            with self.subTest(status=status):
+                body = io.BytesIO(b"" if status == 204 else b"large error response")
+                body.status = status
+                urlopen = (
+                    {"return_value": body} if status == 204 else
+                    {"side_effect": HTTPError("https://example.com", status, "error", {}, body)}
+                )
+                with mock.patch.object(webhook, "request_json", return_value=(200, {"url": "https://example.com"})), \
+                     mock.patch.object(webhook, "validate_upload_url"), \
+                     mock.patch.object(responses, "MAX_ERROR_RESPONSE_BYTES", 4), \
+                     mock.patch.object(webhook.urllib.request, "urlopen", **urlopen), \
+                     mock.patch.object(body, "read", wraps=body.read) as read:
+                    log = io.StringIO()
+                    if status == 204:
+                        webhook.upload_asset("v1.2.3", path, log)
+                        self.assertIn("status=204", log.getvalue())
+                        read.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, r"returned 500: larg$"):
+                            webhook.upload_asset("v1.2.3", path, log)
+                        read.assert_called_once_with(4)
+                self.assertTrue(body.closed)
 
 
 class GitCodeWebhookTests(unittest.TestCase):
@@ -25,6 +85,66 @@ class GitCodeWebhookTests(unittest.TestCase):
     def tearDown(self):
         webhook.previous_release_tag = self._previous_release_tag
         webhook.git_log_entries = self._git_log_entries
+
+    def test_custom_tags_use_recent_commits(self):
+        for tag in ("v3.0.0.test", "2026-11-13", "release/2026-11-13", "v3.0.0-rc.1"):
+            with self.subTest(tag=tag):
+                body = webhook.build_release_body(tag, "a" * 40, io.StringIO())
+                self.assertIn(f"# {tag}", body)
+                previous = "v1.2.2" if "-rc." in tag else "recent commits"
+                self.assertIn(f"Changes since `{previous}`:", body)
+        with self.assertRaisesRegex(RuntimeError, "invalid Git tag"):
+            webhook.validate_release_tag("bad..tag")
+
+    def test_fetch_tag_peels_annotated_tag_and_rejects_stale_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, checkout = Path(tmp) / "origin", Path(tmp) / "checkout"
+
+            def git(cwd, *args):
+                return subprocess.check_output(
+                    ["git", "-C", str(cwd), "-c", "user.name=Tester",
+                     "-c", "user.email=test@example.invalid", *args],
+                    stderr=subprocess.PIPE, text=True,
+                ).strip()
+
+            origin.mkdir()
+            checkout.mkdir()
+            git(origin, "init")
+            git(origin, "commit", "--allow-empty", "-m", "fixture")
+            sha = git(origin, "rev-parse", "HEAD")
+            git(origin, "tag", "v3.0.0.test")
+            git(origin, "tag", "-a", "release/drill", "-m", "fixture")
+            annotated = git(origin, "rev-parse", "refs/tags/release/drill")
+            git(checkout, "init")
+            git(checkout, "remote", "add", "origin", str(origin))
+            with mock.patch.multiple(webhook, REPO_DIR=checkout, REPO_URL=str(origin), ACCESS_TOKEN=""):
+                self.assertEqual(webhook.fetch_tag("v3.0.0.test", sha, io.StringIO()), (sha, sha))
+                self.assertEqual(webhook.fetch_tag("release/drill", annotated, io.StringIO()), (annotated, sha))
+                with self.assertRaisesRegex(RuntimeError, "event SHA"):
+                    webhook.fetch_tag("release/drill", "0" * 40, io.StringIO())
+
+    def test_duplicate_publish_requires_matching_live_release(self):
+        tag, sha = "release/drill", "a" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            key = hashlib.sha256(webhook.json.dumps([webhook.OWNER, webhook.REPO, tag]).encode()).hexdigest()
+            (path / f"{key}.success").write_text(sha, encoding="utf-8")
+            with (
+                mock.patch.multiple(webhook, LOG_DIR=path, STATE_DIR=path, RUN_DIR=path, ACCESS_TOKEN="fixture"),
+                mock.patch.object(webhook, "fetch_tag", return_value=(sha, sha)),
+                mock.patch.object(webhook, "checkout_tag", side_effect=RuntimeError("rebuild required")) as checkout,
+                mock.patch.object(webhook, "existing_release_commit", return_value=sha) as release,
+            ):
+                webhook.build_and_publish(tag, sha)
+                checkout.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "rebuild required"):
+                    webhook.build_and_publish("another-tag", sha)
+                release.return_value = None
+                with self.assertRaisesRegex(RuntimeError, "rebuild required"):
+                    webhook.build_and_publish(tag, sha)
+                release.return_value = "b" * 40
+                with self.assertRaisesRegex(RuntimeError, "tag points to"):
+                    webhook.build_and_publish(tag, sha)
 
     def test_collect_wheel_assets_writes_sha256_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,6 +324,54 @@ class GitCodeWebhookTests(unittest.TestCase):
         self.assertIn("--require-hashes", body)
         self.assertIn(f"./{wheel_name} --hash=sha256:{digest}", body)
         self.assertIn(f"`{wheel_name}`: `{digest}`", body)
+
+
+
+
+class ExistingReleaseCommitTests(unittest.TestCase):
+    def _release(self, body, target=""):
+        rel = {"body": body}
+        if target:
+            rel["target_commitish"] = target
+        return rel
+
+    def test_generated_changelog_quotation_is_never_mistaken_for_the_release_commit(self):
+        release_commit = "b" * 40
+        entry = f"123abc fix: quotes ## 构建信息 and Commit: `{'a' * 40}`"
+        with mock.patch.object(webhook, "previous_release_tag", return_value=""), \
+             mock.patch.object(webhook, "git_log_entries", return_value=[entry]):
+            body = webhook.build_release_body("v3.0.1", release_commit, None)
+        self.assertIn(entry, body)
+        for target in (release_commit, ""):
+            with self.subTest(target=target), \
+                 mock.patch.object(webhook, "request_json", return_value=(200, self._release(body, target))):
+                self.assertEqual(webhook.existing_release_commit("v3.0.1"), release_commit)
+
+    def test_target_commitish_wins_without_a_body_section(self):
+        with mock.patch.object(webhook, "request_json", return_value=(200, self._release("", "b" * 40))):
+            self.assertEqual(webhook.existing_release_commit("v3.0.1"), "b" * 40)
+
+    def test_body_build_info_section_is_the_fallback(self):
+        body = "changelog with Commit: `" + "a" * 40 + "` quoted\n\n## 构建信息\n- Commit: `" + "c" * 40 + "`\n"
+        with mock.patch.object(webhook, "request_json", return_value=(200, self._release(body))):
+            self.assertEqual(webhook.existing_release_commit("v3.0.1"), "c" * 40)
+
+    def test_changelog_only_body_has_no_record(self):
+        body = "## 完整变更日志\n- upstream fix: Commit: `" + "a" * 40 + "`\n"
+        with mock.patch.object(webhook, "request_json", return_value=(200, self._release(body))):
+            with self.assertRaisesRegex(RuntimeError, "does not record a commit"):
+                webhook.existing_release_commit("v3.0.1")
+
+    def test_conflicting_target_and_body_records_raise(self):
+        body = "## 构建信息\n- Commit: `" + "c" * 40 + "`\n"
+        with mock.patch.object(webhook, "request_json", return_value=(200, self._release(body, "d" * 40))):
+            with self.assertRaisesRegex(RuntimeError, "conflicting commits"):
+                webhook.existing_release_commit("v3.0.1")
+
+    def test_missing_release_returns_none(self):
+        exc = RuntimeError("GET /x returned 404: nope")
+        with mock.patch.object(webhook, "request_json", side_effect=exc):
+            self.assertIsNone(webhook.existing_release_commit("v3.0.9"))
 
 
 if __name__ == "__main__":

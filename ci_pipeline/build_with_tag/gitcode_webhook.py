@@ -17,6 +17,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+if __package__:
+    from .gitcode_response import read_error_excerpt, read_json_response_body
+    from .release_tag import release_recorded_commit, valid_tag
+else:
+    from gitcode_response import read_error_excerpt, read_json_response_body
+    from release_tag import release_recorded_commit, valid_tag
+
 
 ZERO_SHA = "0" * 40
 
@@ -86,6 +93,7 @@ def log_line(fp, msg):
 def run_cmd(args, cwd, log, env_overrides=None, timeout=None):
     log_line(log, "$ " + " ".join(shlex.quote(a) for a in args))
     child_env = os.environ.copy()
+    child_env.pop("GITCODE_ACCESS_TOKEN", None)
     if env_overrides:
         child_env.update(env_overrides)
     proc = subprocess.Popen(
@@ -99,10 +107,11 @@ def run_cmd(args, cwd, log, env_overrides=None, timeout=None):
     )
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            log.write(line)
-            log.flush()
-            print(line, end="", flush=True)
+        with proc.stdout:
+            for line in proc.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end="", flush=True)
         code = proc.wait(timeout=timeout)
     except Exception:
         proc.kill()
@@ -123,18 +132,15 @@ def check_output(args, cwd):
 
 
 def validate_release_tag(tag):
-    match = RELEASE_TAG_RE.fullmatch(tag)
-    if not match:
-        raise RuntimeError(
-            "invalid release tag: "
-            f"{tag}; expected v<MAJOR>.<MINOR>.<PATCH> or "
-            "v<MAJOR>.<MINOR>.<PATCH>-<alpha|beta|rc>.<N>"
-        )
-    return match
+    if not valid_tag(tag):
+        raise RuntimeError(f"invalid Git tag: {tag!r}")
+    return RELEASE_TAG_RE.fullmatch(tag)
 
 
 def release_tag_key(tag):
-    match = validate_release_tag(tag)
+    match = RELEASE_TAG_RE.fullmatch(tag)
+    if match is None:
+        return None
     prerelease = match.group("prerelease")
     pre_num = match.group("pre_num")
     if prerelease:
@@ -187,16 +193,25 @@ def ensure_existing_repo(log):
     return git_env
 
 
-def checkout_tag(tag, sha, log):
+def fetch_tag(tag, sha, log):
     git_env = ensure_existing_repo(log)
-    refspec = f"+refs/tags/{tag}:refs/tags/{tag}"
-    run_cmd(["git", "fetch", "--force", "--tags", "origin", refspec], REPO_DIR, log, git_env)
-    run_cmd(["git", "checkout", "--force", f"refs/tags/{tag}"], REPO_DIR, log, git_env)
-    run_cmd(["git", "clean", "-ffdx"], REPO_DIR, log, git_env)
+    ref = f"refs/tags/{tag}"
+    run_cmd(["git", "fetch", "--force", "--tags", "origin", f"+{ref}:{ref}"], REPO_DIR, log, git_env)
+    tag_sha = check_output(["git", "rev-parse", "--verify", ref], REPO_DIR)
+    commit = check_output(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], REPO_DIR)
+    if sha and sha not in (commit, tag_sha):
+        raise RuntimeError(f"event SHA {sha} differs from tag {tag!r} ({tag_sha}, commit {commit})")
+    return tag_sha, commit
+
+
+def checkout_tag(tag, sha, log):
+    _, commit = fetch_tag(tag, sha, log)
+    run_cmd(["git", "checkout", "--force", "--detach", commit], REPO_DIR, log)
+    run_cmd(["git", "clean", "-ffdx"], REPO_DIR, log)
     checked_sha = check_output(["git", "rev-parse", "HEAD"], REPO_DIR)
     log_line(log, f"checked out {tag} at {checked_sha}")
-    if sha and sha != ZERO_SHA and checked_sha != sha:
-        log_line(log, f"warning: webhook sha {sha} differs from checked out sha {checked_sha}")
+    if checked_sha != commit:
+        raise RuntimeError(f"checked out {checked_sha}; expected {commit}")
     return checked_sha
 
 
@@ -260,27 +275,37 @@ def request_json(method, path, params=None, body=None, expected=(200, 201)):
     req = urllib.request.Request(api_url(path, params), data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            payload = resp.read()
-            text = payload.decode("utf-8", "replace") if payload else ""
-            parsed = json.loads(text) if text else {}
             if resp.status not in expected:
-                raise RuntimeError(f"{method} {path} returned {resp.status}: {text[:1000]}")
-            return resp.status, parsed
+                text = read_error_excerpt(resp, 1000)
+                raise RuntimeError(f"{method} {path} returned {resp.status}: {text}")
+            text = read_json_response_body(resp, f"{method} {path} returned {resp.status}")
+            return resp.status, json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"{method} {path} returned {exc.code}: {text[:1000]}") from exc
+        with exc:
+            text = read_error_excerpt(exc, 1000)
+        raise RuntimeError(f"{method} {path} returned {exc.code}: {text}") from exc
 
 
-def release_exists(tag):
+def existing_release_commit(tag):
     try:
-        request_json("GET", f"/repos/{OWNER}/{REPO}/releases/{urllib.parse.quote(tag, safe='')}")
-        return True
-    except Exception:
-        return False
+        _, release = request_json("GET", f"/repos/{OWNER}/{REPO}/releases/{urllib.parse.quote(tag, safe='')}")
+    except RuntimeError as exc:
+        if " returned 404:" in str(exc):
+            return None
+        raise
+    try:
+        commit = release_recorded_commit(release)
+    except ValueError as exc:
+        raise RuntimeError(f"Release {tag!r}: {exc}") from exc
+    if not commit:
+        raise RuntimeError(f"Release {tag!r} does not record a commit")
+    return commit
 
 
 def previous_release_tag(current_tag, log):
     current_key = release_tag_key(current_tag)
+    if current_key is None:
+        return ""
     try:
         tags = check_output(
             ["git", "tag", "--merged", "HEAD"],
@@ -556,7 +581,7 @@ def format_integrity_section(wheel_assets):
 def build_release_body(tag, sha, log, wheel_assets=None):
     wheel_assets = wheel_assets or []
     match = validate_release_tag(tag)
-    previous_tag = previous_release_tag(tag, log)
+    previous_tag = previous_release_tag(tag, log) if match else ""
     entries = git_log_entries(previous_tag, log)
     grouped = {
         "features": [],
@@ -583,7 +608,6 @@ def build_release_body(tag, sha, log, wheel_assets=None):
         "## 安装与部署",
         python_support_line(wheel_assets),
         "- Wheel: 请在本 Release 附件中下载与运行环境匹配的 `.whl`",
-        f"- 构建命令: `{BUILD_COMMAND}`",
         "",
         format_integrity_section(wheel_assets),
         "",
@@ -593,7 +617,7 @@ def build_release_body(tag, sha, log, wheel_assets=None):
     body.extend(f"- {entry}" for entry in entries)
     if not entries:
         body.append("- 暂无")
-    if match.group("prerelease"):
+    if match and match.group("prerelease"):
         body.extend(
             [
                 "",
@@ -609,7 +633,6 @@ def build_release_body(tag, sha, log, wheel_assets=None):
             "",
             "## 构建信息",
             f"- Commit: `{sha}`",
-            f"- Builder: `{socket.gethostname()}`",
         ]
     )
     return "\n".join(body) + "\n"
@@ -630,7 +653,7 @@ def create_release(tag, sha, log, wheel_assets=None):
         log_line(log, f"created release {tag}, status={status}")
     except Exception as exc:
         log_line(log, f"release create failed: {exc}")
-        if STRICT_RELEASE_CREATE or not release_exists(tag):
+        if STRICT_RELEASE_CREATE or existing_release_commit(tag) != sha:
             raise
         log_line(log, f"release {tag} already exists or is readable; continuing to upload assets")
 
@@ -651,13 +674,14 @@ def upload_asset(tag, file_path, log):
     req = urllib.request.Request(upload_url, data=data, headers=headers, method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            text = resp.read().decode("utf-8", "replace")
             if resp.status < 200 or resp.status >= 300:
-                raise RuntimeError(f"PUT returned {resp.status}: {text[:1000]}")
+                text = read_error_excerpt(resp, 1000)
+                raise RuntimeError(f"PUT returned {resp.status}: {text}")
             log_line(log, f"uploaded {name}, status={resp.status}, bytes={len(data)}")
     except urllib.error.HTTPError as exc:
-        text = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(f"PUT upload for {name} returned {exc.code}: {text[:1000]}") from exc
+        with exc:
+            text = read_error_excerpt(exc, 1000)
+        raise RuntimeError(f"PUT upload for {name} returned {exc.code}: {text}") from exc
 
 
 def build_and_publish(tag, sha, publish=True):
@@ -665,7 +689,7 @@ def build_and_publish(tag, sha, publish=True):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    safe_tag = tag.replace("/", "_")
+    safe_tag = hashlib.sha256(json.dumps([OWNER, REPO, tag]).encode()).hexdigest()
     log_path = LOG_DIR / f"{safe_tag}-{int(time.time())}.log"
     success_marker = STATE_DIR / f"{safe_tag}.success"
     running_marker = STATE_DIR / f"{safe_tag}.running"
@@ -673,14 +697,19 @@ def build_and_publish(tag, sha, publish=True):
         log_line(log, f"job start tag={tag} sha={sha} publish={publish}")
         if publish and not ACCESS_TOKEN:
             raise RuntimeError("GITCODE_ACCESS_TOKEN is empty; fill /etc/cinderx-webhook.env before publishing")
-        if success_marker.exists() and publish:
-            # The marker guards against duplicate publishing only; a
-            # rehearsal of an already-released tag must still build.
-            log_line(log, f"success marker exists for {tag}; skipping duplicate build")
-            return str(log_path)
+        _, expected_commit = fetch_tag(tag, sha, log)
+        if publish:
+            released = existing_release_commit(tag)
+            if released is not None and released != expected_commit:
+                raise RuntimeError(f"Release {tag!r} records {released}; tag points to {expected_commit}")
+            if released == expected_commit and success_marker.exists() and (
+                success_marker.read_text(encoding="utf-8").strip() == expected_commit
+            ):
+                log_line(log, f"success marker exists for {tag}; skipping duplicate build")
+                return str(log_path)
         running_marker.write_text(str(os.getpid()), encoding="utf-8")
         try:
-            checked_sha = checkout_tag(tag, sha, log)
+            checked_sha = checkout_tag(tag, expected_commit, log)
             # One commit epoch drives every builder: both wheels then carry
             # the same date-derived version and deterministic zip metadata
             # (setup.py and the normalize step consume it).
@@ -746,11 +775,12 @@ def build_and_publish(tag, sha, publish=True):
             if not publish:
                 log_line(log, f"publish skipped (rehearsal); wheels stay in {wheelhouse}")
                 return str(log_path)
+            fetch_tag(tag, checked_sha, log)
             create_release(tag, checked_sha, log, wheel_assets)
             for asset in wheel_assets:
                 upload_asset(tag, asset["path"], log)
                 upload_asset(tag, asset["sha256_path"], log)
-            success_marker.write_text(time.strftime("%Y-%m-%d %H:%M:%S %z"), encoding="utf-8")
+            success_marker.write_text(checked_sha + "\n", encoding="utf-8")
             log_line(log, f"job success tag={tag}")
             return str(log_path)
         finally:

@@ -35,6 +35,13 @@ void Ci_JitRecursionBoundary311_Enter(void);
 void Ci_JitRecursionBoundary311_Leave(void);
 int Ci_JitRecursionBoundary311_Refuse(PyThreadState* tstate);
 
+// GIL-protected, conservatively invalidated qualification for the immutable
+// configured OFF mode. Never infer this from a paused JIT's mutable state.
+extern int Ci_OffEntryEnabled311;
+int Ci_OffEntryConfigure311(void);
+void Ci_OffEntryInvalidate311(void);
+int Ci_JitShell311_CanUseOffEntry(void);
+
 // The single in-process dict-keys version allocator (specialize_wrapper.c).
 // Assigns from the top half of the 32-bit range -- disjoint from libpython's
 // private bottom-up counter -- and returns 0 at exhaustion, which every

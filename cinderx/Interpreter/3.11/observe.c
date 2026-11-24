@@ -24,6 +24,7 @@
 #include "cinderx/Interpreter/3.11/observe.h"
 
 #include "cinderx/Common/code.h"
+#include "cinderx/Interpreter/3.11/specga.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -208,6 +209,14 @@ static int resolve_autojit_threshold_from_env(uint64_t* threshold) {
 }
 
 int Ci_Observe311_ResolveMode(Ci_JitMode311* mode, const char** spelling) {
+  // Explicit attribute modes use interpreter execution without exporting
+  // synthetic JIT settings into the environment inherited by children.
+  if (Ci_AttrPathMode311() >= 2) {
+    *mode = CI_JIT_MODE_311_OFF;
+    if (spelling != NULL)
+      *spelling = "off";
+    return 0;
+  }
   const char* raw = getenv("CINDERX_JIT_MODE");
   if (raw == NULL || *raw == '\0') {
     raw = "off";

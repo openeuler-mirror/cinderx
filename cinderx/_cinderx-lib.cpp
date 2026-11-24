@@ -683,6 +683,25 @@ PyDoc_STRVAR(
     install_frame_evaluator_doc,
     "Install the CinderX frame evaluator.  This is needed for the JIT "
     "and Static Python to function.");
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_AttrPathConfigSnapshot311(void);
+extern "C" PyObject* Ci_AttrPathStatus311(void);
+extern "C" PyObject* Ci_AttrPathCounters311(void);
+extern "C" PyObject* Ci_AttrMroStats311(void);
+extern "C" PyObject* Ci_RegisterTorchRegistry311(PyObject*, PyObject*);
+static PyObject* interp_off_entry_enabled(PyObject*, PyObject*) {
+  return PyBool_FromLong(Ci_OffEntryEnabled311 && Ci_EvalHook311_IsInstalled());
+}
+static PyObject* attr_mro_stats(PyObject*, PyObject*) {
+  return Ci_AttrMroStats311();
+}
+static PyObject* attr_path_status(PyObject*, PyObject*) {
+  return Ci_AttrPathStatus311();
+}
+static PyObject* attr_path_counters(PyObject*, PyObject*) {
+  return Ci_AttrPathCounters311();
+}
+#endif
 PyObject* install_frame_evaluator(PyObject* /* mod */, PyObject* /* args */) {
   if (Ci_InitFrameEvalFunc() < 0) {
     return nullptr;
@@ -1273,6 +1292,29 @@ PyMethodDef _cinderx_methods[] = {
      METH_NOARGS,
      PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
                "compiled-function creations and machine-code entries.")},
+#if PY_VERSION_HEX < 0x030C0000
+    {"_attr_mro_stats",
+     attr_mro_stats,
+     METH_NOARGS,
+     "Type-cache qualification diagnostics."},
+    {"_interp_off_entry_enabled",
+     interp_off_entry_enabled,
+     METH_NOARGS,
+     "Whether the installed evaluator has a qualified JIT-off fast entry."},
+    {"_attr_path_status",
+     attr_path_status,
+     METH_NOARGS,
+     "Attribute-path configuration."},
+    {"_attr_path_counters",
+     attr_path_counters,
+     METH_NOARGS,
+     "Optional attribute-path counters, or None."},
+    {"_register_torch_registry_311",
+     Ci_RegisterTorchRegistry311,
+     METH_VARARGS,
+     "Register the verified PyTorch 2.10 attribute handler for this "
+     "experiment."},
+#endif
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,
@@ -1451,6 +1493,8 @@ int _cinderx_exec_impl(PyObject* m) {
         running_version);
     return -1;
   }
+  // Only an admitted main-interpreter import may capture process settings.
+  Ci_AttrPathConfigSnapshot311();
 #endif
 
   cinderx::initStaticObjects();

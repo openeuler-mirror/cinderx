@@ -3,10 +3,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
+import runpy
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 def _load_setup_function(name: str):
@@ -20,6 +24,10 @@ def _load_setup_function(name: str):
                 "hashlib": hashlib,
                 "json": json,
                 "os": os,
+                "platform": platform,
+                "shutil": shutil,
+                "subprocess": subprocess,
+                "sys": sys,
             }
             exec(compile(module, str(setup_py), "exec"), namespace)
             return namespace[name]
@@ -37,6 +45,9 @@ pgo_profile_records = _load_setup_function("pgo_profile_records")
 write_pgo_profile_manifest = _load_setup_function("write_pgo_profile_manifest")
 write_pgo_profile_manifest.__globals__["pgo_profile_records"] = pgo_profile_records
 pgo_workload_environment = _load_setup_function("pgo_workload_environment")
+reproducible_pgo_setarch_prefix = _load_setup_function(
+    "reproducible_pgo_setarch_prefix"
+)
 pgo_workload_timeout = _load_setup_function("pgo_workload_timeout")
 ensure_cinderx_not_loaded = _load_setup_function("ensure_cinderx_not_loaded")
 
@@ -46,8 +57,6 @@ _REPOSITORY_WORKLOAD = str(
     / "TestScripts"
     / "pgo_train_workloads.py"
 )
-# Twelve serial scenarios, 120s each by default (see pgo_train_workloads.py).
-_WORST_CASE_DEFAULT = 12 * 120
 
 
 class PgoWorkloadTests(unittest.TestCase):
@@ -127,6 +136,34 @@ class PgoWorkloadTests(unittest.TestCase):
         self.assertNotIn("PYTHONHOME", environment)
         self.assertNotIn("PYTHONUSERBASE", environment)
 
+    def test_reproducible_pgo_disables_startup_grace_only_for_the_workload(self) -> None:
+        source = {"CINDERX_JIT_STARTUP_GRACE_MS": "100"}
+        default = pgo_workload_environment(source, "/tmp/build-lib")
+        reproducible = pgo_workload_environment(
+            source, "/tmp/build-lib", reproducible=True
+        )
+        self.assertEqual(default["CINDERX_JIT_STARTUP_GRACE_MS"], "100")
+        self.assertEqual(reproducible["CINDERX_JIT_STARTUP_GRACE_MS"], "0")
+        self.assertEqual(source["CINDERX_JIT_STARTUP_GRACE_MS"], "100")
+
+    @mock.patch.object(shutil, "which", return_value="/usr/bin/setarch")
+    @mock.patch.object(subprocess, "run")
+    def test_reproducible_pgo_probes_setarch(self, run, which) -> None:
+        prefix = ["/usr/bin/setarch", platform.machine(), "-R"]
+        probe = [*prefix, sys.executable, "-I", "-S", "-c", "pass"]
+        run.return_value = subprocess.CompletedProcess(probe, 0)
+        self.assertEqual(reproducible_pgo_setarch_prefix(), prefix)
+        which.assert_called_once_with("setarch")
+        run.assert_called_once_with(probe, capture_output=True, text=True)
+
+        run.return_value = subprocess.CompletedProcess(
+            probe, 1, stderr="Operation not permitted"
+        )
+        with self.assertRaises(RuntimeError) as raised:
+            reproducible_pgo_setarch_prefix()
+        self.assertIn("CINDERX_CP311_SECCOMP_PROFILE", str(raised.exception))
+        self.assertIn("Operation not permitted", str(raised.exception))
+
     def test_preloaded_extension_stops_the_build(self) -> None:
         ensure_cinderx_not_loaded({})
         with self.assertRaisesRegex(RuntimeError, "already loaded"):
@@ -170,35 +207,32 @@ class PgoWorkloadTests(unittest.TestCase):
 
 
 class PgoWorkloadTimeoutTests(unittest.TestCase):
-    def test_repository_default_covers_worst_case(self) -> None:
-        self.assertEqual(
-            pgo_workload_timeout({}, "repository", _REPOSITORY_WORKLOAD),
-            _WORST_CASE_DEFAULT,
-        )
+    def test_repository_timeout_matches_training_configuration(self) -> None:
+        flag = "CINDERX_PGO_INTERPRETER_TRAINING"
+        for interpreter_training, scenario_count in ((None, 19), ("0", 12), ("1", 19)):
+            with mock.patch.dict(os.environ):
+                if interpreter_training is None:
+                    os.environ.pop(flag, None)
+                else:
+                    os.environ[flag] = interpreter_training
 
-    def test_repository_scenario_timeout_scales_the_budget(self) -> None:
-        self.assertEqual(
-            pgo_workload_timeout(
-                {"CINDERX_PGO_SCENARIO_TIMEOUT": "30"},
-                "repository",
-                _REPOSITORY_WORKLOAD,
-            ),
-            12 * 30,
-        )
-
-    def test_explicit_override_is_never_below_the_worst_case(self) -> None:
-        clamped = pgo_workload_timeout(
-            {"CINDERX_PGO_WORKLOAD_TIMEOUT": "600"},
-            "repository",
-            _REPOSITORY_WORKLOAD,
-        )
-        self.assertEqual(clamped, _WORST_CASE_DEFAULT)
-        honored = pgo_workload_timeout(
-            {"CINDERX_PGO_WORKLOAD_TIMEOUT": "5000"},
-            "repository",
-            _REPOSITORY_WORKLOAD,
-        )
-        self.assertEqual(honored, 5000)
+                default_budget = scenario_count * 120
+                cases = (
+                    ({}, default_budget),
+                    ({"CINDERX_PGO_SCENARIO_TIMEOUT": "30"}, scenario_count * 30),
+                    ({"CINDERX_PGO_WORKLOAD_TIMEOUT": "600"}, default_budget),
+                    ({"CINDERX_PGO_WORKLOAD_TIMEOUT": "5000"}, 5000),
+                )
+                for overrides, expected in cases:
+                    with self.subTest(
+                        interpreter_training=interpreter_training, overrides=overrides
+                    ):
+                        self.assertEqual(
+                            pgo_workload_timeout(
+                                overrides, "repository", _REPOSITORY_WORKLOAD
+                            ),
+                            expected,
+                        )
 
     def test_non_repository_workload_keeps_the_fixed_default(self) -> None:
         self.assertEqual(pgo_workload_timeout({}, "custom", None), 600)
@@ -272,6 +306,22 @@ class PgoProfileTests(unittest.TestCase):
 
 
 class PgoCompilerValidationTests(unittest.TestCase):
+    def test_launcher_seeds_compiler_output_with_chained_launcher(self) -> None:
+        root = Path(__file__).resolve().parents[4]
+        launcher = str(root / "ci_pipeline" / "gcc_pgo_launcher.py")
+        for output in ("first.o", "second.o"):
+            command = ["stdbuf", "-o", "L", "gcc", "-c", "test.c", "-o", str(root / output)]
+            with (
+                self.subTest(output=output),
+                mock.patch.object(sys, "argv", [launcher, str(root), *command]),
+                mock.patch.object(os, "execvp") as execvp,
+            ):
+                runpy.run_path(launcher, run_name="__main__")
+                seed = hashlib.sha256(f"compile:{output}".encode()).hexdigest()[:16]
+                execvp.assert_called_once_with(
+                    "stdbuf", [*command, f"-frandom-seed=0x{seed}"]
+                )
+
     def test_profile_use_diagnostics_are_errors(self) -> None:
         cmake = (Path(__file__).resolve().parents[4] / "CMakeLists.txt").read_text(
             encoding="utf-8"
