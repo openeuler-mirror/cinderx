@@ -74,7 +74,9 @@ CINDERX_ENABLE_PGO=0 CINDERX_ENABLE_LTO=0 python3.11 -m pip install .
 ## 性能测试
 
 推荐使用 [pyperformance](https://github.com/python/pyperformance) 进行基准性能测试。pyperformance 是 Python 官方认可的基准测试套件，覆盖 JSON 序列化、正则匹配、加密运算、迭代器等多种场景，能够全面评估 CinderX 带来的性能提升。
-性能测试需要基于自行编译的 CPython 进行，以确保基线一致和访问内部 API正常。CinderX依据自动导入功能， 替换CPython原生解释器，从而可借用pyperformance测试套件进行CinderX的性能测试。
+CPython 3.11 的跑分命令见[CPython 3.11 性能测试](#cpython-311-性能测试)。
+
+下文的源码构建和 AutoJIT 示例适用于 CPython 3.14。CinderX依据自动导入功能， 替换CPython原生解释器，从而可借用pyperformance测试套件进行CinderX的性能测试。
 
 
 以下步骤从源码构建 CPython 开始，逐步完成测试环境搭建。
@@ -250,6 +252,49 @@ CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 -m pyperformance run \
     -o test.json
 ```
 pyperformance可通过`-b`参数指定用例范围，也可通过`--fast`方式快速验证，更多使用方式参考[pyperformance Docs](https://pyperformance.readthedocs.io)
+
+### CPython 3.11 性能测试
+
+按[安装部署指南](../../docs/zh/installation_guide.md#cpython-311)准备 CPython 3.11.6 和对应的 CinderX 安装包。以下命令使用已安装 `pyperformance==1.13.0` 的 `python3.11`。若使用其他解释器路径，替换命令中的 `python3.11` 即可。测试系统 RPM 时，应使用基于发行版 `/usr/bin/python3.11` 的环境。
+
+pyperformance 在 worker 虚拟环境中运行用例。已有 worker 时复用该环境。首次需要提前准备时，可在跑分目录执行 `python3.11 -m pyperformance venv create -b nbody`，完成后使用命令输出的环境路径。
+
+`include-system-site-packages` 控制 worker 能否访问基础解释器的系统包目录。按 CinderX 的安装位置处理：
+
+- **wheel 直接装在 worker 中**　用该 worker 的 `bin/python` 安装 wheel，它就能从自己的包目录导入 CinderX。
+- **复用基础解释器中的安装**　按[RPM 安装说明](../../docs/zh/installation_guide.md#cpython-311-rpm)安装的 RPM 位于系统包目录。若 worker 需要使用这份安装，在其 `pyvenv.cfg` 中将 `include-system-site-packages` 设为 `true`。wheel 若安装在同一基础解释器的系统包目录中，也按此处理。
+
+下面用 `nbody` 对比同一份 CinderX 安装关闭和开启 JIT 的耗时。两组使用同一帧求值器，只切换 `CINDERX_JIT_MODE`。在未额外设置 JIT 参数的终端和同一目录中依次运行，使用尚不存在的结果文件名。需要绑核时，两组使用相同的 `--affinity` 编号。
+
+**1. 运行基线（关闭 JIT）**
+
+保持 CinderX 插件和帧求值器启用，将 JIT 模式设为 `off`，结果保存到 `cp311-off.json`。
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder CINDERX_JIT_MODE=off \
+    python3.11 -m pyperformance run -b nbody --warmups 3 \
+    --inherit-environ CINDERX_PLUGIN_ENABLE,CINDERX_EVAL_MODE,CINDERX_JIT_MODE \
+    -o cp311-off.json
+```
+
+**2. 运行候选（开启 JIT）**
+
+将 JIT 模式改为 `execute`，结果保存到 `cp311-execute.json`。
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder CINDERX_JIT_MODE=execute \
+    python3.11 -m pyperformance run -b nbody --warmups 3 \
+    --inherit-environ CINDERX_PLUGIN_ENABLE,CINDERX_EVAL_MODE,CINDERX_JIT_MODE \
+    -o cp311-execute.json
+```
+
+**3. 比较结果**
+
+两组都跑完后，用 `pyperf compare_to` 对比两份 JSON 的耗时。`--table` 将对比结果以表格形式输出。
+
+```bash
+python3.11 -m pyperf compare_to cp311-off.json cp311-execute.json --table
+```
 
 ---
 
