@@ -11,9 +11,11 @@
 
 #include "cinderx/Common/audit.h"
 #include "cinderx/Common/code.h"
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/import.h"
 #include "cinderx/Common/log.h"
+#include "cinderx/Common/property.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/string.h"
@@ -531,12 +533,9 @@ void recordAutoJitInterpretedCall(const AutoJitGateState& state) {
   }
 }
 
-ICStabilityReason icStabilityBypassReason(
+ICStabilityReason autoJitAdmissionExclusion(
     BorrowedRef<PyCodeObject> code,
     const AutoJitGateState& state) {
-  if (!getConfig().auto_jit_ic_stability) {
-    return ICStabilityReason::Disabled;
-  }
   if (!getConfig().auto_classify) {
     return ICStabilityReason::NonAuto;
   }
@@ -564,8 +563,110 @@ ICStabilityReason icStabilityBypassReason(
   return ICStabilityReason::None;
 }
 
+ICStabilityReason icStabilityBypassReason(
+    BorrowedRef<PyCodeObject> code,
+    const AutoJitGateState& state) {
+  if (!getConfig().auto_jit_ic_stability) {
+    return ICStabilityReason::Disabled;
+  }
+  return autoJitAdmissionExclusion(code, state);
+}
+
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED)
+// A borrowed value from a unicode-only class dictionary can be inspected
+// under the GIL without invoking the descriptor or running Python key methods.
+bool isOwnPropertyGetter(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> code,
+    PyObject* receiver) {
+  PyTypeObject* owner = Py_TYPE(receiver);
+  if (!PyType_HasFeature(owner, Py_TPFLAGS_HEAPTYPE) ||
+      !PyUnicode_CheckExact(code->co_name)) {
+    return false;
+  }
+  PyObject* dict = getBorrowedTypeDict(owner);
+  if (dict == nullptr || !hasOnlyUnicodeKeys(dict)) {
+    return false;
+  }
+  PyObject* descr = PyDict_GetItem(dict, code->co_name);
+  return descr != nullptr && Py_IS_TYPE(descr, &PyProperty_Type) &&
+      reinterpret_cast<Ci_propertyobject*>(descr)->prop_get == func.getObj();
+}
+
+// Keep indexing, slicing and pure method forwarders on their usual warmup.
+bool readsAttributeWithoutSubscript(BorrowedRef<PyCodeObject> code) {
+  bool reads_attribute = false;
+  for (auto instr : BytecodeInstructionBlock{code}) {
+    switch (instr.opcode()) {
+      case BINARY_SLICE:
+      case BUILD_SLICE:
+      case STORE_SLICE:
+      case STORE_SUBSCR:
+      case DELETE_SUBSCR:
+        return false;
+      case BINARY_OP:
+        if (instr.oparg() == NB_SUBSCR) {
+          return false;
+        }
+        break;
+      case LOAD_ATTR:
+        // An odd operand prepares a method call, not a value attribute read.
+        reads_attribute |= (instr.oparg() & 1) == 0;
+        break;
+    }
+  }
+  return reads_attribute;
+}
+
+struct PropertyAdmission {
+  StructureKey key;
+  uint32_t limit;
+};
+
+std::optional<PropertyAdmission> earlyPropertyAdmission(
+    BorrowedRef<PyFunctionObject> func,
+    const AutoJitGateState& state,
+    PyObject* receiver,
+    uint32_t configured,
+    ICStabilityReason bypass) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (configured < 2 || configured >= kICStabilityMinimumWindow ||
+      state.context.startup_phase || state.extra == nullptr ||
+      code->_co_monitoring != nullptr || code->co_argcount != 1 ||
+      code->co_kwonlyargcount != 0 ||
+      (code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) != 0 ||
+      !lowRoiReleaseIsActive()) {
+    return std::nullopt;
+  }
+  // IC sampling can be disabled independently of AutoJIT. In that case the
+  // usual IC bypass enum has not inspected the jitlist, flags or ROI history.
+  if (bypass == ICStabilityReason::Disabled) {
+    bypass = autoJitAdmissionExclusion(code, state);
+  }
+  if (bypass != ICStabilityReason::None ||
+      (Ci_code_extra_load_skey_acquire(state.extra) & kSkeyDecidedColdBit) ||
+      !isOwnPropertyGetter(func, code, receiver)) {
+    return std::nullopt;
+  }
+  auto key = getOrComputeStructureKey(code, state.extra);
+  if (!key.has_value()) {
+    return std::nullopt;
+  }
+  uint32_t shorter =
+      shortWarmupPropertyThreshold(configured, *key, state.context, true);
+  if (state.calls < shorter || !readsAttributeWithoutSubscript(code)) {
+    return std::nullopt;
+  }
+  auto decision =
+      computeThresholdForCode(code, *key, state.context, configured);
+  if (decision.limit != configured ||
+      decision.branch_reason != BranchReason::None) {
+    return std::nullopt;
+  }
+  return PropertyAdmission{*key, shorter};
+}
+
 ICStabilityReason icStabilityBypassForProcess(
     ICStabilityReason existing,
     const std::optional<StructureKey>& key,
@@ -842,17 +943,31 @@ PyObject* jitVectorcall(
 
   incAutoJitGateStat(g_auto_jit_gate_stats.jit_vectorcall);
 
-  // If there's a call count limit, interpret the function as usual until the
-  // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     AutoJitGateState state = readAutoJitGateState(code);
     ICStabilityReason stability_bypass = icStabilityBypassReason(code, state);
+    uint32_t effective_limit = *limit;
+    std::optional<StructureKey> key;
+    ThresholdDecision decision{*limit, BranchReason::None};
     if (state.calls < *limit) {
-      incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
-      auto entry = getInterpretedVectorcall(func);
-      observeAutoJitICWarmup(code, state, *limit, stability_bypass);
-      recordAutoJitInterpretedCall(state);
-      return entry(func_obj, stack, nargsf, kwnames);
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+      if (getConfig().auto_classify && kwnames == nullptr &&
+          PyVectorcall_NARGS(nargsf) == 1) {
+        if (auto early = earlyPropertyAdmission(
+                func, state, stack[0], *limit, stability_bypass)) {
+          key = early->key;
+          effective_limit = early->limit;
+        }
+      }
+#endif
+      if (state.calls < effective_limit) {
+        incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
+        auto entry = getInterpretedVectorcall(func);
+        observeAutoJitICWarmup(code, state, *limit, stability_bypass);
+        recordAutoJitInterpretedCall(state);
+        return entry(func_obj, stack, nargsf, kwnames);
+      }
     }
 
     if (getConfig().roi_backoff_enabled && state.extra != nullptr) {
@@ -869,10 +984,7 @@ PyObject* jitVectorcall(
       }
     }
 
-    uint32_t effective_limit = *limit;
-    std::optional<StructureKey> key;
-    ThresholdDecision decision{*limit, BranchReason::None};
-    if (getConfig().auto_classify) {
+    if (getConfig().auto_classify && !key.has_value()) {
       if (shouldDeferSuspendableAutoJitWithoutStructureKey(
               code, state.context)) {
         effective_limit = kAutoJitInterpretOnlyThreshold;
@@ -1092,8 +1204,8 @@ FlagProcessor initFlagProcessor() {
       [](const std::string& val) {
         g_auto_jit_option_valid = parseAutoJitOption(val);
       },
-      "Enable auto-JIT mode, which compiles functions after the given "
-      "threshold");
+      "Enable auto-JIT with a numeric call threshold, or auto[:N] for "
+      "adaptive classification around a base threshold");
 
 #if PY_VERSION_HEX < 0x030C0000
   flag_processor

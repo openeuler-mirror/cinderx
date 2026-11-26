@@ -18,6 +18,8 @@ namespace jit {
 
 inline constexpr uint64_t kICStabilitySampleInterval = 4;
 inline constexpr uint8_t kICStabilityRequiredSamples = 3;
+inline constexpr uint64_t kICStabilityMinimumWindow =
+    1 + kICStabilitySampleInterval * (kICStabilityRequiredSamples - 1);
 inline constexpr uint64_t kICStabilityMaxExtraCalls = 128;
 inline constexpr uint16_t kICStabilityMaxSites = 32;
 inline constexpr size_t kICStabilityMaxCodeUnits = 1024;
@@ -105,6 +107,28 @@ inline ICStabilityReason icStabilityAdmissionBypassReason(
 
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED)
+// Apply only to a verified property getter in a released CP314 process.
+// Interpret one call of a branchy getter with a loop before admitting it.
+inline uint32_t shortWarmupPropertyThreshold(
+    uint32_t configured,
+    const StructureKey& key,
+    const GateContext& context,
+    bool released) {
+  if (configured < 2 || configured >= kICStabilityMinimumWindow || !released ||
+      context.startup_phase || context.import_phase || context.setup_phase ||
+      key.is_static || key.is_suspendable || key.highRisk()) {
+    return configured;
+  }
+  if (key.code_size_bucket == 0 && key.loop_score == 0) {
+    return 0;
+  }
+  if (key.family == Family::BranchFSM && key.code_size_bucket == 1 &&
+      key.loop_score == 1) {
+    return 1;
+  }
+  return configured;
+}
+
 inline ICStabilityReason icStabilityAdmissionBypassReason(
     ICStabilityReason existing,
     const std::optional<StructureKey>& key,
@@ -117,9 +141,7 @@ inline ICStabilityReason icStabilityAdmissionBypassReason(
   // Extending it moves compilation of infrequently called functions into
   // later application work. Keep the requested admission point; generated
   // guards and normal deoptimization still protect speculative code.
-  constexpr uint64_t minimum_window =
-      1 + kICStabilitySampleInterval * (kICStabilityRequiredSamples - 1);
-  if (warmup_limit < minimum_window) {
+  if (warmup_limit < kICStabilityMinimumWindow) {
     return ICStabilityReason::ShortWarmup;
   }
   return ICStabilityReason::None;

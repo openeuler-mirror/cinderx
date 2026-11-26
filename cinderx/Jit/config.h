@@ -245,7 +245,8 @@ struct Config {
   uint32_t attr_cache_size{4};
   std::optional<uint32_t> compile_after_n_calls;
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
-  // numeric PYTHONJITAUTO and Python APIs keep this disabled.
+  // numeric PYTHONJITAUTO and Python APIs keep this disabled. The suffix is
+  // a base threshold. Eligible property getters can warm up sooner.
   bool auto_classify{false};
   // Bounded interpreter feedback sampling before ordinary automatic admission.
   // Numeric thresholds, explicit compilation, OSR and free-threaded builds

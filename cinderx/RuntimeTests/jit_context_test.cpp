@@ -945,6 +945,7 @@ def arm(func):
   DeathInFlightProbe probe;
   probe.ctx = jit_ctx_.get();
   probe.func = func.get();
+  SCOPE_EXIT(g_death_in_flight_probe = nullptr);
   g_death_in_flight_probe = &probe;
 
   {
@@ -971,7 +972,6 @@ def arm(func):
   func.reset();
   uint64_t deaths_after =
       jit::triggerStatsSnapshot().function_destroyed_notifications;
-  g_death_in_flight_probe = nullptr;
 
   ASSERT_TRUE(probe.ran) << "the user callback never ran";
   EXPECT_TRUE(probe.pending_before)

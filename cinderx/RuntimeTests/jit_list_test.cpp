@@ -1,8 +1,16 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/jit_list.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <unistd.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <system_error>
 
 using JITListTest = RuntimeTest;
 using WildcardJITListTest = RuntimeTest;
@@ -120,10 +128,6 @@ TEST_F(WildcardJITListTest, Lookup) {
   EXPECT_TRUE(jitlist->lookupName(foo, foo_bar_evaluate));
   EXPECT_FALSE(jitlist->lookupName(bar, foo_evaluate));
 }
-
-#include <cstdio>
-#include <fstream>
-#include <string>
 
 using JITListExtendedTest = RuntimeTest;
 
@@ -278,14 +282,24 @@ TEST_F(JITListExtendedTest, ParseFileWithContent) {
   auto jitlist = JITList::create();
   ASSERT_NE(jitlist, nullptr);
 
-  std::string tmp_path = std::tmpnam(nullptr);
-  {
-    std::ofstream ofs(tmp_path);
-    ofs << "test_module:test_func1\n";
-    ofs << "test_module:test_func2\n";
-    ofs << "# comment line\n";
-    ofs << "other_module:other_func\n";
-  }
+  std::error_code error;
+  const auto tmp_dir = std::filesystem::temp_directory_path(error);
+  ASSERT_FALSE(error) << error.message();
+  std::string tmp_path = (tmp_dir / "cinderx-jit-list-XXXXXX").string();
+  const int fd = ::mkstemp(tmp_path.data());
+  ASSERT_GE(fd, 0) << "Unable to create a temporary file in " << tmp_dir;
+  SCOPE_EXIT({
+    ::close(fd);
+    ::unlink(tmp_path.c_str());
+  });
+
+  constexpr char kContents[] =
+      "test_module:test_func1\n"
+      "test_module:test_func2\n"
+      "# comment line\n"
+      "other_module:other_func\n";
+  constexpr auto kSize = static_cast<ssize_t>(sizeof(kContents) - 1);
+  ASSERT_EQ(::write(fd, kContents, kSize), kSize);
 
   jitlist->parseFile(tmp_path.c_str());
 
@@ -303,6 +317,4 @@ TEST_F(JITListExtendedTest, ParseFileWithContent) {
   EXPECT_EQ(jitlist->lookupName(test_mod, func1), 1);
   EXPECT_EQ(jitlist->lookupName(test_mod, func2), 1);
   EXPECT_EQ(jitlist->lookupName(other_mod, other_func), 1);
-
-  std::remove(tmp_path.c_str());
 }

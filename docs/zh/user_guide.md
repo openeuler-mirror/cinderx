@@ -2,7 +2,7 @@
 
 本指南介绍CinderX的主要功能、适用场景、配置方法和故障处理。先按CPython版本选择运行配置，再根据需要查看诊断和性能验证方法。下文将CPython 3.11、3.14分别简称为CP311、CP314。
 
-首次使用建议先完成[快速入门](quick_start.md)；安装、升级和环境管理见[安装部署指南](installation_guide.md)。本文对应的源码基线和发布包信息见[版本说明书](https://gitcode.com/openeuler/cinderx/releases)。
+首次使用建议先完成[快速入门](quick_start.md)；安装、升级和环境管理见[安装部署指南](installation_guide.md)。本文对应的源码基线和发布包信息见[版本说明书](release_notes.md)。
 
 ## 特性、架构与适用场景
 
@@ -24,11 +24,12 @@ JIT（即时编译器）把受支持函数的字节码转换为中间表示，�
 
 ## 通用配置与API
 
-环境变量通常在进程启动或JIT初始化时读取，修改后应启动新进程。对于同时提供环境变量和`-X`选项的JIT参数，`-X`选项优先；排查时应记录两者。初次使用建议采用对应版本的示例配置，再逐项调整。
+在启动前设置下表中JIT环境变量。修改后，重新启动Python进程。要调整阈值，修改`PYTHONJITAUTO`的值。默认值和取值范围见[自动调度参数](#自动调度与参数)。
 
 | 环境变量 | 用法与作用 |
 |---|---|
 | `CINDERX_PLUGIN_ENABLE=1` | 启用site启动阶段的插件自动加载；两条线还需满足各自启动条件 |
+| `CINDERX_EVAL_MODE` | 设置CPython 3.11的帧求值器。默认值和取值区别见[启动与执行模式](#启动与执行模式) |
 | `CINDERX_DISABLE=1` | 关闭CinderX的常规插件加载和Python包初始化 |
 | `PYTHONJITDISABLE=1` | 禁用JIT，可用于两条Python支持线 |
 | `PYTHONJITAUTO=N` | 使用数值调用阈值；达到阈值后仍受准入和运行条件约束 |
@@ -74,12 +75,21 @@ CP311 RPM用于openEuler 24.03 LTS-SP5 AArch64的CPython 3.11.6；安装与维�
 
 ```bash
 CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
-  CINDERX_JIT_MODE=execute PYTHONJITAUTO=20 \
+  CINDERX_JIT_MODE=execute \
   CINDERX_OSR_ENABLED=0 PYTHONJITLIGHTWEIGHTFRAME=0 \
   "$CINDERX_PY" your_app.py
 ```
 
-`CINDERX_EVAL_MODE=cinder`选择CinderX帧求值器，`CINDERX_JIT_MODE=execute`选择机器码执行模式。本例显式设置这两项，便于检查启动配置。`CINDERX_JIT_MODE`默认是`off`，可选模式如下：
+在CPython 3.11中，`CINDERX_EVAL_MODE`控制插件是否主动安装CinderX帧求值器。
+
+|取值|作用|
+|--|--|
+|stock|未设置变量时的默认值。插件跳过安装求值器的步骤。在默认的`CINDERX_JIT_MODE=off`下，常规插件启动继续使用`CPython`原有的帧求值器。|
+|cinder|插件请求安装`CinderX`帧求值器。|
+
+只接受小写的`stock`和`cinder`。变量已设置但值为空，或使用其他取值，插件会报配置错误。
+
+`CINDERX_JIT_MODE`单独控制JIT运行方式，默认为`off`。`execute`成功初始化时会自行安装CinderX帧求值器，即使`CINDERX_EVAL_MODE`设为`stock`。各模式的作用如下。
 
 | 模式 | 作用 |
 |---|---|
@@ -92,9 +102,17 @@ CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
 
 ### 自动调度与参数
 
-CP311使用数值调用阈值。`PYTHONJITAUTO=20`表示函数达到该调用阈值后进入编译判断；未显式设置时，调用观察器的默认阈值为50。启动宽限期、函数支持范围和退避状态等条件仍可能推迟或拒绝编译。
+CP311启用`execute`后，未设置`PYTHONJITAUTO`和`PYTHONJITALL`时，调用阈值默认为`50`。要调整阈值，在启动前设置`PYTHONJITAUTO=N`。`N`只能由十进制数字组成，范围为`0`至`4294967295`。
 
-CP311不支持`PYTHONJITAUTO=auto`／`auto:N`行为分类；使用这些配置会被拒绝。按次数自动编译与行为分类是两种能力。
+|配置|含义|
+|--|--|
+|50|默认值，首次运行可沿用。|
+|20|比默认值更早开始调度判断，可用于对比预热和编译开销。|
+|0或1|从首次被计数的调用开始判断，适合定向诊断。|
+
+调用观察器按代码对象累计次数。达到阈值后，启动宽限期、函数准入和退避等条件仍可能推迟编译或使函数继续解释执行。
+
+空的`PYTHONJITAUTO`按未设置处理。负数、带符号或空白的值、小数、超出范围的值及`auto/auto:N`会使CP311的`execute`初始化报错。通过`site`自动加载时，Python可能在打印错误后继续运行。排查时查看启动日志，并用`cinderx.jit.is_enabled()`确认JIT状态。
 
 当前CP311不支持JIT列表，也未开放`compile_after_n_calls`、`lazy_compile`等CP314控制接口。请通过启动配置设置数值阈值；调用未开放的接口会报错。
 

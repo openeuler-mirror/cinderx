@@ -11,6 +11,10 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstdlib>
 
 /* Begin GDB hook */
 
@@ -92,13 +96,27 @@ register_elf_ctx(ELFObjectContext* ctx, const char* type, void* ptr) {
   memcpy(elf_object_start, elfctx_get_object_ptr(ctx), elf_object_size);
 
   if (jit::getConfig().gdb.write_elf_objects) {
-    // Write the ELF object to /tmp
+    const char* directory = std::getenv("TMPDIR");
+    if (directory == nullptr || directory[0] == '\0') {
+      directory = "/tmp";
+    }
     struct jit_string_t* filename =
-        ss_sprintf_alloc("/tmp/cinder_%s_%p_elf", type, ptr);
-    int fd;
-    if ((fd = open(ss_get_string(filename), O_CREAT | O_RDWR, 0600))) {
-      if (write(fd, elf_object_start, elf_object_size) < 0) {
-        JIT_DLOG("Failed to write to {}", ss_get_string(filename));
+        ss_sprintf_alloc("%s/cinder_%s_%p_elf", directory, type, ptr);
+    const char* path = ss_get_string(filename);
+    int fd = open(
+        path, O_CREAT | O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+      JIT_DLOG("Failed to open {}", path);
+    } else {
+      struct stat info;
+      if (fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+          ftruncate(fd, 0) == 0) {
+        const ssize_t written = write(fd, elf_object_start, elf_object_size);
+        if (written < 0 || static_cast<size_t>(written) != elf_object_size) {
+          JIT_DLOG("Failed to write to {}", path);
+        }
+      } else {
+        JIT_DLOG("Failed to prepare ELF file {}", path);
       }
       close(fd);
     }
