@@ -13,6 +13,7 @@
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <limits>
 #include <unordered_set>
 
 using namespace jit::hir;
@@ -68,6 +69,13 @@ int firstPublishedOffset(
   return -1;
 }
 
+void runPositionPasses(Function& func) {
+  SSAify{}.Run(func);
+  Simplify{}.Run(func);
+  PhiElimination{}.Run(func);
+  InsertUpdatePrevInstr{}.Run(func);
+}
+
 std::unique_ptr<Function> compileAndRunPass(
     RuntimeTest* test,
     const char* src) {
@@ -76,10 +84,7 @@ std::unique_ptr<Function> compileAndRunPass(
   if (irfunc == nullptr) {
     return nullptr;
   }
-  SSAify{}.Run(*irfunc);
-  Simplify{}.Run(*irfunc);
-  PhiElimination{}.Run(*irfunc);
-  InsertUpdatePrevInstr{}.Run(*irfunc);
+  runPositionPasses(*irfunc);
   return irfunc;
 }
 
@@ -179,6 +184,56 @@ def test(value):
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+TEST_F(InsertUpdatePrevInstrTest, PublishesBothCallsOnOneLine) {
+  const char* src = R"(
+def test(first, second):
+  first(); second()
+)";
+  auto irfunc = compileAndRunPass(this, src);
+  ASSERT_NE(irfunc, nullptr);
+
+  auto offsets = publishedOffsets(*irfunc);
+  int calls = 0;
+  for (const auto& instr : jit::BytecodeInstructionBlock{irfunc->code}) {
+    if (instr.opcode() == CALL) {
+      int expected = instr.nextInstrOffset().asIndex().value() - 1;
+      EXPECT_TRUE(offsets.contains(expected)) << "missing call at " << expected;
+      calls++;
+    }
+  }
+  EXPECT_EQ(calls, 2);
+}
+
+TEST_F(InsertUpdatePrevInstrTest, PublishesCallOnMaximumLineNumber) {
+  const char* src = R"(
+def test(first, second):
+  first()
+  return second()
+)";
+  std::unique_ptr<Function> irfunc;
+  CompileToHIR(src, "test", irfunc);
+  ASSERT_NE(irfunc, nullptr);
+
+  auto* code = irfunc->code.get();
+  int last_call = -1;
+  for (const auto& instr : jit::BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == CALL) {
+      last_call = instr.nextInstrOffset().asIndex().value() - 1;
+    }
+  }
+  ASSERT_GE(last_call, 0);
+  int byte_offset = last_call * sizeof(_Py_CODEUNIT);
+  ASSERT_EQ(PyCode_Addr2Line(code, byte_offset), code->co_firstlineno + 2);
+
+  // The first call completes a position update before the second call's line.
+  constexpr int max_line = std::numeric_limits<int>::max();
+  code->co_firstlineno = max_line - 2;
+  ASSERT_EQ(PyCode_Addr2Line(code, byte_offset), max_line);
+
+  runPositionPasses(*irfunc);
+  EXPECT_TRUE(publishedOffsets(*irfunc).contains(last_call));
+}
+
 TEST_F(
     InsertUpdatePrevInstrTest,
     PythonVisibleBoundariesPublishPrecisePositions) {
