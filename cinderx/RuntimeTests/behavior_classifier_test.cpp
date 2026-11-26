@@ -682,6 +682,67 @@ TEST_F(BehaviorClassifierTest, SteadyStateCompilesTinyStartupLikeWork) {
   EXPECT_EQ(tiny_numeric_decision.branch_reason, BranchReason::None);
 }
 
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED)
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    ShortPropertyAdmissionPreservesRoiHistory) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().roi_backoff_enabled = true;
+  for (int history = 0; history < 6; ++history) {
+    Ref<> objects = compileStockAndGet(
+        R"(
+class Receiver:
+    payload = 8
+
+    @property
+    def value(self):
+        return self.payload
+
+targets = (Receiver(), Receiver.value.fget)
+)",
+        "targets");
+    ASSERT_NE(objects, nullptr);
+    ASSERT_TRUE(PyTuple_Check(objects.get()));
+    PyObject* receiver = PyTuple_GET_ITEM(objects.get(), 0);
+    Ref<> function = Ref<>::create(PyTuple_GET_ITEM(objects.get(), 1));
+    CodeExtra* extra = codeExtra(codeFromFunc(function));
+    ASSERT_NE(extra, nullptr);
+    extra->calls = history == 0 ? 0 : 1;
+    if (history == 1) {
+      extra->roi_ctl = 1u << CI_CODE_EXTRA_ROI_ROUND_SHIFT;
+    } else if (history == 2) {
+      extra->roi_deopt_count = 1;
+    } else if (history == 3) {
+      extra->roi_recompile_floor = 128;
+    } else if (history == 4) {
+      extra->roi_aging_epoch_ms = 1;
+    } else if (history == 5) {
+      Ci_code_extra_or_skey_release(extra, kSkeyDecidedColdBit);
+    }
+    const auto ctl = extra->roi_ctl;
+    const auto count = extra->roi_deopt_count;
+    const auto floor = extra->roi_recompile_floor;
+    const auto epoch = extra->roi_aging_epoch_ms;
+    auto result = Ref<>::steal(PyObject_CallOneArg(function, receiver));
+    ASSERT_NE(result, nullptr);
+    EXPECT_TRUE(isIntEquals(result, 8));
+    if (history == 0) {
+      EXPECT_NE(extra->jit_compiled, nullptr)
+          << "positive short-admission path";
+    } else {
+      EXPECT_EQ(extra->jit_compiled, nullptr) << "history=" << history;
+      EXPECT_EQ(extra->roi_ctl, ctl);
+      EXPECT_EQ(extra->roi_deopt_count, count);
+      EXPECT_EQ(extra->roi_recompile_floor, floor);
+      EXPECT_EQ(extra->roi_aging_epoch_ms, epoch);
+    }
+  }
+}
+#endif
+
 TEST_F(
     BehaviorClassifierRuntimeTest,
     AutoClassifyCompilesTinyObjectHelpersOnPythonCallPath) {
