@@ -27,14 +27,18 @@ def target_event(target):
     return matches[0]
 
 
-def warm(target, arguments, expected, *, minimum_calls=64):
+def warm(target, arguments, expected, *, minimum_calls=64, keywords=None):
     # The specification allows at most 128 extra interpreted calls beyond the
     # original admission point. Every call uses natural AutoJIT admission.
     # A few additional calls make the installed path, not merely admission,
     # observable. Calls go through the real function, without force_compile.
     saw_compiled = False
     for index in range(minimum_calls + 148):
-        value = target(*arguments)
+        value = (
+            target(*arguments)
+            if keywords is None
+            else target(*arguments, **keywords)
+        )
         assert value == expected, (index, value, expected)
         compiled = jit.is_jit_compiled(target)
         if index < minimum_calls:
@@ -61,13 +65,202 @@ def mature(minimum_calls=64):
 
 
 def short_warmup():
+    class Receiver:
+        value = 7
+
+        @property
+        def target(self):
+            return (self.value + 1) * 3
+
+    descriptor = Receiver.target
+    getter = descriptor.fget
+    receiver = Receiver()
+    assert not jit.is_jit_compiled(getter)
+    # LOAD_ATTR_PROPERTY can enter the getter without its AutoJIT vectorcall.
+    for _ in range(148):
+        assert descriptor.__get__(receiver, Receiver) == 24
+    return {"event": target_event(getter)}
+
+
+def ordinary_short_warmup():
     return mature(minimum_calls=2)
+
+
+def short_loop_property():
+    class Receiver:
+        states = ((False,) * 3 + (True,) + (False,) * 8,)
+
+        @property
+        def target(self):
+            result = 0
+            # Keep one backedge and enough control instructions for bucket 1.
+            for a, b, c, d, e, f, g, h, i, j, k, l in self.states:
+                if a:
+                    result = 1
+                if b:
+                    result = 2
+                if c:
+                    result = 3
+                if d:
+                    result = 4
+                if e:
+                    result = 5
+                if f:
+                    result = 6
+                if g:
+                    result = 7
+                if h:
+                    result = 8
+                if i:
+                    result = 9
+                if j:
+                    result = 10
+                if k:
+                    result = 11
+                if l:
+                    result = 12
+                # Both paths use the same loop backedge.
+                result += 1
+            return result
+
+    getter = Receiver.target.fget
+    return {"event": warm(getter, (Receiver(),), 5, minimum_calls=1)}
+
+
+def short_property_ineligible(kind):
+    class Receiver:
+        value = 7
+        items = [0, 1, 2, 3]
+
+        def lookup(self, key):
+            return key
+
+    class DerivedProperty(property):
+        pass
+
+    if kind == "two_args":
+        def target_with_offset(receiver, offset):
+            return receiver.value + offset
+
+        Receiver.target_with_offset = property(target_with_offset)
+        event = warm(target_with_offset, (Receiver(), 2), 9, minimum_calls=2)
+        return {"event": event}
+
+    if kind == "slice":
+        def target_with_slice(receiver):
+            return receiver.items[1:3]
+
+        Receiver.target_with_slice = property(target_with_slice)
+        event = warm(target_with_slice, (Receiver(),), [1, 2], minimum_calls=2)
+        return {"event": event}
+
+    if kind == "subscript":
+        def target_with_subscript(receiver):
+            return receiver.items[0]
+
+        Receiver.target_with_subscript = property(target_with_subscript)
+        event = warm(target_with_subscript, (Receiver(),), 0, minimum_calls=2)
+        return {"event": event}
+
+    if kind == "method_forwarder":
+        def target_forwarding_method(receiver):
+            return receiver.lookup("key")
+
+        Receiver.target_forwarding_method = property(target_forwarding_method)
+        event = warm(target_forwarding_method, (Receiver(),), "key", minimum_calls=2)
+        return {"event": event}
+
+    if kind == "constant":
+        def target_with_constant(receiver):
+            return 7
+
+        Receiver.target_with_constant = property(target_with_constant)
+        event = warm(target_with_constant, (Receiver(),), 7, minimum_calls=2)
+        return {"event": event}
+
+    def target(receiver):
+        return receiver.value
+
+    Receiver.target = property(target)
+    if kind == "method":
+        Receiver.target = target
+    elif kind == "subclass":
+        Receiver.target = DerivedProperty(target)
+    elif kind == "inherited":
+        class DerivedReceiver(Receiver):
+            pass
+
+        receiver = DerivedReceiver()
+        return {"event": warm(target, (receiver,), 7, minimum_calls=2)}
+    elif kind == "replaced":
+        Receiver.target = property(lambda receiver: receiver.value + 1)
+    elif kind == "alias":
+        del Receiver.target
+        Receiver.alias = property(target)
+
+    receiver = Receiver()
+    if kind == "keywords":
+        event = warm(target, (), 7, minimum_calls=2, keywords={"receiver": receiver})
+    else:
+        event = warm(target, (receiver,), 7, minimum_calls=2)
+    return {"event": event}
+
+
+def short_attribute_semantics():
+    class Descriptor:
+        def __get__(self, receiver, owner):
+            receiver.reads += 1
+            if receiver.fail:
+                raise LookupError("attribute lookup failed")
+            return receiver.payload
+
+    class Receiver:
+        value = Descriptor()
+
+        def __init__(self):
+            self.payload = 7
+            self.reads = 0
+            self.fail = False
+
+    def target(receiver):
+        return receiver.value
+
+    Receiver.target = property(target)
+    receiver = Receiver()
+    event = warm(target, (receiver,), 7, minimum_calls=0)
+    assert receiver.reads == 148, receiver.reads
+    Receiver.value = property(lambda value: value.payload + 1)
+    assert target(receiver) == 8
+    Receiver.value = Descriptor()
+    receiver.fail = True
+    try:
+        target(receiver)
+    except LookupError as error:
+        assert str(error) == "attribute lookup failed"
+    else:
+        raise AssertionError("descriptor exception was swallowed")
+    assert receiver.reads == 149, receiver.reads
+
+    class CustomLookup:
+        def __getattribute__(self, name):
+            if name == "value":
+                return "custom lookup"
+            return object.__getattribute__(self, name)
+
+    assert target(CustomLookup()) == "custom lookup"
+    try:
+        target(object())
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("missing attribute exception was swallowed")
+    return {"event": event, "descriptor_reads": receiver.reads}
 
 
 def setup_short_warmup():
     cinderx._autojit_setup_enter()
     try:
-        return mature(minimum_calls=2)
+        return short_warmup()
     finally:
         cinderx._autojit_setup_leave()
 
@@ -217,11 +410,16 @@ def manual():
     return mature()
 
 
-def explicit_jit_list():
+def explicit_jit_list(minimum_calls=64):
     jit.append_jit_list(f"{__name__}:explicit_jit_list.<locals>.target")
 
-    def target(value):
-        return (value + 1) * 3
+    class Receiver:
+        value = 7
+
+    def target(receiver):
+        return (receiver.value + 1) * 3
+
+    Receiver.target = property(target)
 
     # Explicit-list scheduling installs the CinderX frame evaluator. In auto
     # mode the vectorcall gate and frame entry can both advance the shared
@@ -230,8 +428,8 @@ def explicit_jit_list():
     # the exact internal threshold in the native event instead.
     assert not jit.is_jit_compiled(target)
     first_compiled_invocation = None
-    invocation_count = 64 + 276
-    arguments = (7,)
+    invocation_count = minimum_calls + 276
+    arguments = (Receiver(),)
     for invocation in range(1, invocation_count + 1):
         value = target(*arguments)
         assert value == 24, (invocation, value, 24)
@@ -239,8 +437,12 @@ def explicit_jit_list():
             first_compiled_invocation = invocation
     assert first_compiled_invocation is not None
     event = target_event(target)
-    assert event["calls"] == 64, event
-    assert event["ic_stability_reason"] == "explicit", event
+    assert event["calls"] == minimum_calls, event
+    reason = (
+        "disabled" if os.environ.get("CINDERX_AUTOJIT_IC_STABILITY") == "0"
+        else "explicit"
+    )
+    assert event["ic_stability_reason"] == reason, event
     assert event["ic_stability_samples"] == 0, event
     return {
         "event": event,
@@ -248,6 +450,10 @@ def explicit_jit_list():
         "python_invocations": invocation_count,
         "checked_value": 24,
     }
+
+
+def explicit_short_warmup():
+    return explicit_jit_list(minimum_calls=2)
 
 
 def low_threshold():
@@ -640,15 +846,24 @@ def instance_value_semantics():
 
 def main():
     cases = {case.__name__: case for case in (
-        mature, short_warmup, setup_short_warmup, long_effective_warmup,
+        mature, short_warmup, ordinary_short_warmup, short_loop_property,
+        short_attribute_semantics, setup_short_warmup, long_effective_warmup,
         inplace_numeric,
         natural_late_stable, natural_wait_cap,
         manual, cold_branch, all_unknown, no_sites, attribute_phases,
         subscript, instance_value_semantics, instance_value_type_churn,
         method_with_values,
-        explicit_jit_list, explicit_loop, low_threshold, late_warmup_change,
+        explicit_jit_list, explicit_short_warmup, explicit_loop, low_threshold,
+        late_warmup_change,
         unknown_then_known,
     )}
+    cases.update({
+        f"short_property_{kind}": lambda kind=kind: short_property_ineligible(kind)
+        for kind in (
+            "method", "subclass", "inherited", "replaced", "alias", "keywords",
+            "two_args", "slice", "subscript", "method_forwarder", "constant",
+        )
+    })
     parser = argparse.ArgumentParser()
     parser.add_argument("case", choices=cases)
     args = parser.parse_args()

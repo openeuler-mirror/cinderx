@@ -161,18 +161,73 @@ class AutoJitICStabilityTests(unittest.TestCase):
         self.assertEqual(result["event"]["ic_stability_samples"], 3)
         self.assertEqual(result["event"]["ic_stability_first_calls"], 56)
 
-    def test_short_warmup_keeps_original_admission_and_semantics(self):
+    def test_mature_small_property_compiles_on_first_call(self):
         for stability in (None, "1"):
             with self.subTest(stability=stability):
                 event = self.run_case(
                     "short_warmup", mode="auto:2", stability=stability
                 )["event"]
-                self.assertEqual(event["calls"], 2)
-                self.assertEqual(event["effective_limit"], 2)
-                self.assertEqual(event["ic_stability_admission_calls"], 2)
+                self.assertEqual(event["calls"], 0)
+                self.assertEqual(event["effective_limit"], 0)
+                self.assertEqual(event["ic_stability_admission_calls"], 0)
                 self.assertEqual(event["ic_stability_reason"], "short_warmup")
                 self.assertEqual(event["ic_stability_samples"], 0)
                 self.assertEqual(event["shape"]["loop_score"], 0)
+
+    def test_mature_branch_property_compiles_after_one_interpreted_call(self):
+        event = self.run_case("short_loop_property", mode="auto:2")["event"]
+        self.assertEqual(event["calls"], 1)
+        self.assertEqual(event["effective_limit"], 1)
+        self.assertEqual(event["ic_stability_reason"], "loop_work")
+        self.assertEqual(event["shape"]["family"], "BranchFSM")
+        self.assertEqual(event["shape"]["loop_score"], 1)
+        self.assertEqual(event["shape"]["code_size_bucket"], 1)
+        self.assertEqual(event["shape"]["risk_reason"], 0)
+
+    def test_ineligible_property_calls_keep_the_original_threshold(self):
+        cases = (
+            "method", "subclass", "inherited", "replaced", "alias", "keywords",
+            "two_args", "slice", "subscript", "method_forwarder", "constant",
+        )
+        for kind in cases:
+            with self.subTest(kind=kind):
+                event = self.run_case(
+                    f"short_property_{kind}", mode="auto:2"
+                )["event"]
+                self.assertEqual(event["calls"], 2)
+                self.assertEqual(event["effective_limit"], 2)
+
+    def test_ordinary_small_function_keeps_the_original_threshold(self):
+        event = self.run_case("ordinary_short_warmup", mode="auto:2")["event"]
+        self.assertEqual(event["calls"], 2)
+        self.assertEqual(event["effective_limit"], 2)
+
+    def test_first_admission_preserves_attribute_side_effects_and_errors(self):
+        result = self.run_case("short_attribute_semantics", mode="auto:2")
+        event = result["event"]
+        self.assertEqual(event["calls"], 0)
+        self.assertEqual(event["effective_limit"], 0)
+        self.assertEqual(event["ic_stability_reason"], "short_warmup")
+        self.assertEqual(event["shape"]["loop_score"], 0)
+        self.assertEqual(event["shape"]["code_size_bucket"], 0)
+        self.assertEqual(event["shape"]["risk_reason"], 0)
+        self.assertEqual(result["descriptor_reads"], 149)
+
+    def test_plain_numeric_threshold_does_not_admit_small_properties_early(self):
+        event = self.run_case("short_warmup", mode="2")["event"]
+        self.assertEqual(event["calls"], 2)
+        self.assertEqual(event["effective_limit"], 2)
+        self.assertEqual(event["ic_stability_reason"], "non_auto")
+
+    def test_explicit_short_threshold_is_independent_of_ic_switch(self):
+        for stability, reason in (("1", "explicit"), ("0", "disabled")):
+            with self.subTest(stability=stability):
+                event = self.run_case(
+                    "explicit_short_warmup", mode="auto:2", stability=stability
+                )["event"]
+                self.assertEqual(event["calls"], 2)
+                self.assertEqual(event["effective_limit"], 2)
+                self.assertEqual(event["ic_stability_reason"], reason)
 
     def test_cold_process_keeps_existing_short_threshold_stability(self):
         event = self.run_case(

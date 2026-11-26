@@ -74,6 +74,60 @@ TEST(AutoJitICStabilityTest, KnownNoLoopKeepsStabilityAdmission) {
 
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED)
+TEST(AutoJitICStabilityTest, MaturePropertyUsesShapeSpecificWarmup) {
+  StructureKey key;
+  GateContext steady;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 0);
+  EXPECT_EQ(shortWarmupPropertyThreshold(3, key, steady, true), 0);
+  EXPECT_EQ(shortWarmupPropertyThreshold(8, key, steady, true), 0);
+  for (uint32_t limit : {0u, 1u, 9u, 64u}) {
+    EXPECT_EQ(shortWarmupPropertyThreshold(limit, key, steady, true), limit);
+  }
+
+  key.family = Family::BranchFSM;
+  key.loop_score = 1;
+  key.code_size_bucket = 1;
+  for (uint32_t limit : {2u, 3u, 8u}) {
+    EXPECT_EQ(shortWarmupPropertyThreshold(limit, key, steady, true), 1);
+  }
+  key.loop_score = 2;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.loop_score = 1;
+  key.code_size_bucket = 2;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.code_size_bucket = 1;
+  key.family = Family::NumericLoop;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+}
+
+TEST(
+    AutoJitICStabilityTest,
+    ShortPropertyWarmupProtectsColdStartupAndRiskyCode) {
+  StructureKey key;
+  GateContext steady;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, false), 2);
+  for (GateContext context :
+       {GateContext{true, false, false},
+        GateContext{false, true, false},
+        GateContext{false, false, true}}) {
+    EXPECT_EQ(shortWarmupPropertyThreshold(2, key, context, true), 2);
+  }
+  key.loop_score = 1;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.loop_score = 0;
+  key.code_size_bucket = 1;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.code_size_bucket = 0;
+  key.risk_reason = kRiskException;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.risk_reason = kRiskNone;
+  key.is_suspendable = true;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+  key.is_suspendable = false;
+  key.is_static = true;
+  EXPECT_EQ(shortWarmupPropertyThreshold(2, key, steady, true), 2);
+}
+
 TEST(AutoJitICStabilityTest, ShortWarmupDoesNotExtendOriginalAdmission) {
   StructureKey key;
   for (uint32_t limit : {0u, 1u, 2u, 8u}) {

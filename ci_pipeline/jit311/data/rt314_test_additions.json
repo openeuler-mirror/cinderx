@@ -3,6 +3,9 @@
     "hir_cse_test.txt": "156c4ab4477a9835b9ae67d7e934e5b7ae8a4b989d42164b8238b7fa7b1cf29d"
   },
   "test_additions": {
+    "AutoJitICStabilityTest.MaturePropertyUsesShapeSpecificWarmup": "pass",
+    "AutoJitICStabilityTest.ShortPropertyWarmupProtectsColdStartupAndRiskyCode": "pass",
+    "BehaviorClassifierRuntimeTest.ShortPropertyAdmissionPreservesRoiHistory": "pass",
     "AutoJitICStabilityTest.ShortWarmupDoesNotExtendOriginalAdmission": "pass",
     "BehaviorClassifierTest.ReleaseQueryDoesNotSpendHeldCallBudget": "pass",
     "CodeLayoutTest.AppendingKnownSuccessorDoesNotDuplicateItsEdge": "pass",
