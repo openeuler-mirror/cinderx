@@ -1,8 +1,24 @@
 # 快速入门
 
-本指南以CP311 wheel为例，介绍完成Python环境准备、软件包获取与安装、示例创建、JIT启动和结果检查的完整流程。示例使用`v3.0.0`对应的包版本`2026.11.10.0`；CP311 RPM的发行号为`1`。
+本指南以CP311 wheel为例，介绍完成Python环境准备、软件包获取与安装、示例创建、JIT启动和结果检查的完整流程。示例使用`v3.0.0`对应的包版本`2026.11.10.0`。
+
+## 配套版本
+
+以下以`v3.0.0`为例：
+
+| 项目 | 内容 |
+|---|---|
+| 产品版本 | `v3.0.0` |
+| wheel元数据版本 | `2026.11.10.0` |
+| CP311 RPM版本 | `2026.11.10.0-1`，包名`python3-cinderx` |
+| 架构 | Linux AArch64 / ARM64 |
+| wheel来源 | `openeuler/cinderx` Release附件 |
+| RPM来源 | 暂未公开发布。已取得RPM时，参见[本地安装步骤](installation_guide.md)本地安装。 |
+| 校验方式 | wheel使用同一Release的SHA256文件。通过软件源安装的RPM由DNF自动校验。 |
 
 ## 安装软件包
+
+完成[环境检查](installation_guide.md#准备环境)后，执行以下步骤安装软件包。
 
 1. 在源码仓库外准备工作目录。
 
@@ -22,8 +38,15 @@
     `CINDERX_PY`始终指向所选环境的解释器，后文安装与运行均使用它。
 
 3. 获取并安装软件包。
+网页下载和命令行下载任选一种，得到的文件相同。
 
-    1. 先选择与所选Python对应的一行，设置完整文件名。
+    - 网页下载
+
+      从[CinderX Releases](https://gitcode.com/openeuler/cinderx/releases)选择正式版本，下载与解释器和架构匹配的wheel及同名`.sha256`文件。版本映射、已知限制和升级变化见[版本说明书](https://gitcode.com/openeuler/cinderx/releases)。
+    
+    - 命令行下载
+
+    1. 使用CPython 3.11 wheel，设置完整文件名。
 
         ```shell
         wheel=cinderx-2026.11.10.0-cp311-cp311-linux_aarch64.whl
@@ -38,7 +61,7 @@
           curl --fail --location --retry 3 --output "$wheel.sha256" "$base_url/$wheel.sha256"
         ```
 
-    3. 校验并安装到已选环境：
+    3. 校验并安装到已选环境。
 
         ```bash
         sha256sum -c "$wheel.sha256" &&
